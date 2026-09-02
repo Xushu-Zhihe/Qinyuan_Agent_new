@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "httpx": {
+      "command": "python",
+      "args": ["server.py"]
+    }
+  }
+}
+   

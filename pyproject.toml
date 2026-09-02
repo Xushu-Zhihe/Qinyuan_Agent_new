@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qinyuan-agent"
+version = "0.1.0"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "docker>=7.1,<8",
+    "langchain-core>=0.3,<2",
+    "langchain-openai>=0.3,<2",
+    "mcp[cli]>=1.9,<2",
+    "pydantic>=2.7,<3",
+    "python-dotenv>=1,<2",
+]
+
+[project.scripts]
+qinyuan-agent = "agent:main"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["agent"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["Agents*", "LLMs*", "MCPs*", "Sandbox*", "Skills*", "tools*", "agent_core*"]
+
+[tool.setuptools.package-data]
+Skills = ["**/*.md", "**/*.py", "**/*.json"]
+"MCPs.Mcp_client" = ["registry.json"]
+"MCPs.LibcSearcher_Mcp" = ["database.json"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

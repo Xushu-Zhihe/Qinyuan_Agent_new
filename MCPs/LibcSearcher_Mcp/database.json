@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "source": "libc.rip api/find metadata captured during image preparation",
+  "entries": [
+    {
+      "id": "libc6_2.23-0ubuntu11.2_amd64",
+      "arch": "amd64",
+      "family": "glibc",
+      "buildid": "c4fd86ec1eed57a09c79ce601f6c6e3796f574df",
+      "sha256": "bdbfca693a182f4846e78d21eb965fffe9a6c0bba136c908143319fa96119dfe",
+      "download_url": "https://libc.rip/download/libc6_2.23-0ubuntu11.2_amd64.so",
+      "symbols": {
+        "__libc_start_main_ret": "0x20840",
+        "system": "0x453a0",
+        "dup2": "0xf7a30",
+        "str_bin_sh": "0x18ce17",
+        "read": "0xf7310",
+        "write": "0xf7370",
+        "puts": "0x6f6a0",
+        "printf": "0x55810"
+      }
+    },
+    {
+      "id": "libc6_2.27-3ubuntu1_amd64",
+      "arch": "amd64",
+      "family": "glibc",
+      "buildid": "b417c0ba7cc5cf06d1d1bed6652cedb9253c60d0",
+      "sha256": "cd7c1a035d24122798d97a47a10f6e2b71d58710aecfd392375f1aa9bdde164d",
+      "download_url": "https://libc.rip/download/libc6_2.27-3ubuntu1_amd64.so",
+      "symbols": {
+        "__libc_start_main_ret": "0x21b97",
+        "system": "0x4f440",
+        "dup2": "0x1109a0",
+        "str_bin_sh": "0x1b3e9a",
+        "read": "0x110070",
+        "write": "0x110140",
+        "puts": "0x809c0",
+        "printf": "0x64e80"
+      }
+    },
+    {
+      "id": "libc6_2.27-3ubuntu1.4_amd64",
+      "arch": "amd64",
+      "family": "glibc",
+      "buildid": "ce450eb01a5e5acc7ce7b8c2633b02cc109333e9",
+      "sha256": "467d8d5596e31cec78cdcde0c589bd04c031ec36598531bfd77e346ac447d9d6",
+      "download_url": "https://libc.rip/download/libc6_2.27-3ubuntu1.4_amd64.so",
+      "symbols": {
+        "__libc_start_main_ret": "0x21bf7",
+        "system": "0x4f550",
+        "dup2": "0x110a70",
+        "str_bin_sh": "0x1b3e1a",
+        "read": "0x110140",
+        "write": "0x110210",
+        "puts": "0x80aa0",
+        "printf": "0x64f70"
+      }
+    },
+    {
+      "id": "libc6_2.31-0ubuntu9.10_amd64",
+      "arch": "amd64",
+      "family": "glibc",
+      "buildid": "965ff93b372ec6e456142d04b7d3795aefdcf0c5",
+      "sha256": "7ee6f1d397c152dc83caeb6a86e888d9f86e5f0c2d33559a9100923bda872cd4",
+      "download_url": "https://libc.rip/download/libc6_2.31-0ubuntu9.10_amd64.so",
+      "symbols": {
+        "__libc_start_main_ret": "0x24083",
+        "system": "0x52290",
+        "dup2": "0x10e8c0",
+        "str_bin_sh": "0x1b45bd",
+        "read": "0x10dfc0",
+        "write": "0x10e060",
+        "puts": "0x84420",
+        "printf": "0x61c90"
+      }
+    },
+    {
+      "id": "libc6_2.34-0ubuntu3_amd64",
+      "arch": "amd64",
+      "family": "glibc",
+      "buildid": "b8037b6260865346802321dd2256b8ad1d857e63",
+      "sha256": "64c5884701cf52968917726289eb66bfd2e776f9d18d7e37c4449b91efa6d0cf",
+      "download_url": "https://libc.rip/download/libc6_2.34-0ubuntu3_amd64.so",
+      "symbols": {
+        "__libc_start_main_ret": "0x2dfd0",
+        "system": "0x54ae0",
+        "dup2": "0x118140",
+        "str_bin_sh": "0x1dbcba",
+        "read": "0x117900",
+        "write": "0x1179a0",
+        "puts": "0x84ed0",
+        "printf": "0x644c0"
+      }
+    },
+    {
+      "id": "libc6_2.35-0ubuntu3_amd64",
+      "arch": "amd64",
+      "family": "glibc",
+      "buildid": "89c3cb85f9e55046776471fed05ec441581d1969",
+      "sha256": "ebaed8bd64291875c908cc6e7f5115ae7bf605a5da56ce3da4028e2fcfb0d8e5",
+      "download_url": "https://libc.rip/download/libc6_2.35-0ubuntu3_amd64.so",
+      "symbols": {
+        "__libc_start_main_ret": "0x29d90",
+        "system": "0x50d60",
+        "dup2": "0x1151c0",
+        "str_bin_sh": "0x1d8698",
+        "read": "0x114980",
+        "write": "0x114a20",
+        "puts": "0x80ed0",
+        "printf": "0x60770"
+      }
+    },
+    {
+      "id": "libc6_2.37-0ubuntu1_amd64",
+      "arch": "amd64",
+      "family": "glibc",
+      "buildid": "cca53e34d3ff43a4faa2e89f22ae42e0509fa4fb",
+      "sha256": "58f2607ee5d98d34437809d33e28caf70d0ce7a9bd6e3233b1abb658b0032a02",
+      "download_url": "https://libc.rip/download/libc6_2.37-0ubuntu1_amd64.so",
+      "symbols": {
+        "__libc_start_main_ret": "0x23a90",
+        "system": "0x4ebd0",
+        "dup2": "0x10c0d0",
+        "str_bin_sh": "0x1b51d2",
+        "read": "0x10b8b0",
+        "write": "0x10b950",
+        "puts": "0x7a9c0",
+        "printf": "0x55ed0"
+      }
+    }
+  ]
+}

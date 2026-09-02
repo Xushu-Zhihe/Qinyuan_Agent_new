@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "zap": {
+      "command": "python",
+      "args": ["server.py"]
+    }
+  }
+}

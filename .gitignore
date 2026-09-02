@@ -1,0 +1,35 @@
+架构图.svg
+流程图.svg
+Qinyuan_agent架构图.svg
+Qinyuan_Agent流程图.svg
+Qinyuan_Agent_confirmed_flow.svg
+
+.vscode
+.env
+
+# Local Python environments and dependency caches
+.venv/
+venv/
+.uv-cache/
+
+# Test and runtime workspaces
+/.test-temp-*/
+/.test-work/
+/challenge/
+/work/
+/tests/.test-work/
+/tests/.runtime-work/
+/tests/.sandbox-work/
+/tests/.stage-work/
+/tests/.cancel-work/
+
+# Python caches and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Packaging output
+/build/
+/dist/
+/dist-final/

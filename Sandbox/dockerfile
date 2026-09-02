@@ -1,0 +1,211 @@
+ARG NUCLEI_VERSION=v3.4.10
+ARG JADX_VERSION=1.5.6
+ARG JADX_SHA256=545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974
+
+# Pin the working PowerShell 7.5.0 filesystem. A floating stage tag can leave
+# pwsh and System.Management.Automation.dll from different upstream revisions
+# when Docker reuses only part of the multi-stage cache.
+FROM mcr.microsoft.com/powershell@sha256:7ab5bd5ca6f95a3351fa0c6a1205237d57048c94542355aab55519a0861a9b25 AS powershell-tool
+
+FROM golang:1.26-bookworm AS security-tools-builder
+
+ARG SUBFINDER_VERSION=v2.15.0
+ARG HTTPX_VERSION=v1.10.0
+ARG FFUF_VERSION=v2.1.0
+ARG AMASS_VERSION=v4.2.0
+
+ENV CGO_ENABLED=0 \
+    GOBIN=/out \
+    GOMAXPROCS=2 \
+    GOPROXY="https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://proxy.golang.org|direct"
+
+# Go 工具只在构建阶段编译；最终镜像不包含 Go 编译器。
+# 每个工具使用独立构建层：网络或 Docker Desktop 偶发中断时，已经成功的
+# 工具会保留在层缓存中，重新构建只需继续未完成的步骤。
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    mkdir -p /out \
+    && go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@${SUBFINDER_VERSION} \
+    || { go clean -modcache -cache; \
+         go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@${SUBFINDER_VERSION}; }
+
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    go install github.com/projectdiscovery/httpx/cmd/httpx@${HTTPX_VERSION} \
+    || { go clean -modcache -cache; \
+         go install github.com/projectdiscovery/httpx/cmd/httpx@${HTTPX_VERSION}; }
+
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    go install github.com/ffuf/ffuf/v2@${FFUF_VERSION} \
+    || { go clean -modcache -cache; \
+         go install github.com/ffuf/ffuf/v2@${FFUF_VERSION}; }
+
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    go install github.com/owasp-amass/amass/v4/cmd/amass@${AMASS_VERSION} \
+    || { go clean -modcache -cache; \
+         go install github.com/owasp-amass/amass/v4/cmd/amass@${AMASS_VERSION}; }
+
+# 模板在镜像构建时下载一次，Agent 容器启动时无需重复联网下载。
+RUN git clone --depth 1 \
+    https://github.com/projectdiscovery/nuclei-templates.git \
+    /nuclei-templates
+
+# Nuclei 依赖树很大，源码编译既慢又容易受 Go 代理波动影响。
+# 直接复用 ProjectDiscovery 官方镜像中的固定版本二进制。
+FROM projectdiscovery/nuclei:${NUCLEI_VERSION} AS nuclei-tool
+
+FROM debian:bookworm-slim
+
+ARG JADX_VERSION
+ARG JADX_SHA256
+
+# 先复制构建产物，让最终阶段依赖 builder 完成。这样 BuildKit 不会在
+# Go 编译占用大量内存时并行运行 apt，避免资源峰值导致 apt 异常退出。
+COPY --from=security-tools-builder /out/subfinder /usr/local/bin/subfinder
+COPY --from=security-tools-builder /out/httpx /usr/local/bin/httpx
+COPY --from=security-tools-builder /out/ffuf /usr/local/bin/ffuf
+COPY --from=security-tools-builder /out/amass /usr/local/bin/amass
+COPY --from=security-tools-builder /nuclei-templates /opt/nuclei-templates
+COPY --from=nuclei-tool /usr/local/bin/nuclei /usr/local/bin/nuclei
+COPY --from=powershell-tool /opt/microsoft/powershell/7 /opt/microsoft/powershell/7
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false \
+    PATH="/opt/dirsearch/bin:${PATH}" \
+    PYTHONPATH="/opt/qinyuan/python" \
+    NUCLEI_TEMPLATES_DIR=/opt/nuclei-templates \
+    PS_INSTALL_FOLDER=/opt/microsoft/powershell/7 \
+    PSModuleAnalysisCachePath=/tmp/qinyuan-cache/powershell/ModuleAnalysisCache \
+    POWERSHELL_DISTRIBUTION_CHANNEL=PSDocker-Debian-12 \
+    PIP_INDEX_URL=https://pypi.org/simple \
+    PIP_DEFAULT_TIMEOUT=60 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_RETRIES=5
+
+RUN rm -rf /var/lib/apt/lists/* \
+    && apt-get -o Acquire::Retries=5 update \
+    && apt-get install --no-install-recommends -y \
+        ca-certificates \
+        coreutils \
+        curl \
+        file \
+        binutils \
+        gdb \
+        libicu72 \
+        libssl3 \
+        nmap \
+        openjdk-17-jre-headless \
+        perl \
+        php-cli \
+        python3 \
+        python3-pip \
+        python3-venv \
+        zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
+
+# Install the pinned JADX CLI release and verify the digest published by
+# GitHub before exposing it to sandbox commands.
+RUN curl --fail --location --retry 5 --retry-all-errors \
+        "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
+        --output /tmp/jadx.zip \
+    && echo "${JADX_SHA256}  /tmp/jadx.zip" | sha256sum --check --strict \
+    && mkdir -p /opt/jadx \
+    && python3 -m zipfile -e /tmp/jadx.zip /opt/jadx \
+    && rm /tmp/jadx.zip \
+    && chmod -R a=rX /opt/jadx \
+    && chmod 0755 /opt/jadx/bin/jadx \
+    && ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx
+
+# 与 APT 分层，PyPI 波动时不必重新安装系统包。固定容易发生兼容问题的
+# 二进制依赖，避免未来的新版本导致 Python 3.11 运行异常。
+RUN /usr/bin/python3 -m venv --without-pip /opt/dirsearch \
+    && /usr/bin/python3 -m pip install --no-cache-dir --target \
+        "$(/opt/dirsearch/bin/python3 -c \
+            'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+        "pip==25.3" \
+    && (/opt/dirsearch/bin/python3 -m pip install --no-cache-dir \
+            "cffi==1.17.1" \
+            "chardet==5.2.0" \
+            "dirsearch==0.4.3.post1" \
+        || /opt/dirsearch/bin/python3 -m pip install --no-cache-dir \
+            "cffi==1.17.1" \
+            "chardet==5.2.0" \
+            "dirsearch==0.4.3.post1")
+
+# Keep CTF analysis packages in a dedicated target directory. The runtime is
+# read-only and non-root, so MCPs use PYTHONPATH instead of installing packages
+# during a challenge.
+RUN mkdir -p /opt/qinyuan/python \
+    && /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir \
+        --target /opt/qinyuan/python \
+        "pwntools==4.14.1" \
+        "z3-solver==4.15.1.0" \
+        "pycryptodome==3.23.0"
+
+# Keep a small, offline LibcSearcher-compatible matcher and its verified
+# symbol-offset index in the read-only analysis library path. This is metadata
+# only; the image does not contain the Ubuntu libc package corpus.
+COPY MCPs/LibcSearcher_Mcp/runtime.py /opt/qinyuan/python/qinyuan_libcsearcher.py
+COPY MCPs/LibcSearcher_Mcp/database.json /opt/qinyuan/python/qinyuan_libcsearcher_index.json
+
+# 内置小型字典用于开发和集成测试；生产环境可在后续镜像版本中替换。
+RUN mkdir -p /opt/qinyuan/wordlists \
+    && printf '%s\n' \
+        admin api assets backup config dashboard docs images index login robots.txt static upload \
+        > /opt/qinyuan/wordlists/common.txt \
+    && printf '%s\n' \
+        admin assets backup css dashboard docs images js login private public static upload uploads \
+        > /opt/qinyuan/wordlists/directories.txt \
+    && printf '%s\n' \
+        api auth health login logout metrics openapi.json register status swagger users v1 v2 \
+        > /opt/qinyuan/wordlists/api.txt \
+    && printf '%s\n' \
+        admin administrator console dashboard manage manager panel portal staff superuser \
+        > /opt/qinyuan/wordlists/admin.txt \
+    && chmod -R a=rX /opt/qinyuan /opt/nuclei-templates \
+    && chmod 0755 /usr/local/bin/subfinder /usr/local/bin/httpx \
+        /usr/local/bin/nuclei /usr/local/bin/ffuf /usr/local/bin/amass \
+    && command -v nmap >/dev/null \
+    && command -v curl >/dev/null \
+    && command -v php >/dev/null \
+    && command -v file >/dev/null \
+    && command -v jadx >/dev/null \
+    && command -v readelf >/dev/null \
+    && command -v objdump >/dev/null \
+    && command -v nm >/dev/null \
+    && command -v strings >/dev/null \
+    && command -v gdb >/dev/null \
+    && command -v subfinder >/dev/null \
+    && command -v amass >/dev/null \
+    && command -v httpx >/dev/null \
+    && command -v ffuf >/dev/null \
+    && command -v dirsearch >/dev/null \
+    && command -v nuclei >/dev/null \
+    && command -v pwsh >/dev/null \
+    && php -r 'exit(PHP_VERSION_ID >= 80200 ? 0 : 1);' \
+    && /usr/bin/python3 -c "import Crypto, pwn, z3, qinyuan_libcsearcher; assert qinyuan_libcsearcher.find_candidates({'puts': '0x80ed0'})['candidate_count'] >= 1"
+
+RUN groupadd --gid 10001 sandbox \
+    && useradd \
+        --uid 10001 \
+        --gid 10001 \
+        --create-home \
+        --shell /usr/sbin/nologin \
+        sandbox \
+    && mkdir -p /workspace \
+    && chown 10001:10001 /workspace
+
+WORKDIR /workspace
+USER 10001:10001
+
+# Validate the same non-root entrypoint used by SandboxService. This catches
+# an inconsistent copied PowerShell runtime while the image is being built.
+RUN pwsh -NoLogo -NoProfile -NonInteractive -Command \
+    '$PSVersionTable.PSVersion.ToString()' >/dev/null \
+    && jadx --version >/dev/null
+
+CMD ["sleep", "infinity"]

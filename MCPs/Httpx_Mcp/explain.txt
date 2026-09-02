@@ -1,0 +1,40 @@
+
+
+本次对httpx mcp进行了安全加固，添加了非法的屏蔽词
+
+
+## Httpx MCP 工具说明
+### 概述
+Httpx MCP 是基于 Model Context Protocol (MCP) 标准实现的 HTTP 探测工具插件，为 AI Agent 提供目标存活探测和信息收集能力。
+
+### 功能特性
+工具函数 功能描述 run_httpx_probe 对单个目标 URL/IP 执行 HTTP 探测 run_httpx_batch 从文件批量读取目标并执行探测
+
+### 使用方法
+单目标探测：
+
+批量探测：
+
+### 新增技术
+特性 说明 安全加固 正则表达式校验参数，防止命令注入 完善异常处理 支持超时、权限、文件未找到等多种异常场景 代码复用 单目标和批量模式共用核心执行逻辑 默认参数优化 启用状态码、内容长度、标题、技术探测等关键参数
+
+### 依赖要求
+- Python 3.11+
+- mcp[cli] >= 1.9.0
+- httpx 命令行工具
+安装 httpx：
+
+```
+go install -v github.com/
+projectdiscovery/httpx/cmd/
+httpx@latest
+```
+### 启动方式
+```
+cd MCPs/Httpx_Mcp
+uv run server.py
+```
+### 安全说明
+- 参数采用白名单校验机制，拒绝 shell 元字符
+- 命令以列表形式构建，避免 shell=True 风险
+- 批量模式验证目标文件存在性，防止路径遍历攻击

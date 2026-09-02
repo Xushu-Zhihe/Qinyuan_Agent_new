@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "dirsearch": {
+      "command": "python",
+      "args": ["-m", "src.server"]
+    }
+  }
+}

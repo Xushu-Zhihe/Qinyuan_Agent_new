@@ -1,0 +1,13 @@
+{
+    "mcpServers":{
+        "nmap-demo":{
+            "command":"uv",
+            "args":[
+                "--directory",
+                "/home/autyui/桌面/Agent/Mcp/MCPS/Nmap_Mcp",
+                "run",
+                "server.py"
+            ]
+        }
+    }
+}

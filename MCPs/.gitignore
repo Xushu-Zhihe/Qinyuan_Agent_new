@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Local env / secrets
+.env
+.env.*
+
+# Logs and scan outputs
+*.log
+results/
+scan_results/
+output/
+
+Mcp_client/registry.txt

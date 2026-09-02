@@ -1,0 +1,25 @@
+[project]
+name = "ffuf-mcp"
+version = "1.0.0"
+description = "MCP server for ffuf web fuzzing with blackboard architecture"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+ffuf-mcp = "server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.mcp]
+command = "python"
+args = ["server.py"]
+
+[[tool.mcp.assets]]
+path = "**/*.py"
+
+[tool.hatch.build.targets.default]
+packages = ["."]

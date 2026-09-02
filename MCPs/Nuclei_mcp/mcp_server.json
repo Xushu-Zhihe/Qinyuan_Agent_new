@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nuclei": {
+      "command": "python",
+      "args": ["server.py"]
+    }
+  }
+}
