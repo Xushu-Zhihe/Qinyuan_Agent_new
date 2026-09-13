@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from MCPs.analysis_common import validate_sandbox_path, validate_timeout
+from agent_core.file_inspection import inspection_arguments
 from MCPs.fastmcp_compat import FastMCP
 
 
@@ -18,15 +18,16 @@ mcp = FastMCP(
 
 @mcp.tool(title="Identify Sandbox File")
 def inspect_file(path: str, timeout_seconds: int = 30) -> dict[str, Any]:
-    normalized_path = validate_sandbox_path(path)
-    timeout = validate_timeout(timeout_seconds)
+    arguments = inspection_arguments(path)
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 60:
+        raise ValueError("timeout_seconds must be between 1 and 60")
     return {
         "sandbox_command": {
-            "tool": "file",
-            "arguments": ["--brief", "--dereference", "--", normalized_path],
-            "timeout_seconds": timeout,
+            "tool": "python3",
+            "arguments": list(arguments),
+            "timeout_seconds": timeout_seconds,
         },
-        "request": {"operation": "file_type", "path": normalized_path},
+        "request": {"operation": "file_type", "path": path},
     }
 
 

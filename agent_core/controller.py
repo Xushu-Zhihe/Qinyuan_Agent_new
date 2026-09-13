@@ -1,0 +1,1153 @@
+from __future__ import annotations
+
+import math
+import uuid
+from dataclasses import dataclass, replace
+from threading import RLock
+from typing import Any
+
+from agent_core.contracts import ModelBackend, TaskRequest, TaskRequestError, resolve_model_backend
+from agent_core.control_state_repository import ControlStateRepository, RecoveryResult
+from agent_core.control_store import (
+    CommittedOperation,
+    ControlCommitResult,
+    ControlMutation,
+    ControlStateSnapshot,
+    ControlStore,
+    IdempotencyConflictError,
+    StaleControlStateError,
+    StorageError,
+    TaskRunNotFoundError,
+    TaskRunSnapshot,
+    TurnRegistration,
+    TurnOperation,
+    UpsertExecution,
+    UpsertIntent,
+    UpsertPlan,
+    UpsertTaskRun,
+    UpsertTurn,
+)
+from agent_core.domain import ExecutionStatus, IntentStatus, PlanStatus, TurnStatus
+from agent_core.runtime import (
+    InvalidTransition,
+    RuntimeEvent,
+    TERMINAL_STATUSES,
+    TaskRunController as LegacyTaskRunController,
+    TaskRunStatus,
+    TaskRunSandboxPort,
+)
+
+
+class ControllerRegistryError(RuntimeError):
+    """Base error for in-process TaskRun controller ownership."""
+
+
+class ControllerAlreadyClaimedError(ControllerRegistryError):
+    """A TaskRun is already bound to another writable controller."""
+
+
+class ControllerNotClaimedError(ControllerRegistryError):
+    """A controller attempted to release a binding it does not own."""
+
+
+class TaskRunControllerRegistry:
+    """Process-local exclusive ownership for persistent TaskRun controllers."""
+
+    def __init__(self) -> None:
+        self._bindings: dict[str, object] = {}
+        self._lock = RLock()
+
+    def claim(self, task_run_id: str, controller: object) -> None:
+        if not isinstance(task_run_id, str) or not task_run_id.strip():
+            raise ValueError("task_run_id must be a non-empty string")
+        if controller is None:
+            raise ValueError("controller must not be None")
+        with self._lock:
+            existing = self._bindings.get(task_run_id)
+            if existing is not None and existing is not controller:
+                raise ControllerAlreadyClaimedError(
+                    f"TaskRun is already claimed: {task_run_id}"
+                )
+            self._bindings[task_run_id] = controller
+
+    def release(self, task_run_id: str, controller: object) -> None:
+        with self._lock:
+            existing = self._bindings.get(task_run_id)
+            if existing is None or existing is not controller:
+                raise ControllerNotClaimedError(
+                    f"controller does not own TaskRun binding: {task_run_id}"
+                )
+            del self._bindings[task_run_id]
+
+    def owner(self, task_run_id: str) -> object | None:
+        with self._lock:
+            return self._bindings.get(task_run_id)
+
+    def is_claimed(self, task_run_id: str) -> bool:
+        with self._lock:
+            return task_run_id in self._bindings
+
+
+class SandboxCleanupError(RuntimeError):
+    """Sandbox compensation or terminal cleanup failed."""
+
+    def __init__(
+        self,
+        sandbox_id: str,
+        reason: str,
+        *,
+        original_error: BaseException | None = None,
+        cleanup_error: BaseException | None = None,
+    ) -> None:
+        self.sandbox_id = sandbox_id
+        self.original_error = original_error
+        self.cleanup_error = cleanup_error
+        super().__init__(f"Sandbox cleanup failed for {sandbox_id}: {reason}")
+
+
+class CommittedStateReloadError(StorageError):
+    """The mutation committed, but the post-commit control snapshot is unavailable."""
+
+    committed = True
+
+    def __init__(self, message: str, commit: ControlCommitResult | None = None) -> None:
+        self.commit = commit
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class _PersistentDependencies:
+    store: ControlStore
+    repository: ControlStateRepository
+    registry: TaskRunControllerRegistry
+
+
+def _clock_now(clock: Any) -> float:
+    value = clock.now_utc() if hasattr(clock, "now_utc") else clock()
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Clock must return a numeric UTC Unix timestamp") from exc
+    if not math.isfinite(result):
+        raise ValueError("Clock must return a finite UTC Unix timestamp")
+    return result
+
+
+def _validate_mutation_id(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("mutation_id must be a UUID4 string")
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("mutation_id must be a UUID4 string") from exc
+    if parsed.version != 4 or str(parsed) != value.lower():
+        raise ValueError("mutation_id must be a canonical UUID4 string")
+    return value
+
+
+class TaskRunController(LegacyTaskRunController):
+    """Own exactly one TaskRun, with an optional persistent control-plane mode."""
+
+    def __init__(
+        self,
+        sandbox: Any,
+        *,
+        clock: Any = __import__("time").monotonic,
+        store: ControlStore | None = None,
+        repository: ControlStateRepository | None = None,
+        registry: TaskRunControllerRegistry | None = None,
+    ) -> None:
+        super().__init__(sandbox, clock=clock if callable(clock) else _clock_now_wrapper(clock))
+        supplied = (store, repository, registry)
+        if any(item is not None for item in supplied) and not all(
+            item is not None for item in supplied
+        ):
+            raise ValueError("persistent mode requires store, repository, and registry")
+        self._persistent = (
+            _PersistentDependencies(store, repository, registry)
+            if store is not None and repository is not None and registry is not None
+            else None
+        )
+        self._persistent_snapshot: TaskRunSnapshot | None = None
+        self._persistent_state: ControlStateSnapshot | None = None
+        self._persistent_task_run_id: str | None = None
+        self._registry_released = False
+        self._cache_invalid = False
+        self._closed = False
+
+    def _now_utc(self) -> float:
+        return _clock_now(self._clock)
+
+    def _require_persistent(self) -> _PersistentDependencies:
+        if self._persistent is None:
+            raise InvalidTransition("persistent ControlStore dependencies are not configured")
+        if self._cache_invalid:
+            raise StorageError("controller cache is invalid; reload the TaskRun state")
+        return self._persistent
+
+    @property
+    def task_run(self) -> Any:
+        """Return the committed TaskRun view in persistent mode.
+
+        Legacy callers still receive the mutable in-memory TaskRun.  Persistent
+        callers must never observe the inherited, uncommitted legacy field.
+        """
+
+        if self._persistent is None:
+            return super().task_run
+        self._require_persistent()
+        if self._persistent_snapshot is None:
+            raise InvalidTransition("TaskRun has not been started or attached")
+        return self._persistent_snapshot
+
+    def poll(self) -> TaskRunStatus:
+        """Keep the legacy polling API out of the persistent mutation path."""
+
+        if self._persistent is None:
+            return super().poll()
+        raise InvalidTransition(
+            "persistent TaskRun time changes require advance_time(mutation_id)"
+        )
+
+    def start(
+        self,
+        request: TaskRequest,
+        effective_model_backend: ModelBackend | str | None = None,
+        mutation_id: str | None = None,
+    ) -> Any:
+        if self._persistent is None:
+            if effective_model_backend is not None or mutation_id is not None:
+                raise InvalidTransition("persistent dependencies are required for this start signature")
+            return super().start(request)
+        return self._start_persistent(request, effective_model_backend, mutation_id)
+
+    def _start_persistent(
+        self,
+        request: TaskRequest,
+        effective_model_backend: ModelBackend | str | None,
+        mutation_id: str | None,
+    ) -> CommittedOperation:
+        deps = self._require_persistent()
+        if self._persistent_task_run_id is not None or self._closed:
+            raise InvalidTransition("TaskRunController can only start or attach once")
+        if not isinstance(request, TaskRequest):
+            raise TaskRequestError("request must be a TaskRequest")
+        if effective_model_backend is None:
+            raise TaskRequestError("effective_model_backend must be specified")
+        try:
+            backend = resolve_model_backend(effective_model_backend, None)
+        except TaskRequestError:
+            raise
+        if backend is None:
+            raise TaskRequestError("effective_model_backend must be specified")
+        _validate_mutation_id(mutation_id)
+        assert mutation_id is not None
+        if request.model_backend is not None and request.model_backend is not backend:
+            raise TaskRequestError("TaskRequest model_backend conflicts with effective_model_backend")
+
+        task_run_id = str(uuid.uuid4())
+        deps.registry.claim(task_run_id, self)
+        self._registry_released = False
+        sandbox_id: str | None = None
+        committed = False
+        try:
+            started_at = self._now_utc()
+            deadline_at = started_at + request.deadline_seconds
+            sandbox_id = deps_sandbox_create(self._sandbox, task_run_id)
+            change = UpsertTaskRun(
+                task_run_id=task_run_id,
+                request=request,
+                effective_model_backend=backend,
+                started_at=started_at,
+                deadline_at=deadline_at,
+                status=TaskRunStatus.RUNNING,
+                sandbox_id=sandbox_id,
+            )
+            event = RuntimeEvent(
+                type="task_run_started",
+                task_run_id=task_run_id,
+                timestamp=started_at,
+                status=TaskRunStatus.RUNNING,
+                details={
+                    "operation": "start_task_run",
+                    "entity_ids": [task_run_id],
+                    "result": task_run_id,
+                },
+            )
+            mutation = ControlMutation.create(
+                task_run_id=task_run_id,
+                mutation_id=mutation_id,
+                operation="start_task_run",
+                request=request,
+                effective_model_backend=backend,
+                base_checkpoint_sequence=0,
+                state_changes=(change,),
+                event=event,
+            )
+            commit = deps.store.commit(mutation)
+            committed = True
+            # Preserve the committed identity if post-commit reload fails.
+            self._persistent_task_run_id = task_run_id
+            task_snapshot = deps.repository.load_task_run(task_run_id)
+            state = deps.repository.load_control_state(task_run_id)
+            if task_snapshot is None or state is None:
+                raise StorageError("committed TaskRun could not be reloaded")
+            self._persistent_task_run_id = task_run_id
+            self._persistent_snapshot = task_snapshot
+            self._persistent_state = state
+            self._sandbox_destroyed = False
+            return CommittedOperation(value=task_run_id, commit=commit)
+        except Exception as exc:
+            if committed:
+                self._cache_invalid = True
+                raise
+            try:
+                deps.registry.release(task_run_id, self)
+                self._registry_released = True
+            except Exception:
+                pass
+            if sandbox_id is not None:
+                try:
+                    self._sandbox.destroy(sandbox_id)
+                except Exception as cleanup_exc:
+                    raise SandboxCleanupError(
+                        sandbox_id,
+                        "compensating destroy failed after start failure",
+                        original_error=exc,
+                        cleanup_error=cleanup_exc,
+                    ) from cleanup_exc
+            raise
+
+    def attach(self, task_run_id: str) -> ControlStateSnapshot:
+        deps = self._require_persistent()
+        if self._persistent_task_run_id is not None or self._closed:
+            raise InvalidTransition("TaskRunController can only start or attach once")
+        if not isinstance(task_run_id, str) or not task_run_id.strip():
+            raise ValueError("task_run_id must be a non-empty string")
+        deps.registry.claim(task_run_id, self)
+        self._registry_released = False
+        try:
+            snapshot = deps.repository.load_task_run(task_run_id)
+            state = deps.repository.load_control_state(task_run_id)
+            if snapshot is None or state is None:
+                raise TaskRunNotFoundError(f"TaskRun does not exist: {task_run_id}")
+            if isinstance(self._sandbox, TaskRunSandboxPort):
+                self._sandbox.bind(
+                    task_run_id, snapshot.sandbox_id,
+                    terminal=snapshot.status in TERMINAL_STATUSES,
+                )
+            self._persistent_task_run_id = task_run_id
+            self._persistent_snapshot = snapshot
+            self._persistent_state = state
+            self._sandbox_destroyed = False
+            return state
+        except Exception:
+            try:
+                deps.registry.release(task_run_id, self)
+            finally:
+                self._registry_released = True
+            raise
+
+    def status(self) -> TaskRunStatus:
+        if self._persistent is None:
+            return self.task_run.status
+        self._require_persistent()
+        if self._persistent_snapshot is None:
+            raise InvalidTransition("TaskRun has not been started or attached")
+        return self._persistent_snapshot.status
+
+    def commit_turn_registration(
+        self,
+        registration: TurnRegistration,
+        mutation_id: str,
+    ) -> CommittedOperation:
+        """Atomically persist a prepared pending Turn and its fixed Intent list."""
+
+        if self._persistent is None:
+            raise InvalidTransition("persistent ControlStore dependencies are not configured")
+        if not isinstance(registration, TurnRegistration):
+            raise ValueError("registration must be a TurnRegistration")
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, _state = self._require_bound_state()
+        if registration.task_run_id != task_run.task_run_id:
+            raise InvalidTransition("TurnRegistration belongs to another TaskRun")
+
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            operation = replay.event.details.get("operation")
+            if operation == "register_turn":
+                return CommittedOperation.from_commit(replay)
+            self._assert_deadline_preempted_replay(replay)
+            return CommittedOperation.from_commit(replay)
+
+        deps = self._require_persistent()
+        if task_run.status is not TaskRunStatus.RUNNING:
+            raise InvalidTransition("Turn registration requires a running TaskRun")
+        now = self._now_utc()
+        if now >= task_run.deadline_at:
+            return self._finish_persistent(
+                TaskRunStatus.DEADLINE_EXCEEDED,
+                mutation_id=mutation_id,
+                now=now,
+                failure_reason=task_run.failure_reason,
+            )
+
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.RUNNING,
+            details={
+                "operation": "register_turn",
+                "entity_ids": list(registration.entity_ids),
+                "result": registration.turn_id,
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation="register_turn",
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=registration.base_checkpoint_sequence,
+            state_changes=registration.state_changes,
+            event=event,
+        )
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit()
+        return CommittedOperation.from_commit(commit)
+
+    def commit_turn_operation(
+        self,
+        operation: TurnOperation,
+        mutation_id: str,
+    ) -> CommittedOperation:
+        """Commit one Turn working-copy delta and reload the committed snapshot."""
+
+        if self._persistent is None:
+            raise InvalidTransition("persistent ControlStore dependencies are not configured")
+        deps = self._persistent
+        if not isinstance(operation, TurnOperation):
+            raise ValueError("operation must be a TurnOperation")
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, _state = self._require_bound_state()
+        if operation.task_run_id != task_run.task_run_id:
+            raise InvalidTransition("TurnOperation belongs to another TaskRun")
+        if self._closed or self._registry_released:
+            raise InvalidTransition("TurnOperation requires an owned, open Controller")
+        replay = self._load_existing_commit(mutation_id)
+        now = replay.event.timestamp if replay is not None else self._now_utc()
+        if replay is None:
+            self._require_persistent()
+            if task_run.status is not TaskRunStatus.RUNNING:
+                raise InvalidTransition("TurnOperation requires a running TaskRun")
+            if operation.base_checkpoint_sequence != self.control_state.latest_checkpoint.sequence:
+                raise StaleControlStateError("TurnOperation was prepared from a stale checkpoint")
+            if now >= task_run.deadline_at:
+                raise InvalidTransition(
+                    "TaskRun deadline elapsed; call advance_time(mutation_id) before further work"
+                )
+        changes = tuple(
+            replace(change, finished_at=now)
+            if isinstance(change, UpsertTaskRun) else change
+            for change in operation.state_changes
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation=operation.operation,
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=operation.base_checkpoint_sequence,
+            state_changes=changes,
+            event=operation.event(timestamp=now),
+        )
+        if replay is not None:
+            # The Store checks the original fingerprint. No evidence lookup,
+            # snapshot reload, clock-driven transition or Sandbox call on replay.
+            return CommittedOperation.from_commit(deps.store.commit(mutation))
+        deps.repository.validate_candidate(self.control_state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        if self.status() in TERMINAL_STATUSES:
+            self._cleanup_after_terminal()
+        return CommittedOperation.from_commit(commit)
+
+    def mark_candidate_found(
+        self,
+        mutation_id: str | None = None,
+    ) -> Any:
+        """Move a persistent TaskRun into its external confirmation period."""
+
+        if self._persistent is None:
+            if mutation_id is not None:
+                raise InvalidTransition(
+                    "mutation_id is only supported with persistent dependencies"
+                )
+            return super().mark_candidate_found()
+
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, state = self._require_bound_state()
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            if replay.event.details.get("operation") == "request_completion_confirmation":
+                return CommittedOperation.from_commit(replay)
+            self._assert_deadline_preempted_replay(replay)
+            return CommittedOperation.from_commit(replay)
+        deps = self._require_persistent()
+        if task_run.status is not TaskRunStatus.RUNNING:
+            raise InvalidTransition(
+                "a completion candidate can only be reported while running"
+            )
+        now = self._now_utc()
+        if now >= task_run.deadline_at:
+            # A caller may arrive exactly at the deadline without having first
+            # advanced time.  The hard deadline still wins for this mutation.
+            return self._finish_persistent(
+                TaskRunStatus.DEADLINE_EXCEEDED,
+                mutation_id=mutation_id,
+                now=now,
+                failure_reason=task_run.failure_reason,
+            )
+        confirmation_deadline = now + 180
+        change = UpsertTaskRun(
+            task_run_id=task_run.task_run_id,
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            started_at=task_run.started_at,
+            deadline_at=task_run.deadline_at,
+            status=TaskRunStatus.AWAITING_CONFIRMATION,
+            sandbox_id=task_run.sandbox_id,
+            confirmation_deadline=confirmation_deadline,
+            finished_at=None,
+            failure_reason=task_run.failure_reason,
+        )
+        event = RuntimeEvent(
+            type="completion_confirmation_requested",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.AWAITING_CONFIRMATION,
+            details={
+                "operation": "request_completion_confirmation",
+                "entity_ids": [task_run.task_run_id],
+                "result": "awaiting_confirmation",
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation="request_completion_confirmation",
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            state_changes=(change,),
+            event=event,
+        )
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit()
+        return CommittedOperation.from_commit(commit)
+
+    def advance_time(self, mutation_id: str) -> CommittedOperation | None:
+        """Persist deadline/confirmation transitions; return None if unchanged."""
+
+        if self._persistent is None:
+            # Legacy controllers retain their historical poll behavior.
+            _validate_mutation_id(mutation_id)
+            self.poll()
+            return None
+
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, state = self._require_bound_state()
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            self._assert_finish_replay(
+                replay,
+                {TaskRunStatus.DEADLINE_EXCEEDED.value, TaskRunStatus.ASSUMED_ACHIEVED.value},
+            )
+            return CommittedOperation.from_commit(replay)
+        self._require_persistent()
+        if task_run.status in TERMINAL_STATUSES:
+            return None
+
+        now = self._now_utc()
+        # Deadline is the hard boundary and always wins over confirmation grace.
+        if now >= task_run.deadline_at:
+            return self._finish_persistent(
+                TaskRunStatus.DEADLINE_EXCEEDED,
+                mutation_id=mutation_id,
+                now=now,
+                failure_reason=task_run.failure_reason,
+            )
+        if (
+            task_run.status is TaskRunStatus.AWAITING_CONFIRMATION
+            and task_run.confirmation_deadline is not None
+            and now >= task_run.confirmation_deadline
+        ):
+            return self._finish_persistent(
+                TaskRunStatus.ASSUMED_ACHIEVED,
+                mutation_id=mutation_id,
+                now=now,
+                failure_reason=task_run.failure_reason,
+            )
+        return None
+
+    def handle_control_message(
+        self,
+        message: Any,
+        mutation_id: str | None = None,
+    ) -> Any:
+        """Handle the existing external completion confirmation message."""
+
+        if self._persistent is None:
+            if mutation_id is not None:
+                raise InvalidTransition(
+                    "mutation_id is only supported with persistent dependencies"
+                )
+            return super().handle_control_message(message)
+
+        mutation_id = _validate_mutation_id(mutation_id)
+        if not isinstance(message, dict) and not hasattr(message, "get"):
+            raise InvalidTransition("control message must be an object")
+        if message.get("type") != "completion":
+            raise InvalidTransition("unsupported control message type")
+        task_run, _state = self._require_bound_state()
+        if message.get("task_run_id") != task_run.task_run_id:
+            raise InvalidTransition("control message task_run_id does not match")
+        if message.get("status") != "achieved":
+            raise InvalidTransition("completion message status must be achieved")
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            self._assert_finish_replay(
+                replay,
+                {TaskRunStatus.ACHIEVED.value, TaskRunStatus.DEADLINE_EXCEEDED.value},
+            )
+            return CommittedOperation.from_commit(replay)
+        self._require_persistent()
+        if task_run.status is not TaskRunStatus.AWAITING_CONFIRMATION:
+            raise InvalidTransition(
+                "completion can only be confirmed during the confirmation period"
+            )
+
+        # Re-use the supplied mutation ID for a due-time transition.  This
+        # ensures a confirmation arriving at the boundary observes Deadline
+        # precedence and remains idempotent.
+        due = self.advance_time(mutation_id)
+        if due is not None:
+            return due
+        return self._finish_persistent(
+            TaskRunStatus.ACHIEVED,
+            mutation_id=mutation_id,
+            now=self._now_utc(),
+            failure_reason=task_run.failure_reason,
+        )
+
+    def model_failed(
+        self,
+        reason: str | None = None,
+        mutation_id: str | None = None,
+    ) -> Any:
+        if self._persistent is None:
+            if mutation_id is not None:
+                raise InvalidTransition(
+                    "mutation_id is only supported with persistent dependencies"
+                )
+            return super().model_failed(reason)
+        return self._finish_public(
+            TaskRunStatus.FAILED,
+            mutation_id=mutation_id,
+            failure_reason=reason,
+        )
+
+    def cancel(self, mutation_id: str | None = None) -> Any:
+        if self._persistent is None:
+            if mutation_id is not None:
+                raise InvalidTransition(
+                    "mutation_id is only supported with persistent dependencies"
+                )
+            return super().cancel()
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, _state = self._require_bound_state()
+        # A caller may send another cancel with a fresh mutation ID. It reads
+        # the first terminal result without registering that ID or touching Docker.
+        existing = self._load_existing_commit(mutation_id)
+        if existing is None and (task_run.status in TERMINAL_STATUSES or self._cache_invalid):
+            commit = self._persistent.store.load_terminal_commit(task_run.task_run_id)
+            if commit is not None:
+                return CommittedOperation.from_commit(commit)
+            if task_run.status in TERMINAL_STATUSES:
+                raise StorageError("terminal TaskRun has no committed result")
+        return self._finish_public(
+            TaskRunStatus.CANCELLED,
+            mutation_id=mutation_id,
+            failure_reason=None,
+        )
+
+    def conclude(
+        self,
+        status: TaskRunStatus,
+        mutation_id: str | None = None,
+    ) -> Any:
+        if self._persistent is None:
+            if mutation_id is not None:
+                raise InvalidTransition(
+                    "mutation_id is only supported with persistent dependencies"
+                )
+            return super().conclude(status)
+        if status not in {TaskRunStatus.PARTIAL, TaskRunStatus.INCONCLUSIVE}:
+            raise InvalidTransition("conclude only accepts partial or inconclusive")
+        return self._finish_public(
+            status,
+            mutation_id=mutation_id,
+            failure_reason=None,
+        )
+
+    def _require_bound_state(self) -> tuple[Any, ControlStateSnapshot]:
+        if (
+            self._persistent_task_run_id is None
+            or self._persistent_snapshot is None
+            or self._persistent_state is None
+        ):
+            raise InvalidTransition("TaskRunController has no attached TaskRun")
+        return self._persistent_snapshot, self._persistent_state
+
+    def _load_existing_commit(self, mutation_id: str) -> Any:
+        assert self._persistent is not None
+        loader = getattr(self._persistent.store, "load_committed_mutation", None)
+        if loader is None:
+            return None
+        return loader(self._persistent_task_run_id, mutation_id)
+
+    @staticmethod
+    def _assert_replay_operation(commit: Any, operation: str) -> None:
+        if commit.event.details.get("operation") != operation:
+            raise IdempotencyConflictError(
+                "mutation_id was already committed for another operation"
+            )
+
+    @classmethod
+    def _assert_finish_replay(cls, commit: Any, allowed_results: set[str]) -> None:
+        cls._assert_replay_operation(commit, "finish_task_run")
+        result = commit.event.details.get("result")
+        if result not in allowed_results:
+            raise IdempotencyConflictError(
+                "mutation_id was already committed for a different terminal result"
+            )
+
+    @classmethod
+    def _assert_deadline_preempted_replay(cls, commit: Any) -> None:
+        cls._assert_finish_replay(commit, {TaskRunStatus.DEADLINE_EXCEEDED.value})
+
+    def _finish_public(
+        self,
+        status: TaskRunStatus,
+        *,
+        mutation_id: str | None,
+        failure_reason: str | None,
+    ) -> CommittedOperation:
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, _state = self._require_bound_state()
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            self._assert_finish_replay(
+                replay, {status.value, TaskRunStatus.DEADLINE_EXCEEDED.value}
+            )
+            return CommittedOperation.from_commit(replay)
+        self._require_persistent()
+        if task_run.status in TERMINAL_STATUSES:
+            raise InvalidTransition("cannot change a terminal TaskRun")
+        now = self._now_utc()
+        if now >= task_run.deadline_at:
+            return self._finish_persistent(
+                TaskRunStatus.DEADLINE_EXCEEDED,
+                mutation_id=mutation_id,
+                now=now,
+                failure_reason=task_run.failure_reason,
+            )
+        return self._finish_persistent(
+            status,
+            mutation_id=mutation_id,
+            now=now,
+            failure_reason=failure_reason,
+        )
+
+    def _finish_persistent(
+        self,
+        status: TaskRunStatus,
+        *,
+        mutation_id: str,
+        now: float,
+        failure_reason: str | None,
+    ) -> CommittedOperation:
+        deps = self._require_persistent()
+        task_run, state = self._require_bound_state()
+        if task_run.status in TERMINAL_STATUSES:
+            replay = self._load_existing_commit(mutation_id)
+            if replay is not None:
+                self._assert_replay_operation(replay, "finish_task_run")
+                return CommittedOperation.from_commit(replay)
+            raise InvalidTransition("cannot change a terminal TaskRun")
+        change = UpsertTaskRun(
+            task_run_id=task_run.task_run_id,
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            started_at=task_run.started_at,
+            deadline_at=task_run.deadline_at,
+            status=status,
+            sandbox_id=task_run.sandbox_id,
+            confirmation_deadline=task_run.confirmation_deadline,
+            finished_at=now,
+            failure_reason=failure_reason,
+        )
+        event = RuntimeEvent(
+            type="task_run_finished",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=status,
+            details={
+                "operation": "finish_task_run",
+                "entity_ids": [task_run.task_run_id],
+                "result": status.value,
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation="finish_task_run",
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            state_changes=(change,),
+            event=event,
+        )
+        deps.repository.validate_candidate(state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        self._cleanup_after_terminal()
+        return CommittedOperation(value=status.value, commit=commit)
+
+    def reload_state(self) -> ControlStateSnapshot:
+        """Explicitly revalidate committed state and restore this owner's cache.
+
+        This is a read/revalidation path, not a mutation or Sandbox recovery:
+        it never creates, binds, interrupts, destroys, or replays a resource.
+        Keep the old cache inaccessible until the entire snapshot is verified.
+        """
+
+        # Deliberately do not call _require_persistent: recovering an invalid
+        # cache is the purpose of this entry point.
+        deps = self._persistent
+        if deps is None:
+            raise InvalidTransition("persistent ControlStore dependencies are not configured")
+        task_run_id = self._persistent_task_run_id
+        if task_run_id is None or self._closed or self._registry_released:
+            raise InvalidTransition("reload_state requires an owned, open Controller")
+        if deps.registry.owner(task_run_id) is not self:
+            raise ControllerNotClaimedError("controller does not own TaskRun binding")
+        try:
+            # The repository validates the full snapshot and external evidence.
+            # Its embedded TaskRun avoids combining two separate snapshot reads.
+            state = deps.repository.load_control_state(task_run_id)
+            if state is None:
+                raise TaskRunNotFoundError(f"TaskRun does not exist: {task_run_id}")
+            if (
+                state.task_run.task_run_id != task_run_id
+                or state.latest_checkpoint.task_run_id != task_run_id
+            ):
+                raise StorageError("reloaded control state belongs to another TaskRun")
+            if self._persistent_snapshot is not None and (
+                state.task_run.sandbox_id != self._persistent_snapshot.sandbox_id
+            ):
+                raise StorageError("reloaded control state changed the bound Sandbox ID")
+            if self._persistent_state is not None and (
+                state.latest_checkpoint.sequence
+                < self._persistent_state.latest_checkpoint.sequence
+            ):
+                raise StorageError("reloaded control state has a stale checkpoint")
+        except Exception as exc:
+            self._cache_invalid = True
+            if isinstance(exc, StorageError):
+                raise
+            raise StorageError("control state revalidation failed during reload_state") from exc
+        self._persistent_snapshot = state.task_run
+        self._persistent_state = state
+        self._cache_invalid = False
+        return state
+
+    def cleanup_sandbox(self) -> None:
+        """Explicitly retry cleanup of a durably terminal TaskRun; never commit."""
+
+        self._require_persistent()
+        task_run, _state = self._require_bound_state()
+        if task_run.status not in TERMINAL_STATUSES:
+            raise InvalidTransition("cleanup requires a terminal TaskRun")
+        self._cleanup_after_terminal()
+
+    def _cleanup_after_terminal(self) -> None:
+        """Clean a persisted terminal TaskRun after its commit is durable."""
+
+        task_run, state = self._require_bound_state()
+        if task_run.sandbox_id is None or self._sandbox_destroyed:
+            return
+        if isinstance(self._sandbox, TaskRunSandboxPort):
+            self._sandbox.quiesce(task_run.sandbox_id)
+        active_execution = any(
+            item.status is ExecutionStatus.RUNNING for item in state.executions
+        )
+        should_interrupt = (
+            task_run.status
+            in {TaskRunStatus.DEADLINE_EXCEEDED, TaskRunStatus.CANCELLED}
+            or active_execution
+        )
+        interrupt_error: BaseException | None = None
+        destroy_error: BaseException | None = None
+        if should_interrupt:
+            try:
+                self._sandbox.interrupt(task_run.sandbox_id)
+            except BaseException as exc:  # cleanup must still attempt destroy
+                interrupt_error = exc
+        try:
+            self._sandbox.destroy(task_run.sandbox_id)
+            self._sandbox_destroyed = True
+        except BaseException as exc:
+            destroy_error = exc
+        if interrupt_error is not None or destroy_error is not None:
+            reason = (
+                "sandbox interrupt failed"
+                if interrupt_error is not None and destroy_error is None
+                else "sandbox destroy failed"
+            )
+            raise SandboxCleanupError(
+                task_run.sandbox_id,
+                reason,
+                original_error=interrupt_error,
+                cleanup_error=destroy_error,
+            ) from (destroy_error or interrupt_error)
+
+    def recover_task_run(self, mutation_id: str) -> RecoveryResult:
+        """Persist the confirmed crash-recovery transition for one attached task."""
+
+        deps = self._require_persistent()
+        _validate_mutation_id(mutation_id)
+        if (
+            self._persistent_task_run_id is None
+            or self._persistent_snapshot is None
+            or self._persistent_state is None
+        ):
+            raise InvalidTransition("recover_task_run requires an attached TaskRun")
+
+        state = self._persistent_state
+        existing = self._load_existing_commit(mutation_id)
+        if existing is not None:
+            operation = existing.event.details.get("operation")
+            if operation != "recover_running_execution_as_inconclusive":
+                raise IdempotencyConflictError(
+                    "mutation_id was already committed for another operation"
+                )
+            refreshed = self._reload_after_commit()
+            return RecoveryResult(state=refreshed, commit=existing)
+        if state.task_run.status in TERMINAL_STATUSES:
+            return RecoveryResult(state=state, commit=None)
+
+        running_executions = tuple(
+            item
+            for item in state.executions
+            if item.status is ExecutionStatus.RUNNING
+        )
+        if not running_executions:
+            return RecoveryResult(state=state, commit=None)
+        if len(running_executions) != 1:
+            raise StorageError("control state contains multiple running Executions")
+
+        mutation = self._build_recovery_mutation(
+            state,
+            mutation_id=mutation_id,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+        )
+        commit = deps.store.commit(mutation)
+        refreshed = self._reload_after_commit()
+        if isinstance(self._sandbox, TaskRunSandboxPort):
+            self._sandbox.quiesce(refreshed.task_run.sandbox_id)
+        return RecoveryResult(state=refreshed, commit=commit)
+
+    def _build_recovery_mutation(
+        self,
+        state: ControlStateSnapshot,
+        *,
+        mutation_id: str,
+        base_checkpoint_sequence: int,
+    ) -> ControlMutation:
+        running_executions = tuple(
+            item
+            for item in state.executions
+            if item.status is ExecutionStatus.RUNNING
+        )
+        if len(running_executions) != 1:
+            raise StorageError(
+                "crash recovery requires exactly one running Execution"
+            )
+        execution = running_executions[0]
+        plans = {item.plan_id: item for item in state.plans}
+        intents = {item.intent_id: item for item in state.intents}
+        turns = {item.turn_id: item for item in state.turns}
+        plan = plans.get(execution.plan_id)
+        if plan is None:
+            raise StorageError("running Execution references an unknown Plan")
+        intent = intents.get(plan.intent_id)
+        if intent is None:
+            raise StorageError("running Execution Plan references an unknown Intent")
+        turn = turns.get(intent.turn_id)
+        if turn is None:
+            raise StorageError("running Execution Intent references an unknown Turn")
+        if plan.status in {
+            PlanStatus.COMPLETED,
+            PlanStatus.FAILED,
+            PlanStatus.INCONCLUSIVE,
+        }:
+            raise StorageError("running Execution is attached to a terminal Plan")
+        if intent.status in {
+            IntentStatus.SUCCEEDED,
+            IntentStatus.FAILED,
+            IntentStatus.INCONCLUSIVE,
+        }:
+            raise StorageError("running Execution is attached to a terminal Intent")
+        if turn.status in {
+            TurnStatus.COMPLETED,
+            TurnStatus.FAILED,
+            TurnStatus.INCONCLUSIVE,
+        }:
+            raise StorageError("running Execution is attached to a terminal Turn")
+
+        task_run = state.task_run
+        now = self._now_utc()
+        task_change = UpsertTaskRun(
+            task_run_id=task_run.task_run_id,
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            started_at=task_run.started_at,
+            deadline_at=task_run.deadline_at,
+            status=TaskRunStatus.INCONCLUSIVE,
+            sandbox_id=task_run.sandbox_id,
+            confirmation_deadline=task_run.confirmation_deadline,
+            finished_at=now,
+            failure_reason="unfinished_execution_detected_during_recovery",
+        )
+        plan_change = UpsertPlan(
+            plan_id=plan.plan_id,
+            intent_id=plan.intent_id,
+            steps=plan.steps,
+            status=PlanStatus.INCONCLUSIVE,
+        )
+        intent_change = UpsertIntent(
+            intent_id=intent.intent_id,
+            turn_id=intent.turn_id,
+            description=intent.description,
+            priority=intent.priority,
+            intent_type=intent.intent_type,
+            status=IntentStatus.INCONCLUSIVE,
+        )
+        execution_change = UpsertExecution(
+            execution_id=execution.execution_id,
+            plan_id=execution.plan_id,
+            step_index=execution.step_index,
+            command_ref=execution.command_ref,
+            status=ExecutionStatus.RUNNING,
+            output_ref=None,
+        )
+        turn_change = UpsertTurn(
+            turn_id=turn.turn_id,
+            task_run_id=turn.task_run_id,
+            sequence=turn.sequence,
+            turn_target=turn.turn_target,
+            intent_ids=turn.intent_ids,
+            status=TurnStatus.INCONCLUSIVE,
+        )
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.INCONCLUSIVE,
+            details={
+                "operation": "recover_running_execution_as_inconclusive",
+                "entity_ids": [
+                    task_run.task_run_id,
+                    execution.execution_id,
+                    plan.plan_id,
+                    intent.intent_id,
+                    turn.turn_id,
+                ],
+                "result": "inconclusive",
+            },
+        )
+        return ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation="recover_running_execution_as_inconclusive",
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=base_checkpoint_sequence,
+            state_changes=(
+                task_change,
+                execution_change,
+                plan_change,
+                intent_change,
+                turn_change,
+            ),
+            event=event,
+        )
+
+    def _reload_after_commit(self, commit: ControlCommitResult | None = None) -> ControlStateSnapshot:
+        assert self._persistent is not None
+        assert self._persistent_task_run_id is not None
+        try:
+            snapshot = self._persistent.repository.load_task_run(
+                self._persistent_task_run_id
+            )
+            state = self._persistent.repository.load_control_state(
+                self._persistent_task_run_id
+            )
+            if snapshot is None or state is None:
+                raise StorageError("committed TaskRun could not be reloaded")
+        except Exception as exc:
+            self._cache_invalid = True
+            if isinstance(exc, StorageError):
+                raise CommittedStateReloadError(
+                    f"mutation committed; control state reload unavailable: {exc}", commit
+                ) from exc
+            raise CommittedStateReloadError(
+                f"mutation committed; control state reload failed: {exc}", commit
+            ) from exc
+        self._persistent_snapshot = snapshot
+        self._persistent_state = state
+        return state
+
+    def close(self) -> None:
+        deps = self._require_persistent()
+        if self._persistent_task_run_id is None or self._persistent_snapshot is None:
+            raise InvalidTransition("TaskRunController has no bound TaskRun")
+        if self._persistent_snapshot.status not in TERMINAL_STATUSES:
+            raise InvalidTransition("close is only allowed after TaskRun reaches a terminal state")
+        if not self._registry_released:
+            deps.registry.release(self._persistent_task_run_id, self)
+            self._registry_released = True
+        self._closed = True
+
+    @property
+    def control_state(self) -> ControlStateSnapshot:
+        self._require_persistent()
+        if self._persistent_state is None:
+            raise InvalidTransition("persistent TaskRun has not been started or attached")
+        return self._persistent_state
+
+
+def _clock_now_wrapper(clock: Any):
+    def wrapped() -> float:
+        return _clock_now(clock)
+
+    return wrapped
+
+
+def deps_sandbox_create(sandbox: Any, task_run_id: str) -> str:
+    sandbox_id = sandbox.create(task_run_id)
+    if not isinstance(sandbox_id, str) or not sandbox_id.strip():
+        raise StorageError("Sandbox.create must return a non-empty sandbox_id")
+    return sandbox_id

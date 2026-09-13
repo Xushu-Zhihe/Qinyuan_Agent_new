@@ -24,7 +24,7 @@ py-modules = ["agent"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["Agents*", "LLMs*", "MCPs*", "Sandbox*", "Skills*", "tools*", "agent_core*"]
+include = ["Agents*", "LLMs*", "MCPs*", "Sandbox*", "Skills*", "tools*", "agent_core*", "agent_adapters*"]
 
 [tool.setuptools.package-data]
 Skills = ["**/*.md", "**/*.py", "**/*.json"]
@@ -33,7 +33,18 @@ Skills = ["**/*.md", "**/*.py", "**/*.json"]
 
 [tool.uv]
 package = true
+cache-dir = ".test/uv-cache"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+cache_dir = ".test/pytest-cache"
+addopts = "--basetemp=.test/pytest-tmp"
+
+[tool.ruff]
+cache-dir = ".test/ruff-cache"
+extend-exclude = [".test"]
+
+[tool.mypy]
+cache_dir = ".test/mypy-cache"
+exclude = ['^\.test/']

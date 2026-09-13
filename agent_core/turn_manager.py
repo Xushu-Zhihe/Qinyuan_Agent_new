@@ -1,7 +1,16 @@
 from __future__ import annotations
 
-from typing import Iterable
+import uuid
+from dataclasses import replace
+from typing import Iterable, Protocol
 
+from agent_core.control_store import (
+    ControlStateSnapshot,
+    TaskRunSnapshot,
+    TurnRegistration,
+    UpsertIntent,
+    UpsertTurn,
+)
 from agent_core.domain import (
     EXECUTION_TERMINAL_STATUSES,
     DomainError,
@@ -26,15 +35,70 @@ from agent_core.domain import (
     TurnStatus,
     classify_failure,
 )
-from agent_core.runtime import TaskRunController, TaskRunStatus
+from agent_core.modeling import IntentCandidate
+from agent_core.runtime import TaskRun, TaskRunStatus
+
+
+_TURN_TERMINAL_STATUSES = frozenset(
+    {
+        TurnStatus.COMPLETED,
+        TurnStatus.INCONCLUSIVE,
+        TurnStatus.FAILED,
+    }
+)
+_TURN_REGISTRATION_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL,
+    "qinyuan-agent/turn-registration/v1",
+)
+
+
+class TurnTaskRunPort(Protocol):
+    """State needed by the domain; persistent working copies have no lifecycle I/O."""
+
+    @property
+    def task_run(self) -> TaskRun | TaskRunSnapshot: ...
+
+    def status(self) -> TaskRunStatus: ...
+
+    def model_failed(self, reason: str) -> TaskRunStatus: ...
+
+    def conclude(self, status: TaskRunStatus) -> TaskRunStatus: ...
+
+
+class _SnapshotTaskRun:
+    def __init__(self, task_run: TaskRunSnapshot) -> None:
+        self.task_run = task_run
+
+    def status(self) -> TaskRunStatus:
+        return self.task_run.status
+
+    def model_failed(self, reason: str) -> TaskRunStatus:
+        self.task_run = replace(
+            self.task_run, status=TaskRunStatus.FAILED, failure_reason=reason
+        )
+        return self.task_run.status
+
+    def conclude(self, status: TaskRunStatus) -> TaskRunStatus:
+        self.task_run = replace(self.task_run, status=status)
+        return status
+
+
+class _CommittedPlanEvidence:
+    def __init__(self, state: ControlStateSnapshot) -> None:
+        self._records = {
+            record.plan_validation_id: record for record in state.plan_validation_records
+        }
+
+    def lookup(self, plan_validation_id: str) -> PlanValidationEvidence | None:
+        return self._records.get(plan_validation_id)
 
 
 class TurnManager:
-    """In-memory owner of the fixed Intent list for one running TaskRun."""
+    """Domain state machine, used by legacy memory mode or disposable snapshots."""
 
     def __init__(
         self,
-        controller: TaskRunController,
+        controller: TurnTaskRunPort,
         evidence: ExecutionEvidencePort,
         plan_validation_evidence: PlanValidationEvidencePort,
     ) -> None:
@@ -54,6 +118,58 @@ class TurnManager:
         self._execution_retry_commands: dict[tuple[str, int], str] = {}
         self._execution_retry_counts: dict[tuple[str, int, str], int] = {}
 
+    @classmethod
+    def from_snapshot(
+        cls, state: ControlStateSnapshot, evidence: ExecutionEvidencePort
+    ) -> "TurnManager":
+        """Restore a disposable domain copy using only committed control records."""
+
+        manager = cls(_SnapshotTaskRun(state.task_run), evidence, _CommittedPlanEvidence(state))
+        manager.turns = {item.turn_id: item.to_domain() for item in state.turns}
+        manager.intents = {item.intent_id: item.to_domain() for item in state.intents}
+        manager.plans = {item.plan_id: item.to_domain() for item in state.plans}
+        manager.executions = {item.execution_id: item.to_domain() for item in state.executions}
+        manager.facts = {item.fact_id: item.to_domain() for item in state.facts}
+        manager.failures = [item.to_domain() for item in state.failure_summaries]
+        running_turns = [item.turn_id for item in state.turns if item.status is TurnStatus.RUNNING]
+        if len(running_turns) > 1:
+            raise DomainError("snapshot contains multiple running Turns")
+        manager._active_turn_id = next(iter(running_turns), None)
+
+        # Appended evidence is not consumed until its separate domain mutation commits.
+        failure_refs = {item.evidence_ref for item in state.failure_summaries}
+        execution_commands = {
+            (item.plan_id, item.step_index, item.command_ref) for item in state.executions
+        }
+        for record in state.plan_validation_records:
+            command_key = (record.plan_id, record.step_index, record.command_ref)
+            consumed = record.plan_validation_id in failure_refs
+            if (
+                record.status is PlanValidationStatus.SUCCEEDED
+                and record.step_index is not None
+                and record.command_ref is not None
+                and command_key in execution_commands
+            ):
+                consumed = True
+                manager._command_validation_ids[
+                    (record.plan_id, record.step_index, record.command_ref)
+                ] = record.plan_validation_id
+            if consumed:
+                key = (record.plan_id, record.step_index)
+                expected_attempt = manager._plan_validation_attempts.get(key, 0) + 1
+                if record.attempt != expected_attempt:
+                    raise DomainError("consumed PlanValidationRecord attempts are not contiguous")
+                manager._plan_validation_attempts[key] = record.attempt
+                manager._consumed_plan_validation_ids.add(record.plan_validation_id)
+
+        for failure in state.failure_summaries:
+            execution = manager.executions.get(failure.evidence_ref)
+            if execution is not None and failure.failure_type is FailureType.ENVIRONMENT_FAULT:
+                key = (execution.plan_id, execution.step_index, execution.command_ref)
+                manager._execution_retry_counts[key] = manager._execution_retry_counts.get(key, 0) + 1
+                manager._execution_retry_commands[key[:2]] = execution.command_ref
+        return manager
+
     @property
     def task_run_id(self) -> str:
         return self._controller.task_run.task_run_id
@@ -68,6 +184,98 @@ class TurnManager:
             if item.failure_type is FailureType.TARGET_MISMATCH
         )
 
+    @staticmethod
+    def prepare_turn_registration(
+        *,
+        state: ControlStateSnapshot,
+        mutation_id: str,
+        turn_target: str,
+        candidates: tuple[IntentCandidate, ...],
+    ) -> TurnRegistration:
+        """Build, but do not submit, the first mutation for a new Turn."""
+
+        if not isinstance(state, ControlStateSnapshot):
+            raise DomainError("state must be a ControlStateSnapshot")
+        if not isinstance(mutation_id, str):
+            raise DomainError("mutation_id must be a UUID4 string")
+        try:
+            parsed_mutation_id = uuid.UUID(mutation_id)
+        except (ValueError, AttributeError) as exc:
+            raise DomainError("mutation_id must be a UUID4 string") from exc
+        if (
+            parsed_mutation_id.version != 4
+            or str(parsed_mutation_id) != mutation_id.lower()
+        ):
+            raise DomainError("mutation_id must be a canonical UUID4 string")
+        if not isinstance(turn_target, str) or not turn_target.strip():
+            raise DomainError("turn_target must be a non-empty string")
+        if not isinstance(candidates, tuple) or not candidates:
+            raise DomainError("Intent candidates must be a non-empty tuple")
+        if any(not isinstance(item, IntentCandidate) for item in candidates):
+            raise DomainError("Intent candidates must contain IntentCandidate values")
+        if state.task_run.status is not TaskRunStatus.RUNNING:
+            raise DomainTransitionError(
+                "Turn registration requires a running TaskRun"
+            )
+        if any(item.status not in _TURN_TERMINAL_STATUSES for item in state.turns):
+            raise DomainTransitionError(
+                "a previous Turn must be terminal before registering another Turn"
+            )
+
+        task_run_id = state.task_run.task_run_id
+        turn_id = str(
+            uuid.uuid5(
+                _TURN_REGISTRATION_NAMESPACE,
+                f"{task_run_id}:{mutation_id}:turn:0",
+            )
+        )
+        intent_ids = tuple(
+            str(
+                uuid.uuid5(
+                    _TURN_REGISTRATION_NAMESPACE,
+                    f"{task_run_id}:{mutation_id}:intent:{index}",
+                )
+            )
+            for index, _candidate in enumerate(candidates, start=1)
+        )
+        if turn_id in {item.turn_id for item in state.turns} or any(
+            intent_id in {item.intent_id for item in state.intents}
+            for intent_id in intent_ids
+        ):
+            raise DomainError("deterministic Turn or Intent ID already exists")
+
+        sequence = max((item.sequence for item in state.turns), default=0) + 1
+        changes: tuple[UpsertTurn | UpsertIntent, ...] = (
+            UpsertTurn(
+                turn_id=turn_id,
+                task_run_id=task_run_id,
+                sequence=sequence,
+                turn_target=turn_target,
+                intent_ids=intent_ids,
+                status=TurnStatus.PENDING,
+            ),
+            *(
+                UpsertIntent(
+                    intent_id=intent_id,
+                    turn_id=turn_id,
+                    description=candidate.description,
+                    priority=index,
+                    intent_type=candidate.intent_type,
+                    status=IntentStatus.PENDING,
+                )
+                for index, (intent_id, candidate) in enumerate(
+                    zip(intent_ids, candidates, strict=True),
+                    start=1,
+                )
+            ),
+        )
+        return TurnRegistration(
+            task_run_id=task_run_id,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            turn_id=turn_id,
+            state_changes=changes,
+        )
+
     def register_turn(self, turn: Turn, intents: Iterable[Intent]) -> None:
         self._require_running_task()
         if turn.task_run_id != self.task_run_id:
@@ -76,8 +284,17 @@ class TurnManager:
             raise DomainError("duplicate turn_id")
         if any(item.sequence == turn.sequence for item in self.turns.values()):
             raise DomainError("Turn sequence must be unique within a TaskRun")
+        if any(
+            item.status not in _TURN_TERMINAL_STATUSES
+            for item in self.turns.values()
+        ):
+            raise DomainTransitionError(
+                "a previous Turn must be terminal before registering another Turn"
+            )
 
         intent_values = tuple(intents)
+        if not intent_values:
+            raise DomainError("Turn must contain a non-empty Intent list")
         if tuple(item.intent_id for item in intent_values) != turn.intent_ids:
             raise DomainError("Turn intent_ids must match the supplied Intent list")
         if len({item.priority for item in intent_values}) != len(intent_values):
@@ -97,6 +314,10 @@ class TurnManager:
             raise DomainError("Plan intent_id does not reference an existing Intent")
         if plan.plan_id in self.plans:
             raise DomainError("duplicate plan_id")
+        if any(item.intent_id == plan.intent_id for item in self.plans.values()):
+            raise DomainError("an Intent may only contain one Plan")
+        if plan.status is not PlanStatus.PENDING:
+            raise DomainTransitionError("Plan must start as pending")
         self.plans[plan.plan_id] = plan
 
     def select_next_intent(self, turn_id: str) -> Intent | None:
@@ -150,6 +371,13 @@ class TurnManager:
         plan = self._plan(plan_id)
         if plan.status is not PlanStatus.RUNNING:
             raise DomainTransitionError("only a running Plan can be completed")
+        if any(
+            item.plan_id == plan.plan_id and item.status is ExecutionStatus.RUNNING
+            for item in self.executions.values()
+        ):
+            raise DomainTransitionError(
+                "Plan cannot complete while an Execution is running"
+            )
         plan.status = PlanStatus.COMPLETED
         return plan.status
 
@@ -210,6 +438,12 @@ class TurnManager:
                 raise DomainError(
                     "environment retry must reuse the first PlanValidationRecord"
                 )
+            previous = [
+                item for item in self.executions.values()
+                if (item.plan_id, item.step_index) == retry_key
+            ]
+            if len(previous) != 1 or previous[0].status not in EXECUTION_TERMINAL_STATUSES:
+                raise DomainTransitionError("only one environment retry Execution may be created")
         else:
             _, validation = self._consume_plan_validation(
                 plan_validation_id,
@@ -217,6 +451,10 @@ class TurnManager:
                 expected_plan_id=plan.plan_id,
                 expected_step_index=execution.step_index,
             )
+            if validation.command_ref != execution.command_ref:
+                raise DomainError(
+                    "Execution command_ref must match its PlanValidationRecord"
+                )
             self._command_validation_ids[
                 (execution.plan_id, execution.step_index, execution.command_ref)
             ] = validation.plan_validation_id
@@ -230,6 +468,8 @@ class TurnManager:
         self._running_plan(execution.plan_id)
         if execution.status is not ExecutionStatus.PENDING:
             raise DomainTransitionError("Execution can only start from pending")
+        if any(item.status is ExecutionStatus.RUNNING for item in self.executions.values()):
+            raise DomainTransitionError("another Execution is already running in the Sandbox")
         execution.status = ExecutionStatus.RUNNING
         return execution.status
 
@@ -318,6 +558,8 @@ class TurnManager:
 
     def create_fact(self, fact: Fact) -> Fact:
         self._require_running_task()
+        if fact.status is not FactStatus.CANDIDATE:
+            raise DomainTransitionError("Fact must start as candidate and be verified separately")
         if fact.fact_id in self.facts:
             raise DomainError("duplicate fact_id")
         turn = self._turn(fact.turn_id)
@@ -349,6 +591,8 @@ class TurnManager:
         """Apply explicit FactVerifier judgments plus mechanical evidence checks."""
 
         self._require_running_task()
+        if not isinstance(turn_target_satisfied, bool) or not isinstance(evidence_supports_content, bool):
+            raise DomainError("FactVerifier judgments must be booleans")
         fact = self._fact(fact_id)
         if fact.status is not FactStatus.CANDIDATE:
             raise DomainTransitionError("only a candidate Fact can be verified")
@@ -403,6 +647,7 @@ class TurnManager:
     def conclude_task(self, status: TaskRunStatus) -> TaskRunStatus:
         """Apply the user-confirmed partial/inconclusive terminal rule."""
 
+        self._require_running_task()
         if status not in {TaskRunStatus.PARTIAL, TaskRunStatus.INCONCLUSIVE}:
             raise DomainError("TaskRun conclusion must be partial or inconclusive")
         if any(
@@ -472,7 +717,14 @@ class TurnManager:
         )
 
     def _require_running_task(self) -> None:
-        status = self._controller.poll()
+        if (
+            isinstance(self._controller.task_run, TaskRunSnapshot)
+            and not isinstance(self._controller, _SnapshotTaskRun)
+        ):
+            raise DomainTransitionError(
+                "persistent TaskRun operations require TurnWorkingCopy and Controller commit"
+            )
+        status = self._controller.status()
         if status is not TaskRunStatus.RUNNING:
             raise DomainTransitionError("TaskRun is not running")
 

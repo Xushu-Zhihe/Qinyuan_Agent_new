@@ -13,6 +13,7 @@ venv/
 .uv-cache/
 
 # Test and runtime workspaces
+/.test/
 /.test-temp-*/
 /.test-work/
 /challenge/

@@ -77,3 +77,4 @@ class CommandResult:
     timed_out: bool = False
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    termination_confirmed: bool = False

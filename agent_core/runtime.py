@@ -4,7 +4,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 from agent_core.contracts import TaskRequest
 
@@ -54,6 +54,17 @@ class SandboxPort(Protocol):
         """Destroy the Sandbox after the TaskRun reaches a terminal state."""
 
 
+@runtime_checkable
+class TaskRunSandboxPort(SandboxPort, Protocol):
+    """T2 lifecycle extension; legacy in-memory sandboxes need not implement it."""
+
+    def bind(self, task_run_id: str, sandbox_id: str, *, terminal: bool) -> None:
+        """Verify an active resource, or bind a terminal resource for cleanup only."""
+
+    def quiesce(self, sandbox_id: str) -> None:
+        """Close execution admission before starting terminal cleanup."""
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeEvent:
     type: str
@@ -61,6 +72,7 @@ class RuntimeEvent:
     timestamp: float
     status: TaskRunStatus
     details: Mapping[str, Any] = field(default_factory=dict)
+    sequence: int | None = None
 
 
 @dataclass(slots=True)

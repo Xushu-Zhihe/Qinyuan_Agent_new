@@ -112,9 +112,16 @@ def add_plan_validation(
     status: PlanValidationStatus = PlanValidationStatus.SUCCEEDED,
     failure_type: FailureType | None = None,
     short_reason: str = "command generated",
+    command_ref: str | None = None,
     observed_at: float | None = None,
     task_run_id: str | None = None,
 ) -> PlanValidationRecord:
+    if (
+        command_ref is None
+        and status is PlanValidationStatus.SUCCEEDED
+        and step_index is not None
+    ):
+        command_ref = "command-1"
     record = PlanValidationRecord(
         plan_validation_id=plan_validation_id,
         plan_id=plan_id,
@@ -124,6 +131,7 @@ def add_plan_validation(
         status=status,
         failure_type=failure_type,
         short_reason=short_reason,
+        command_ref=command_ref,
         observed_at=(
             manager._controller.task_run.started_at
             if observed_at is None
@@ -198,6 +206,7 @@ def complete_successful_execution(
         evidence,
         plan_validation_id=plan_validation_id,
         plan_id=plan_id,
+        command_ref=command_ref,
     )
     execution = Execution(
         execution_id=execution_id,

@@ -299,6 +299,7 @@ class PlanValidationRecord:
     status: PlanValidationStatus
     failure_type: FailureType | None
     short_reason: str
+    command_ref: str | None
     observed_at: float
 
     def __post_init__(self) -> None:
@@ -316,8 +317,20 @@ class PlanValidationRecord:
         if self.status is PlanValidationStatus.SUCCEEDED:
             if self.failure_type is not None:
                 raise DomainError("successful PlanValidationRecord must not have failure_type")
+            if self.step_index is None:
+                if self.command_ref is not None:
+                    raise DomainError(
+                        "Plan-level PlanValidationRecord must not have command_ref"
+                    )
+            else:
+                _non_empty(
+                    self.command_ref,
+                    "successful step PlanValidationRecord.command_ref",
+                )
         elif not isinstance(self.failure_type, FailureType):
             raise DomainError("failed PlanValidationRecord requires a FailureType")
+        elif self.command_ref is not None:
+            raise DomainError("failed PlanValidationRecord must not have command_ref")
         _non_empty(self.short_reason, "PlanValidationRecord.short_reason")
         if not isinstance(self.observed_at, (int, float)):
             raise DomainError("PlanValidationRecord.observed_at must be numeric")

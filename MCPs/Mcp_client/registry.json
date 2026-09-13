@@ -146,7 +146,7 @@
       "cwd": "../File_Mcp",
       "args": ["server.py"],
       "tags": ["reverse-engineering", "file-analysis"],
-      "sandboxTools": ["file"],
+      "sandboxTools": ["python3"],
       "enabled": true
     },
     "jadx": {

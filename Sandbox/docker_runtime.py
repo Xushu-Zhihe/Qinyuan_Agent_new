@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-from contextlib import suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from hashlib import sha256
 from threading import Lock
 from typing import Callable, TypeVar
@@ -43,6 +43,8 @@ class DockerRuntime:
     def __init__(
         self,
         settings: SandboxSettings | None = None,
+        *,
+        prepare_network: bool = True,
     ) -> None:
         self.settings = settings or SandboxSettings()
 
@@ -84,7 +86,8 @@ class DockerRuntime:
             self._stream_client_lock = Lock()
             self._active_output_streams: dict[str, object] = {}
             self._active_output_streams_lock = Lock()
-            self._ensure_network()
+            if prepare_network:
+                self._ensure_network()
 
         except DockerRuntimeError:
             if client is not None:
@@ -474,6 +477,8 @@ class DockerRuntime:
         self,
         sandbox_id: str,
         request: CommandRequest,
+        *,
+        admission: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> CommandResult:
         """
         在指定 Agent 的容器中执行命令。
@@ -511,17 +516,20 @@ class DockerRuntime:
                 (container.attrs.get("Config") or {}).get("WorkingDir")
                 or "/workspace"
             )
-            execution = self.client.api.exec_create(
-                container=container.id,
-                cmd=command,
-                stdout=True,
-                stderr=True,
-                stdin=False,
-                tty=False,
-                privileged=False,
-                user="10001:10001",
-                workdir=configured_workdir,
-            )
+            # T2 serializes dispatch against closing execution admission. Do not
+            # hold this guard while draining output: cancellation must progress.
+            with admission() if admission is not None else nullcontext():
+                execution = self.client.api.exec_create(
+                    container=container.id,
+                    cmd=command,
+                    stdout=True,
+                    stderr=True,
+                    stdin=False,
+                    tty=False,
+                    privileged=False,
+                    user="10001:10001",
+                    workdir=configured_workdir,
+                )
 
             exec_id = execution.get("Id")
             if not isinstance(exec_id, str) or not exec_id:
@@ -529,6 +537,8 @@ class DockerRuntime:
                     "Docker did not return a valid exec ID"
                 )
 
+            # This request was admitted at exec_create. Do not block terminal
+            # stop on the streaming handshake (it has a longer read timeout).
             output_stream = self._stream_api().exec_start(
                 exec_id=exec_id,
                 detach=False,
@@ -536,7 +546,13 @@ class DockerRuntime:
                 stream=True,
                 demux=True,
             )
-            self._register_output_stream(sandbox_id, output_stream)
+            try:
+                with admission() if admission is not None else nullcontext():
+                    self._register_output_stream(sandbox_id, output_stream)
+            except Exception:
+                output_stream.close()
+                output_stream = None
+                raise
 
             for output in output_stream:
                 if isinstance(output, tuple):
@@ -593,6 +609,7 @@ class DockerRuntime:
 
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
+            termination_confirmed=execution_info.get("Running") is False,
         )
 
     def interrupt(self, sandbox_id: str) -> None:

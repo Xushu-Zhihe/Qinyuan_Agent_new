@@ -1,0 +1,1209 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Protocol, TypeAlias
+
+from agent_core.contracts import ModelBackend, TaskRequest
+from agent_core.domain import (
+    Execution,
+    ExecutionStatus,
+    Fact,
+    FactStatus,
+    FailureSummary,
+    FailureType,
+    Intent,
+    IntentStatus,
+    Plan,
+    PlanStep,
+    PlanStatus,
+    PlanValidationRecord,
+    PlanValidationStatus,
+    Turn,
+    TurnStatus,
+)
+from agent_core.runtime import RuntimeEvent, TaskRunStatus
+
+
+class StorageError(RuntimeError):
+    """Base error exposed by a ControlStore implementation."""
+
+
+class IdempotencyConflictError(StorageError):
+    """The same mutation ID was reused for different request content."""
+
+
+class StaleControlStateError(StorageError):
+    """A new mutation was calculated from an obsolete checkpoint."""
+
+
+class TaskRunNotFoundError(StorageError):
+    """A required TaskRun does not exist."""
+
+
+def _non_empty(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _non_negative_integer(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _positive_integer(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _finite_timestamp(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a numeric UTC Unix timestamp")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field_name} must be finite")
+    return result
+
+
+def _uuid4(value: object, field_name: str) -> str:
+    text = _non_empty(value, field_name)
+    try:
+        parsed = uuid.UUID(text)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(f"{field_name} must be a UUID4 string") from exc
+    if parsed.version != 4 or str(parsed) != text.lower():
+        raise ValueError(f"{field_name} must be a canonical UUID4 string")
+    return text
+
+
+def canonical_json(value: object) -> str:
+    """Encode confirmed control-plane data with one deterministic JSON form."""
+
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def task_request_snapshot(
+    request: TaskRequest,
+    effective_model_backend: ModelBackend,
+) -> dict[str, object]:
+    return {
+        "effective_model_backend": effective_model_backend.value,
+        "request": task_request_payload(request),
+    }
+
+
+def task_request_payload(request: TaskRequest) -> dict[str, object]:
+    return {
+        "deadline_seconds": request.deadline_seconds,
+        "goal": request.goal,
+        "target": request.target.to_dict(),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class UpsertTaskRun:
+    task_run_id: str
+    request: TaskRequest
+    effective_model_backend: ModelBackend
+    started_at: float
+    deadline_at: float
+    status: TaskRunStatus
+    sandbox_id: str
+    confirmation_deadline: float | None = None
+    finished_at: float | None = None
+    failure_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        _non_empty(self.task_run_id, "UpsertTaskRun.task_run_id")
+        if not isinstance(self.request, TaskRequest):
+            raise ValueError("UpsertTaskRun.request must be a TaskRequest")
+        if not isinstance(self.effective_model_backend, ModelBackend):
+            raise ValueError(
+                "UpsertTaskRun.effective_model_backend must be a ModelBackend"
+            )
+        if (
+            self.request.model_backend is not None
+            and self.request.model_backend is not self.effective_model_backend
+        ):
+            raise ValueError(
+                "UpsertTaskRun effective_model_backend conflicts with TaskRequest"
+            )
+        _finite_timestamp(self.started_at, "UpsertTaskRun.started_at")
+        _finite_timestamp(self.deadline_at, "UpsertTaskRun.deadline_at")
+        if self.deadline_at != self.started_at + self.request.deadline_seconds:
+            raise ValueError("UpsertTaskRun.deadline_at must match TaskRequest")
+        if not isinstance(self.status, TaskRunStatus):
+            raise ValueError("UpsertTaskRun.status must be a TaskRunStatus")
+        _non_empty(self.sandbox_id, "UpsertTaskRun.sandbox_id")
+        if self.confirmation_deadline is not None:
+            _finite_timestamp(
+                self.confirmation_deadline,
+                "UpsertTaskRun.confirmation_deadline",
+            )
+        if self.finished_at is not None:
+            _finite_timestamp(self.finished_at, "UpsertTaskRun.finished_at")
+        if self.failure_reason is not None:
+            _non_empty(self.failure_reason, "UpsertTaskRun.failure_reason")
+
+
+@dataclass(frozen=True, slots=True)
+class UpsertTurn:
+    turn_id: str
+    task_run_id: str
+    sequence: int
+    turn_target: str
+    intent_ids: tuple[str, ...]
+    status: TurnStatus
+
+    def __post_init__(self) -> None:
+        _non_empty(self.turn_id, "UpsertTurn.turn_id")
+        _non_empty(self.task_run_id, "UpsertTurn.task_run_id")
+        _positive_integer(self.sequence, "UpsertTurn.sequence")
+        _non_empty(self.turn_target, "UpsertTurn.turn_target")
+        if not isinstance(self.intent_ids, tuple):
+            raise ValueError("UpsertTurn.intent_ids must be a tuple")
+        if any(not isinstance(item, str) or not item.strip() for item in self.intent_ids):
+            raise ValueError("UpsertTurn.intent_ids must contain non-empty strings")
+        if len(self.intent_ids) != len(set(self.intent_ids)):
+            raise ValueError("UpsertTurn.intent_ids must be unique")
+        if not isinstance(self.status, TurnStatus):
+            raise ValueError("UpsertTurn.status must be a TurnStatus")
+
+
+@dataclass(frozen=True, slots=True)
+class UpsertIntent:
+    intent_id: str
+    turn_id: str
+    description: str
+    priority: int
+    intent_type: str | None
+    status: IntentStatus
+
+    def __post_init__(self) -> None:
+        _non_empty(self.intent_id, "UpsertIntent.intent_id")
+        _non_empty(self.turn_id, "UpsertIntent.turn_id")
+        _non_empty(self.description, "UpsertIntent.description")
+        _positive_integer(self.priority, "UpsertIntent.priority")
+        if self.intent_type is not None:
+            _non_empty(self.intent_type, "UpsertIntent.intent_type")
+        if not isinstance(self.status, IntentStatus):
+            raise ValueError("UpsertIntent.status must be an IntentStatus")
+
+
+@dataclass(frozen=True, slots=True)
+class UpsertPlan:
+    plan_id: str
+    intent_id: str
+    steps: tuple[PlanStep, ...]
+    status: PlanStatus
+
+    def __post_init__(self) -> None:
+        _non_empty(self.plan_id, "UpsertPlan.plan_id")
+        _non_empty(self.intent_id, "UpsertPlan.intent_id")
+        if not isinstance(self.steps, tuple) or not self.steps:
+            raise ValueError("UpsertPlan.steps must be a non-empty tuple")
+        if any(not isinstance(step, PlanStep) for step in self.steps):
+            raise ValueError("UpsertPlan.steps must contain PlanStep values")
+        if not isinstance(self.status, PlanStatus):
+            raise ValueError("UpsertPlan.status must be a PlanStatus")
+
+
+@dataclass(frozen=True, slots=True)
+class UpsertExecution:
+    execution_id: str
+    plan_id: str
+    step_index: int
+    command_ref: str
+    status: ExecutionStatus
+    output_ref: str | None
+
+    def __post_init__(self) -> None:
+        _non_empty(self.execution_id, "UpsertExecution.execution_id")
+        _non_empty(self.plan_id, "UpsertExecution.plan_id")
+        _non_negative_integer(self.step_index, "UpsertExecution.step_index")
+        _non_empty(self.command_ref, "UpsertExecution.command_ref")
+        if not isinstance(self.status, ExecutionStatus):
+            raise ValueError("UpsertExecution.status must be an ExecutionStatus")
+        terminal = self.status in {
+            ExecutionStatus.SUCCEEDED,
+            ExecutionStatus.FAILED,
+            ExecutionStatus.TIMED_OUT,
+            ExecutionStatus.CANCELLED,
+            ExecutionStatus.REJECTED,
+        }
+        if terminal and self.output_ref is None:
+            raise ValueError("terminal UpsertExecution requires output_ref")
+        if not terminal and self.output_ref is not None:
+            raise ValueError("non-terminal UpsertExecution must not have output_ref")
+        if self.output_ref is not None:
+            _non_empty(self.output_ref, "UpsertExecution.output_ref")
+
+
+@dataclass(frozen=True, slots=True)
+class UpsertFact:
+    fact_id: str
+    turn_id: str
+    content: str
+    source_ref: str
+    status: FactStatus
+
+    def __post_init__(self) -> None:
+        _non_empty(self.fact_id, "UpsertFact.fact_id")
+        _non_empty(self.turn_id, "UpsertFact.turn_id")
+        _non_empty(self.content, "UpsertFact.content")
+        if len(self.content) > 256:
+            raise ValueError("UpsertFact.content must be at most 256 Unicode code points")
+        _non_empty(self.source_ref, "UpsertFact.source_ref")
+        if not isinstance(self.status, FactStatus):
+            raise ValueError("UpsertFact.status must be a FactStatus")
+
+
+@dataclass(frozen=True, slots=True)
+class AppendFailureSummary:
+    failure_type: FailureType
+    short_reason: str
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.failure_type, FailureType):
+            raise ValueError("AppendFailureSummary.failure_type must be a FailureType")
+        _non_empty(self.short_reason, "AppendFailureSummary.short_reason")
+        if len(self.short_reason) > 256:
+            raise ValueError(
+                "AppendFailureSummary.short_reason must be at most 256 Unicode code points"
+            )
+        _non_empty(self.evidence_ref, "AppendFailureSummary.evidence_ref")
+
+
+@dataclass(frozen=True, slots=True)
+class PlanValidationRecordDraft:
+    plan_validation_id: str
+    plan_id: str
+    task_run_id: str
+    step_index: int | None
+    attempt: int
+    status: PlanValidationStatus
+    failure_type: FailureType | None
+    short_reason: str
+    command_ref: str | None
+
+    def __post_init__(self) -> None:
+        _non_empty(
+            self.plan_validation_id,
+            "PlanValidationRecordDraft.plan_validation_id",
+        )
+        _non_empty(self.plan_id, "PlanValidationRecordDraft.plan_id")
+        _non_empty(self.task_run_id, "PlanValidationRecordDraft.task_run_id")
+        if self.step_index is not None:
+            _non_negative_integer(
+                self.step_index,
+                "PlanValidationRecordDraft.step_index",
+            )
+        _positive_integer(self.attempt, "PlanValidationRecordDraft.attempt")
+        if not isinstance(self.status, PlanValidationStatus):
+            raise ValueError(
+                "PlanValidationRecordDraft.status must be a PlanValidationStatus"
+            )
+        if self.status is PlanValidationStatus.SUCCEEDED:
+            if self.failure_type is not None:
+                raise ValueError(
+                    "successful PlanValidationRecordDraft must not have failure_type"
+                )
+            if self.step_index is None:
+                if self.command_ref is not None:
+                    raise ValueError(
+                        "Plan-level PlanValidationRecordDraft must not have command_ref"
+                    )
+            else:
+                _non_empty(
+                    self.command_ref,
+                    "successful step PlanValidationRecordDraft.command_ref",
+                )
+        elif not isinstance(self.failure_type, FailureType):
+            raise ValueError(
+                "failed PlanValidationRecordDraft requires a FailureType"
+            )
+        elif self.command_ref is not None:
+            raise ValueError(
+                "failed PlanValidationRecordDraft must not have command_ref"
+            )
+        _non_empty(self.short_reason, "PlanValidationRecordDraft.short_reason")
+
+
+@dataclass(frozen=True, slots=True)
+class AppendPlanValidationRecord:
+    record: PlanValidationRecordDraft
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, PlanValidationRecordDraft):
+            raise ValueError(
+                "AppendPlanValidationRecord.record must be a PlanValidationRecordDraft"
+            )
+
+
+StateChange: TypeAlias = (
+    UpsertTaskRun
+    | UpsertTurn
+    | UpsertIntent
+    | UpsertPlan
+    | UpsertExecution
+    | UpsertFact
+    | AppendFailureSummary
+    | AppendPlanValidationRecord
+)
+
+STATE_CHANGE_TYPES = (
+    UpsertTaskRun,
+    UpsertTurn,
+    UpsertIntent,
+    UpsertPlan,
+    UpsertExecution,
+    UpsertFact,
+    AppendFailureSummary,
+    AppendPlanValidationRecord,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnRegistration:
+    """Prepared first scheduling mutation for one fixed Turn and Intent list."""
+
+    task_run_id: str
+    base_checkpoint_sequence: int
+    turn_id: str
+    state_changes: tuple[StateChange, ...]
+
+    def __post_init__(self) -> None:
+        _non_empty(self.task_run_id, "TurnRegistration.task_run_id")
+        _non_negative_integer(
+            self.base_checkpoint_sequence,
+            "TurnRegistration.base_checkpoint_sequence",
+        )
+        _non_empty(self.turn_id, "TurnRegistration.turn_id")
+        if not isinstance(self.state_changes, tuple) or len(self.state_changes) < 2:
+            raise ValueError(
+                "TurnRegistration must contain one Turn and a non-empty Intent list"
+            )
+
+        turn, *intents = self.state_changes
+        if not isinstance(turn, UpsertTurn):
+            raise ValueError("TurnRegistration must begin with UpsertTurn")
+        if any(not isinstance(item, UpsertIntent) for item in intents):
+            raise ValueError("TurnRegistration may only contain UpsertIntent after Turn")
+        if turn.task_run_id != self.task_run_id or turn.turn_id != self.turn_id:
+            raise ValueError("TurnRegistration Turn belongs to another TaskRun")
+        if turn.status is not TurnStatus.PENDING:
+            raise ValueError("TurnRegistration Turn must begin pending")
+
+        typed_intents = tuple(intents)
+        intent_ids = tuple(item.intent_id for item in typed_intents)
+        if turn.intent_ids != intent_ids:
+            raise ValueError("TurnRegistration intent_ids must match its Intents")
+        if any(item.turn_id != turn.turn_id for item in typed_intents):
+            raise ValueError("TurnRegistration Intent belongs to another Turn")
+        if any(item.status is not IntentStatus.PENDING for item in typed_intents):
+            raise ValueError("TurnRegistration Intents must begin pending")
+        if tuple(item.priority for item in typed_intents) != tuple(
+            range(1, len(typed_intents) + 1)
+        ):
+            raise ValueError("TurnRegistration Intent priorities must be ordered from one")
+
+    @property
+    def entity_ids(self) -> tuple[str, ...]:
+        """Event references, preserving the fixed priority order."""
+
+        return (self.turn_id,) + tuple(
+            item.intent_id
+            for item in self.state_changes
+            if isinstance(item, UpsertIntent)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OperationResultRule:
+    event_type: str
+    allowed_results: frozenset[str] = frozenset()
+    dynamic_result_entity: str | None = None
+    result_required: bool = True
+
+    def __post_init__(self) -> None:
+        _non_empty(self.event_type, "OperationResultRule.event_type")
+        if self.allowed_results and self.dynamic_result_entity is not None:
+            raise ValueError(
+                "OperationResultRule cannot mix fixed and dynamic results"
+            )
+        if not self.allowed_results and self.dynamic_result_entity is None:
+            raise ValueError("OperationResultRule must define a result contract")
+        if any(not isinstance(item, str) or not item.strip() for item in self.allowed_results):
+            raise ValueError(
+                "OperationResultRule.allowed_results must contain non-empty strings"
+            )
+        if self.dynamic_result_entity is not None:
+            _non_empty(
+                self.dynamic_result_entity,
+                "OperationResultRule.dynamic_result_entity",
+            )
+
+
+TURN_OPERATIONS = frozenset({
+    "select_next_intent", "register_plan", "start_plan", "complete_plan",
+    "append_plan_validation_record", "create_execution", "start_execution",
+    "complete_execution", "create_fact", "verify_fact", "succeed_intent_with_fact",
+    "complete_turn", "record_command_generation_failure", "record_execution_failure",
+    "record_target_mismatch", "finish_task_run",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class TurnOperation:
+    """Immutable domain delta; the Controller supplies the event, clock and commit."""
+
+    task_run_id: str
+    base_checkpoint_sequence: int
+    operation: str
+    state_changes: tuple[StateChange, ...]
+    entity_ids: tuple[str, ...]
+    result: str | None
+
+    def __post_init__(self) -> None:
+        _non_empty(self.task_run_id, "TurnOperation.task_run_id")
+        _non_negative_integer(self.base_checkpoint_sequence, "TurnOperation.base_checkpoint_sequence")
+        if self.operation not in TURN_OPERATIONS:
+            raise ValueError("unsupported TurnOperation.operation")
+        if not isinstance(self.state_changes, tuple) or not self.state_changes:
+            raise ValueError("TurnOperation requires typed state changes")
+        if any(not isinstance(item, STATE_CHANGE_TYPES) for item in self.state_changes):
+            raise ValueError("TurnOperation contains an unsupported state change")
+        if not isinstance(self.entity_ids, tuple):
+            raise ValueError("TurnOperation.entity_ids must be a tuple")
+        task_changes = [item for item in self.state_changes if isinstance(item, UpsertTaskRun)]
+        if len(task_changes) > 1:
+            raise ValueError("TurnOperation may change at most one TaskRun")
+        if task_changes:
+            task = task_changes[0]
+            if task.task_run_id != self.task_run_id:
+                raise ValueError("TurnOperation TaskRun belongs to another task")
+            if self.operation == "finish_task_run":
+                if task.status not in {TaskRunStatus.PARTIAL, TaskRunStatus.INCONCLUSIVE}:
+                    raise ValueError("Turn conclusion must be partial or inconclusive")
+            elif self.operation not in {"record_execution_failure", "record_command_generation_failure"} or (
+                task.status is not TaskRunStatus.FAILED or self.result != "task_failed"
+            ):
+                raise ValueError("only model failure may terminate a TaskRun in a Turn operation")
+        elif self.operation == "finish_task_run" or self.result == "task_failed":
+            raise ValueError("terminal TurnOperation requires its TaskRun state change")
+        validate_control_event(self.operation, self.state_changes, self.event(timestamp=0.0))
+
+    def event(self, *, timestamp: float) -> RuntimeEvent:
+        details: dict[str, object] = {
+            "operation": self.operation, "entity_ids": list(self.entity_ids),
+        }
+        if self.result is not None:
+            details["result"] = self.result
+        status = next(
+            (item.status for item in self.state_changes if isinstance(item, UpsertTaskRun)),
+            TaskRunStatus.RUNNING,
+        )
+        return RuntimeEvent(
+            type=CONTROL_OPERATION_RULES[self.operation].event_type,
+            task_run_id=self.task_run_id, timestamp=timestamp, status=status, details=details,
+        )
+
+
+_CONTROL_EVENT_TYPE = "control_state_committed"
+
+CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
+    {
+        "start_task_run": OperationResultRule(
+            event_type="task_run_started",
+            dynamic_result_entity="task_run",
+        ),
+        "request_completion_confirmation": OperationResultRule(
+            event_type="completion_confirmation_requested",
+            allowed_results=frozenset({"awaiting_confirmation"}),
+        ),
+        "finish_task_run": OperationResultRule(
+            event_type="task_run_finished",
+            allowed_results=frozenset(
+                {
+                    "achieved",
+                    "assumed_achieved",
+                    "partial",
+                    "inconclusive",
+                    "failed",
+                    "cancelled",
+                    "deadline_exceeded",
+                }
+            ),
+        ),
+        "select_next_intent": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="running_intent",
+            result_required=False,
+        ),
+        "register_turn": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="turn",
+        ),
+        "register_plan": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="plan",
+        ),
+        "start_plan": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"running"}),
+        ),
+        "complete_plan": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"completed"}),
+        ),
+        "append_plan_validation_record": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="plan_validation",
+        ),
+        "create_execution": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="execution",
+        ),
+        "start_execution": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"running"}),
+        ),
+        "complete_execution": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"succeeded"}),
+        ),
+        "create_fact": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="fact",
+        ),
+        "verify_fact": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"verified", "rejected"}),
+        ),
+        "succeed_intent_with_fact": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"succeeded"}),
+        ),
+        "complete_turn": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"completed"}),
+        ),
+        "record_command_generation_failure": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset(
+                {
+                    "retry_command_generation",
+                    "try_next_intent",
+                    "turn_inconclusive",
+                    "task_failed",
+                }
+            ),
+        ),
+        "record_execution_failure": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset(
+                {
+                    "retry_execution",
+                    "try_next_intent",
+                    "turn_inconclusive",
+                    "task_failed",
+                }
+            ),
+        ),
+        "record_target_mismatch": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset(
+                {"try_next_intent", "turn_inconclusive"}
+            ),
+        ),
+        "recover_running_execution_as_inconclusive": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"inconclusive"}),
+        ),
+    }
+)
+
+
+def _dynamic_result_ids(
+    state_changes: tuple[StateChange, ...],
+    entity: str,
+) -> frozenset[str]:
+    if entity == "task_run":
+        return frozenset(
+            change.task_run_id
+            for change in state_changes
+            if isinstance(change, UpsertTaskRun)
+        )
+    if entity == "turn":
+        return frozenset(
+            change.turn_id
+            for change in state_changes
+            if isinstance(change, UpsertTurn)
+        )
+    if entity in {"intent", "running_intent"}:
+        return frozenset(
+            change.intent_id
+            for change in state_changes
+            if isinstance(change, UpsertIntent)
+            and (entity == "intent" or change.status is IntentStatus.RUNNING)
+        )
+    if entity == "plan":
+        return frozenset(
+            change.plan_id
+            for change in state_changes
+            if isinstance(change, UpsertPlan)
+        )
+    if entity == "execution":
+        return frozenset(
+            change.execution_id
+            for change in state_changes
+            if isinstance(change, UpsertExecution)
+        )
+    if entity == "fact":
+        return frozenset(
+            change.fact_id
+            for change in state_changes
+            if isinstance(change, UpsertFact)
+        )
+    if entity == "plan_validation":
+        return frozenset(
+            change.record.plan_validation_id
+            for change in state_changes
+            if isinstance(change, AppendPlanValidationRecord)
+        )
+    raise ValueError(f"unsupported dynamic result entity: {entity}")
+
+
+def validate_control_event(
+    operation: str,
+    state_changes: tuple[StateChange, ...],
+    event: RuntimeEvent,
+) -> None:
+    rule = CONTROL_OPERATION_RULES.get(operation)
+    if rule is None:
+        raise ValueError(f"unsupported ControlMutation.operation: {operation}")
+    if event.type != rule.event_type:
+        raise ValueError(
+            f"operation {operation} requires RuntimeEvent.type={rule.event_type}"
+        )
+    if not isinstance(event.details, Mapping):
+        raise ValueError("RuntimeEvent.details must be a JSON object")
+    details = dict(event.details)
+    if any(not isinstance(key, str) for key in details):
+        raise ValueError("RuntimeEvent.details keys must be strings")
+    allowed_fields = {"operation", "entity_ids", "result"}
+    unknown_fields = set(details) - allowed_fields
+    if unknown_fields:
+        raise ValueError(
+            "RuntimeEvent.details contains unsupported fields: "
+            + ", ".join(sorted(unknown_fields))
+        )
+    if details.get("operation") != operation:
+        raise ValueError(
+            "ControlMutation.operation must match RuntimeEvent.details.operation"
+        )
+    entity_ids = details.get("entity_ids")
+    if not isinstance(entity_ids, list) or not entity_ids:
+        raise ValueError(
+            "RuntimeEvent.details.entity_ids must be a non-empty array"
+        )
+    if any(not isinstance(item, str) or not item.strip() for item in entity_ids):
+        raise ValueError(
+            "RuntimeEvent.details.entity_ids must contain non-empty strings"
+        )
+    if len(entity_ids) != len(set(entity_ids)):
+        raise ValueError("RuntimeEvent.details.entity_ids must be unique")
+
+    result_present = "result" in details
+    if not result_present:
+        if rule.result_required:
+            raise ValueError(f"operation {operation} requires RuntimeEvent.details.result")
+        return
+
+    result = details["result"]
+    if not isinstance(result, str) or not result.strip():
+        raise ValueError("RuntimeEvent.details.result must be a non-empty string")
+    if rule.allowed_results:
+        if result not in rule.allowed_results:
+            raise ValueError(
+                f"operation {operation} does not allow result={result}"
+            )
+        return
+
+    assert rule.dynamic_result_entity is not None
+    if result not in entity_ids:
+        raise ValueError(
+            "a dynamic RuntimeEvent.details.result must appear in entity_ids"
+        )
+    matching_ids = _dynamic_result_ids(
+        state_changes,
+        rule.dynamic_result_entity,
+    )
+    if result not in matching_ids:
+        raise ValueError(
+            f"operation {operation} result does not match its typed state_changes"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointDraft:
+    task_run_id: str
+    sequence: int
+
+    def __post_init__(self) -> None:
+        _non_empty(self.task_run_id, "CheckpointDraft.task_run_id")
+        _positive_integer(self.sequence, "CheckpointDraft.sequence")
+
+
+@dataclass(frozen=True, slots=True)
+class Checkpoint:
+    task_run_id: str
+    sequence: int
+    watermark_event_sequence: int
+    created_at: float
+
+    def __post_init__(self) -> None:
+        _non_empty(self.task_run_id, "Checkpoint.task_run_id")
+        _positive_integer(self.sequence, "Checkpoint.sequence")
+        _positive_integer(
+            self.watermark_event_sequence,
+            "Checkpoint.watermark_event_sequence",
+        )
+        _finite_timestamp(self.created_at, "Checkpoint.created_at")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlMutation:
+    task_run_id: str
+    mutation_id: str
+    operation: str
+    request: TaskRequest
+    effective_model_backend: ModelBackend
+    base_checkpoint_sequence: int
+    state_changes: tuple[StateChange, ...]
+    event: RuntimeEvent
+    checkpoint: CheckpointDraft
+    request_fingerprint: str
+
+    def __post_init__(self) -> None:
+        _non_empty(self.task_run_id, "ControlMutation.task_run_id")
+        _uuid4(self.mutation_id, "ControlMutation.mutation_id")
+        _non_empty(self.operation, "ControlMutation.operation")
+        if not isinstance(self.request, TaskRequest):
+            raise ValueError("ControlMutation.request must be a TaskRequest")
+        if not isinstance(self.effective_model_backend, ModelBackend):
+            raise ValueError(
+                "ControlMutation.effective_model_backend must be a ModelBackend"
+            )
+        _non_negative_integer(
+            self.base_checkpoint_sequence,
+            "ControlMutation.base_checkpoint_sequence",
+        )
+        if not isinstance(self.state_changes, tuple) or not self.state_changes:
+            raise ValueError("ControlMutation.state_changes must be a non-empty tuple")
+        if any(not isinstance(change, STATE_CHANGE_TYPES) for change in self.state_changes):
+            raise ValueError("ControlMutation contains an unsupported state change")
+        if self.event.task_run_id != self.task_run_id:
+            raise ValueError("ControlMutation.event belongs to another TaskRun")
+        validate_control_event(self.operation, self.state_changes, self.event)
+        if self.checkpoint.task_run_id != self.task_run_id:
+            raise ValueError("ControlMutation.checkpoint belongs to another TaskRun")
+        if self.checkpoint.sequence != self.base_checkpoint_sequence + 1:
+            raise ValueError(
+                "ControlMutation checkpoint sequence must equal base sequence plus one"
+            )
+        _non_empty(self.request_fingerprint, "ControlMutation.request_fingerprint")
+        if len(self.request_fingerprint) != 64:
+            raise ValueError("ControlMutation.request_fingerprint must be SHA-256 hex")
+        try:
+            int(self.request_fingerprint, 16)
+        except ValueError as exc:
+            raise ValueError(
+                "ControlMutation.request_fingerprint must be SHA-256 hex"
+            ) from exc
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        task_run_id: str,
+        mutation_id: str,
+        operation: str,
+        request: TaskRequest,
+        effective_model_backend: ModelBackend,
+        base_checkpoint_sequence: int,
+        state_changes: tuple[StateChange, ...],
+        event: RuntimeEvent,
+    ) -> "ControlMutation":
+        checkpoint = CheckpointDraft(
+            task_run_id=task_run_id,
+            sequence=base_checkpoint_sequence + 1,
+        )
+        provisional = cls(
+            task_run_id=task_run_id,
+            mutation_id=mutation_id,
+            operation=operation,
+            request=request,
+            effective_model_backend=effective_model_backend,
+            base_checkpoint_sequence=base_checkpoint_sequence,
+            state_changes=state_changes,
+            event=event,
+            checkpoint=checkpoint,
+            request_fingerprint="0" * 64,
+        )
+        return cls(
+            task_run_id=provisional.task_run_id,
+            mutation_id=provisional.mutation_id,
+            operation=provisional.operation,
+            request=provisional.request,
+            effective_model_backend=provisional.effective_model_backend,
+            base_checkpoint_sequence=provisional.base_checkpoint_sequence,
+            state_changes=provisional.state_changes,
+            event=provisional.event,
+            checkpoint=provisional.checkpoint,
+            request_fingerprint=control_mutation_fingerprint(provisional),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlCommitResult:
+    event: RuntimeEvent
+    checkpoint: Checkpoint
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedOperation:
+    value: str | None
+    commit: ControlCommitResult
+
+    @classmethod
+    def from_commit(cls, commit: ControlCommitResult) -> "CommittedOperation":
+        result = commit.event.details.get("result")
+        if result is not None and not isinstance(result, str):
+            raise ValueError("committed RuntimeEvent result must be a string")
+        return cls(value=result, commit=commit)
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedPlanValidation:
+    record: PlanValidationRecord
+    commit: ControlCommitResult
+
+    @classmethod
+    def from_store(
+        cls,
+        store: "ControlStore",
+        *,
+        task_run_id: str,
+        plan_validation_id: str,
+        commit: ControlCommitResult,
+    ) -> "CommittedPlanValidation":
+        record = store.load_plan_validation_record(
+            task_run_id,
+            plan_validation_id,
+        )
+        return cls(record=record, commit=commit)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRunSnapshot:
+    task_run_id: str
+    request: TaskRequest
+    effective_model_backend: ModelBackend
+    started_at: float
+    deadline_at: float
+    status: TaskRunStatus
+    sandbox_id: str
+    confirmation_deadline: float | None
+    finished_at: float | None
+    failure_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TurnSnapshot:
+    turn_id: str
+    task_run_id: str
+    sequence: int
+    turn_target: str
+    intent_ids: tuple[str, ...]
+    status: TurnStatus
+
+    def to_domain(self) -> Turn:
+        return Turn(
+            turn_id=self.turn_id,
+            task_run_id=self.task_run_id,
+            sequence=self.sequence,
+            turn_target=self.turn_target,
+            intent_ids=self.intent_ids,
+            status=self.status,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class IntentSnapshot:
+    intent_id: str
+    turn_id: str
+    description: str
+    priority: int
+    intent_type: str | None
+    status: IntentStatus
+
+    def to_domain(self) -> Intent:
+        return Intent(
+            intent_id=self.intent_id,
+            turn_id=self.turn_id,
+            description=self.description,
+            priority=self.priority,
+            intent_type=self.intent_type,
+            status=self.status,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PlanSnapshot:
+    plan_id: str
+    intent_id: str
+    steps: tuple[PlanStep, ...]
+    status: PlanStatus
+
+    def to_domain(self) -> Plan:
+        return Plan(
+            plan_id=self.plan_id,
+            intent_id=self.intent_id,
+            steps=self.steps,
+            status=self.status,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionSnapshot:
+    execution_id: str
+    plan_id: str
+    step_index: int
+    command_ref: str
+    status: ExecutionStatus
+    output_ref: str | None
+
+    def to_domain(self) -> Execution:
+        return Execution(
+            execution_id=self.execution_id,
+            plan_id=self.plan_id,
+            step_index=self.step_index,
+            command_ref=self.command_ref,
+            status=self.status,
+            output_ref=self.output_ref,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FactRecordSnapshot:
+    fact_id: str
+    turn_id: str
+    content: str
+    source_ref: str
+    status: FactStatus
+    created_event_sequence: int
+    created_event_ordinal: int
+
+    def to_domain(self) -> Fact:
+        return Fact(
+            fact_id=self.fact_id,
+            turn_id=self.turn_id,
+            content=self.content,
+            source_ref=self.source_ref,
+            status=self.status,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FailureSummaryRecordSnapshot:
+    failure_type: FailureType
+    short_reason: str
+    evidence_ref: str
+    created_event_sequence: int
+    created_event_ordinal: int
+
+    def to_domain(self) -> FailureSummary:
+        return FailureSummary(
+            failure_type=self.failure_type,
+            short_reason=self.short_reason,
+            evidence_ref=self.evidence_ref,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlStateRows:
+    task_run: TaskRunSnapshot
+    latest_checkpoint: Checkpoint
+    turns: tuple[TurnSnapshot, ...]
+    intents: tuple[IntentSnapshot, ...]
+    plans: tuple[PlanSnapshot, ...]
+    executions: tuple[ExecutionSnapshot, ...]
+    facts: tuple[FactRecordSnapshot, ...]
+    failure_summaries: tuple[FailureSummaryRecordSnapshot, ...]
+    plan_validation_records: tuple[PlanValidationRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ControlStateSnapshot:
+    task_run: TaskRunSnapshot
+    latest_checkpoint: Checkpoint
+    turns: tuple[TurnSnapshot, ...]
+    intents: tuple[IntentSnapshot, ...]
+    plans: tuple[PlanSnapshot, ...]
+    executions: tuple[ExecutionSnapshot, ...]
+    facts: tuple[FactRecordSnapshot, ...]
+    failure_summaries: tuple[FailureSummaryRecordSnapshot, ...]
+    plan_validation_records: tuple[PlanValidationRecord, ...]
+
+
+class ControlStore(Protocol):
+    def commit(self, mutation: ControlMutation) -> ControlCommitResult: ...
+
+    def load_committed_mutation(
+        self,
+        task_run_id: str,
+        mutation_id: str,
+    ) -> ControlCommitResult | None: ...
+
+    def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None: ...
+
+    def load_terminal_commit(self, task_run_id: str) -> ControlCommitResult | None:
+        """First persisted terminal result for repeated cancellation; no new mutation."""
+        ...
+
+    def load_control_state_rows(
+        self,
+        task_run_id: str,
+    ) -> ControlStateRows | None: ...
+
+    def load_plan_validation_record(
+        self,
+        task_run_id: str,
+        plan_validation_id: str,
+    ) -> PlanValidationRecord: ...
+
+
+def _state_change_payload(change: StateChange) -> dict[str, object]:
+    if isinstance(change, UpsertTaskRun):
+        return {
+            "type": "upsert_task_run",
+            "task_run_id": change.task_run_id,
+            "request": task_request_snapshot(
+                change.request,
+                change.effective_model_backend,
+            ),
+            "sandbox_id": change.sandbox_id,
+            "status": change.status.value,
+            "failure_reason": change.failure_reason,
+        }
+    if isinstance(change, UpsertTurn):
+        return {
+            "type": "upsert_turn",
+            "turn_id": change.turn_id,
+            "task_run_id": change.task_run_id,
+            "sequence": change.sequence,
+            "turn_target": change.turn_target,
+            "intent_ids": list(change.intent_ids),
+            "status": change.status.value,
+        }
+    if isinstance(change, UpsertIntent):
+        return {
+            "type": "upsert_intent",
+            "intent_id": change.intent_id,
+            "turn_id": change.turn_id,
+            "description": change.description,
+            "priority": change.priority,
+            "intent_type": change.intent_type,
+            "status": change.status.value,
+        }
+    if isinstance(change, UpsertPlan):
+        return {
+            "type": "upsert_plan",
+            "plan_id": change.plan_id,
+            "intent_id": change.intent_id,
+            "steps": [{"description": item.description} for item in change.steps],
+            "status": change.status.value,
+        }
+    if isinstance(change, UpsertExecution):
+        return {
+            "type": "upsert_execution",
+            "execution_id": change.execution_id,
+            "plan_id": change.plan_id,
+            "step_index": change.step_index,
+            "command_ref": change.command_ref,
+            "status": change.status.value,
+            "output_ref": change.output_ref,
+        }
+    if isinstance(change, UpsertFact):
+        return {
+            "type": "upsert_fact",
+            "fact_id": change.fact_id,
+            "turn_id": change.turn_id,
+            "content": change.content,
+            "source_ref": change.source_ref,
+            "status": change.status.value,
+        }
+    if isinstance(change, AppendFailureSummary):
+        return {
+            "type": "append_failure_summary",
+            "failure_type": change.failure_type.value,
+            "short_reason": change.short_reason,
+            "evidence_ref": change.evidence_ref,
+        }
+    if isinstance(change, AppendPlanValidationRecord):
+        record = change.record
+        return {
+            "type": "append_plan_validation_record",
+            "plan_validation_id": record.plan_validation_id,
+            "plan_id": record.plan_id,
+            "task_run_id": record.task_run_id,
+            "step_index": record.step_index,
+            "attempt": record.attempt,
+            "status": record.status.value,
+            "failure_type": (
+                record.failure_type.value if record.failure_type is not None else None
+            ),
+            "short_reason": record.short_reason,
+            "command_ref": record.command_ref,
+        }
+    raise TypeError("unsupported state change")
+
+
+def control_mutation_fingerprint(mutation: ControlMutation) -> str:
+    details = dict(mutation.event.details)
+    payload = {
+        "task_run_id": mutation.task_run_id,
+        "task_request": task_request_snapshot(
+            mutation.request,
+            mutation.effective_model_backend,
+        ),
+        "operation": mutation.operation,
+        "base_checkpoint_sequence": mutation.base_checkpoint_sequence,
+        "state_changes": [
+            _state_change_payload(change) for change in mutation.state_changes
+        ],
+        "event": {
+            "type": mutation.event.type,
+            "status": mutation.event.status.value,
+            "details": details,
+        },
+    }
+    encoded = canonical_json(payload).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
