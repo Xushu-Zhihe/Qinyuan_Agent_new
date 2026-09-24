@@ -38,18 +38,24 @@
 
 `AgentApplicationPort`、`RunSupervisorPort`、`StagePlannerPort`、`ProcedureSelectorPort`、`ProcedureRunnerPort`、`ToolGatewayPort`、`PolicyPort`、`MCPManagerPort`、`SandboxRuntimePort`、`ExecutionRecorderPort`、`FactVerifierPort`、`GoalEvaluatorPort` 和 `EventPort`。
 
-T3 已补齐工具、Policy、MCP、Sandbox 执行和 ExecutionRecorder 的方法及类型，见末节。其余 Protocol 只表达职责边界，公共参数、返回值与错误结构尚未冻结，暂不填入 `Any`、万能字典或猜测字段。
+T3 已补齐工具、Policy、MCP、Sandbox 执行和 ExecutionRecorder，T4 增加专用文件类型验证、Intent 评估和循环入口，见后文。其余 Protocol 只表达职责边界，公共参数、返回值与错误结构尚未冻结，暂不填入 `Any`、万能字典或猜测字段。
+
+## T5 公共入口与后续转换器边界（2026-09-24）
+
+T5 面向独立的自动化渗透测试 Agent 提供 CLI 与事件，不再声明或实现 qinyuan-bat 专用适配接口。CLI 和 Python API 的应用操作仍归属 `AgentApplicationPort`；这一职责约定不代表公共签名或外部序列化已经冻结。
+
+后续独立转换器负责多题目获取、调用 `qinyuan-agent-new` 和平台 flag 提交。它使用哪种公共调用入口、如何传递题目/附件、接收结果和提交回执，均需另行确认；本次不新增转换器 Protocol、字段或占位签名。当前 TaskRun、Intent 和控制面类型继续复用，转换器不直接修改其内部状态。
 
 ## 待确认后才能补齐的声明
 
-1. `AgentApplicationPort`：CLI/Python API 的输入、同步/异步、结果格式、事件订阅、退出码和 `resume` 标识。
+1. `AgentApplicationPort`：CLI/Python API 的输入、同步/异步、结果格式、事件订阅，以及 CLI 退出码、外部 `resume/cancel` 标识与操作语义。
 2. `RunSupervisorPort`：循环驱动、动态 Intent、路径耗尽、Budget 和终止返回值。
 3. `StagePlannerPort`：StageContext、前置/后置条件、时间片和计划返回值。
 4. `ProcedureSelectorPort` / `ProcedureRunnerPort`：ProcedureFact 字段、版本、匹配排序、校验失败和执行失败路径。
 5. `ToolGatewayPort` / `PolicyPort`：T3 File Tool 已确认，其他 Tool 的权限粒度与 Scope/ROE 仍需确认。
 6. `MCPManagerPort` / `SandboxRuntimePort`：T3 方法已确认，其他 Tool、远程 MCP 和真实 Docker 验收仍需确认。
 7. `ExecutionRecorderPort`：T3 执行记录、保留、截断、Hash 与脱敏已确认；一般 Artifact 的扩展字段和清理 API 仍待后续确认。
-8. `FactVerifierPort` / `GoalEvaluatorPort`：验证器输入、目标完成规则、ResultFact/TaskResult 字段及误判处理。
+8. 通用 `FactVerifierPort` / TaskRun `GoalEvaluatorPort`：任意事实与整体任务判断仍待确认；T4 文件类型验证器和只读 IntentGoalEvaluatorPort 已实现，不以此扩大到通用目标判断。
 9. `EventPort`：事件类型、顺序、持久化、重放、订阅和背压。
 
 ## T2 外围适配入口
@@ -85,10 +91,30 @@ T3 已补齐工具、Policy、MCP、Sandbox 执行和 ExecutionRecorder 的方�
 
 本轮只确认上述 Python 内部类型及本地证据文件，不冻结 CLI、外部 TaskResult 或通用远程 wire protocol。T3 不提供删除运行中证据的 API；调用方应在不再需要审计或控制面恢复后显式清理整份证据目录。
 
-## T4 已确认边界，具体签名待确认（2026-09-13）
+## T4 已确认边界（2026-09-23）
 
 单 Intent direct 循环返回当前 Intent 目标已满足/未满足/无法确定的判断。Fact 验证通过不等于 Intent 目标满足，Intent 目标满足也不等于 TaskRun 目标满足；完成确认、TaskRun 终态和最终 TaskResult 由上层按已有契约处理。T4 不因文件类型 Fact 成立就调用任务完成确认入口。
 
-文件类型候选采用专用结构，表达被检查对象、工具识别结果和来源 Execution 引用，不让验证器理解任意自然语言候选。具体字段、输出规范化、评估类型和签名尚未冻结。
+文件类型候选为 `FileTypeFactCandidate(path, observed_type, execution_id)`。只接受成功、停止已确认、双流未截断、stderr 为空的单行工具输出；最多移除一个末尾换行，正文不得含控制字符或 Unicode 行分隔符，类型文本最多 200 字且逐字匹配。可信验证器签发独立证明；`commit_verified_file_type_fact(intent_id, candidate, proof_id, fact_id, mutation_id)` 在重新核对证明后原子提交 verified Fact、事件和 Checkpoint。旧 `verify_fact` 的 Turn 层语义保持不变。
 
-当前 Intent 只有 description，没有独立的结构化目标；旧 `verify_fact` 接口的 `turn_target_satisfied` 明确表示 Turn 目标判断，不能暗中改作 Intent 满足或候选内容有效。新增目标契约、验证入口的兼容方式及评估与持久化状态的关系，见 `T4_proposal.md` 的待确认建议；确认前不补齐 Python Protocol。
+只读 `IntentGoalEvaluatorPort.evaluate(task_run_id, intent_id)` 返回 `IntentGoalEvaluation(task_run_id, intent_id, outcome, verified_fact_ids, short_reason)`。`satisfied/verified_file_type_fact` 只列出本 Intent 当前目标的可复核已提交 verified Fact；没有支持事实时返回 `not_satisfied/no_supporting_verified_fact`，本 Intent 有 pending/running 或已记录结果未知的 Execution 时返回 `inconclusive/execution_outcome_unknown`。已提交证明缺失或损坏抛存储异常，缺失目标或跨任务归属抛 `state_conflict`，不伪装为三态结果。`complete_satisfied_intent(intent_id, evaluation, mutation_id)` 由 Controller 重新评估并核对支持 Fact ID 后，仅原子提交 Intent.succeeded；同 ID 精确重放不重新评估，Turn 和 TaskRun 状态不随之完成。
+
+`intent_action` 的归一化内部响应使用 `kind` 判别对象，且恰为 `inspect_file(path)`、`file_type_candidate(path, observed_type, execution_id)` 或 `stop(short_reason)` 之一；多字段、缺字段和未知 kind 拒绝。请求携带可信的 Intent/Plan/步骤 0/目标路径及最近已提交 Execution 观察，stdout/stderr 共用 4096 字符上下文预算，保留原始双流截断和上下文裁剪标记；观察不是 verified Fact。T4 模型调用台账按 TaskRun/Intent 保存已开始和经校验结果，不保存原始提示/响应；每 Intent 的 Plan 生成至多 2 次，动作调用至多 8 次，首期最多一次成功工具派发。循环结果使用 `IntentLoopResult(task_run_id, intent_id, evaluation, stop_reason, plan_id, execution_ids, verified_fact_ids)`，不包含 TaskResult。
+
+Intent 的 description 不用于推导目标；可信调用方独立提供并持久保留 `FileTypeIntentGoal`，Intent 结束不删除；上层先提交 `Intent.running`，Controller 在首次 Plan 生成前核对归属、运行状态、任务范围和当前授权，并将目标、事件及 Checkpoint 原子绑定；未绑定时 T4 拒绝启动。重试和恢复核对同一目标。目标保存在独立一对一控制面表，schema 2 引入该表，旧库按版本原子迁移，旧 Intent 不自动补目标。旧 `verify_fact` 接口的 `turn_target_satisfied` 明确表示 Turn 目标判断，不能暗中改作 Intent 满足或候选内容有效。绑定签名为 `bind_intent_goal(goal, import_id, mutation_id, authorization) -> IntentGoalBindingResult`，返回 `created`/`replayed`/`existing`，首次提交事件保存原 import_id，目标表不保存授权或收据副本。
+
+已确认：来源 `local_path` 与 Sandbox 路径必须通过可信附件导入记录精确映射，URL 本轮不支持；绑定业务指纹只比较操作类型和四个目标字段，授权不入指纹；专用 `IntentGoalBindingResult` 区分 `created`/`replayed`/`existing`；六个稳定错误码、重复绑定及新 mutation 授权重验规则按 `T4_proposal.md` 执行，首期只支持 `file_type`。目标表不存授权快照或凭据，恢复后新工具派发重验当前授权。附件导入声明、成功收据及绑定入口已经实现。
+
+本地附件来源根目录已确认并实现：持久化 `TaskRunController.start()` 增加仅限持久化模式的可选关键字参数 `source_root: str | None = None`；提供时须是可信入口预先解析的现存规范绝对目录，由 Controller 校验后随 TaskRun 启动原子保存。schema 3 使旧记录的该字段为 NULL；NULL TaskRun 不能执行 T4 本地导入。后续状态提交不可修改根目录，恢复时核对同一规范路径。
+
+附件导入的公开入口为 `AttachmentImporter.import_attachment(AttachmentImportRequest, cancellation_token)` 与 `recover_import(import_id, cancellation_token)`，均为异步；请求固定含 import_id、TaskRun/Sandbox ID、附件索引、来源根目录和 Sandbox 目标路径，`local_path` 只从持久 TaskRequest 读取。独立 `AttachmentImportSandboxPort` 提供一次准入锁内的 `create_and_readback` 与只读 `readback`，返回字节数和 SHA-256。前置拒绝使用 `AttachmentImportRejected.code`，参数/占用冲突、证据损坏、声明后未知结果分别使用独立异常；`import_not_found` 表示显式恢复的 ID 从未声明。真实 Docker 导入适配器未纳入 T4 验收。
+
+## T4 执行入口及恢复声明（2026-09-24）
+
+`IntentToolCallingLoop.run(intent_id: str, authorization: ToolAuthorization, cancellation_token: CancellationToken) -> IntentLoopResult` 为异步入口。构造时注入 Controller、ModelInvocationCoordinator、Gateway、FileTypeVerifier、IntentGoalEvaluatorPort、只读工具证据、共享调用/动作台账及有界上下文读取。模型协调器须使用同一台账；可信上层先导入、选中 Intent.running 并绑定目标。公共类型见 `agent_core/intent_loop.py`；`IntentToolCallingLoopPort` 声明此入口。
+
+`ModelInvocationCoordinator.invoke_async` 保留同步 invoke 的兼容性，仅适配器调用进入工作线程，SQLite 留在原线程；取消/Deadline 后不消费迟到结果，未完成调用保持未知。Plan 完成后仍可请求候选或 stop，但不允许新检查。
+
+`IntentPlanApplication` 固定 Plan 摘要、plan_id、注册/启动 mutation；`IntentActionApplication` 固定动作及工具首次/重试 ID、完成 Plan ID，或证明/Fact/提交/完成 Intent ID。`IntentApplicationStorePort` 提供 save/load_plan_application 与 save/load_action_application，SQLite schema 6 实现不可覆盖声明并复核模型调用归属。
+
+`IntentActionRejected.code` 为 path_out_of_scope、unsupported_plan_steps、repeated_inspection。同动作重放复用结果或重现拒绝；只有当前 Intent 成功检查后的新检查动作报 repeated_inspection。异常停止本次调用，不改变领域状态，上层不能自动空转重调。其余停止/失败/恢复规则以 `T4_proposal.md` 为准。

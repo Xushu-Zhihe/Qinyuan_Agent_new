@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -12,6 +12,13 @@ from agent_core import (
     FailureSummary,
     FailureType,
     IntentContext,
+    IntentActionContext,
+    IntentActionResponse,
+    InspectFileAction,
+    FileTypeCandidateAction,
+    StopIntentAction,
+    ToolObservation,
+    ExecutionStatus,
     IntentGenerationResponse,
     ModelContractError,
     ModelError,
@@ -26,6 +33,9 @@ from agent_core.fake_model_adapters import (
     FakeClaudeCodeAdapter,
     FakeCodexAdapter,
     FakeDeepSeekAdapter,
+)
+from agent_core.model_invocation_audit import (
+    ModelInvocationRecord,
 )
 
 
@@ -55,6 +65,31 @@ class FakeErrorEvidence:
 
     def exists(self, task_run_id: str, evidence_ref: str) -> bool:
         return (task_run_id, evidence_ref) in self.records
+
+
+class MemoryInvocationAudit:
+    def __init__(self) -> None:
+        self.records: dict[str, ModelInvocationRecord] = {}
+
+    def begin_model_invocation(self, start):
+        previous = self.records.get(start.model_request_id)
+        if previous is not None:
+            assert previous.start == start
+            return previous
+        self.records[start.model_request_id] = ModelInvocationRecord(start, None)
+        return None
+
+    def complete_model_invocation(self, completion):
+        previous = self.records[completion.model_request_id]
+        record = ModelInvocationRecord(previous.start, completion)
+        self.records[completion.model_request_id] = record
+        return record
+
+    def list_model_invocations(self, task_run_id, intent_id):
+        return tuple(
+            item for item in self.records.values()
+            if item.start.task_run_id == task_run_id and item.start.intent_id == intent_id
+        )
 
 
 def make_request(
@@ -89,6 +124,97 @@ def coordinator(adapter: object, deadline: FakeDeadline | None = None) -> ModelI
         deadline or FakeDeadline([60]),
         FakeErrorEvidence(),
     )
+
+
+def make_action_request(observation: ToolObservation | None = None) -> ModelRequest:
+    return replace(
+        make_request(request_type=ModelRequestType.PLAN_GENERATION),
+        request_type=ModelRequestType.INTENT_ACTION,
+        action_context=IntentActionContext(
+            "intent-1", "plan-1", 0, "/workspace/input/sample.txt", observation
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_action", "expected"),
+    [
+        (
+            {"kind": "inspect_file", "path": "/workspace/input/sample.txt"},
+            InspectFileAction("/workspace/input/sample.txt"),
+        ),
+        (
+            {
+                "kind": "file_type_candidate",
+                "path": "/workspace/input/sample.txt",
+                "observed_type": "ASCII text",
+                "execution_id": "execution-1",
+            },
+            FileTypeCandidateAction(
+                "/workspace/input/sample.txt", "ASCII text", "execution-1"
+            ),
+        ),
+        ({"kind": "stop", "short_reason": "no further action"}, StopIntentAction("no further action")),
+    ],
+)
+def test_fake_model_normalizes_one_intent_action(raw_action, expected) -> None:
+    adapter = FakeCodexAdapter(
+        [{"event": "completed", "payload": {"action": raw_action}}]
+    )
+    result = coordinator(adapter).invoke(make_action_request(), FakeCancellationToken())
+    assert isinstance(result, IntentActionResponse)
+    assert result.action == expected
+
+
+def test_intent_action_rejects_extra_fields_after_one_correction() -> None:
+    invalid = {"kind": "inspect_file", "path": "/workspace/input/sample.txt", "command": "x"}
+    adapter = FakeCodexAdapter(
+        [{"event": "completed", "payload": {"action": invalid}}] * 2
+    )
+    result = coordinator(adapter).invoke(make_action_request(), FakeCancellationToken())
+    assert result.kind is ModelErrorKind.INVALID_RESPONSE
+    assert len(adapter.invocations) == 2
+
+
+def test_intent_action_observation_has_one_shared_output_limit() -> None:
+    observation = ToolObservation(
+        "execution-1", ExecutionStatus.SUCCEEDED, "a" * 4095, "b", False,
+        False, True,
+    )
+    assert make_action_request(observation).action_context.latest_tool_observation == observation
+    with pytest.raises(ModelContractError, match="4096"):
+        replace(observation, stderr="bb")
+
+
+def test_audited_intent_action_correction_replays_without_new_model_call() -> None:
+    request = replace(
+        make_action_request(),
+        model_request_id=str(uuid4()),
+        task_run_id=str(uuid4()),
+    )
+    adapter = FakeCodexAdapter(
+        [
+            {"event": "completed", "payload": {"action": {"kind": "inspect_file"}}},
+            {
+                "event": "completed",
+                "payload": {"action": {"kind": "inspect_file", "path": "/workspace/input/sample.txt"}},
+            },
+        ]
+    )
+    audit = MemoryInvocationAudit()
+    runner = ModelInvocationCoordinator(
+        adapter, FakeDeadline([60]), FakeErrorEvidence(),
+        audit=audit, clock=lambda: 1_800_000_000.0,
+    )
+    first = runner.invoke(request, FakeCancellationToken())
+    assert first == IntentActionResponse(InspectFileAction("/workspace/input/sample.txt"))
+    assert len(adapter.invocations) == 2
+    assert runner.invoke(request, FakeCancellationToken()) == first
+    assert len(adapter.invocations) == 2
+    records = audit.list_model_invocations(request.task_run_id, request.intent.intent_id)
+    assert [item.completion.result_kind for item in records] == [
+        "invalid_structure", "intent_action"
+    ]
 
 
 @pytest.mark.parametrize(

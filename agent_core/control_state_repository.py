@@ -16,6 +16,7 @@ from agent_core.control_store import (
 from agent_core.control_candidate import project_candidate, validate_control_ownership, validate_running_transition
 from agent_core.domain import (
     EXECUTION_TERMINAL_STATUSES,
+    ExecutionEvidence,
     ExecutionEvidencePort,
     ExecutionStatus,
     FailureSummary,
@@ -25,6 +26,11 @@ from agent_core.domain import (
     TurnStatus,
 )
 from agent_core.modeling import FactSnapshot
+from agent_core.file_type_fact import fact_content
+from agent_core.file_type_verifier import (
+    FileTypeProofEvidence,
+    FileTypeProofEvidencePort,
+)
 
 
 MAX_CONTEXT_FACTS = 64
@@ -51,12 +57,31 @@ class ControlStateRepository:
         self,
         store: ControlStore,
         execution_evidence: ExecutionEvidencePort,
+        file_type_proofs: FileTypeProofEvidencePort | None = None,
     ) -> None:
         self._store = store
         self._execution_evidence = execution_evidence
+        self._file_type_proofs = file_type_proofs
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None:
         return self._store.load_task_run(task_run_id)
+
+    def _file_type_proof(
+        self, execution_id: str, proof_id: str
+    ) -> FileTypeProofEvidence:
+        if self._file_type_proofs is None:
+            raise StorageError("file-type proof evidence is not configured")
+        try:
+            return self._file_type_proofs.lookup_file_type_proof(
+                execution_id, proof_id
+            )
+        except Exception as exc:
+            raise StorageError("file-type proof evidence is unavailable") from exc
+
+    def _verified_file_type_evidence(
+        self, execution_id: str, proof_id: str
+    ) -> ExecutionEvidence:
+        return self._file_type_proof(execution_id, proof_id).execution
 
     def validate_candidate(self, state: ControlStateSnapshot, mutation: ControlMutation) -> None:
         """Recheck the resulting candidate, without writing or retaining evidence."""
@@ -76,7 +101,13 @@ class ControlStateRepository:
                 execution = executions[change.source_ref]
                 if execution.status not in EXECUTION_TERMINAL_STATUSES:
                     raise StorageError("Fact source Execution must be terminal")
-                evidence = self._execution_evidence.lookup(change.source_ref)
+                evidence = (
+                    self._verified_file_type_evidence(
+                        change.source_ref, change.verification_ref
+                    )
+                    if change.verification_ref is not None
+                    else self._execution_evidence.lookup(change.source_ref)
+                )
                 if evidence is None:
                     raise StorageError("Fact source Execution evidence is unavailable")
                 if change.status is FactStatus.VERIFIED and (
@@ -294,6 +325,26 @@ class ControlStateRepository:
             if source_intent.turn_id != turn.turn_id:
                 raise StorageError("Fact source Execution belongs to another Turn")
             fact.to_domain()
+            if fact.verification_ref is not None:
+                verified = self._file_type_proof(
+                    fact.source_ref, fact.verification_ref
+                )
+                binding = self._store.load_intent_goal(source_intent.intent_id)
+                if (
+                    fact.status is not FactStatus.VERIFIED
+                    or binding is None
+                    or verified.proof.intent_id != source_intent.intent_id
+                    or verified.proof.path != binding.goal.path
+                    or fact.content != fact_content(verified.proof.observed_type)
+                    or verified.execution.task_run_id != task_run_id
+                    or verified.execution.target_ref not in {
+                        item.value for item in rows.task_run.request.target.attachments
+                    }
+                    or not rows.task_run.started_at
+                    <= verified.execution.observed_at
+                    <= rows.task_run.deadline_at
+                ):
+                    raise StorageError("file-type Fact proof does not match control state")
 
         for summary in rows.failure_summaries:
             execution = executions.get(summary.evidence_ref)

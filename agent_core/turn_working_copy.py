@@ -301,6 +301,7 @@ class TurnWorkingCopy:
                     failure_reason="model_error"
                     if result == "task_failed"
                     else task.failure_reason,
+                    source_root=task.source_root,
                 ),
             )
         return self._operation(operation, changes, result)
@@ -399,6 +400,7 @@ class TurnWorkingCopy:
                         fact.content,
                         fact.source_ref,
                         fact.status,
+                        fact.verification_ref,
                     )
                 )
         changes.extend(

@@ -175,6 +175,13 @@ class ToolResult:
     action: FailureAction | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class StoredToolRequest:
+    request: ToolRequest
+    authorization: ToolAuthorization
+    sandbox_id: str
+
+
 class ToolCallError(RuntimeError):
     def __init__(self, failure_type: FailureType, short_reason: str) -> None:
         self.failure_type = failure_type

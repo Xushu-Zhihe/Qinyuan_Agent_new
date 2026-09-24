@@ -225,6 +225,7 @@ class Fact:
     content: str
     source_ref: str
     status: FactStatus = FactStatus.CANDIDATE
+    verification_ref: str | None = None
 
     def __setattr__(self, name: str, value: object) -> None:
         if name == "content":
@@ -240,6 +241,8 @@ class Fact:
         _non_empty(self.turn_id, "turn_id")
         _non_empty(self.content, "content")
         _non_empty(self.source_ref, "source_ref")
+        if self.verification_ref is not None:
+            _non_empty(self.verification_ref, "verification_ref")
         if not isinstance(self.status, FactStatus):
             raise DomainError("Fact status must be a FactStatus")
 

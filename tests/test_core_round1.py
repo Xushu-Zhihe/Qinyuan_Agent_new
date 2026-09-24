@@ -105,6 +105,26 @@ def test_task_request_validates_confirmed_shape_and_round_trips() -> None:
         (
             {
                 "goal": "x",
+                "target": {
+                    "attachments": [
+                        {"kind": "local_path", "path": "/workspace/input/a.bin"}
+                    ]
+                },
+            },
+            "relative",
+        ),
+        (
+            {
+                "goal": "x",
+                "target": {
+                    "attachments": [{"kind": "local_path", "path": "C:a.bin"}]
+                },
+            },
+            "relative",
+        ),
+        (
+            {
+                "goal": "x",
                 "target": {"attachments": [{"kind": "other", "url": "x"}]},
             },
             "local_path",

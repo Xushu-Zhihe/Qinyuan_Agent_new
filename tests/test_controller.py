@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -203,6 +204,13 @@ def controller_database_path() -> Path:
     )
 
 
+@pytest.fixture
+def source_root() -> Path:
+    path = controller_database_path().parent / f"source-{uuid4()}"
+    path.mkdir(parents=True)
+    return path
+
+
 def _commit_control_mutation(
     store: SqliteControlStore,
     *,
@@ -377,6 +385,68 @@ def test_persistent_start_commits_then_reloads_and_claims_registry() -> None:
         assert controller.status() is TaskRunStatus.RUNNING
         assert sandbox.calls == [("create", controller.control_state.task_run.sandbox_id)]
         assert registry.owner(committed.value) is controller
+
+
+def test_persistent_start_saves_source_root_and_keeps_it_after_finish(
+    source_root: Path,
+) -> None:
+    clock = FakeClock()
+    sandbox = FakeSandbox()
+    canonical_root = str(source_root.resolve(strict=True))
+    database = source_root / "control.sqlite3"
+    with SqliteControlStore.open(database, clock=clock) as store:
+        controller = TaskRunController(
+            sandbox,
+            clock=clock,
+            store=store,
+            repository=ControlStateRepository(store, EmptyEvidence()),
+            registry=TaskRunControllerRegistry(),
+        )
+        started = controller.start(
+            request(),
+            effective_model_backend=ModelBackend.CODEX_CLI,
+            mutation_id=str(uuid4()),
+            source_root=canonical_root,
+        )
+        assert controller.control_state.task_run.source_root == canonical_root
+        assert store.load_task_run(started.value).source_root == canonical_root
+
+        controller.cancel(str(uuid4()))
+        assert store.load_task_run(started.value).source_root == canonical_root
+
+    with SqliteControlStore.open(database, clock=clock) as reopened:
+        assert reopened.load_task_run(started.value).source_root == canonical_root
+
+
+@pytest.mark.parametrize("invalid_root", ["relative", "missing", "noncanonical", "file"])
+def test_persistent_start_rejects_invalid_source_root_before_sandbox_create(
+    source_root: Path, invalid_root: str
+) -> None:
+    source_file = source_root / "sample.txt"
+    source_file.write_text("sample", encoding="utf-8")
+    values = {
+        "relative": "attachments",
+        "missing": str(source_root / "missing"),
+        "noncanonical": f"{source_root}{os.sep}.",
+        "file": str(source_file),
+    }
+    sandbox = FakeSandbox()
+    with SqliteControlStore.open(source_root / "control.sqlite3", clock=FakeClock()) as store:
+        controller = TaskRunController(
+            sandbox,
+            clock=FakeClock(),
+            store=store,
+            repository=ControlStateRepository(store, EmptyEvidence()),
+            registry=TaskRunControllerRegistry(),
+        )
+        with pytest.raises(ValueError, match="source_root"):
+            controller.start(
+                request(),
+                effective_model_backend=ModelBackend.CODEX_CLI,
+                mutation_id=str(uuid4()),
+                source_root=values[invalid_root],
+            )
+        assert sandbox.create_requests == []
 
 
 def test_register_turn_persists_fixed_pending_intents_and_replays() -> None:

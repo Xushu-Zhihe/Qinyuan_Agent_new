@@ -7,9 +7,11 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Protocol, TypeAlias
+from typing import Literal, Protocol, TypeAlias, cast
 
 from agent_core.contracts import ModelBackend, TaskRequest
+from agent_core.intent_goals import FileTypeIntentGoal
+from agent_core.file_type_fact import FACT_PREFIX
 from agent_core.domain import (
     Execution,
     ExecutionStatus,
@@ -126,11 +128,18 @@ class UpsertTaskRun:
     confirmation_deadline: float | None = None
     finished_at: float | None = None
     failure_reason: str | None = None
+    source_root: str | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.task_run_id, "UpsertTaskRun.task_run_id")
         if not isinstance(self.request, TaskRequest):
             raise ValueError("UpsertTaskRun.request must be a TaskRequest")
+        if self.source_root is not None and (
+            not isinstance(self.source_root, str)
+            or not self.source_root
+            or "\x00" in self.source_root
+        ):
+            raise ValueError("UpsertTaskRun.source_root must be a path or None")
         if not isinstance(self.effective_model_backend, ModelBackend):
             raise ValueError(
                 "UpsertTaskRun.effective_model_backend must be a ModelBackend"
@@ -205,6 +214,15 @@ class UpsertIntent:
 
 
 @dataclass(frozen=True, slots=True)
+class UpsertIntentGoal:
+    goal: FileTypeIntentGoal
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.goal, FileTypeIntentGoal):
+            raise ValueError("UpsertIntentGoal.goal must be a FileTypeIntentGoal")
+
+
+@dataclass(frozen=True, slots=True)
 class UpsertPlan:
     plan_id: str
     intent_id: str
@@ -260,6 +278,7 @@ class UpsertFact:
     content: str
     source_ref: str
     status: FactStatus
+    verification_ref: str | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.fact_id, "UpsertFact.fact_id")
@@ -268,6 +287,8 @@ class UpsertFact:
         if len(self.content) > 256:
             raise ValueError("UpsertFact.content must be at most 256 Unicode code points")
         _non_empty(self.source_ref, "UpsertFact.source_ref")
+        if self.verification_ref is not None:
+            _non_empty(self.verification_ref, "UpsertFact.verification_ref")
         if not isinstance(self.status, FactStatus):
             raise ValueError("UpsertFact.status must be a FactStatus")
 
@@ -359,6 +380,7 @@ StateChange: TypeAlias = (
     UpsertTaskRun
     | UpsertTurn
     | UpsertIntent
+    | UpsertIntentGoal
     | UpsertPlan
     | UpsertExecution
     | UpsertFact
@@ -370,6 +392,7 @@ STATE_CHANGE_TYPES = (
     UpsertTaskRun,
     UpsertTurn,
     UpsertIntent,
+    UpsertIntentGoal,
     UpsertPlan,
     UpsertExecution,
     UpsertFact,
@@ -409,7 +432,7 @@ class TurnRegistration:
         if turn.status is not TurnStatus.PENDING:
             raise ValueError("TurnRegistration Turn must begin pending")
 
-        typed_intents = tuple(intents)
+        typed_intents = cast(tuple[UpsertIntent, ...], tuple(intents))
         intent_ids = tuple(item.intent_id for item in typed_intents)
         if turn.intent_ids != intent_ids:
             raise ValueError("TurnRegistration intent_ids must match its Intents")
@@ -563,6 +586,10 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             event_type=_CONTROL_EVENT_TYPE,
             dynamic_result_entity="plan",
         ),
+        "bind_intent_goal": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="intent_goal",
+        ),
         "start_plan": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"running"}),
@@ -591,11 +618,19 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             event_type=_CONTROL_EVENT_TYPE,
             dynamic_result_entity="fact",
         ),
+        "commit_verified_file_type_fact": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="fact",
+        ),
         "verify_fact": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"verified", "rejected"}),
         ),
         "succeed_intent_with_fact": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"succeeded"}),
+        ),
+        "complete_satisfied_intent": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"succeeded"}),
         ),
@@ -668,6 +703,12 @@ def _dynamic_result_ids(
             for change in state_changes
             if isinstance(change, UpsertPlan)
         )
+    if entity == "intent_goal":
+        return frozenset(
+            change.goal.intent_id
+            for change in state_changes
+            if isinstance(change, UpsertIntentGoal)
+        )
     if entity == "execution":
         return frozenset(
             change.execution_id
@@ -701,18 +742,73 @@ def validate_control_event(
         raise ValueError(
             f"operation {operation} requires RuntimeEvent.type={rule.event_type}"
         )
+    if operation == "bind_intent_goal" and (
+        len(state_changes) != 1
+        or not isinstance(state_changes[0], UpsertIntentGoal)
+    ):
+        raise ValueError("bind_intent_goal requires one Intent goal change")
+    if operation == "commit_verified_file_type_fact" and (
+        len(state_changes) != 1
+        or not isinstance(state_changes[0], UpsertFact)
+        or state_changes[0].status is not FactStatus.VERIFIED
+        or state_changes[0].verification_ref is None
+    ):
+        raise ValueError("file-type Fact commit requires one verified Fact with proof")
+    if operation == "complete_satisfied_intent" and (
+        len(state_changes) != 1
+        or not isinstance(state_changes[0], UpsertIntent)
+        or state_changes[0].status is not IntentStatus.SUCCEEDED
+    ):
+        raise ValueError("Intent completion requires one succeeded Intent change")
+    if operation != "commit_verified_file_type_fact" and any(
+        isinstance(change, UpsertFact) and change.verification_ref is not None
+        for change in state_changes
+    ):
+        raise ValueError("a Fact proof reference requires the dedicated file-type operation")
     if not isinstance(event.details, Mapping):
         raise ValueError("RuntimeEvent.details must be a JSON object")
     details = dict(event.details)
     if any(not isinstance(key, str) for key in details):
         raise ValueError("RuntimeEvent.details keys must be strings")
     allowed_fields = {"operation", "entity_ids", "result"}
+    if operation == "bind_intent_goal":
+        allowed_fields.add("import_id")
+    if operation == "commit_verified_file_type_fact":
+        allowed_fields.update({"intent_id", "path", "observed_type"})
+    if operation == "complete_satisfied_intent":
+        allowed_fields.add("verified_fact_ids")
     unknown_fields = set(details) - allowed_fields
     if unknown_fields:
         raise ValueError(
             "RuntimeEvent.details contains unsupported fields: "
             + ", ".join(sorted(unknown_fields))
         )
+    if operation == "bind_intent_goal":
+        _uuid4(details.get("import_id"), "RuntimeEvent.details.import_id")
+    if operation == "commit_verified_file_type_fact":
+        change = state_changes[0]
+        assert isinstance(change, UpsertFact)
+        _uuid4(change.fact_id, "UpsertFact.fact_id")
+        _uuid4(change.verification_ref, "UpsertFact.verification_ref")
+        if (
+            not isinstance(details.get("intent_id"), str)
+            or not isinstance(details.get("path"), str)
+            or not isinstance(details.get("observed_type"), str)
+            or change.content != FACT_PREFIX + details["observed_type"]
+        ):
+            raise ValueError("file-type Fact event does not match its content")
+    if operation == "complete_satisfied_intent":
+        change = state_changes[0]
+        assert isinstance(change, UpsertIntent)
+        fact_ids = details.get("verified_fact_ids")
+        if (
+            details.get("entity_ids") != [change.intent_id]
+            or not isinstance(fact_ids, list)
+            or not fact_ids
+            or any(not isinstance(item, str) or not item for item in fact_ids)
+            or len(fact_ids) != len(set(fact_ids))
+        ):
+            raise ValueError("Intent completion requires supporting Fact IDs")
     if details.get("operation") != operation:
         raise ValueError(
             "ControlMutation.operation must match RuntimeEvent.details.operation"
@@ -901,6 +997,19 @@ class CommittedOperation:
 
 
 @dataclass(frozen=True, slots=True)
+class PersistedIntentGoal:
+    goal: FileTypeIntentGoal
+    first_commit: ControlCommitResult
+
+
+@dataclass(frozen=True, slots=True)
+class IntentGoalBindingResult:
+    goal: FileTypeIntentGoal
+    first_commit: ControlCommitResult
+    disposition: Literal["created", "replayed", "existing"]
+
+
+@dataclass(frozen=True, slots=True)
 class CommittedPlanValidation:
     record: PlanValidationRecord
     commit: ControlCommitResult
@@ -933,6 +1042,7 @@ class TaskRunSnapshot:
     confirmation_deadline: float | None
     finished_at: float | None
     failure_reason: str | None
+    source_root: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1020,6 +1130,7 @@ class FactRecordSnapshot:
     status: FactStatus
     created_event_sequence: int
     created_event_ordinal: int
+    verification_ref: str | None = None
 
     def to_domain(self) -> Fact:
         return Fact(
@@ -1028,6 +1139,7 @@ class FactRecordSnapshot:
             content=self.content,
             source_ref=self.source_ref,
             status=self.status,
+            verification_ref=self.verification_ref,
         )
 
 
@@ -1082,6 +1194,8 @@ class ControlStore(Protocol):
         mutation_id: str,
     ) -> ControlCommitResult | None: ...
 
+    def load_intent_goal(self, intent_id: str) -> PersistedIntentGoal | None: ...
+
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None: ...
 
     def load_terminal_commit(self, task_run_id: str) -> ControlCommitResult | None:
@@ -1102,7 +1216,7 @@ class ControlStore(Protocol):
 
 def _state_change_payload(change: StateChange) -> dict[str, object]:
     if isinstance(change, UpsertTaskRun):
-        return {
+        payload: dict[str, object] = {
             "type": "upsert_task_run",
             "task_run_id": change.task_run_id,
             "request": task_request_snapshot(
@@ -1113,6 +1227,9 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
             "status": change.status.value,
             "failure_reason": change.failure_reason,
         }
+        if change.source_root is not None:
+            payload["source_root"] = change.source_root
+        return payload
     if isinstance(change, UpsertTurn):
         return {
             "type": "upsert_turn",
@@ -1133,6 +1250,14 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
             "intent_type": change.intent_type,
             "status": change.status.value,
         }
+    if isinstance(change, UpsertIntentGoal):
+        return {
+            "type": "upsert_intent_goal",
+            "task_run_id": change.goal.task_run_id,
+            "intent_id": change.goal.intent_id,
+            "goal_type": change.goal.goal_type,
+            "path": change.goal.path,
+        }
     if isinstance(change, UpsertPlan):
         return {
             "type": "upsert_plan",
@@ -1152,7 +1277,7 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
             "output_ref": change.output_ref,
         }
     if isinstance(change, UpsertFact):
-        return {
+        data = {
             "type": "upsert_fact",
             "fact_id": change.fact_id,
             "turn_id": change.turn_id,
@@ -1160,6 +1285,9 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
             "source_ref": change.source_ref,
             "status": change.status.value,
         }
+        if change.verification_ref is not None:
+            data["verification_ref"] = change.verification_ref
+        return data
     if isinstance(change, AppendFailureSummary):
         return {
             "type": "append_failure_summary",
@@ -1187,6 +1315,50 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
 
 
 def control_mutation_fingerprint(mutation: ControlMutation) -> str:
+    if mutation.operation == "complete_satisfied_intent":
+        (change,) = mutation.state_changes
+        assert isinstance(change, UpsertIntent)
+        return hashlib.sha256(
+            canonical_json(
+                {
+                    "operation": mutation.operation,
+                    "task_run_id": mutation.task_run_id,
+                    "intent_id": change.intent_id,
+                    "verified_fact_ids": mutation.event.details["verified_fact_ids"],
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+    if mutation.operation == "bind_intent_goal":
+        (change,) = mutation.state_changes
+        assert isinstance(change, UpsertIntentGoal)
+        return hashlib.sha256(
+            canonical_json(
+                {
+                    "operation": mutation.operation,
+                    "task_run_id": change.goal.task_run_id,
+                    "intent_id": change.goal.intent_id,
+                    "goal_type": change.goal.goal_type,
+                    "path": change.goal.path,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+    if mutation.operation == "commit_verified_file_type_fact":
+        (change,) = mutation.state_changes
+        assert isinstance(change, UpsertFact)
+        return hashlib.sha256(
+            canonical_json(
+                {
+                    "operation": mutation.operation,
+                    "task_run_id": mutation.task_run_id,
+                    "intent_id": mutation.event.details["intent_id"],
+                    "path": mutation.event.details["path"],
+                    "observed_type": mutation.event.details["observed_type"],
+                    "execution_id": change.source_ref,
+                    "proof_id": change.verification_ref,
+                    "fact_id": change.fact_id,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
     details = dict(mutation.event.details)
     payload = {
         "task_run_id": mutation.task_run_id,

@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import uuid
+import time
+import asyncio
+import threading
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Any, Mapping, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol, TypeAlias
+
+if TYPE_CHECKING:
+    from agent_core.model_invocation_audit import ModelInvocationAuditPort
 
 from agent_core.contracts import Target
-from agent_core.domain import FailureSummary, FailureType, PlanStep
+from agent_core.domain import ExecutionStatus, FailureSummary, FailureType, PlanStep
+from agent_core.file_inspection import validate_inspection_path
 
 
 class ModelContractError(ValueError):
@@ -24,6 +31,7 @@ def _non_empty(value: Any, field_name: str) -> str:
 class ModelRequestType(StrEnum):
     INTENT_GENERATION = "intent_generation"
     PLAN_GENERATION = "plan_generation"
+    INTENT_ACTION = "intent_action"
 
 
 class ModelErrorKind(StrEnum):
@@ -61,6 +69,53 @@ class IntentContext:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolObservation:
+    execution_id: str
+    status: ExecutionStatus
+    stdout: str
+    stderr: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+    context_clipped: bool
+
+    def __post_init__(self) -> None:
+        _non_empty(self.execution_id, "execution_id")
+        if not isinstance(self.status, ExecutionStatus):
+            raise ModelContractError("observation status must be an ExecutionStatus")
+        if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
+            raise ModelContractError("observation streams must be text")
+        if len(self.stdout) + len(self.stderr) > 4096:
+            raise ModelContractError("observation streams exceed 4096 characters")
+        if any(
+            type(value) is not bool
+            for value in (
+                self.stdout_truncated, self.stderr_truncated, self.context_clipped
+            )
+        ):
+            raise ModelContractError("observation truncation flags must be boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class IntentActionContext:
+    intent_id: str
+    plan_id: str
+    step_index: int
+    goal_path: str
+    latest_tool_observation: ToolObservation | None = None
+
+    def __post_init__(self) -> None:
+        _non_empty(self.intent_id, "intent_id")
+        _non_empty(self.plan_id, "plan_id")
+        if type(self.step_index) is not int or self.step_index != 0:
+            raise ModelContractError("first T4 Intent action requires step_index=0")
+        validate_inspection_path(self.goal_path)
+        if self.latest_tool_observation is not None and not isinstance(
+            self.latest_tool_observation, ToolObservation
+        ):
+            raise ModelContractError("latest_tool_observation must be a ToolObservation")
+
+
+@dataclass(frozen=True, slots=True)
 class ModelRequest:
     model_request_id: str
     task_run_id: str
@@ -74,6 +129,7 @@ class ModelRequest:
     intent: IntentContext | None = None
     correction_of_model_request_id: str | None = None
     short_reason: str | None = None
+    action_context: IntentActionContext | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.model_request_id, "model_request_id")
@@ -109,8 +165,17 @@ class ModelRequest:
         if self.request_type is ModelRequestType.PLAN_GENERATION:
             if not isinstance(self.intent, IntentContext):
                 raise ModelContractError("plan_generation requires an IntentContext")
-        elif self.intent is not None:
-            raise ModelContractError("intent_generation must not include an IntentContext")
+            if self.action_context is not None:
+                raise ModelContractError("plan_generation must not include action context")
+        elif self.request_type is ModelRequestType.INTENT_ACTION:
+            if not isinstance(self.intent, IntentContext) or not isinstance(
+                self.action_context, IntentActionContext
+            ):
+                raise ModelContractError("intent_action requires Intent and action context")
+            if self.action_context.intent_id != self.intent.intent_id:
+                raise ModelContractError("Intent action context belongs to another Intent")
+        elif self.intent is not None or self.action_context is not None:
+            raise ModelContractError("intent_generation must not include Intent context")
 
         correction_fields = (
             self.correction_of_model_request_id,
@@ -164,8 +229,57 @@ class NormalizedPlanResponse:
     steps: object
 
 
+@dataclass(frozen=True, slots=True)
+class NormalizedIntentActionResponse:
+    action: object
+
+
+@dataclass(frozen=True, slots=True)
+class InspectFileAction:
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class FileTypeCandidateAction:
+    path: str
+    observed_type: str
+    execution_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class StopIntentAction:
+    short_reason: str
+
+
+IntentAction: TypeAlias = (
+    InspectFileAction | FileTypeCandidateAction | StopIntentAction
+)
+
+
+def parse_intent_action(raw: object) -> IntentAction:
+    if not isinstance(raw, Mapping):
+        raise ModelContractError("intent_action requires one action object")
+    fields = {
+        "inspect_file": {"kind", "path"},
+        "file_type_candidate": {"kind", "path", "observed_type", "execution_id"},
+        "stop": {"kind", "short_reason"},
+    }
+    kind = raw.get("kind")
+    if not isinstance(kind, str) or kind not in fields or set(raw) != fields[kind]:
+        raise ModelContractError("intent_action fields are invalid")
+    if kind == "inspect_file":
+        return InspectFileAction(validate_inspection_path(raw["path"]))
+    if kind == "file_type_candidate":
+        return FileTypeCandidateAction(
+            validate_inspection_path(raw["path"]),
+            _non_empty(raw["observed_type"], "observed_type"),
+            _non_empty(raw["execution_id"], "execution_id"),
+        )
+    return StopIntentAction(_non_empty(raw["short_reason"], "short_reason"))
+
+
 NormalizedModelResponse: TypeAlias = (
-    NormalizedIntentResponse | NormalizedPlanResponse
+    NormalizedIntentResponse | NormalizedPlanResponse | NormalizedIntentActionResponse
 )
 
 
@@ -179,7 +293,14 @@ class PlanGenerationResponse:
     candidate: PlanCandidate
 
 
-ModelResponse: TypeAlias = IntentGenerationResponse | PlanGenerationResponse
+@dataclass(frozen=True, slots=True)
+class IntentActionResponse:
+    action: IntentAction
+
+
+ModelResponse: TypeAlias = (
+    IntentGenerationResponse | PlanGenerationResponse | IntentActionResponse
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +366,24 @@ class StructuredResponseValidator:
     ) -> ModelResponse:
         if request.request_type is ModelRequestType.INTENT_GENERATION:
             return self._intent_response(response)
-        return self._plan_response(response)
+        if request.request_type is ModelRequestType.PLAN_GENERATION:
+            return self._plan_response(response)
+        return self._intent_action_response(response)
+
+    def _intent_action_response(
+        self, response: NormalizedModelResponse
+    ) -> IntentActionResponse:
+        if not isinstance(response, NormalizedIntentActionResponse):
+            raise StructuredResponseValidationError(
+                ModelErrorKind.INVALID_RESPONSE, "intent_action requires one action object"
+            )
+        try:
+            action = parse_intent_action(response.action)
+        except (ModelContractError, TypeError, ValueError) as exc:
+            raise StructuredResponseValidationError(
+                ModelErrorKind.INVALID_RESPONSE, "intent_action values are invalid"
+            ) from exc
+        return IntentActionResponse(action)
 
     def _intent_response(
         self,
@@ -338,33 +476,173 @@ class ModelInvocationCoordinator:
         error_evidence: ModelErrorEvidencePort,
         *,
         validator: StructuredResponseValidator | None = None,
+        audit: ModelInvocationAuditPort | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._adapter = adapter
         self._deadline = deadline
         self._error_evidence = error_evidence
         self._validator = validator or StructuredResponseValidator()
+        self._audit = audit
+        self._clock = clock
+
+    @property
+    def invocation_audit(self) -> ModelInvocationAuditPort | None:
+        return self._audit
 
     def invoke(
         self,
         request: ModelRequest,
         cancellation_token: CancellationToken,
     ) -> ModelResponse | ModelError:
-        first = self._invoke_adapter(request, cancellation_token)
-        if isinstance(first, ModelError):
-            return self._validate_model_error(request, first)
+        first, correction_allowed = self._invoke_once(request, cancellation_token)
+        if not correction_allowed or request.correction_of_model_request_id is not None:
+            return first
+        assert isinstance(first, ModelError)
+        correction = self._correction_request(request, first.short_reason)
+        corrected, _ = self._invoke_once(correction, cancellation_token)
+        return corrected
 
-        try:
-            return self._validator.validate(request, first)
-        except StructuredResponseValidationError as issue:
-            correction = self._correction_request(request, issue.short_reason)
+    def _invoke_once(
+        self, request: ModelRequest, cancellation_token: CancellationToken
+    ) -> tuple[ModelResponse | ModelError, bool]:
+        replay = self._begin_audit(request)
+        if replay is not None:
+            return replay
+        raw = self._invoke_adapter(request, cancellation_token)
+        return self._complete_invocation(request, raw)
 
-        corrected = self._invoke_adapter(correction, cancellation_token)
-        if isinstance(corrected, ModelError):
-            return self._validate_model_error(correction, corrected)
+    async def invoke_async(
+        self, request: ModelRequest, cancellation_token: CancellationToken
+    ) -> ModelResponse | ModelError:
+        """Keep audit writes local; isolate an adapter's late result on interruption."""
+        first, correction_allowed = await self._invoke_once_async(request, cancellation_token)
+        if not correction_allowed or request.correction_of_model_request_id is not None:
+            return first
+        assert isinstance(first, ModelError)
+        correction = self._correction_request(request, first.short_reason)
+        corrected, _ = await self._invoke_once_async(correction, cancellation_token)
+        return corrected
+
+    async def _invoke_once_async(
+        self, request: ModelRequest, cancellation_token: CancellationToken
+    ) -> tuple[ModelResponse | ModelError, bool]:
+        if cancellation_token.is_cancelled:
+            return ModelError(ModelErrorKind.CANCELLED, "model call was cancelled"), False
+        remaining = self._deadline.remaining_seconds()
+        if remaining <= 0:
+            return ModelError(ModelErrorKind.TIMED_OUT, "TaskRun deadline elapsed"), False
+        replay = self._begin_audit(request)
+        if replay is not None:
+            return replay
+        stopped = threading.Event()
+
+        class InvocationToken:
+            @property
+            def is_cancelled(self) -> bool:
+                return stopped.is_set() or cancellation_token.is_cancelled
+
+        timeout = min(600.0, float(remaining))
+        task = asyncio.create_task(asyncio.to_thread(
+            self._adapter.invoke, request, timeout, InvocationToken()
+        ))
+        end = asyncio.get_running_loop().time() + timeout
         try:
-            return self._validator.validate(correction, corrected)
-        except StructuredResponseValidationError as issue:
-            return ModelError(kind=issue.kind, short_reason=issue.short_reason)
+            while True:
+                cancelled = cancellation_token.is_cancelled
+                expired = (
+                    self._deadline.remaining_seconds() <= 0
+                    or asyncio.get_running_loop().time() >= end
+                )
+                if cancelled or expired:
+                    stopped.set()
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    return ModelError(
+                        ModelErrorKind.CANCELLED if cancelled else ModelErrorKind.TIMED_OUT,
+                        "model call interrupted; persisted outcome remains unknown",
+                    ), False
+                if task.done():
+                    return self._complete_invocation(request, task.result())
+                await asyncio.wait({task}, timeout=0.025)
+        except BaseException:
+            stopped.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    def _begin_audit(
+        self, request: ModelRequest
+    ) -> tuple[ModelResponse | ModelError, bool] | None:
+        audit = self._audit
+        if audit is not None and request.request_type is not ModelRequestType.INTENT_GENERATION:
+            from agent_core.model_invocation_audit import (
+                ModelInvocationRecoveryRequired,
+                ModelInvocationStart,
+            )
+
+            assert request.intent is not None
+            existing = next(
+                (
+                    item
+                    for item in audit.list_model_invocations(
+                        request.task_run_id, request.intent.intent_id
+                    )
+                    if item.start.model_request_id == request.model_request_id
+                ),
+                None,
+            )
+            start = ModelInvocationStart(
+                request.model_request_id,
+                request.task_run_id,
+                request.intent.intent_id,
+                request.request_type,
+                request.action_context.plan_id if request.action_context else None,
+                request.correction_of_model_request_id,
+                existing.start.started_at if existing is not None else self._clock(),
+            )
+            previous = audit.begin_model_invocation(start)
+            if previous is not None:
+                if previous.completion is None:
+                    raise ModelInvocationRecoveryRequired(
+                        "model invocation result was not committed"
+                    )
+                return (
+                    previous.completion.result,
+                    previous.completion.result_kind == "invalid_structure",
+                )
+        return None
+
+    def _complete_invocation(
+        self, request: ModelRequest, raw: NormalizedModelResponse | ModelError
+    ) -> tuple[ModelResponse | ModelError, bool]:
+        audit = self._audit
+        kind: Literal["plan", "intent_action", "invalid_structure", "model_error", "intent_generation"]
+        if isinstance(raw, ModelError):
+            result: ModelResponse | ModelError = self._validate_model_error(request, raw)
+            kind = "model_error"
+        else:
+            try:
+                result = self._validator.validate(request, raw)
+                kind = (
+                    "plan"
+                    if isinstance(result, PlanGenerationResponse)
+                    else "intent_action"
+                    if isinstance(result, IntentActionResponse)
+                    else "intent_generation"
+                )
+            except StructuredResponseValidationError as issue:
+                result = ModelError(kind=issue.kind, short_reason=issue.short_reason)
+                kind = "invalid_structure"
+        if audit is not None and request.request_type is not ModelRequestType.INTENT_GENERATION:
+            from agent_core.model_invocation_audit import ModelInvocationCompletion
+
+            assert kind != "intent_generation"
+            assert isinstance(result, (PlanGenerationResponse, IntentActionResponse, ModelError))
+            audit.complete_model_invocation(
+                ModelInvocationCompletion(request.model_request_id, self._clock(), kind, result)
+            )
+        return result, kind == "invalid_structure"
 
     def _invoke_adapter(
         self,
@@ -405,14 +683,27 @@ class ModelInvocationCoordinator:
             short_reason="model error evidence_ref is invalid for the current TaskRun",
         )
 
-    @staticmethod
     def _correction_request(
+        self,
         request: ModelRequest,
         short_reason: str,
     ) -> ModelRequest:
+        correction_id = str(uuid.uuid4())
+        if self._audit is not None and request.intent is not None:
+            previous = [
+                item.start.model_request_id
+                for item in self._audit.list_model_invocations(
+                    request.task_run_id, request.intent.intent_id
+                )
+                if item.start.correction_of_model_request_id == request.model_request_id
+            ]
+            if len(previous) > 1:
+                raise ModelContractError("model audit contains duplicate correction calls")
+            if previous:
+                correction_id = previous[0]
         return replace(
             request,
-            model_request_id=str(uuid.uuid4()),
+            model_request_id=correction_id,
             correction_of_model_request_id=request.model_request_id,
             short_reason=short_reason,
         )

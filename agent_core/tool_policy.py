@@ -14,6 +14,13 @@ from agent_core.tool_contracts import (
 
 
 class FileToolPolicy:
+    def authorize_intent_path(self, *, goal_path: str, requested_path: str) -> PolicyDecision:
+        """T4's extra scope check; gateway authorization is still mandatory."""
+        return PolicyDecision(
+            requested_path == goal_path,
+            "authorized" if requested_path == goal_path else "path_out_of_scope",
+        )
+
     def authorize(
         self, request: ToolRequest, authorization: ToolAuthorization
     ) -> PolicyDecision:

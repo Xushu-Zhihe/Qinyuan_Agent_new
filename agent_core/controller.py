@@ -3,9 +3,11 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass, replace
+from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from agent_core.attachment_import import AttachmentImportEvidencePort
 from agent_core.contracts import ModelBackend, TaskRequest, TaskRequestError, resolve_model_backend
 from agent_core.control_state_repository import ControlStateRepository, RecoveryResult
 from agent_core.control_store import (
@@ -15,6 +17,7 @@ from agent_core.control_store import (
     ControlStateSnapshot,
     ControlStore,
     IdempotencyConflictError,
+    IntentGoalBindingResult,
     StaleControlStateError,
     StorageError,
     TaskRunNotFoundError,
@@ -22,12 +25,27 @@ from agent_core.control_store import (
     TurnRegistration,
     TurnOperation,
     UpsertExecution,
+    UpsertFact,
     UpsertIntent,
+    UpsertIntentGoal,
     UpsertPlan,
     UpsertTaskRun,
     UpsertTurn,
 )
-from agent_core.domain import ExecutionStatus, IntentStatus, PlanStatus, TurnStatus
+from agent_core.domain import ExecutionStatus, FactStatus, IntentStatus, PlanStatus, TurnStatus
+from agent_core.file_inspection import FILE_TOOL
+from agent_core.file_type_fact import FileTypeFactCandidate, fact_content
+from agent_core.file_type_verifier import (
+    FileTypeProofEvidencePort,
+    FileTypeVerificationError,
+)
+from agent_core.intent_goals import FileTypeIntentGoal, IntentGoalBindingError
+from agent_core.intent_goal_evaluator import (
+    IntentGoalEvaluation,
+    IntentGoalEvaluationError,
+    IntentGoalEvaluatorPort,
+)
+from agent_core.tool_contracts import ToolAuthorization
 from agent_core.runtime import (
     InvalidTransition,
     RuntimeEvent,
@@ -145,6 +163,23 @@ def _validate_mutation_id(value: object) -> str:
     return value
 
 
+def _validate_source_root(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise TaskRequestError("source_root must be a canonical absolute directory")
+    root = Path(value)
+    if not root.is_absolute():
+        raise TaskRequestError("source_root must be a canonical absolute directory")
+    try:
+        canonical = root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise TaskRequestError("source_root must be an existing directory") from exc
+    if not canonical.is_dir() or str(canonical) != value:
+        raise TaskRequestError("source_root must be a canonical absolute directory")
+    return value
+
+
 class TaskRunController(LegacyTaskRunController):
     """Own exactly one TaskRun, with an optional persistent control-plane mode."""
 
@@ -156,6 +191,9 @@ class TaskRunController(LegacyTaskRunController):
         store: ControlStore | None = None,
         repository: ControlStateRepository | None = None,
         registry: TaskRunControllerRegistry | None = None,
+        attachment_imports: AttachmentImportEvidencePort | None = None,
+        file_type_proofs: FileTypeProofEvidencePort | None = None,
+        intent_goal_evaluator: IntentGoalEvaluatorPort | None = None,
     ) -> None:
         super().__init__(sandbox, clock=clock if callable(clock) else _clock_now_wrapper(clock))
         supplied = (store, repository, registry)
@@ -174,6 +212,9 @@ class TaskRunController(LegacyTaskRunController):
         self._registry_released = False
         self._cache_invalid = False
         self._closed = False
+        self._attachment_imports = attachment_imports
+        self._file_type_proofs = file_type_proofs
+        self._intent_goal_evaluator = intent_goal_evaluator
 
     def _now_utc(self) -> float:
         return _clock_now(self._clock)
@@ -214,18 +255,27 @@ class TaskRunController(LegacyTaskRunController):
         request: TaskRequest,
         effective_model_backend: ModelBackend | str | None = None,
         mutation_id: str | None = None,
+        *,
+        source_root: str | None = None,
     ) -> Any:
         if self._persistent is None:
-            if effective_model_backend is not None or mutation_id is not None:
+            if (
+                effective_model_backend is not None
+                or mutation_id is not None
+                or source_root is not None
+            ):
                 raise InvalidTransition("persistent dependencies are required for this start signature")
             return super().start(request)
-        return self._start_persistent(request, effective_model_backend, mutation_id)
+        return self._start_persistent(
+            request, effective_model_backend, mutation_id, source_root
+        )
 
     def _start_persistent(
         self,
         request: TaskRequest,
         effective_model_backend: ModelBackend | str | None,
         mutation_id: str | None,
+        source_root: str | None,
     ) -> CommittedOperation:
         deps = self._require_persistent()
         if self._persistent_task_run_id is not None or self._closed:
@@ -244,6 +294,7 @@ class TaskRunController(LegacyTaskRunController):
         assert mutation_id is not None
         if request.model_backend is not None and request.model_backend is not backend:
             raise TaskRequestError("TaskRequest model_backend conflicts with effective_model_backend")
+        source_root = _validate_source_root(source_root)
 
         task_run_id = str(uuid.uuid4())
         deps.registry.claim(task_run_id, self)
@@ -262,6 +313,7 @@ class TaskRunController(LegacyTaskRunController):
                 deadline_at=deadline_at,
                 status=TaskRunStatus.RUNNING,
                 sandbox_id=sandbox_id,
+                source_root=source_root,
             )
             event = RuntimeEvent(
                 type="task_run_started",
@@ -473,6 +525,330 @@ class TaskRunController(LegacyTaskRunController):
             self._cleanup_after_terminal()
         return CommittedOperation.from_commit(commit)
 
+    def bind_intent_goal(
+        self,
+        goal: FileTypeIntentGoal,
+        import_id: str,
+        mutation_id: str,
+        authorization: ToolAuthorization,
+    ) -> IntentGoalBindingResult:
+        """Bind one file-type goal after Intent selection and before its Plan."""
+
+        if not isinstance(goal, FileTypeIntentGoal):
+            raise TypeError("goal must be a FileTypeIntentGoal")
+        if not isinstance(authorization, ToolAuthorization):
+            raise TypeError("authorization must be a ToolAuthorization")
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, state = self._require_bound_state()
+        if goal.task_run_id != task_run.task_run_id:
+            raise IntentGoalBindingError("task_run_mismatch")
+        deps = self._require_persistent()
+
+        replay = deps.store.load_committed_mutation(task_run.task_run_id, mutation_id)
+        if replay is not None:
+            existing = deps.store.load_intent_goal(goal.intent_id)
+            if (
+                replay.event.details.get("operation") != "bind_intent_goal"
+                or existing is None
+                or existing.goal != goal
+                or existing.first_commit.event.sequence != replay.event.sequence
+            ):
+                raise IntentGoalBindingError("mutation_conflict")
+            return IntentGoalBindingResult(
+                existing.goal, existing.first_commit, "replayed"
+            )
+
+        now = self._now_utc()
+        intent = next((item for item in state.intents if item.intent_id == goal.intent_id), None)
+        if (
+            self._closed
+            or self._registry_released
+            or task_run.status is not TaskRunStatus.RUNNING
+            or now >= task_run.deadline_at
+            or intent is None
+            or intent.status is not IntentStatus.RUNNING
+        ):
+            raise IntentGoalBindingError("intent_not_running")
+        imports = self._attachment_imports
+        if imports is None:
+            raise InvalidTransition("attachment import evidence is not configured")
+        existing = deps.store.load_intent_goal(goal.intent_id)
+        if existing is not None and existing.goal != goal:
+            raise IntentGoalBindingError("goal_conflict")
+        if existing is None and any(
+            plan.intent_id == goal.intent_id for plan in state.plans
+        ):
+            raise IntentGoalBindingError("intent_not_running")
+
+        def verify_import_scope() -> None:
+            checked_at = self._now_utc()
+            if checked_at >= task_run.deadline_at:
+                raise IntentGoalBindingError("intent_not_running")
+            claim = imports.read_claim(import_id)
+            receipt = imports.read_receipt(import_id)
+            attachments = task_run.request.target.attachments
+            if (
+                claim is None
+                or receipt is None
+                or claim.identity() != receipt.identity()
+                or claim.claimed_at != receipt.claimed_at
+                or receipt.task_run_id != task_run.task_run_id
+                or receipt.sandbox_id != task_run.sandbox_id
+                or receipt.source_root != task_run.source_root
+                or receipt.sandbox_path != goal.path
+                or receipt.attachment_index >= len(attachments)
+                or attachments[receipt.attachment_index].kind != "local_path"
+                or receipt.local_path != attachments[receipt.attachment_index].value
+                or not task_run.started_at <= receipt.claimed_at
+                or receipt.completed_at > checked_at
+            ):
+                raise IntentGoalBindingError("goal_path_not_in_task_scope")
+
+        verify_import_scope()
+        if (
+            authorization.task_run_id != task_run.task_run_id
+            or FILE_TOOL not in authorization.allowed_tools
+            or goal.path not in authorization.allowed_paths
+        ):
+            raise IntentGoalBindingError("goal_path_not_authorized")
+
+        if existing is not None:
+            return IntentGoalBindingResult(
+                existing.goal, existing.first_commit, "existing"
+            )
+
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.RUNNING,
+            details={
+                "operation": "bind_intent_goal",
+                "entity_ids": [goal.intent_id],
+                "result": goal.intent_id,
+                "import_id": import_id,
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation="bind_intent_goal",
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            state_changes=(UpsertIntentGoal(goal),),
+            event=event,
+        )
+        deps.repository.validate_candidate(state, mutation)
+        verify_import_scope()
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        return IntentGoalBindingResult(goal, commit, "created")
+
+    def commit_verified_file_type_fact(
+        self,
+        intent_id: str,
+        candidate: FileTypeFactCandidate,
+        proof_id: str,
+        fact_id: str,
+        mutation_id: str,
+    ) -> CommittedOperation:
+        """Commit one independently proved file-type Fact without a candidate row."""
+
+        if not isinstance(candidate, FileTypeFactCandidate):
+            raise TypeError("candidate must be a FileTypeFactCandidate")
+        _validate_mutation_id(proof_id)
+        _validate_mutation_id(fact_id)
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, state = self._require_bound_state()
+        if self._persistent is None:
+            raise InvalidTransition("persistent ControlStore dependencies are not configured")
+        execution = next(
+            (item for item in state.executions if item.execution_id == candidate.execution_id),
+            None,
+        )
+        plan = next(
+            (item for item in state.plans if execution is not None and item.plan_id == execution.plan_id),
+            None,
+        )
+        intent = next((item for item in state.intents if item.intent_id == intent_id), None)
+        turn = next(
+            (item for item in state.turns if intent is not None and item.turn_id == intent.turn_id),
+            None,
+        )
+        if turn is None:
+            raise FileTypeVerificationError("state_conflict")
+        now = self._now_utc()
+        change = UpsertFact(
+            fact_id=fact_id,
+            turn_id=turn.turn_id,
+            content=fact_content(candidate.observed_type),
+            source_ref=candidate.execution_id,
+            status=FactStatus.VERIFIED,
+            verification_ref=proof_id,
+        )
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.RUNNING,
+            details={
+                "operation": "commit_verified_file_type_fact",
+                "entity_ids": [fact_id],
+                "result": fact_id,
+                "intent_id": intent_id,
+                "path": candidate.path,
+                "observed_type": candidate.observed_type,
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation="commit_verified_file_type_fact",
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            state_changes=(change,),
+            event=event,
+        )
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            return CommittedOperation.from_commit(self._persistent.store.commit(mutation))
+
+        deps = self._require_persistent()
+        if (
+            self._closed
+            or self._registry_released
+            or task_run.status is not TaskRunStatus.RUNNING
+            or now >= task_run.deadline_at
+            or intent is None
+            or intent.status is not IntentStatus.RUNNING
+            or turn is None
+            or turn.status is not TurnStatus.RUNNING
+            or plan is None
+            or plan.intent_id != intent_id
+            or plan.status is not PlanStatus.COMPLETED
+            or len(plan.steps) != 1
+            or execution is None
+            or execution.step_index != 0
+            or execution.status is not ExecutionStatus.SUCCEEDED
+            or any(item.fact_id == fact_id for item in state.facts)
+        ):
+            raise FileTypeVerificationError("state_conflict")
+        binding = deps.store.load_intent_goal(intent_id)
+        if binding is None or binding.goal.task_run_id != task_run.task_run_id:
+            raise FileTypeVerificationError("state_conflict")
+        if candidate.path != binding.goal.path:
+            raise FileTypeVerificationError("candidate_rejected")
+        if self._file_type_proofs is None:
+            raise InvalidTransition("file-type proof evidence is not configured")
+        verified = self._file_type_proofs.lookup_file_type_proof(
+            candidate.execution_id, proof_id
+        )
+        if (
+            verified.proof.task_run_id != task_run.task_run_id
+            or verified.proof.intent_id != intent_id
+            or verified.proof.path != candidate.path
+            or verified.proof.observed_type != candidate.observed_type
+            or verified.execution.target_ref not in {
+                item.value for item in task_run.request.target.attachments
+            }
+        ):
+            raise FileTypeVerificationError("evidence_unavailable")
+        deps.repository.validate_candidate(state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        return CommittedOperation.from_commit(commit)
+
+    def complete_satisfied_intent(
+        self,
+        intent_id: str,
+        evaluation: IntentGoalEvaluation,
+        mutation_id: str,
+    ) -> CommittedOperation:
+        """Commit only the Intent transition after a fresh read-only evaluation."""
+
+        if not isinstance(evaluation, IntentGoalEvaluation):
+            raise TypeError("evaluation must be an IntentGoalEvaluation")
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, state = self._require_bound_state()
+        if (
+            evaluation.task_run_id != task_run.task_run_id
+            or evaluation.intent_id != intent_id
+            or evaluation.outcome != "satisfied"
+            or not evaluation.verified_fact_ids
+        ):
+            raise IntentGoalEvaluationError("state_conflict")
+        deps = self._require_persistent()
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            details = replay.event.details
+            if (
+                details.get("operation") != "complete_satisfied_intent"
+                or details.get("entity_ids") != [intent_id]
+                or details.get("verified_fact_ids") != list(evaluation.verified_fact_ids)
+            ):
+                raise IdempotencyConflictError("mutation_id was already committed for a different Intent completion")
+            return CommittedOperation.from_commit(replay)
+
+        now = self._now_utc()
+        intent = next((item for item in state.intents if item.intent_id == intent_id), None)
+        turn = next(
+            (item for item in state.turns if intent is not None and item.turn_id == intent.turn_id),
+            None,
+        )
+        if (
+            self._closed
+            or self._registry_released
+            or task_run.status is not TaskRunStatus.RUNNING
+            or now >= task_run.deadline_at
+            or intent is None
+            or intent.status is not IntentStatus.RUNNING
+            or turn is None
+            or turn.status is not TurnStatus.RUNNING
+            or self._intent_goal_evaluator is None
+        ):
+            raise IntentGoalEvaluationError("state_conflict")
+        fresh = self._intent_goal_evaluator.evaluate(task_run.task_run_id, intent_id)
+        if fresh != evaluation:
+            raise IntentGoalEvaluationError("state_conflict")
+
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.RUNNING,
+            details={
+                "operation": "complete_satisfied_intent",
+                "entity_ids": [intent_id],
+                "result": "succeeded",
+                "verified_fact_ids": list(evaluation.verified_fact_ids),
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation="complete_satisfied_intent",
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            state_changes=(
+                UpsertIntent(
+                    intent.intent_id,
+                    intent.turn_id,
+                    intent.description,
+                    intent.priority,
+                    intent.intent_type,
+                    IntentStatus.SUCCEEDED,
+                ),
+            ),
+            event=event,
+        )
+        deps.repository.validate_candidate(state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        return CommittedOperation.from_commit(commit)
+
     def mark_candidate_found(
         self,
         mutation_id: str | None = None,
@@ -521,6 +897,7 @@ class TaskRunController(LegacyTaskRunController):
             confirmation_deadline=confirmation_deadline,
             finished_at=None,
             failure_reason=task_run.failure_reason,
+            source_root=task_run.source_root,
         )
         event = RuntimeEvent(
             type="completion_confirmation_requested",
@@ -797,6 +1174,7 @@ class TaskRunController(LegacyTaskRunController):
             confirmation_deadline=task_run.confirmation_deadline,
             finished_at=now,
             failure_reason=failure_reason,
+            source_root=task_run.source_root,
         )
         event = RuntimeEvent(
             type="task_run_finished",
@@ -1030,6 +1408,7 @@ class TaskRunController(LegacyTaskRunController):
             confirmation_deadline=task_run.confirmation_deadline,
             finished_at=now,
             failure_reason="unfinished_execution_detected_during_recovery",
+            source_root=task_run.source_root,
         )
         plan_change = UpsertPlan(
             plan_id=plan.plan_id,

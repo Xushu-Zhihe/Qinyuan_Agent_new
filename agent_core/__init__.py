@@ -60,6 +60,12 @@ from agent_core.modeling import (
     FactSnapshot,
     IntentCandidate,
     IntentContext,
+    IntentActionContext,
+    IntentActionResponse,
+    InspectFileAction,
+    FileTypeCandidateAction,
+    StopIntentAction,
+    ToolObservation,
     IntentGenerationResponse,
     ModelAdapter,
     ModelContractError,
@@ -73,11 +79,13 @@ from agent_core.modeling import (
     NormalizedIntentResponse,
     NormalizedModelResponse,
     NormalizedPlanResponse,
+    NormalizedIntentActionResponse,
     PlanCandidate,
     PlanGenerationResponse,
     StructuredResponseValidator,
 )
 from agent_core.turn_manager import TurnManager
+from agent_core.intent_loop import IntentActionRejected, IntentLoopResult, IntentToolCallingLoop
 from agent_core.control_store import (
     AppendFailureSummary,
     AppendPlanValidationRecord,
@@ -149,6 +157,9 @@ from agent_core.interfaces import (
 )
 
 __all__ = [
+    "IntentActionRejected",
+    "IntentLoopResult",
+    "IntentToolCallingLoop",
     "AgentApplicationPort",
     "AtomicCommitterPort",
     "ClockPort",
@@ -209,6 +220,12 @@ __all__ = [
     "FactSnapshot",
     "IntentCandidate",
     "IntentContext",
+    "IntentActionContext",
+    "IntentActionResponse",
+    "InspectFileAction",
+    "FileTypeCandidateAction",
+    "StopIntentAction",
+    "ToolObservation",
     "IntentGenerationResponse",
     "ModelAdapter",
     "ModelContractError",
@@ -222,6 +239,7 @@ __all__ = [
     "NormalizedIntentResponse",
     "NormalizedModelResponse",
     "NormalizedPlanResponse",
+    "NormalizedIntentActionResponse",
     "PlanCandidate",
     "PlanGenerationResponse",
     "StructuredResponseValidator",

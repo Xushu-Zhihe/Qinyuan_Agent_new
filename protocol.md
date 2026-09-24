@@ -2,7 +2,7 @@
 
 ## 范围
 
-本文件记录已确认的跨模块协议和未冻结部分。它不把当前 Python 类名自动当成稳定的外部 wire protocol；真实 CLI、qinyuan-bat 转接和外部 MCP 集成仍需按实际入口复核。
+本文件记录已确认的跨模块协议和未冻结部分。它不把当前 Python 类名自动当成稳定的外部 wire protocol；独立 Agent 的 CLI 与事件、后续转换器调用和其他外部 MCP 集成仍需按实际入口确认与验收。2026-09-24 用户取消 T5 的 qinyuan-bat 专用转接，后续转换器单独确认协议。
 
 ## 已冻结协议
 
@@ -44,7 +44,7 @@ SQLite 是控制面唯一事实来源。一次变更通过 `ControlMutation` 原
 
 ### 事件
 
-当前持久化事件类型冻结为 `task_run_started`、`completion_confirmation_requested`、`task_run_finished` 和 `control_state_committed`。事件 details 只允许 `operation`、`entity_ids`、`result`；序号由存储层生成。事件订阅、实时推送、重放和背压语义尚未冻结。
+当前持久化事件类型冻结为 `task_run_started`、`completion_confirmation_requested`、`task_run_finished` 和 `control_state_committed`。事件 details 按操作白名单校验；基础字段为 `operation`、`entity_ids`、`result`，T4 绑定、Fact 提交和 Intent 完成增加各自已确认的 import_id、候选或支持 Fact 引用。序号由存储层生成。事件订阅、实时推送、重放和背压语义尚未冻结。
 
 ### T2 生命周期与模拟验收协议
 
@@ -57,9 +57,15 @@ SQLite 是控制面唯一事实来源。一次变更通过 `ControlMutation` 原
 - 已提交 mutation 的重放只返回首次结果，不重载证据、不访问 Docker；重复取消使用新 mutation ID 时也读取首次终态结果，不登记新 ID、不新建事件/Checkpoint。清理失败后只使用独立 `cleanup_sandbox()`；已不存在算成功，归属不符拒绝，无法确认算未知。该规则替代历史生命周期测试中“重放自动重试销毁”的行为。
 - Fake Docker 的固定脚本写入带 TaskRun ID 的标记、由下一 Intent 读取并断言，且校验两次 Sandbox ID 相同、另一 TaskRun 标记为空；这仅证明模拟调用和状态传递。等待脚本模拟取消/Deadline 分支，不证明真实进程已终止。Python 可以启动其他程序，因此 `python3` 允许列表不构成脚本权限边界；测试只发出三类固定脚本，T3 才接入 Policy/MCP。
 
+## 后续独立转换器（职责已确认，协议未冻结）
+
+转换器负责自动获取多道题目、调用 `qinyuan-agent-new` 和向题目平台提交 flag。这一职责划分不指定 CLI、Python API、HTTP 或其他传输方式，也不继承 qinyuan-bat 的 stdin/stdout 格式。
+
+Agent 请求/结果协议与题目平台的获取/提交协议分属不同边界；Agent 的结果不等同于平台接受 flag 的回执。题目与附件映射、任务关联、flag 交付字段、鉴权、版本、错误、重试、提交去重及回执状态均待转换器设计阶段逐项确认。转换器协议不属于 T5 验收范围，不阻塞独立 Agent 的 CLI 契约确认。
+
 ## 版本、错误与取消
 
-当前控制面 schema 版本为 1；`protocol.md` 本身不是外部版本协商协议。公共 CLI、Python API、qinyuan-bat 转接和 MCP 命令协议的版本号、兼容窗口和迁移策略尚未确认。
+当前控制面 schema 版本为 6；`protocol.md` 本身不是外部版本协商协议。公共 CLI、Python API、事件和 MCP 命令协议的版本号、兼容窗口和迁移策略尚未确认；后续转换器与题目平台的版本协议另行确认。T5 不要求兼容 qinyuan-bat wire protocol。
 
 错误必须保留发生阶段、结构化类别、证据引用和短原因。模型错误、Policy 拒绝、参数错误、环境故障、目标不匹配和未知结果分别处理；不能把所有错误压成普通任务失败。
 
@@ -67,9 +73,9 @@ SQLite 是控制面唯一事实来源。一次变更通过 `ControlMutation` 原
 
 ## 待确认协议问题
 
-- CLI 输入、输出、实时事件和退出码。
+- 独立 Agent 的 CLI 输入、输出、同步/异步、实时事件、退出码及外部 `resume/cancel` 语义。
 - Python API 的异步模型和长期兼容承诺。
-- qinyuan-bat 转接的确切 stdin/stdout、错误和版本边界。
+- 后续独立转换器的 Agent 调用协议、题目/附件映射、flag 交付，以及题目平台获取/提交的错误、幂等与版本边界（不属于 T5）。
 - ToolRequest、PolicyDecision、MCPCommand、SandboxExecutionRequest、ExecutionRecord、TaskResult 的字段和序列化格式。
 - Stage/Procedure/RAG 的协议、失败分支、候选提交粒度和策略记忆。
 - 目标范围、网络、写文件、工具权限、MCP Server 运行位置和真实目标授权。
@@ -101,10 +107,28 @@ SQLite 是控制面唯一事实来源。一次变更通过 `ControlMutation` 原
 
 ## T4 已确认范围与目标层级（2026-09-13）
 
-T4 使用 Fake Model、真实本机 File MCP、Fake Docker 和真实持久化完成单 Intent 链路。文件类型 Fact 表示工具对被检查对象的识别结果，Fake Docker 的夹具输出不证明真实文件类型。专用候选的字段、空输出/截断/多行规则、规范化范围和候选匹配规则仍待确认。
+T4 使用 Fake Model、真实本机 File MCP、Fake Docker 和真实持久化完成单 Intent 链路。文件类型 Fact 表示工具对被检查对象的识别结果，Fake Docker 的夹具输出不证明真实文件类型。专用候选固定为 path、observed_type、execution_id；工具必须成功、停止已确认、双流未截断且 stderr 为空，stdout 最多去掉一个末尾换行后须为非空白单行、最多 200 字且无控制字符或 Unicode 行分隔符，候选逐字匹配，不做类型归纳。
 
 T4 返回当前 Intent 目标已满足/未满足/无法确定的判断，不把工具成功或 Intent 满足升级成 TaskRun 目标满足。完成确认、TaskRun 终态和最终 TaskResult 留给上层按已有契约处理。只有整体目标本身也是该文件识别目标时，上层才可能根据相应事实作出任务层判断；不能仅凭目标文字相似推导。取消/Deadline 仍遵守已有 Controller 提交与清理协议。
 
-验证时从可信请求收据取得路径，并同时核对授权、保存的实际命令、Execution 及其关联；收据中的路径不能代替实际派发命令的一致性检查。历史 `target_ref=None` 的证据不得直接改写成已验证目标。是否允许对完整历史证据作显式重新验证，以及验证结果如何保存，仍待确认。
+验证时从可信请求收据取得路径，并同时核对授权、保存的实际命令、Execution 及其关联；收据中的路径不能代替实际派发命令的一致性检查。历史 `target_ref=None` 的证据不得直接改写成已验证目标。T4 使用独立不可覆盖的文件类型证明及专用只读复核端口，旧 T3 lookup 行为不变。
 
-目标层级与职责边界已经确认，新增输入/返回类型尚未冻结。Plan 步骤绑定、步骤/Plan 完成、循环计数和耗尽结果、失败后的继续/退出、原子提交粒度及恢复安全位置，必须确认后实现。已提交操作不得重复产生副作用，未知执行不得重新派发。
+Intent 评估器只读核对持久目标及当前 Intent 已提交的 verified Fact 证明。支持 Fact 优先，返回 `satisfied` 和按提交顺序列出的支持 Fact ID；没有支持 Fact 且当前 Intent 的 Execution 未决或结果未知时返回 `inconclusive`；其余返回 `not_satisfied`。证明缺失、损坏或数据库读取异常直接抛异常。Controller 的 `complete_satisfied_intent` 在提交前重新评估并要求支持 Fact ID 完全一致，然后仅原子写 Intent.succeeded、事件和 Checkpoint；同 mutation 精确重放不重复复核，Turn/TaskRun 不自动完成。
+
+T4 模型调用预算按每个 Intent 独立统计：Plan 生成最多 2 次（含结构纠正），动作最多 8 次（含纠正），首期最多一次成功工具派发；TaskRun 仍受整体 Deadline。schema 5 的 `model_invocations` 在同一 SQLite 文件以独立事务先登记调用、再登记经校验的结构化 Plan/动作或错误类别，不推进控制面事件或 Checkpoint，不保存原始提示、原始响应或凭据。结果类别为 `plan`、`intent_action`、`invalid_structure`、`model_error`；未完成调用要求显式恢复，不自动重新调用。跨重启计数包含已开始调用，旧记录不回填。
+
+目标层级与职责边界已经确认：目标绑定随 TaskRun 保留，Intent 结束不删除；可信调用方提供目标，循环提出 Intent 完成请求，Controller 最终提交，评估器只读。上层先持久化 `Intent.running`，Controller 在首次生成 Plan 前核对归属、运行状态、任务范围和当前授权，再将目标、`control_state_committed` 事件及 Checkpoint 原子提交；未绑定目标时 T4 拒绝启动。重试和恢复核对同一目标。目标采用独立一对一 `intent_goals` 控制面表，schema 2 引入该表，旧库按版本原子迁移，保留旧数据，旧 Intent 不自动补目标（2026-09-23 已确认）。写入签名、不可变校验和同 TaskRun 内的 mutation 幂等已实现。Plan 步骤、循环计数、失败/停止及恢复规则已逐项确认，见 `T4_proposal.md`。已提交操作不得重复产生副作用，未知执行不得重新派发。
+
+T4 七项绑定规则已确认（2026-09-23）：`TaskRequest.target.attachments[].local_path` 必须通过可信附件导入记录映射到 Sandbox 精确路径，不能按同名推断，URL 不作为首期 `file_type` 目标；绑定业务指纹只含操作类型及四个目标字段，授权不入指纹，幂等作用域沿用现有 TaskRun 内作用域；同 mutation 同目标重放首次提交，不同目标报 `mutation_conflict`；新 mutation 同目标重验当前收据和授权、只返回已有绑定；Intent 结束后仅允许旧 mutation 精确重放；用 `IntentGoalBindingResult` 区分 `created`/`replayed`/`existing`，并冻结六个稳定错误码，首期仅 `file_type`。首次事件保存 import_id，目标表不保存授权快照或凭据；首次绑定和新 mutation 同目标调用核对当前授权覆盖精确路径及 `file.inspect_file`。恢复后新工具派发重验当前授权，不足则停止继续并保留目标；同 mutation 精确重放只读首次结果。现有每次工具请求的独立收据保存当次请求、授权和 Sandbox ID，仅用于请求一致性/审计，不代表未来授权仍有效。
+
+T4 本地导入要求可信上层显式提供 TaskRun ID、已绑定 Sandbox ID、附件索引、启动时规范绝对来源根目录和 `/workspace/input/...` 精确目标路径；导入器拒绝越界、符号链接、非普通文件及目标覆盖。schema 3 在 TaskRun 启动事务中保存不可变的 `source_root`；兼容的 NULL 值仅供非 T4 调用及旧记录保留，不可导入本地附件。单文件上限 16 MiB，来源读取、Sandbox 写入与读回最多共用 60 秒，并受 TaskRun 剩余 Deadline 约束。导入为可信上层准备动作，不走 T3 ToolGateway；正常写入与读回须在同一 Sandbox 准入锁内完成。独立本机证据目录先保存不可覆盖的请求声明，再在读回字节数与 SHA-256 匹配后签发成功收据。声明落盘即占用附件索引和目标路径；成功的同 ID 重放仅读历史结果，不再读取源文件或访问 Sandbox；声明后取消、超时、不匹配或未知执行一律要求显式恢复，恢复仅读回原路径并核对原摘要，不自动再次写入。显式恢复缺失声明返回 `import_not_found`。
+
+## T4 调用与副作用的恢复协议（2026-09-24）
+
+SQLite 当前 schema 6。Plan/动作结果在控制面或工具副作用前先保存不可覆盖的 application 声明；声明引用已审计的 model_request_id，并固定后续业务 ID。声明事务不推进 Checkpoint；Plan、Execution、Fact、Intent 状态继续由 Controller 原子提交。迁移保留 schema 5 模型台账，不补造历史声明。
+
+恢复必须复用原声明 ID。有效历史模型结果没有声明、模型调用没有完成、工具收据未完成时返回 recovery_required，不生成新 ID 猜测重试。已完成工具结果重新核对请求收据、授权快照、命令及控制面后可只读续用；孤立证明重试仍完整复核。提交后重载失败须先显式 reload_state，再按原 ID 续接。
+
+模型 stop 和 candidate_rejected 停止循环，不提交 Intent 终态；model_error 保留模型类别，不据此失败整个 TaskRun。Policy/参数错误返回 tool_failed，保留 Gateway 已提交状态；明确环境故障根据 Gateway 动作最多显式重试一次，执行重试使用原命令；未知执行不重派。工具重试不增加模型调用计数，模型调用上限仍从独立台账恢复。
+
+无效动作使用 IntentActionRejected 的独立代码，停止本次 run，领域状态可能仍 running。依据不可变目标、已持久 Plan/动作及 Execution 归属恢复相同拒绝；同一已执行动作的重放不属于新检查。消费动作前先处理取消/Deadline，Gateway 自身的授权检查不被循环提前 Policy 校验替代。

@@ -17,6 +17,7 @@ from agent_core.tool_contracts import (
     ToolRecoveryRequired,
     ToolRequest,
     ToolResult,
+    StoredToolRequest,
 )
 
 
@@ -205,6 +206,45 @@ class FileToolRecorder:
 
     def read_record(self, output_ref: str) -> ExecutionRecord | None:
         return self._record(output_ref)
+
+    def read_request_receipt(self, request_id: str) -> StoredToolRequest | None:
+        receipt = self._read("receipt", request_id)
+        if receipt is None:
+            return None
+        try:
+            snapshot = receipt["snapshot"]
+            if receipt["fingerprint"] != hashlib.sha256(_encode(snapshot)).hexdigest():
+                raise ValueError("request fingerprint mismatch")
+            request = ToolRequest(**snapshot["request"])
+            authorization_data = snapshot["authorization"]
+            authorization = ToolAuthorization(
+                authorization_id=authorization_data["authorization_id"],
+                task_run_id=authorization_data["task_run_id"],
+                allowed_paths=tuple(authorization_data["allowed_paths"]),
+                allowed_tools=tuple(authorization_data["allowed_tools"]),
+            )
+            if request.request_id != request_id:
+                raise ValueError("request ID mismatch")
+            return StoredToolRequest(request, authorization, snapshot["sandbox_id"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise EvidenceStorageError("invalid request receipt") from None
+
+    def read_completed(self, request_id: str) -> ToolResult | None:
+        finished = self._read("finished", request_id)
+        if finished is None:
+            return None
+        try:
+            record = self._record(request_id)
+            if record is None or record.request_id != request_id:
+                raise ValueError("finished request has no matching record")
+            action = (
+                FailureAction(finished["action"])
+                if finished["action"] is not None
+                else None
+            )
+            return ToolResult(record, action)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise EvidenceStorageError("invalid finished request") from None
 
     def lookup(self, execution_id: str) -> ExecutionEvidence | None:
         record = self._record(execution_id)

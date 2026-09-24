@@ -138,7 +138,7 @@ class Scenario:
                         "attachments": [
                             {
                                 "kind": "local_path",
-                                "path": "/workspace/input/sample.txt",
+                                "path": "sample.txt",
                             }
                         ]
                     },

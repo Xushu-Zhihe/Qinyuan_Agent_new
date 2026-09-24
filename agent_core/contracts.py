@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -95,7 +95,7 @@ class Attachment:
             )
             # The source is resolved against the CLI process cwd later.  This
             # round only enforces the confirmed relative-path requirement.
-            if Path(path).is_absolute():
+            if PurePosixPath(path).is_absolute() or PureWindowsPath(path).anchor:
                 raise TaskRequestError(
                     "target.attachments[].path must be relative to the CLI cwd"
                 )

@@ -3,6 +3,9 @@
 ## 依据与状态
 
 本文整理 `Qinyuan_Agent_confirmed_flow.svg`、仓库中已经验证的实现及明确标注的后续已确认边界。
+
+2026-09-24 用户确认本项目定位为独立的自动化渗透测试 Agent，T5 调整为 CLI 与事件；后续独立转换器负责多题目获取、调用 Agent 和平台 flag 提交。该决定已同步至流程图，替代原图中可选 qinyuan-bat 转接入口的旧约定。
+
 首期控制链描述设计目标，尚未完成端到端链路。2026-09-11 用户依据已有实现及 `323 passed` 记录确认 T3 的 `ToolGateway -> Policy -> MCP -> Sandbox` 切片验收通过；真实 Docker、完整 Agent 链路、其他 MCP、Fact 验证、GoalEvaluator、CLI 均不计入 T3 完成。完整流程图中的 Stage、Procedure 和 RAG 相关能力仍是后续设计边界，不能从图形位置推导出未确认的业务规则。
 
 ## 首期控制链
@@ -24,13 +27,13 @@ CLI
   -> TaskResult 或下一轮 Intent
 ```
 
-CLI 和 Python API 的应用入口统一归属 `AgentApplication`。本仓库是 Agent 的唯一调度所有者；未来的 `qinyuan-bat` 只允许作为基础调用或协议转接层，不复制调度、重试、状态机或业务判断。
+CLI 和 Python API 的应用入口统一归属 `AgentApplication`，首期实际入口仍只确认 CLI。本仓库拥有 TaskRun 内的唯一调度权，内部调度、重试、状态机和业务判断由 Agent 负责；外部调用方通过待确认的公共入口调用 Agent，不复制其内部控制逻辑。T5 不实现 qinyuan-bat 专用转接。
 
 `RunSupervisor` 持有一次 TaskRun 的整体循环。`TaskRun` 是一道题目的一次完整解题实例，接收请求后创建全局唯一 Sandbox；该 Sandbox 被同一 TaskRun 的所有 Intent 轮复用，在完成、取消或 Deadline 后销毁。新的运行必须创建新的 TaskRun 和 Sandbox。
 
 `TurnManager` 管理 `Turn -> Intent -> Plan -> Execution -> Fact` 的核心状态。一个 Turn 内的 Intent 依模型返回的可能性顺序逐个尝试，采用深度优先回溯，首期不并行操作同一 Sandbox。现有 `agent_core` 已实现这部分领域状态、失败分类、证据引用和持久化控制面。
 
-`ModelReasoner` 只生成已确认的 Intent 或 Plan 候选。模型不能直接执行命令、写入控制面或提交 Fact；模型调用经过现有供应商无关 `ModelAdapter`、截止时间、取消、结构校验和一次纠正流程。首期只实现 direct 路径。
+`ModelReasoner` 生成已确认的 Intent、Plan 或单项 Intent 动作候选。模型不能直接执行命令、写入控制面或提交 Fact；模型调用经过现有供应商无关 `ModelAdapter`、截止时间、取消、结构校验和一次纠正流程。首期只实现 direct 路径。
 
 工具调用沿单向边界流动：`ToolGateway -> Policy -> MCP Manager -> Sandbox`。Policy 必须在产生副作用前完成权限和目标范围检查。MCP 负责把工具请求转换为实际 command；命令在 TaskRun 的同一 Sandbox 中执行。环境故障、MCP/Sandbox/Docker 故障和目标任务失败必须由执行记录区分，环境故障不能直接加入策略失败集合。
 
@@ -38,11 +41,20 @@ CLI 和 Python API 的应用入口统一归属 `AgentApplication`。本仓库是
 
 `GoalEvaluator` 根据已验证 Fact 判断是否继续下一轮或生成最终结果。Deadline 或取消时只能使用已验证的 ResultFact，输出 `partial` 或 `inconclusive` 的具体外部语义仍需确认。
 
+## Agent 与后续独立转换器的边界
+
+| 组成 | 已确认职责 | 尚未确认的部分 |
+| --- | --- | --- |
+| Qinyuan_Agent_new | 独立自动化渗透；拥有 TaskRun 内的执行、证据、Fact 验证、目标判断和结果生成职责 | 完整 TaskRun 链路尚未验收，CLI 输入输出、事件、退出码及外部 `resume/cancel` 契约待确认 |
+| 后续独立转换器 | 自动获取多道题目、调用 `qinyuan-agent-new`、向题目平台提交 flag | 平台与认证、题目/附件映射、调用方式、批次调度/并发/重试、提交去重、回执处理及部署方式 |
+
+转换器是后续独立交付，不属于当前 Agent 内部模块或 T5 验收范围。Agent 不依赖转换器的批次状态或平台协议；转换器也不直接改写 Agent 的控制面或驱动其内部工具链。Agent 结果与平台提交回执属于不同边界，二者的字段和状态映射需在后续协议确认时明确。
+
 ## 模块边界与依赖方向
 
 T4 于 2026-09-13 确认单 Intent 切片边界：Fact 的证据有效、Intent 目标满足和 TaskRun 目标满足是三个不同判断。例如“附件的工具识别结果为 ASCII text”不能证明“找到 flag”。T4 返回当前 Intent 已满足/未满足/无法确定的判断，不因 Intent 满足就调用 TaskRun 完成确认或宣告任务成功；完成确认、TaskRun 终态和最终 TaskResult 由上层按已有契约处理。上文 GoalEvaluator 到 TaskResult 的链路是整体设计目标，不是 T4 接管上层调度的授权。取消/Deadline 保留 Controller 的生命周期职责。
 
-首个候选采用专用文件类型结构和确定性证据验证。T4 验收使用 Fake Model、真实本机 File MCP、Fake Docker 和真实持久化；Fake Docker 的夹具输出只验证程序规则，不能证明真实文件类型。目标类型、评估接口、步骤/循环/失败/恢复的具体契约仍待确认，当前尚未实现。
+首个候选固定为 `FileTypeFactCandidate(path, observed_type, execution_id)`；只接受成功、停止已确认、双流未截断且 stderr 为空的单行工具输出，最多移除一个末尾换行，类型文本逐字匹配且不归纳源码语言。独立证明文件和专用 Controller 操作已实现，schema 4 为 Fact 增加不可变、可空的 `verification_ref`；旧 Fact 保持 NULL。只读 Intent 评估器返回三态及支持 Fact ID，Controller 重新评估后仅提交当前 Intent.succeeded。T4 验收使用 Fake Model、真实本机 File MCP、Fake Docker 和真实持久化；Fake Docker 的夹具输出只验证程序规则，不能证明真实文件类型。首期 Intent 目标仅支持 `file_type`；`agent_core/intent_loop.py` 已接通单 Intent 循环，失败与恢复契约见 `T4_proposal.md`，实际验证记录见 TODO。
 
 核心领域依赖类型和端口，不依赖 CLI、SQLite、Docker、MCP SDK 或模型 SDK。外围适配器实现核心端口，系统组装集中在应用入口。
 
@@ -91,6 +103,12 @@ StagePlanner、ProcedureSelector、ProcedureRunner 和 RAG 只保留边界。它
 
 自动重载失败后，当前 Registry 所有者可调用 `reload_state()`，经 Repository 重新读取并复核完整状态和外部证据，成功后恢复缓存。该入口不写库、不调用 Sandbox；终态清理和释放注册仍分别调用 `cleanup_sandbox()`、`close()`。失败保留缓存失效及现有所有权，业务重放不承担恢复职责。
 
-SQLite 保存 `TaskRun / Turn / Intent / Plan / PlanStep / Execution / Fact / FailureSummary / PlanValidationRecord / RuntimeEvent / Checkpoint`。状态、一个事件和一个 Checkpoint 在同一事务提交；幂等和陈旧写入由 `ControlStore` 约束。数据库不保存实际 command、stdout/stderr、附件内容、Token 或模型原始响应。
+SQLite 保存 `TaskRun / Turn / Intent / Plan / PlanStep / Execution / Fact / FailureSummary / PlanValidationRecord / RuntimeEvent / Checkpoint`；schema 2 增加一对一 `intent_goals` 表，schema 3 为 TaskRun 增加可空且不可变的 `source_root`，schema 4 为 Fact 增加不可变、可空的 `verification_ref`，schema 5 增加独立的 `model_invocations` 调用台账，schema 6 增加 `intent_plan_applications` 和 `intent_action_applications`，在副作用前固定 Plan、ToolRequest、证明、Fact 与 mutation ID。旧库逐版原子迁移并保留原记录；旧 Intent 不自动补目标，旧 TaskRun 不补猜来源目录，旧 Fact 不补造证明，旧模型调用不回填。控制状态、一个事件和一个 Checkpoint 在同一事务提交；模型调用开始/完成在独立事务记录，不推进控制面 Checkpoint。数据库不保存实际 command、stdout/stderr、附件内容、Token 或模型原始响应。
 
 T1 新提交先在外层投影并复核整组变更后的候选状态及证据；Store 在事务中检查修改前后的归属、不变父级和运行状态组合。SQLite 不调用证据服务。已提交 mutation 的重放只读取首次提交结果，不查询证据或重复 Sandbox 副作用。提交后重载失败明确报告已提交及缓存失效；更强证据保留保证不属于当前控制面契约，详见 `protocol.md`。
+
+## T4 单 Intent 恢复边界（2026-09-24）
+
+`IntentToolCallingLoop.run` 从已绑定目标的 Intent 开始，采用一个单步骤 Plan，成功 Execution 后完成 Plan，再验证/提交文件类型 Fact，最后请求 Controller 仅完成 Intent。schema 6 声明与模型台账均为独立事务，不推进 Checkpoint；副作用仍经过 Controller 或 ToolGateway。已完成工具调用按原动作 ID 复用，新的重复检查被拒；未知结果不重派。模型适配器在工作线程等待，取消或 Deadline 后台账保留未知，迟到结果不产生副作用。
+
+越界、多步骤和成功检查后的新检查动作分别抛出独立拒绝码；它们停止本次 run，领域状态可能仍 running，上层必须处理，不能自动反复调用。stop、候选不支持、预算耗尽与模型错误也不自行提交 Intent 失败或 TaskRun 完成。Gateway 既有失败状态和 Controller 取消/Deadline 路径保留；明确环境故障最多一次显式重试。

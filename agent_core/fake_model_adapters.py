@@ -14,6 +14,7 @@ from agent_core.modeling import (
     ModelErrorKind,
     ModelRequest,
     ModelRequestType,
+    NormalizedIntentActionResponse,
     NormalizedIntentResponse,
     NormalizedModelResponse,
     NormalizedPlanResponse,
@@ -131,9 +132,7 @@ class FakeCodexAdapter(_FakeAdapterBase):
             return _normalized_for_request(request, None)
         return _normalized_for_request(
             request,
-            payload.get("intents")
-            if request.request_type is ModelRequestType.INTENT_GENERATION
-            else payload.get("steps"),
+            _payload_for_request(request, payload),
         )
 
 
@@ -165,9 +164,7 @@ class FakeClaudeCodeAdapter(_FakeAdapterBase):
             return _normalized_for_request(request, None)
         return _normalized_for_request(
             request,
-            data.get("intents")
-            if request.request_type is ModelRequestType.INTENT_GENERATION
-            else data.get("steps"),
+            _payload_for_request(request, data),
         )
 
 
@@ -215,9 +212,7 @@ class FakeDeepSeekAdapter(_FakeAdapterBase):
             return _normalized_for_request(request, None)
         return _normalized_for_request(
             request,
-            data.get("intents")
-            if request.request_type is ModelRequestType.INTENT_GENERATION
-            else data.get("steps"),
+            _payload_for_request(request, data),
         )
 
 
@@ -227,4 +222,14 @@ def _normalized_for_request(
 ) -> NormalizedModelResponse:
     if request.request_type is ModelRequestType.INTENT_GENERATION:
         return NormalizedIntentResponse(candidates=value)
-    return NormalizedPlanResponse(steps=value)
+    if request.request_type is ModelRequestType.PLAN_GENERATION:
+        return NormalizedPlanResponse(steps=value)
+    return NormalizedIntentActionResponse(action=value)
+
+
+def _payload_for_request(request: ModelRequest, payload: Mapping[str, object]) -> object:
+    if request.request_type is ModelRequestType.INTENT_GENERATION:
+        return payload.get("intents")
+    if request.request_type is ModelRequestType.PLAN_GENERATION:
+        return payload.get("steps")
+    return payload.get("action")

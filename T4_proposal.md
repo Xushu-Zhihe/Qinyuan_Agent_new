@@ -1,86 +1,123 @@
-# T4 实施方案草案
+# T4 单 Intent 执行契约
 
-日期：2026-09-13。状态：待用户确认，尚未实现 T4。
+日期：2026-09-24。本文汇总用户逐项确认的 T4 限制；替代早期草案中仍标为“待确认”的对应建议。实现已接通，最终验证记录见 `TODO.md`。真实模型、真实 Docker、本地 CLI 和完整 TaskRun 调度不在本轮验收范围。
 
-本文件依据 `Architecture.md`、`interface.md`、`protocol.md`、`restrict.md`、`TODO.md` 和 `Qinyuan_Agent_confirmed_flow.svg`，结合当前代码编写。以下建议不替代已冻结协议，也不构成用户授权。
-
-## 当前依据
-
-- TODO 的 T4 是“单 Intent direct Tool-Calling Loop”，上下文、循环上限、协议纠正、失败动作和 GoalEvaluator 输入仍等待确认。
-- 现有模型契约只支持生成 Intent 和 Plan，尚无工具调用决策响应。已有模型协调器负责 Deadline、取消检查、结构验证和最多一次纠正。
-- `TurnManager.register_plan` 限制一个 Intent 只有一个 Plan；T4 是否允许重规划不能自行推导。
-- T3 ToolGateway 已拥有单次工具调用、Policy、执行状态提交、证据、幂等和一次显式环境重试。循环应使用该入口并处理返回的 FailureAction。
-- `FileToolRecorder.lookup` 有意将 ExecutionEvidence.target_ref 返回为空。T3 记录不是已验证的目标事实，不能直接用于 T4 的 Fact 范围验证。
-- 现有 `verify_fact` 接收可信调用方的两个布尔判断，并验证证据归属、目标及 TaskRun 时间范围；尚未实现独立的内容验证器。
-- TaskRun 已有 `awaiting_confirmation` 和 180 秒完成确认期；外部确认得到 `achieved`，确认期到达得到 `assumed_achieved`，总 Deadline 优先。
-- 本轮修改前复跑：完整测试 **323 passed in 29.44s**；`git diff --check` 通过。测试沿用真实本机 stdio MCP + Fake Docker，临时产物位于 `.test/`。这不是 T4 验收证据。
-
-## 第一批需要确认的三项决策
-
-### 1. 本轮范围
-
-建议从一个已选定、已持久化的运行中 Intent 开始：
+## 最小链路与状态所有权
 
 ```text
-单 Intent -> direct 生成一个 Plan -> 模型提出下一动作
-    -> ToolGateway -> Policy -> MCP -> 同一 Sandbox
-    -> 持久化执行证据 -> 有界工具反馈 -> 模型提出候选 Fact
-    -> 独立验证 -> Controller 原子提交 -> GoalEvaluator -> 返回上层
+可信附件导入 → Intent.running → 持久目标绑定
+→ Fake Model 单步骤 Plan → 持久 Plan 声明 → Controller 注册/启动
+→ 模型动作 → 持久动作声明 → ToolGateway → Policy → 本机 File MCP
+→ 同一 Fake Docker Sandbox → 持久 Execution → Controller 完成 Plan
+→ 文件类型候选 → 不可覆盖证明 → Controller 提交 verified Fact
+→ 只读 Intent 评估 → Controller 提交 Intent.succeeded → 返回上层
 ```
 
-复用现有一个 Intent 一个 Plan 的规则。多 Intent 自动驱动、CLI、最终 TaskResult、Stage、Procedure、RAG 和其他工具不属于本建议的 T4 切片。若本轮要包括这些能力，需要先明确新增验收范围。
+成功只表示当前 Intent 取得了有证据支持的工具识别结果。TaskRun 目标为“找到 flag”时，`ASCII text` 不证明该任务完成；T4 不调用完成确认、不完成 Turn、不生成 TaskResult。取消和 Deadline 仍由 Controller 执行既有终态提交及清理。流程图中的 direct、工具、证据、验证和评估路径用于此切片，其上层 TaskRun 目标判断、Stage、Procedure、RAG、CLI 及自动多 Intent 调度留后续。
 
-### 2. 模型和验收环境
+Fake Model 只提出候选，核心规则真实执行。真实本机 File MCP 负责命令生成，Fake Docker 输出来自夹具，只能验证程序接受受支持候选、拒绝不受支持候选，不能证明真实文件类型、Docker 隔离或真实进程终止。
 
-建议采用可编排 Fake Model 驱动实际循环、真实本机 File MCP、Fake Docker 和真实 SQLite/文件证据适配器。Fake Model 只提供候选响应，核心验证和提交必须真实执行，不能直接给出“验证成功”。
+## 可信来源、导入与目标
 
-真实模型是另一可选范围。若本轮要求接入，需要明确供应商、调用方式、模型名、端点、凭据来源、工具响应格式、超时和取消规则；不读取或猜测本机其他项目的模型配置。
+- `TaskRunController.start(..., source_root: str | None = None)` 兼容旧调用。可信入口先以 `Path.resolve(strict=True)` 取得现存规范绝对目录，Controller 复核后与启动事件及 Checkpoint 原子保存。旧 TaskRun 的 NULL 不补填，不能导入本地附件。
+- `AttachmentImportRequest(import_id, task_run_id, sandbox_id, attachment_index, source_root, sandbox_path)` 由可信上层提供。原始相对 `local_path` 仅从持久 TaskRequest 的该索引读取；URL 不支持。来源解析必须在根目录内，拒绝符号链接、越界和非普通文件；目标为规范 `/workspace/input/...`，不可覆盖。文件同名不构成映射。
+- `import_attachment(request, cancellation_token)` 和 `recover_import(import_id, cancellation_token)` 均为异步。单文件最多 16 MiB，来源读取、写入及读回共用最多 60 秒且不超过 TaskRun Deadline。
+- 独立导入端口在一次 Sandbox 准入锁内新建、写入、读回字节数和 SHA-256；显式恢复只读回。导入不来自模型，不经过 ToolGateway；本轮仅提供 Fake Sandbox 验收，真实 Docker 导入适配器留后续。
+- 接触 Sandbox 前，保存不可覆盖且带校验和的声明；记录 TaskRun/Sandbox、附件索引、原始 local_path、根目录、精确目标路径、字节数、SHA-256、声明时间。声明起独占附件索引及目标路径；未知结果也阻止新 ID。
+- 读回与原始字节数/摘要一致才签发成功收据，增加完成时间，不保存文件内容。旧 ID 成功重放只核对调用参数并返回原收据，不再读取可能变化的源文件、不访问 Sandbox。同 ID 参数不同或跨 ID 占用冲突均拒绝。
+- 声明存在但无成功收据时返回 `AttachmentImportRecoveryRequired`，不自动写入。显式恢复只在摘要一致时补签，其他情况保持未知。声明后取消、超时或写入/读回异常均属于未知。
+- 前置失败使用 `AttachmentImportRejected(code)`：`task_run_mismatch`、`sandbox_mismatch`、`task_run_not_running`、`source_root_unavailable`、`attachment_not_local`、`source_path_rejected`、`source_unavailable`、`attachment_too_large`、`deadline_or_cancelled`、`import_not_found`。冲突与证据存储异常分别保留独立异常。
 
-### 3. 首条业务目标
+`FileTypeIntentGoal(task_run_id, intent_id, path)` 表示获取该路径有证据支持的类型识别结果，不预设类型，不从自然语言推导。首期仅 `goal_type=file_type`。上层先选中并持久化 Intent.running，首次 Plan 生成前调用：
 
-建议选择“识别获授权 `/workspace/input/sample.txt` 的文件类型”。目标路径同时属于 TaskRequest 的目标引用和调用方提供的 ToolAuthorization。
+```python
+controller.bind_intent_goal(goal, import_id, mutation_id, authorization)
+```
 
-模型提出文件类型候选和来源 Execution 引用；验证器独立读取实际证据，检查来源链、成功退出、停止已确认、路径授权、时间范围、输出完整性及候选与识别结果是否一致。候选表达的是工具对该路径的识别结果，不能扩大为任意文件内容结论。
+Controller 核对 TaskRun/Intent、运行状态、成功导入收据及原声明、附件索引/local_path/source_root/Sandbox/目标路径，以及当前授权包含 `file.inspect_file` 和精确 path；一次事务提交目标、事件和 Checkpoint。可选只读导入端口未配置时拒绝新绑定。目标表不存授权，首次事件保留原 import_id。
 
-GoalEvaluator 接收可信调用方提供的明确目标及已提交的 verified Fact，并核对相关证据。不得从任意自然语言目标猜测一个成功条件，也不得接受模型返回的“目标完成”布尔值作为事实。
+绑定结果为 `IntentGoalBindingResult` 的 `created/replayed/existing`。mutation 作用域是 TaskRun 内；指纹仅含操作及 `task_run_id/intent_id/goal_type/path`。同 ID 同指纹重放首次结果及原 import_id，不读取新收据、不重新授权；同 ID 异指纹冲突。新 ID 同目标必须重新核对收据与当前授权，成功返回 existing，不写事件/Checkpoint；Intent 已结束时新 ID 一律拒绝。目标随 TaskRun 保留，Intent 结束不删除。
 
-若选择其他业务目标或通用目标判断，需要先定义成功条件、证据类型和误判处理。
+稳定错误码：`intent_not_running`、`task_run_mismatch`、`goal_path_not_in_task_scope`、`goal_path_not_authorized`、`goal_conflict`、`mutation_conflict`。存储异常不伪装成这些错误。每次新工具派发仍由 Gateway 重验当前授权；历史请求收据中的授权快照不赋予后续权限。
 
-## 第一批确认后，实施前逐项确认的规则
+## Plan、模型动作、预算与上下文
 
-下表是可讨论的建议，尚未冻结。
+公开入口为 `async IntentToolCallingLoop.run(intent_id, authorization, cancellation_token) -> IntentLoopResult`。Controller、模型协调器、Gateway、验证器、评估器、证据、台账及有界上下文读取在构造时注入；协调器与循环必须使用同一模型调用台账。TaskRun/Plan/目标都来自已提交状态，调用方须先完成导入、Intent.running 和目标绑定。
 
-| 决策 | 建议方案及需要确认的边界 |
+一个 Intent 只有一个 Plan，T4 只接受一个步骤。循环固定工具名 `file.inspect_file`、步骤 0、Plan ID、可信 ID 及既有默认 30 秒工具超时；实际超时由 Gateway 按 Deadline 收缩。成功 Execution 持久化后，Controller 显式完成 Plan，随后模型才能提出 Fact 候选。动作台账允许读取 running 或 completed Plan；completed Plan 不允许发起新的检查。
+
+动作以严格 `kind` 对象归一化，不接受缺字段、额外字段或未知 kind：
+
+```json
+{"kind":"inspect_file","path":"/workspace/input/sample.txt"}
+{"kind":"file_type_candidate","path":"/workspace/input/sample.txt","observed_type":"ASCII text","execution_id":"..."}
+{"kind":"stop","short_reason":"..."}
+```
+
+模型不提供命令、授权、状态、证明 ID、Fact ID 或 mutation ID。`IntentActionContext` 包含 Intent/Plan/步骤 0/goal_path 及最近已提交 Execution 的状态和观察。stdout/stderr 共用 4096 字符（先 stdout 再 stderr），同时保留原双流截断标记及 context_clipped；观察不是 verified Fact。重试后的最近执行按持久动作声明中的请求顺序选择，不能按 UUID 排序推断。Fact 上下文最多 64 条/16384 字，策略失败最多 32 条，沿用既有读取接口。
+
+每 Intent 的 Plan 调用最多 2 次、动作调用最多 8 次，均包含结构纠正且按开始登记计数；TaskRun 不另加次数限制，仍受 Deadline。一次模型响应至多纠正一次结构错误。一次成功文件检查的限制也按 Intent 统计，不妨碍其他 Intent 使用同一 Sandbox。
+
+schema 5 的模型调用台账记录开始/结束、Plan 关联、纠正关联、结果类别及经过结构校验的 Plan/动作摘要；类别为 `plan/intent_action/invalid_structure/model_error`。开始与完成分别只写一次，同 ID 同内容只读重放、不同内容冲突；不记录原始提示、原始响应或凭据，不推进控制面 Checkpoint。已有开始但没有完成结果时停止自动调用，不以重启清零。
+
+`invoke_async` 只把模型适配器调用放在工作线程；SQLite 台账仍在调用线程写入。取消/Deadline 后忽略迟到结果，未完成记录保持未知，不能触发工具或 Fact。Python 不能强制终止该线程，适配器仍须遵守超时与取消令牌；真实供应商适配器需要后续验收。
+
+## 文件类型验证与 Intent 成功
+
+模型候选仅为 `FileTypeFactCandidate(path, observed_type, execution_id)`。验证器复核目标、导入映射、工具请求/授权快照、实际保存命令、Execution 及输出。必须成功退出、停止已确认、未超时/取消、双流未截断、stderr 为空。
+
+stdout 只能是一条非空白文本行，允许末尾无换行或恰好一个 LF/CRLF，仅去掉该末尾换行。正文禁止 Unicode Cc、U+2028/U+2029，最多 200 字；其他空格和大小写保留。候选必须逐字匹配，不将 ASCII text 归纳成 Python 源码。Fact 文本由可信代码生成“工具文件类型识别结果：<observed_type>”；完整路径留在结构化证据。
+
+证明为不可覆盖、带校验和的 `FileTypeVerificationProof(proof_id, task_run_id, intent_id, execution_id, import_id, path, local_path, observed_type, verified_at)`，proof_id 由可信代码生成 UUID4。导入声明、成功、执行开始/结束、证明时间均须在 TaskRun 时间范围，且顺序正确、无未来时间；不另加分钟级过期。
+
+`lookup_file_type_proof(execution_id, proof_id)` 每次重新核对原始证据后才返回 local_path 目标引用。旧 FileToolRecorder.lookup 仍返回 target_ref=None，旧 Fact 不补造证明。
+
+`commit_verified_file_type_fact(intent_id, candidate, proof_id, fact_id, mutation_id)` 提交前复核证明、Execution、目标和状态，一次事务插入 verified Fact、事件与 Checkpoint。指纹含操作、TaskRun/Intent、候选三字段、proof_id、fact_id；旧 ID 精确重放不复核。证明先写而事务失败留下的孤立证明，可由同 ID 重试完整复核后使用；候选失败不创建 Fact、不改控制面。旧 create_fact → verify_fact(turn_target_satisfied=...) 语义不变。
+
+评估器只读返回 `IntentGoalEvaluation(task_run_id, intent_id, outcome, verified_fact_ids, short_reason)`：
+
+| outcome | short_reason | 含义 |
+| --- | --- | --- |
+| satisfied | verified_file_type_fact | 当前目标至少一个已提交 verified Fact 的证明重新核验通过；只列真实支持的 Fact ID，按提交顺序排列。 |
+| not_satisfied | no_supporting_verified_fact | 没有支持事实且没有本 Intent 未决/未知 Execution，不等于目标不可能完成。 |
+| inconclusive | execution_outcome_unknown | 本 Intent 有 pending/running Execution 或其 ID 对应 OUTCOME_UNKNOWN；支持事实优先于未知执行。 |
+
+缺失/跨任务目标为 state_conflict；已提交证明损坏、缺失或存储读取异常直接抛异常。`complete_satisfied_intent(intent_id, evaluation, mutation_id)` 重新只读评估并要求支持 Fact ID 完全一致，才原子提交 Intent.succeeded；旧 mutation 精确重放只返回首次结果。Turn、TaskRun 和完成确认由上层负责。
+
+## 停止与错误
+
+`IntentLoopResult(task_run_id, intent_id, evaluation, stop_reason, plan_id, execution_ids, verified_fact_ids)` 的评估与停止原因分开；ID 仅来自当前 Intent 的已提交对象。停止原因固定为 `intent_satisfied/model_stopped/candidate_rejected/budget_exhausted/tool_failed/recovery_required/model_error/interrupted`。
+
+- stop 立即返回 model_stopped；确定的 candidate_rejected 立即返回，不新增内容修正，不改变 Intent 终态，不产生 target_mismatch。
+- 模型认证/供应商/拒答错误、已返回的超时及一次结构纠正后仍非法，返回 model_error；不调用旧模型失败路径宣布 TaskRun.failed。
+- ToolGateway 的 Policy/参数拒绝或其已提交的失败返回 tool_failed，保留 Gateway/Controller 的既有状态提交。
+- 明确环境故障且 Gateway 给出 RETRY_EXECUTION 或 RETRY_COMMAND_GENERATION 时，用声明中唯一重试 ID 显式重试一次，不再让模型决定。执行重试复用原命令和步骤；第二次仍失败返回 tool_failed，不增加第三次请求。新派发仍重验授权、取消及 Deadline；不增加模型调用次数。
+- 工具结果未知、未完成收据或停止未确认返回 recovery_required，不重派。取消/Deadline 优先通过 Controller 既有生命周期处理；停止已确认则 interrupted，已启动工具但停止未确认则 recovery_required。
+- candidate_rejected 是内容/路径/完整输出不支持；evidence_unavailable 是证据缺失/损坏；state_conflict 是归属/状态冲突。后两类、存储、提交及重载异常直接抛出，不交模型重试。
+
+以下是 T4 限制，使用独立 `IntentActionRejected(code)`，不是通用 Agent 错误策略：
+
+| code | 行为 |
 | --- | --- |
-| 模型动作 | 用有类型的互斥响应表示一次工具请求、一次候选 Fact 或停止当前路径；一次只允许一个动作。领域 ID、授权和实际命令由可信代码拥有。具体字段随后逐项确认。 |
-| Plan 执行 | 保持一个 Intent 一个 Plan，明确每次请求与 PlanStep 的对应关系；需要确认是否必须按顺序执行全部步骤，以及候选 Fact 能否提前结束 Plan。 |
-| 上下文 | 从已提交状态构建任务/本轮目标、当前 Intent/Plan、已验证 Fact、策略失败摘要、允许使用的工具说明、剩余预算和本循环工具观察。沿用现有 Fact 最多 64 条/内容合计 16384 字、策略失败最多 32 条。工具观察单独标为未验证数据；其条数、字数和淘汰规则需确认。 |
-| 循环预算 | 建议最多 8 次决策、8 次工具请求；计划生成和结构纠正也计入另设的总模型调用预算。精确计数、配置上限和耗尽后的 Plan/Intent/Turn 状态需确认；重启不能通过重置内存计数绕过预算。 |
-| 协议纠正 | 沿用同一适配器最多一次结构纠正。再次非法、拒答、认证失败、供应商故障、模型超时分别保留原类别；需要确认循环层如何终止并持久化模型错误证据。 |
-| 工具失败 | Policy/参数错误沿用核心失败动作，未知结果停止当前路径且不重放。环境故障保留一次显式重试能力；需确认由循环立即发起，还是返回调用方决定。不得将环境故障写入策略失败集合。 |
-| Fact 拒绝 | 无来源、跨任务、未成功执行、证据不完整或候选内容无支持均不能成为 verified Fact。需要区分模型候选错误、证据损坏和真正目标不匹配，并确认是否给模型一次修正机会。 |
-| 目标和时效证据 | 建议从不可覆盖的请求/授权收据核对目标路径，再与执行记录及命令交叉校验；不接受模型提供的路径证明。沿用 TaskRun 起止时间范围，并检查观察时间不晚于验证时刻；是否另设有效期需要确认。 |
-| 提交粒度 | 复用现有 candidate -> verified/rejected 和 Controller 提交边界，不让模型提交 Fact。需要确认单个 Fact 还是多个 Fact 一批提交，以及 Plan 完成、Intent 成功、Turn 完成是否需要合并为一个原子操作。 |
-| GoalEvaluator 与完成确认 | 建议判断满足后接入现有 `mark_candidate_found`，保留 180 秒确认期；T4 返回等待确认状态，不自行伪造外部 completion 消息。未满足时返回上层的继续信号，具体输入/返回值需确认。 |
-| 取消和 Deadline | 沿用终态提交并成功重载后才停止和清理的规则。循环需覆盖模型等待、工具等待、验证和提交边界的取消/到期；已提交事实保留，停止时不补造结果。 |
-| 中断和恢复 | 沿用显式恢复和未知执行不重放。需确认本轮是否只报告需要恢复，还是支持完成记录之后的续跑；若支持，循环进度和预算必须可持久恢复。 |
+| path_out_of_scope | 循环先由 Policy 比对 Intent 精确目标，拒绝越界；Gateway 自身授权检查仍保留。 |
+| unsupported_plan_steps | 通用响应允许步骤数组，但 T4 只支持一步；多步不拆分、不新增调整调用。 |
+| repeated_inspection | 只有当前 Intent 已有成功检查后的新动作才拒绝；同一个已执行动作仍只读复用原结果。 |
 
-## 预计代码边界
+拒绝结束本次 run，不改领域状态；Plan/Intent 等可能仍 running，调用方必须将异常视为需要外层处理的停止信号，不能自动空转重调。持久动作/Plan 摘要及固定身份使同一拒绝可恢复重现，不重新调用模型。取消/Deadline 在消费动作前优先处理。跨 TaskRun/Intent 的 Execution 引用仍是 state_conflict。
 
-- 核心增加单 Intent 循环及其有类型的请求、决策和结果契约；模型适配器保留供应商无关边界。
-- ContextBuilder 提供受限的已提交上下文及明确区分的工具观察。
-- FactVerifier 实现确认后的首种内容/证据规则；GoalEvaluator 只消费已验证且已提交的事实。
-- 外层证据适配器提供经收据核验的来源信息，核心不直接读取证据文件或依赖 MCP/Docker SDK。
-- 必要的领域操作仍先生成工作副本变更，由 Controller/Repository 复核后经 SQLite 提交；不增加另一套数据库写入路径。
-- 确认后的接口和规则同步到四份约束文档及 TODO；不得提前标记 T4 完成。
+## schema 6 与安全恢复
 
-## 拟验收证据
+旧 schema 1–5 顺序原子迁移至 6，保留 TaskRun、事件、Checkpoint 和模型台账。schema 2 是 intent_goals，3 是 source_root，4 是 verification_ref，5 是 model_invocations；schema 6 新增：
 
-1. 实际单 Intent 循环从模型工具请求到持久化 verified Fact，再到目标判断可观察；所有工具经过 Policy，复用同一个 Sandbox。
-2. 工具输出不能直接进 verified Fact；伪造内容、错误路径、跨 TaskRun/Intent、无效时间、失败或未知 Execution、截断或损坏证据均拒绝。
-3. 协议纠正及循环预算严格有界；关键失败动作与确定环境重试次数符合确认结果。
-4. 取消、Deadline、提交失败、提交后重载失败、请求重放和显式恢复不导致重复命令或虚假成功。
-5. Fact/失败上下文有界，不混入密钥、实际命令、未经验证的事实或完整历史输出。
-6. 针对性测试、完整测试、相关静态/类型/格式检查、编译、构建和差异检查通过；模拟结果与真实模型/Docker 的未验收范围分开记录。
+- `intent_plan_applications`：以已完成 Plan 调用 ID 唯一关联经校验单步骤、可信 plan_id、注册/启动 mutation ID。在控制面提交前保存，不推进 Checkpoint。
+- `intent_action_applications`：以已完成动作调用 ID 唯一关联动作摘要及副作用 ID。inspect 保存首次/重试 ToolRequest ID 和完成 Plan mutation ID；candidate 保存 proof/fact/提交 Fact/完成 Intent ID；stop 不分配副作用 ID。
 
-以上第一批三项确认后，再依选定范围细化下一批字段和状态规则；未确认的行为不进入实现。
+声明不可覆盖；保存时核对已审计结果与归属，同内容重放，异内容冲突。新的模型调用结果在当前 run 可首次声明；历史已完成但没有声明的有效结果返回 recovery_required，不能猜测旧进程是否已产生副作用。多步骤等确定拒绝可由持久的非法 Plan 摘要重现。
+
+恢复按声明复用原 ID：Plan 尚未注册/启动时从对应安全位置提交；工具已完成时核对收据、命令及控制面后消费，已开始但未完成则停止；候选的证明/Fact/完成 Intent 提交按原 ID 复核或重放。Controller 缓存失效须先显式 reload_state；恢复读取本身不自动修复证据或重派工具。迁移不补造历史声明。
+
+## 验证位置
+
+- `tests/test_intent_loop.py`：真实本机 MCP/Fake Docker 成功链；候选、拒绝、重放、明确重试、未知结果、提交/重载中断、孤立证明、数据库重开、多 Intent、取消/Deadline 和迟到模型结果。
+- `tests/test_attachment_import*`、`test_file_type*`、`test_modeling.py`、`test_control_store.py`：导入、映射、完整证据、不可变证明、台账、迁移与预算规则。
+- 临时文件统一在 `.test/`，保留 `.venv/`；最终实际测试、类型、格式、编译和构建结果见 TODO，未运行的真实环境不升级为验收通过。

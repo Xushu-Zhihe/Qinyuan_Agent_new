@@ -34,3 +34,13 @@ __pycache__/
 /build/
 /dist/
 /dist-final/
+
+.test
+tests
+Architecture.md
+interface.md
+protocol.md
+restrict.md
+T4_proposal.md
+
+

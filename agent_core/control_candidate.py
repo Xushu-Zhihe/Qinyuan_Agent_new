@@ -20,6 +20,7 @@ from agent_core.control_store import (
     UpsertExecution,
     UpsertFact,
     UpsertIntent,
+    UpsertIntentGoal,
     UpsertPlan,
     UpsertTaskRun,
     UpsertTurn,
@@ -94,6 +95,7 @@ def project_candidate(
                 "started_at",
                 "deadline_at",
                 "sandbox_id",
+                "source_root",
             ):
                 if getattr(change, name) != getattr(task, name):
                     raise StorageError("immutable TaskRun fields cannot be modified")
@@ -108,6 +110,7 @@ def project_candidate(
                 change.confirmation_deadline,
                 change.finished_at,
                 change.failure_reason,
+                change.source_root,
             )
         elif isinstance(change, UpsertTurn):
             entity_id = change.turn_id
@@ -139,6 +142,16 @@ def project_candidate(
                 ),
                 ("turn_id",),
             )
+        elif isinstance(change, UpsertIntentGoal):
+            entity_id = change.goal.intent_id
+            intent = intents.get(entity_id)
+            if (
+                intent is None
+                or intent.status is not IntentStatus.RUNNING
+                or change.goal.task_run_id != task.task_run_id
+                or any(plan.intent_id == entity_id for plan in plans.values())
+            ):
+                raise StorageError("Intent goal requires a running Intent before Plan")
         elif isinstance(change, UpsertPlan):
             entity_id = change.plan_id
             _put_snapshot(
@@ -183,8 +196,9 @@ def project_candidate(
                     if old_fact
                     else mutation.checkpoint.sequence,
                     old_fact.created_event_ordinal if old_fact else ordinal,
+                    change.verification_ref,
                 ),
-                ("turn_id", "source_ref"),
+                ("turn_id", "source_ref", "verification_ref"),
             )
         else:
             raise StorageError("unsupported candidate state change")

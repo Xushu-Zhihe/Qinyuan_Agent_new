@@ -33,9 +33,11 @@ from agent_core.modeling import (
     ModelResponse,
 )
 from agent_core.runtime import SandboxPort, TaskRunSandboxPort, TaskRunStatus
+from agent_core.intent_loop import IntentLoopResult
 from agent_core.tool_contracts import (
     ScopedToolGatewayPort, ToolPolicyPort, ToolCommandPlannerPort,
     ToolSandboxPort, ToolRecorderPort,
+    ToolAuthorization,
 )
 
 
@@ -104,7 +106,7 @@ class TurnRegistrationPort(Protocol):
 
 
 class ModelReasonerPort(Protocol):
-    """Intent/Plan generation only; tool calling is still unspecified."""
+    """Provider-neutral candidate generation; the loop owns action application."""
 
     def invoke(
         self, request: ModelRequest, cancellation_token: CancellationToken
@@ -127,6 +129,13 @@ class ControlStatePort(Protocol):
 
 class AgentApplicationPort(Protocol):
     """Application entry boundary; CLI and Python API shapes remain pending."""
+
+
+class IntentToolCallingLoopPort(Protocol):
+    async def run(
+        self, intent_id: str, authorization: ToolAuthorization,
+        cancellation_token: CancellationToken,
+    ) -> IntentLoopResult: ...
 
 
 class RunSupervisorPort(Protocol):
@@ -184,6 +193,7 @@ class EventPort(Protocol):
 
 
 __all__ = [
+    "IntentToolCallingLoopPort",
     "CancellationToken",
     "AgentApplicationPort",
     "AtomicCommitterPort",
