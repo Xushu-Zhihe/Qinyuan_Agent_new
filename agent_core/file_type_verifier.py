@@ -252,7 +252,7 @@ class FileTypeVerifier:
             or request_receipt.sandbox_id != task.sandbox_id
             or authorization.task_run_id != task.task_run_id
             or not self._policy.authorize(request, authorization).allowed
-            or not self._policy.validate_command(request, command).allowed
+            or not self._policy.validate_recorded_command(request, command).allowed
             or record.request_id != request.request_id
             or record.execution_id != execution.execution_id
             or record.task_run_id != task.task_run_id

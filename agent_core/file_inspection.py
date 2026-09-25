@@ -52,7 +52,7 @@ try:
         fail(41, 'non_regular_file')
     try:
         result = subprocess.run(
-            ['/usr/bin/file', '--brief', '--error', '--dereference', '--', '/proc/self/fd/' + str(fd)],
+            ['/usr/bin/file', '--brief', '-E', '--dereference', '--', '/proc/self/fd/' + str(fd)],
             pass_fds=(fd,), env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}, check=False,
         )
     except OSError:
@@ -73,3 +73,8 @@ finally:
 
 def inspection_arguments(path: str) -> tuple[str, ...]:
     return ("-I", "-c", FILE_INSPECTION_SCRIPT, validate_inspection_path(path))
+
+
+# Existing immutable T3/T4 receipts retain the original exact program. This
+# version is accepted only when checking historical evidence, never dispatch.
+LEGACY_FILE_INSPECTION_SCRIPT = FILE_INSPECTION_SCRIPT.replace("'--brief', '-E'", "'--brief', '--error'")

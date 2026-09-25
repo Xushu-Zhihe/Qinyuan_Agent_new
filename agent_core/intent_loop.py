@@ -725,7 +725,7 @@ class IntentToolCallingLoop:
                 or execution.command_ref != record.command_ref
                 or not FileToolPolicy().authorize(request, authorization).allowed
                 or not FileToolPolicy()
-                .validate_command(
+                .validate_recorded_command(
                     request, self._evidence.load_command(execution.command_ref)
                 )
                 .allowed

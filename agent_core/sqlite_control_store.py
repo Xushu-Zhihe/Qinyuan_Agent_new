@@ -331,6 +331,25 @@ class SqliteControlStore:
                 connection.close()
             raise StorageError(f"could not open SQLite control store: {exc}") from exc
 
+    @classmethod
+    def open_readonly(cls, path: str | os.PathLike[str]) -> SqliteControlStore:
+        """Read current-schema history without migrations or journal changes."""
+        database_path = Path(path).resolve(strict=True)
+        connection = sqlite3.connect(
+            database_path.as_uri() + "?mode=ro", uri=True, timeout=0.1,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            version = connection.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0]
+            if version != CURRENT_SCHEMA_VERSION:
+                raise StorageError("read-only history requires the current schema")
+            connection.execute("BEGIN")
+            return cls(connection, database_path, clock=time.time)
+        except BaseException:
+            connection.close()
+            raise
+
     def close(self) -> None:
         try:
             self._connection.close()

@@ -2,7 +2,7 @@
 
 ## 说明
 
-本文件描述 Python 层的端口边界。接口文件只声明签名，不实现业务函数；T2 Sandbox 与 T3 文件工具适配器的已确认实现另见后续章节，CLI 装配和真实 Docker 验收仍属后续交付。已有类型优先复用 `agent_core` 中的定义。
+本文件描述 Python 层的端口边界。接口文件只声明签名，不实现业务函数；T2 Sandbox 与 T3 文件工具适配器的已确认实现另见后续章节，T5 已增加 CLI 装配，历史真实 Docker 文件识别效果复核通过；本次完整独立复验受权限阻塞，详情见 TODO。已有类型优先复用 `agent_core` 中的定义。
 
 ## 已冻结的声明
 
@@ -42,13 +42,19 @@ T3 已补齐工具、Policy、MCP、Sandbox 执行和 ExecutionRecorder，T4 增
 
 ## T5 公共入口与后续转换器边界（2026-09-24）
 
-T5 面向独立的自动化渗透测试 Agent 提供 CLI 与事件，不再声明或实现 qinyuan-bat 专用适配接口。CLI 和 Python API 的应用操作仍归属 `AgentApplicationPort`；这一职责约定不代表公共签名或外部序列化已经冻结。
+T5 面向独立的自动化渗透测试 Agent 提供 CLI、事件和真实单 Intent 文件类型识别。第一阶段以模拟链路验证公共入口，第二阶段接入真实模型、真实 Docker 和实际附件；历史真实效果复核通过，本次完整独立复验受权限阻塞。第一阶段通过不能替代第二阶段，历史通过不能替代本次复验。CLI 和 Python API 的应用操作仍归属 `AgentApplicationPort`；CLI 的外部序列化已冻结为 T5 v1；稳定公共 Python API 仍未冻结。T5 不声明或实现 qinyuan-bat 专用适配接口。
+
+真实接入复用 `ModelAdapter`、`AttachmentImportSandboxPort`、TaskRun Sandbox 生命周期及 `IntentToolCallingLoopPort` 等既有内部边界；正式模型入口已确认使用项目 `.env` 的 DeepSeek API，Codex CLI 本轮不接入。具体请求/响应、超时和取消已确认并实现，见 protocol.md 的 T5 v1 节。输出必须区分当前 Intent 结果与整体 TaskRun 状态，不能将真实文件识别表述为自主解题或找到 flag。多 Intent 调度、任务目标判断和最终 TaskResult 属于 T6。
+
+CLI 外形已确认为同步 `qinyuan-agent-new run-intent --request <JSON 文件|->`，最终 stdout 是单个版本化 JSON，可选 `--events` JSONL 导出持久化控制事件。普通切片结束且无未知副作用时 TaskRun 收尾为 `inconclusive`、整体目标为 `not_evaluated`，清理结果独立报告；请求/响应字段、错误和退出码、事件读回入口与 `resume/cancel` 已确认并实现；`AgentApplicationPort` 仍不承诺稳定公共 Python 签名。
 
 后续独立转换器负责多题目获取、调用 `qinyuan-agent-new` 和平台 flag 提交。它使用哪种公共调用入口、如何传递题目/附件、接收结果和提交回执，均需另行确认；本次不新增转换器 Protocol、字段或占位签名。当前 TaskRun、Intent 和控制面类型继续复用，转换器不直接修改其内部状态。
 
+2026-09-25 已确认前端在 T6 闭环稳定后独立交付。页面操作和 Agent 调用方式尚未冻结，不据此新增 HTTP/WebSocket、事件订阅或前端专用 Protocol；实施前逐项确认，继续复用确认后的应用边界。
+
 ## 待确认后才能补齐的声明
 
-1. `AgentApplicationPort`：CLI/Python API 的输入、同步/异步、结果格式、事件订阅，以及 CLI 退出码、外部 `resume/cancel` 标识与操作语义。
+1. `AgentApplicationPort`：T5 CLI 已实现；仍待确认公共 Python API、通用事件订阅和 T6 完整结果。
 2. `RunSupervisorPort`：循环驱动、动态 Intent、路径耗尽、Budget 和终止返回值。
 3. `StagePlannerPort`：StageContext、前置/后置条件、时间片和计划返回值。
 4. `ProcedureSelectorPort` / `ProcedureRunnerPort`：ProcedureFact 字段、版本、匹配排序、校验失败和执行失败路径。
@@ -118,3 +124,14 @@ Intent 的 description 不用于推导目标；可信调用方独立提供并持
 `IntentPlanApplication` 固定 Plan 摘要、plan_id、注册/启动 mutation；`IntentActionApplication` 固定动作及工具首次/重试 ID、完成 Plan ID，或证明/Fact/提交/完成 Intent ID。`IntentApplicationStorePort` 提供 save/load_plan_application 与 save/load_action_application，SQLite schema 6 实现不可覆盖声明并复核模型调用归属。
 
 `IntentActionRejected.code` 为 path_out_of_scope、unsupported_plan_steps、repeated_inspection。同动作重放复用结果或重现拒绝；只有当前 Intent 成功检查后的新检查动作报 repeated_inspection。异常停止本次调用，不改变领域状态，上层不能自动空转重调。其余停止/失败/恢复规则以 `T4_proposal.md` 为准。
+
+
+## T5 已实现的边界入口（2026-09-25）
+
+- CLI：`agent_adapters.cli.main`，同步 run-intent、status、replay、resume、cancel；wire contract 见 protocol.md T5 v1。
+- 应用装配：`agent_adapters.application.AgentApplication`；内部 Python API，不承诺外部长期兼容。
+- 模型：`DeepSeekModelAdapter.invoke` 实现原 ModelAdapter，取消 HTTP 子进程，不输出供应商原始错误。
+- 附件：`ImportableTaskRunSandbox` 实现既有 AttachmentImportSandboxPort；16 MiB、共享截止预算、精确路径、排他创建、读回验证。
+- 控制面：`TaskRunController.start` 增加可选调用方预声明 `task_run_id`，仍校验 UUID4 并拒绝已存在 ID；`conclude` 增加仅限 inconclusive 的 `reason="single_intent_slice_finished"`，不改写 Intent 结果。
+- 查询：`SqliteControlStore.open_readonly` 不迁移、不创建库；只读证据记录器不创建目录。事件导出仅读取已提交 Checkpoint 水位以内序号。
+- 兼容：`FileToolPolicy.validate_recorded_command` 仅为历史证据接受旧 `--error` 固定程序；新 dispatch 的 validate_command 只接受 `-E` 版本。

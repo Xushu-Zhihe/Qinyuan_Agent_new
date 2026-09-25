@@ -32,7 +32,7 @@ CLI -> TaskRun -> 一个 Sandbox -> Intent 深度优先
 
 ## 3. 已确认架构与全局约束
 
-1. CLI 和 Python API 统一进入 `AgentApplication`；首期实际入口只确认 CLI，具体 CLI wire contract 仍待确认。
+1. CLI 和 Python API 统一进入 `AgentApplication`；首期实际入口为 CLI，T5 v1 wire contract 见 protocol.md；公共 Python API 仍待确认。
 2. 本仓库是 Agent 在 TaskRun 内的唯一调度所有者，负责内部调度、重试、状态机和业务判断。后续独立转换器负责多题目获取、调用 Agent 和提交 flag；批次调度、并发及重试规则待确认，不复制 Agent 内部控制逻辑。
 3. `TaskRun` 是一道题目的一次完整解题实例。接收后创建全局唯一 Sandbox；所有 Intent 轮复用它，完成、取消或 Deadline 后销毁；重新运行必须创建新的 TaskRun 和 Sandbox。
 4. 同一轮的 Intent 按生成模型给出的可能性顺序逐个尝试，采用深度优先回溯；首期不并行操作同一 Sandbox。 `intent_type` 可作为元数据，首期不改变调度。
@@ -153,20 +153,43 @@ Intent 目标与 TaskRun 目标必须分开。例如 TaskRun 目标为“找到 
 
 首条候选固定为 `FileTypeFactCandidate(path, observed_type, execution_id)`。验证要求成功且停止已确认、未超时/取消、双流未截断、stderr 为空、stdout 单行非空白；最多去掉一个末尾换行，正文禁止控制字符和 Unicode 行分隔符，类型文本最多 200 字且逐字匹配。短 Fact 文本为“工具文件类型识别结果：<observed_type>”，完整路径留在独立证明和目标记录。证明文件不可覆盖；schema 4 的 `verification_ref` 对旧 Fact 为 NULL，对 T4 新 verified Fact 必填。专用 Controller 操作在复核证明、Execution 和归属后原子写入 Fact、事件和 Checkpoint，同 mutation 同指纹仅返回首次提交。单 Intent 只接受单步骤 Plan，模型工具请求固定绑定步骤 0，成功 Execution 后显式完成 Plan。历史 `target_ref=None` 不改写。已确认每 Intent 最多 2 次 Plan 生成调用、8 次动作调用、首期最多一次成功工具派发；schema 5 独立台账在模型调用前/后原子记录，未知调用不自动重调。执行循环现通过 schema 6 声明关联固定副作用 ID；完整冻结契约见 `T4_proposal.md`，验收范围及实际结果见本文末尾。
 
-### T5：独立 Agent 的 CLI 与事件
+### T5：CLI、事件与真实单 Intent 文件类型识别
 
-状态：范围调整已确认（2026-09-24）；CLI 与事件契约等待确认，尚未实现或验收。将已验证的 Agent 入口暴露为 CLI；取消 qinyuan-bat 专用转接任务，不将多题目获取或平台 flag 提交纳入 T5。
+状态：**历史真实效果复核通过；本次完整独立复验受环境权限阻塞，不能宣告全部通过**（2026-09-25，用户提供复核结论）。两次历史真实成功记录均确认文件类型、verified Fact、Intent、事件和清理符合切片目标，整体目标保持 `not_evaluated`。本次 T5 专项为 **12 passed、4 failed、18 errors**，真实 Docker 与重新构建也受阻，详见末尾独立复验记录。完整 TaskRun 解题调度仍留在 T6。
 
-- [x] 确认 Agent 与后续独立转换器的职责划分，并同步架构、接口、协议和全局约束文档。
-- [x] 同步 `Qinyuan_Agent_confirmed_flow.svg`：独立转换器经待确认的公共入口调用 Agent，标明 T5 范围及完整链路尚未验收。
-- [ ] 确认 CLI 输入载体、输出格式、同步/异步、事件协议、退出码及 `resume/cancel` 语义。
-- [ ] 按确认后的契约暴露已验证入口，明确本次 CLI 能力范围并完成验收；T4 单 Intent 入口不能被标为完整 TaskRun 链路。
+以下已完成项保留实现阶段与历史本机验收证据，不代表本次独立复验全部通过。
 
-T5 不要求兼容 qinyuan-bat wire protocol，也不预定后续转换器使用 CLI、Python API 或其他调用方式。
+- [x] 两阶段范围、整体目标 not_evaluated、单 Intent 切片终止规则及工具授权逐项确认；不根据 Fact 数量生成 partial/achieved。
+- [x] 同步 `qinyuan-agent-new run-intent --request <JSON文件|-> --mode simulated|real --state-dir <目录>`；保留 `qinyuan-agent` 别名，模拟夹具与真实配置分开。
+- [x] stdout 单个 protocol_version=1 最终 JSON，区分 Intent、TaskRun、整体目标、清理与错误。SQLite 提交后可选 JSONL 导出，独立写进程、2秒超时、不回滚；按 TaskRun ID/序号只读重放。
+- [x] 每任务 UUID 目录、不可覆盖运行声明和独立证据、OS 写锁。status/终态 resume/replay 只读；新工具派发需当前授权，未知模型/工具不重派，未知导入仅显式读回。
+- [x] `cancel` 通过取消请求交给持锁进程处理；`resume --cleanup-only` 独立清理。退出码 0/2/3/4/5/130 与未知结果优先级已确认并验证。
+- [x] 正式模型为 `.env` 中 DeepSeek API，官方 HTTPS、JSON object + thinking disabled、不暴露工具；最多一次结构纠正，无网络/429/5xx自动重试；180秒总等待/10秒连接且受剩余任务预算限制。Codex CLI 不在本轮接入。
+- [x] 真实附件导入使用固定程序/stdin、精确普通文件路径、不可覆盖、共享准入锁与 SHA-256 读回；既有镜像 `qinyuan/pentest-sandbox:0.3.4` 不构建、不拉取。
+- [x] 历史真实单 Intent 链路已通过并完成效果复核：附件 -> DeepSeek -> File MCP -> Docker -> Execution/证据 -> verified Fact -> Intent satisfied -> TaskRun inconclusive -> 清理/事件。真实文件识别不证明找到 flag。
+- [x] Ctrl+C 使用协作取消和可终止进程树；模型响应取消后不得派发工具/写 Fact。真实模型等待中取消 2.911 秒退出，清理成功、130、无 Execution/Fact。
+- [x] 历史全量回归 **468 passed、1 skipped，150.67 秒**；新增模块 Ruff 和限定源文件 mypy 通过。历史构建与安装入口验收详见下文，不记为本次独立复验结果。
+- [ ] 环境权限恢复后，补齐本次受阻的 T5 专项、完整独立复验、真实 Docker 和重新构建验证；重新记录实际结果，不能沿用历史通过数代替。
 
-### T6：首条纵向链路验收
+初次真实执行发现镜像不接受既有 `file --error` 长参数，已改为同语义 `-E`。旧固定程序只允许历史证据复核，新工具派发必须匹配修正版；不重写旧收据。失败 TaskRun 保留证据，并实际验证 Deadline 终态后清理未确认返回 5，显式 cleanup-only 才完成清理。
 
-状态：完整 Agent 尚未完成端到端链路，T4 单 Intent 切片已通过；等待 T5 及整体调度、任务目标判断等后续能力。T1、T2 模拟验收和 T3 工具切片的已有结果不能替代完整 Agent 验收。使用 Fake Model/Tool 或用户允许的本地 Sandbox 命令完成 `CLI -> Model -> Intent 调度 -> Tool -> ResultFact -> GoalEvaluator -> TaskResult`，再决定是否申请真实目标。
+T5 不兼容预定的 qinyuan-bat wire protocol，不实现平台取题/提交，也不决定未来转换器的调用方式。正式协议见 protocol.md 的 T5 v1，使用说明见 README.md。
+
+### T6：真实单题解题闭环
+
+状态：用户于 2026-09-24 确认完整 TaskRun 调度继续留在 T6；尚未实现或验收。以 T5 的真实单 Intent 链路为基础，逐项确认并补齐多 Intent 尝试、失败回溯、任务目标判断和最终结果，实际验证 `CLI -> Model -> Intent 调度 -> Tool -> ResultFact -> GoalEvaluator -> TaskResult`，才可验收“输入题目，让 Agent 自己尝试解题”。T1～T5 的分段或模拟验证不能代替这一闭环；真实题目、工具能力及目标访问范围仍须确认。平台取题和提交 flag 仍由后续独立转换器负责。
+
+2026-09-25 用户确认：T6 继续以 CLI 为入口，增加供用户自行复测的手工测试步骤；前端单列在 T6 闭环稳定之后，不作为 T6 完成条件。
+
+- [ ] 在 T6 功能及 CLI 契约逐项确认后，补齐真实单题请求示例、题目/附件准备、环境与授权前置条件、实际命令和预期结果；不能将 T5 的 `run-intent` 示例当作完整解题命令。
+- [ ] 手工测试说明覆盖题目提交、运行进度与事件读取、执行过程与证据检查、最终结果核对，以及取消/恢复和失败后的处理；具体操作以届时确认的 T6 契约为准。
+- [ ] 为可重复测试明确 `.test/` 下的专用产物目录、TaskRun 标识和验收证据位置，区分单 Intent 满足、整题目标完成和 Sandbox 清理结果；保留 `.venv/`。
+
+### 独立前端建设（T6 闭环稳定后）
+
+状态：**排期方向已确认，功能与交互待逐项确认**（2026-09-25）。前端单独交付，方便用户自行提交任务和查看运行情况；不并入 T6，不改变 T7 的延期状态。
+
+拟讨论范围：题目与附件提交、运行进度、执行过程与证据查看、取消和恢复。以上是待确认的界面需求，不表示功能或协议已经冻结。页面范围、部署方式、访问权限、Agent 调用入口及事件展示方式须先与用户确认，再实现；本次不选前端框架，也不新增 HTTP/WebSocket 等协议。
 
 ### T7：Stage、Procedure、RAG
 
@@ -182,8 +205,8 @@ T5 不要求兼容 qinyuan-bat wire protocol，也不预定后续转换器使用
 
 以下问题会改变公共接口、状态、权限、外部副作用或验收方式；在得到答案前保持等待确认。
 
-1. 独立 Agent 的 CLI 接收任务使用参数、JSON 文件、stdin 还是其他方式？输出人读文本、JSON、文件还是组合？采用同步返回还是异步任务句柄？是否实时事件？退出码、`resume/cancel` 的标识、入口及语义如何定义？
-2. T2 已确认只用 Fake Docker 和固定写入/读取/等待脚本模拟验收；后续真实 Docker 或真实目标验收仍需确认环境、镜像及授权范围。
+1. T5 v1 已确认并实现；T6 的多 Intent 调度、失败回溯、任务目标判断与最终 TaskResult 仍须逐项确认。
+2. T5 历史真实 Docker/无敏感附件效果复核通过，本次独立复验受权限阻塞；新增镜像、工具、网络或真实题目目标必须另行确认范围。
 3. T3 File Tool 的故障证据、分类与单次显式重试已确认；其他 Tool 和真实目标的重试、重启/重建、换 Tool 规则是什么？
 4. Procedure 执行的非零、超时、权限拒绝和后置条件失败分别回到同一 Stage、下一 Stage、下一 Intent 还是终止？
 5. Procedure 校验失败时，是否只丢弃 Procedure Candidate、保留 ResultFact Candidate，或整个 Item 不提交？是否写失败记忆？
@@ -193,14 +216,15 @@ T5 不要求兼容 qinyuan-bat wire protocol，也不预定后续转换器使用
 9. 是否采用补充图的“每轮新开 LLM、只注入相关 Fact/失败摘要/Skill 规则、允许读取工作目录”设计？ `Process_Fact` 是否等同 `ProcedureFact`？
 10. T3 内部工具类型已冻结；其他 Tool 的扩展、通用外部版本/序列化以及 TaskResult 字段是什么？
 11. T3 工具入口已确认异步；应用级 Python API 需要同步、异步还是两者？Event 的顺序、持久化、重放、订阅和背压规则是什么？
-12. 真实 Codex/Claude/DeepSeek 的入口、模型名、端点、凭据来源、子进程权限、超时、取消和原生/JSON Tool Calling 规则是什么？
+12. DeepSeek T5 入口已确认；后续 Codex/Claude、代理端点和其他模型接入仍须确认。
 13. 后续独立转换器对接哪些题目平台，通过何种公共入口调用 Agent？题目与附件如何映射为任务，如何接收可提交的 flag，如何处理批次调度、并发、重试、重复提交和平台回执？以上留待转换器设计阶段逐项询问，不在本次补写契约。
+14. T6 闭环稳定后的前端需要哪些页面与操作，部署在哪里，允许谁访问，通过哪个 Agent 入口调用，如何展示事件、证据及取消/恢复结果？拟讨论范围见前端任务，实施前逐项确认。
 
 ## 8. 验收矩阵
 
 | 场景 | 必须观察到的结果 | 状态 |
 | --- | --- | --- |
-| 合法请求 | 创建唯一 TaskRun 和 Sandbox | T2 模拟已验证；真实链路待验收 |
+| 合法请求 | 创建唯一 TaskRun 和 Sandbox | T2 模拟、T5 真实单 Intent 均已验证 |
 | 多 Intent | 按概率顺序、深度优先、同 Sandbox 顺序执行 | 核心 Fake 已验证 |
 | 工具越权/范围越界 | Policy 在副作用前拒绝 | T3 已验证，拒绝时无 MCP/Sandbox 调用 |
 | MCP 命令生成失败 | 有 PlanValidationRecord 和证据引用，不创建虚假 Execution | T3 已验证，独立审计保留拒绝/失败记录 |
@@ -210,10 +234,14 @@ T5 不要求兼容 qinyuan-bat wire protocol，也不预定后续转换器使用
 | 原子提交/幂等/恢复 | 不产生半提交，不重放未知副作用 | 控制面已验证 |
 | 取消/Deadline | 停止副作用，清理 Sandbox，只输出已验证事实 | T2 模拟顺序已验证；真实 Docker 待验收 |
 | 终态重载失败后的恢复 | `reload_state() -> cleanup_sandbox() -> close()`；释放 Registry 后允许同 Registry 再绑定；重载及业务 mutation 重放不访问 Docker | T2 第二轮模拟验收通过；重载失败仍保持缓存失效 |
-| 全局检查 | 相关测试、模块测试、compileall、静态检查和 `git diff --check` 通过 | T4 全套 434 passed、1 skipped；检查范围和构建结果见末节 |
+| 全局检查 | 相关测试、模块测试、compileall、静态检查和 `git diff --check` 通过 | T4 历史 434 passed、1 skipped；T5 历史 468 passed、1 skipped；本次检查范围和受阻项见独立复验记录，不能宣告全部通过 |
 | T3 已确认工具切片 | `ToolGateway -> Policy -> MCP -> Sandbox` | 2026-09-11 用户依据已有实现及 323 passed 记录验收通过 |
 | T4 单 Intent 切片 | Fake Model → File MCP → Fake Docker → Execution → verified Fact → Intent 完成 | 2026-09-24 用户确认独立复验通过，434 passed、1 skipped；仅完成当前 Intent |
-| T5 独立 CLI 与事件 | 按已确认的公共契约调用 Agent 并输出结果/事件；具体格式及退出语义待确认 | 范围调整已确认，契约及实现待确认；不含专用转接、多题目获取或平台 flag 提交 |
+| T5 第一阶段 CLI 与事件 | 使用模拟链路验证输入、输出、持久化事件、错误和取消 | 历史模拟验证保留；本次 6 项 CLI 输入检查通过，T5 专项 12 passed、4 failed、18 errors，权限阻塞未解除 |
+| T5 第二阶段真实单 Intent | 真实模型、真实 Docker 和实际附件贯通工具执行、证据、Fact 验证与 Intent 结果 | 两次历史真实效果复核通过；本次真实 Docker 与重新构建受阻，不能宣告本次全部通过 |
+| T6 真实单题解题闭环 | 多 Intent 尝试、失败回溯、任务目标判断与最终 TaskResult | 范围已确认；契约、实现与真实验收待完成，平台取题和 flag 提交仍归后续转换器 |
+| T6 CLI 手工复测 | 用户按已确认的请求示例、命令和预期结果复测，并找到对应事件、证据及清理结果 | 已确认纳入 T6；具体步骤随 T6 契约补齐 |
+| 独立前端 | 通过确认后的 Agent 入口提供可观察的任务操作 | 已确认安排在 T6 闭环稳定后；功能、界面、协议与验收标准待确认 |
 | 完整 Agent 链路 | CLI、模型、Intent 调度、工具、Fact 验证、GoalEvaluator、TaskResult 连通 | 尚未完成端到端验收，不计入 T3 或 T4 完成 |
 
 ## 9. 当前验证记录
@@ -296,3 +324,36 @@ T5 不要求兼容 qinyuan-bat wire protocol，也不预定后续转换器使用
 - 唯一跳过项：Windows 无法创建符号链接的测试；明确记为 skipped，不计为通过。
 - **143 个输入文件与当前源码一致**；独立复验未修改原项目源码。
 - 验收范围外：**真实模型、真实 Docker、CLI 和完整 TaskRun 链路**，均不计入此次 T4 验收。
+
+
+## T5 历史本机验收证据（2026-09-25）
+
+本节保留实现阶段的历史记录。下节独立复验结论不能由这些历史通过结果替代。
+
+- 全量：`.test/t5/pytest-final.log`，468 passed、1 skipped（Windows 符号链接条件跳过），150.67秒。新增 34 项测试覆盖 CLI 文件/stdin、严格授权、事件与只读重放、超时导出、清理失败、跨进程锁/取消、5秒进程退出、HTTP 分类/无重试、一次结构纠正、未知模型/工具不重派、未知导入显式读回、恢复新授权、Deadline、旧程序证据兼容。模拟验证与真实证据分开。
+- 真实成功 TaskRun：`f0ea4728-9472-4dd0-8a75-4bd6267ac220`，`.test/t5/real-runs/`；请求模型 `deepseek-v4-flash`，真实 `ASCII text`、1个 verified Fact、Intent succeeded、TaskRun inconclusive、single_intent_slice_finished、整体目标 not_evaluated、清理 succeeded、退出0；14条控制事件在 `.test/t5/real-events-2.jsonl`。最小 API 预检返回的模型别名 `deepseek-flash` 与请求名不同，不据此改写配置。
+- 真实失败/恢复 TaskRun：`b28a55f5-75ba-452c-9ebe-ea4ae6e79488`，初次 file 参数不兼容，工具结果保留 unknown，未自动重试、未生成 Fact；Deadline/清理5和 cleanup-only 已实际经过。保留历史错误，不改为成功。
+- 最终连接/DNS超时补强后真实复验 TaskRun：`cfc1762c-38e5-4b92-b621-76e03286617a`，`.test/t5/real-events-final.jsonl`；Intent satisfied、1个verified Fact、14条事件、TaskRun inconclusive、清理成功、退出0，所有外部/模型未知标记false。
+- 隔离：`.test/t5/real-isolation-report.json`，14项检查全通过，涵盖配置、uid=10001、只读根、仅loopback、出网拒绝、无挂载/socket、导入读回、禁止覆盖/原内容保持及清理确认。
+- 真实取消：`.test/t5/real-cancel/acceptance.json`，TaskRun `60523bfa-bca1-43f0-bae2-a1d418b99dcb`，中断后2.911秒退出，cancelled/cleanup succeeded/130；仅模型响应未知并已丢弃，无工具执行或 Fact。
+- 安装后入口已从独立 `.test/t5-installed-cwd/` 跑通模拟模型/容器 + 真实本机 MCP，TaskRun `91fcc79c-1a61-46e1-ba59-f4d8e4707109`，Intent satisfied、14条事件、清理成功、退出0；89个打包源码文件与工作区一致。
+- 构建产物在 `.test/dist-t5/`；wheel 含两个 CLI 入口及所需模块，无 `.env`、运行证据、缓存或测试包；sdist 仅保留 `.test/qinyuan_agent.egg-info` 构建元数据，无运行数据。Windows 受限构建遇到权限拒绝后，在授权的沙箱外完成构建。
+- 新增文件通过 Ruff；12个已跟踪修改文件的48条既存 lint 问题与 HEAD 对比无新增，不扩展为全库重构。限定10个本轮源文件的 mypy（follow-imports=silent）通过，不宣称全库类型检查无错误。
+
+验收限于当前 Windows / Docker Desktop Linux 环境、指定本机镜像及无敏感小附件。HTTP 错误和慢速写入使用受控测试模拟；并未人为制造真实供应商429/5xx或真实慢磁盘。POSIX 进程组代码未在本轮主机实测。未知创建/停止与损坏证据不自动修复；保留ID/证据，按显式恢复或人工调查处理。所有验收数据保留在 `.test/`，正式 state-dir 不自动删除。
+
+
+最终核对：Docker 按 TaskRun component 标签查询为空，无本轮容器残留；根目录未留下构建/测试临时目录，测试证据保持在 `.test/`。`.test/t5/final-integrity.json` 记录127个源码/文档/验收文件的密钥扫描无匹配，89个wheel源码一致及SVG XML有效。工作区改动尚未提交Git。流程图已同步，但 `Qinyuan_Agent_confirmed_flow.svg` 仍按原 `.gitignore` 忽略；本轮仅为三个新增测试文件增加精确取消忽略规则。
+
+## T5 独立复验记录（2026-09-25，用户提供）
+
+结论：**T5 的历史真实效果复核通过；本次完整独立复验受环境权限阻塞，不能宣告全部通过。**
+
+- 两次历史真实成功记录均确认：`ASCII text`、1 个 verified Fact、Intent 成功、14 条事件、清理成功；整体目标保持 `not_evaluated`，不代表整题解题成功。
+- 本次新增验证：**6 项 CLI 输入检查通过**；静态、格式、类型、编译及差异检查通过。这些结果不能替代受阻的运行验证。
+- 本次 T5 专项：**12 passed、4 failed、18 errors**。用户提供的复验结论将失败和错误均指向 Windows 管道或临时目录权限拒绝；不将失败/错误计为通过，也不据此宣告业务逻辑无缺陷。
+- 本次真实 Docker 和重新构建也受环境权限阻塞，未完成独立复验。
+- 原有 **468 passed、1 skipped** 为历史全套记录，不冒充本次结果；6 项输入检查与专项结果分别记录，不未经核对合并计数。
+- 独立复验未修改原项目源码，**166 个输入文件保持一致**，产物均在 `.test/`。一致性结论对应这次独立复验时的输入，不包含此后文档修订。
+
+记录来源为用户本次提供的复验结果；本次仅同步文档与流程图，没有重新运行上述测试、真实 Docker 或构建。后续在允许相关管道、临时目录和 Docker 操作的环境中补齐受阻验证，再更新独立复验状态。

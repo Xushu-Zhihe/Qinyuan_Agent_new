@@ -8,15 +8,27 @@
 
 ### CLI / Python API
 
-当前只确认 CLI 是首期入口，且 CLI 请求最终进入 `AgentApplication`。`TaskRequest` 的已确认字段为 `goal`、`target`、`deadline_seconds` 和可选 `model_backend`；Target 包含 endpoints 或 attachments，支持已验证的 HTTP/HTTPS/TCP endpoint 与 `local_path/url` attachment 引用。未冻结命令名、输入载体、输出格式、事件流和退出码。
+CLI 请求最终进入 `AgentApplication`，已确认同步 `qinyuan-agent-new run-intent --request <JSON 文件|->`，其中 `-` 从 stdin 读取。请求包含 TaskRequest、附件索引、Sandbox 精确路径和授权，字段及本机操作者授权信任边界见下方 T5 v1。`TaskRequest` 的已确认字段为 `goal`、`target`、`deadline_seconds` 和可选 `model_backend`；Target 包含 endpoints 或 attachments，支持已验证的 HTTP/HTTPS/TCP endpoint 与 `local_path/url` attachment 引用。stdout 为一个带 `protocol_version` 的最终 JSON，stderr 只输出有界诊断；具体字段和退出码已按 2026-09-25 的确认冻结为 T5 v1。
 
 Python 内部模型调用使用 `ModelAdapter.invoke(ModelRequest, timeout_seconds, CancellationToken)`。适配器返回归一化响应或 `ModelError`；调度层负责截止时间、取消、结构校验和最多一次同适配器纠正。
 
+### T5 两阶段范围（2026-09-24，用户确认）
+
+第一阶段通过模拟模型、真实本机 File MCP、模拟 Docker 和真实持久化检查 CLI 的输入、输出、事件、错误和取消。第二阶段接入真实模型与真实 Docker，使用实际附件验证文件类型工具执行、证据保存、Fact 验证和当前 Intent 结果；第二阶段真实链路通过才达到 T5 的最终验收目标。两阶段的验证记录必须区分，不能以模拟输出证明真实文件类型、隔离或进程终止。
+
+真实模型入口已确认是项目 `.env` 配置的 DeepSeek API（`QINYUAN_LLM_BACKEND=openai`、`QINYUAN_MODEL=deepseek-v4-flash`、`OPENAI_BASE_URL=https://api.deepseek.com`、凭据由 `OPENAI_API_KEY` 提供）；Codex CLI 本轮不接入。配置值在启动时校验，密钥不进入源码、控制面、事件或错误输出。采用 JSON object、thinking disabled、无模型工具、HTTP 总等待最多 180 秒/连接含DNS最多 10 秒并受剩余 Deadline 限制；网络错误、429、5xx 不重试。
+
+普通单 Intent 切片明确停止且无待恢复未知副作用时，TaskRun 收尾为 `inconclusive`，原因为 `single_intent_slice_finished`；整体目标判断为 `not_evaluated`。Intent 结果、verified Fact 证据、TaskRun 状态和 Sandbox 清理结果须分开输出。T5 不按 Fact 数量生成 `partial`，也不宣告 `achieved`。取消/Deadline 保留既有终态，未知副作用先走显式恢复；清理失败单列，不改写任务结论。收尾与清理的原子边界沿用 Controller 已有规则，CLI 错误/恢复格式见 T5 v1。
+
+可选 `--events` 将已提交的 SQLite 控制事件导出至 JSONL，允许按 TaskRun ID 和序号只读重放；实时导出失败不回滚已提交控制状态，须报告导出错误。T5 事件字段、2秒导出超时、退出码、resume/cancel 及 DeepSeek 传输已冻结，见下方 T5 v1；通用订阅服务仍待确认。真实模型接入不改变模型只能提出候选/动作、工具必须经过 Policy、Fact 必须先验证后原子提交的边界。
+
+T5 不将 Intent 满足映射为整题成功或找到 flag。多 Intent 尝试、失败回溯、任务目标判断与最终 TaskResult 继续留在 T6 的真实单题闭环；平台取题和 flag 提交由后续转换器另行确认。
+
 ### 模型适配器
 
-`ModelRequestType` 只有 `intent_generation` 和 `plan_generation`。Intent 请求返回有序 `IntentCandidate`；Plan 请求返回一个 `PlanCandidate`。模型不返回领域对象 ID。错误类型为 `authentication_failed`、`timed_out`、`cancelled`、`empty_response`、`refused`、`invalid_response` 和 `provider_failure`。
+`ModelRequestType` 包含 `intent_generation`、`plan_generation` 和 T4 增加的 `intent_action`。Intent 请求返回有序 `IntentCandidate`；Plan 请求返回一个 `PlanCandidate`。模型不返回领域对象 ID。错误类型为 `authentication_failed`、`timed_out`、`cancelled`、`empty_response`、`refused`、`invalid_response` 和 `provider_failure`。
 
-单次模型调用的上限是 `min(600, TaskRun 剩余秒数)`；剩余时间不大于 0 时不调用适配器。结构非法或结构化空数组最多由同一适配器纠正一次；超时、取消、认证失败、明确拒答和供应商故障不伪装成普通任务失败。
+核心调用上限是 `min(600, TaskRun 剩余秒数)`，T5 DeepSeek 适配器进一步限制至配置值且不超过180秒；剩余时间不大于 0 时不调用适配器。结构非法或结构化空数组最多由同一适配器纠正一次；超时、取消、认证失败、明确拒答和供应商故障不伪装成普通任务失败。
 
 ### MCP / Sandbox
 
@@ -44,7 +56,7 @@ SQLite 是控制面唯一事实来源。一次变更通过 `ControlMutation` 原
 
 ### 事件
 
-当前持久化事件类型冻结为 `task_run_started`、`completion_confirmation_requested`、`task_run_finished` 和 `control_state_committed`。事件 details 按操作白名单校验；基础字段为 `operation`、`entity_ids`、`result`，T4 绑定、Fact 提交和 Intent 完成增加各自已确认的 import_id、候选或支持 Fact 引用。序号由存储层生成。事件订阅、实时推送、重放和背压语义尚未冻结。
+当前持久化事件类型冻结为 `task_run_started`、`completion_confirmation_requested`、`task_run_finished` 和 `control_state_committed`。事件 details 按操作白名单校验；基础字段为 `operation`、`entity_ids`、`result`，T4 绑定、Fact 提交和 Intent 完成增加各自已确认的 import_id、候选或支持 Fact 引用。序号由存储层生成。T5 的 JSONL 导出/只读分页重放及 2 秒写入超时已冻结；通用订阅服务仍未定义。
 
 ### T2 生命周期与模拟验收协议
 
@@ -65,15 +77,15 @@ Agent 请求/结果协议与题目平台的获取/提交协议分属不同边界
 
 ## 版本、错误与取消
 
-当前控制面 schema 版本为 6；`protocol.md` 本身不是外部版本协商协议。公共 CLI、Python API、事件和 MCP 命令协议的版本号、兼容窗口和迁移策略尚未确认；后续转换器与题目平台的版本协议另行确认。T5 不要求兼容 qinyuan-bat wire protocol。
+当前控制面 schema 版本为 6；`protocol.md` 本身不是外部版本协商协议。T5 CLI 和导出事件使用 protocol_version=1；Python API、其他 MCP 及后续兼容窗口另行确认；后续转换器与题目平台的版本协议另行确认。T5 不要求兼容 qinyuan-bat wire protocol。
 
 错误必须保留发生阶段、结构化类别、证据引用和短原因。模型错误、Policy 拒绝、参数错误、环境故障、目标不匹配和未知结果分别处理；不能把所有错误压成普通任务失败。
 
-取消要求停止正在进行的副作用并完成可观察清理；T2 的正常路径先提交并重载终态，再关闭准入和清理，提交失败不触发紧急强停。当前已确认的控制面终态是 `cancelled`，Deadline 到达时是 `deadline_exceeded`，只允许依据已验证 Fact 形成 `partial/inconclusive` 结果。T2 stop 和保守恢复清理语义见上节；紧急强制清理、外部事件顺序、Artifact 保留和跨进程取消指令仍待确认。
+取消要求停止正在进行的副作用并完成可观察清理；T2 的正常路径先提交并重载终态，再关闭准入和清理，提交失败不触发紧急强停。当前已确认的控制面终态是 `cancelled`，Deadline 到达时是 `deadline_exceeded`，只允许依据已验证 Fact 形成 `partial/inconclusive` 结果。T2 stop 和保守恢复清理语义见上节；T5 保留运行目录和证据、不自动删除；跨进程取消与事件顺序见下节。紧急强制清理仍不提供。
 
 ## 待确认协议问题
 
-- 独立 Agent 的 CLI 输入、输出、同步/异步、实时事件、退出码及外部 `resume/cancel` 语义。
+- T6 完整 TaskRun 结果和多 Intent 调度；T5 v1 不覆盖这些能力。
 - Python API 的异步模型和长期兼容承诺。
 - 后续独立转换器的 Agent 调用协议、题目/附件映射、flag 交付，以及题目平台获取/提交的错误、幂等与版本边界（不属于 T5）。
 - ToolRequest、PolicyDecision、MCPCommand、SandboxExecutionRequest、ExecutionRecord、TaskResult 的字段和序列化格式。
@@ -132,3 +144,67 @@ SQLite 当前 schema 6。Plan/动作结果在控制面或工具副作用前先�
 模型 stop 和 candidate_rejected 停止循环，不提交 Intent 终态；model_error 保留模型类别，不据此失败整个 TaskRun。Policy/参数错误返回 tool_failed，保留 Gateway 已提交状态；明确环境故障根据 Gateway 动作最多显式重试一次，执行重试使用原命令；未知执行不重派。工具重试不增加模型调用计数，模型调用上限仍从独立台账恢复。
 
 无效动作使用 IntentActionRejected 的独立代码，停止本次 run，领域状态可能仍 running。依据不可变目标、已持久 Plan/动作及 Execution 归属恢复相同拒绝；同一已执行动作的重放不属于新检查。消费动作前先处理取消/Deadline，Gateway 自身的授权检查不被循环提前 Policy 校验替代。
+
+
+## T5 v1 CLI 与恢复协议（2026-09-25，逐项确认）
+
+入口为 `qinyuan-agent-new`，保留 `qinyuan-agent` 别名。同步执行，无后台任务服务。
+
+```text
+run-intent --request <JSON文件|-> --mode simulated|real --state-dir <目录> [--events <新JSONL文件>]
+           [--fixture <模拟JSON>] [--env-file <.env路径>]
+status --task-run-id <UUID> --state-dir <目录>
+replay --task-run-id <UUID> --state-dir <目录> [--after-sequence 0] [--limit 128]
+resume --task-run-id <UUID> --state-dir <目录> [--authorization <JSON文件>]
+       [--verify-import | --cleanup-only] [--events <新JSONL文件>]
+cancel --task-run-id <UUID> --state-dir <目录>
+```
+
+版本化请求示例：
+
+```json
+{
+  "protocol_version": 1,
+  "task_request": {
+    "goal": "find flag",
+    "target": {"attachments": [{"kind": "local_path", "path": ".test/t5/fixture.txt"}]},
+    "deadline_seconds": 120
+  },
+  "intent": {
+    "description": "identify file type",
+    "attachment_index": 0,
+    "sandbox_path": "/workspace/input/t5-fixture.txt"
+  },
+  "authorization": {
+    "allowed_tools": ["file.inspect_file"],
+    "allowed_paths": ["/workspace/input/t5-fixture.txt"]
+  }
+}
+```
+
+只接受一个本地附件；路径相对于调用 cwd，导入时再次检查普通文件、符号链接、范围、16 MiB 上限和摘要。授权必须精确匹配唯一工具与目标路径。本机操作者的 JSON 是 T5 可信输入；未来转换器不继承此信任。`simulated` 必须单独指定夹具，`real` 禁止夹具。通用 TaskRequest 的其他 endpoint/url 能力不由该 CLI 暴露。
+
+真实模式读取 `.env`（不修改环境或全局配置），只允许官方 `https://api.deepseek.com` 或其 `/v1` 路径，拒绝代理端点，不使用 HTTP_PROXY/HTTPS_PROXY、不跳转。请求 `/chat/completions`，JSON object 且 thinking disabled，不发送 tools；仅沿用 T4 一次结构纠正。旧 MAX_RETRIES 配置不启用网络重试。模型上下文/响应各有 64 KiB 适配器上限，输出 token 上限 1024。CLI 请求/授权 JSON 上限 1 MiB，重复键与非有限数值拒绝。这些为有界实现限制，不放宽核心契约。
+
+每次 TaskRun 使用 `state-dir/UUID/`，包含 `control.sqlite`、不可覆盖的 `run.json`、启动声明、独立 tools/imports/proofs 证据、slice/recovery 结果、cleanup 记录和操作报告。运行声明不含密钥；OS 文件锁覆盖整个写操作。状态、终态 resume、重复 cancel 和 replay 不迁移数据库，不连接模型或 Docker。只读 SQLite 使用一致快照。记录与附件不会自动过期或自动删除。
+
+stdout 每次操作输出一个 `protocol_version=1` JSON（`--help` 为帮助文字例外），包含 `task_run_id`、`mode`、`intent`、`overall_goal`、`task_run`、`cleanup`、`recovery`、`errors`、`exit_code`，使用 events 时附 `event_export`。Intent 内分列实际领域 status、evaluation、slice_result 和 Facts；model stop 可以使切片结束而 Intent 领域状态仍 running，不伪造 Intent 成功或失败。错误使用有界 code/category/phase，原始 SDK 异常、密钥不输出。子进程 stdout/stderr 不直接穿透主进程。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 切片明确停止且清理成功；不表示整题成功，也不保证 Intent 满足 |
+| 2 | 输入/配置拒绝，未启动新的 TaskRun |
+| 3 | 明确运行错误、Deadline 或事件导出错误 |
+| 4 | 结果未知/恢复必需，保留 TaskRun ID 和未知标记 |
+| 5 | 终态已提交但清理失败或尚未确认 |
+| 130 | 用户取消，外部执行结果无未知且清理成功；未完成模型响应允许丢弃 |
+
+优先级：终态清理未确认为 5；工具/导入结果未知为 4（即使取消并清理成功）；仅模型响应未完成且取消清理成功为 130；其余明确错误/导出失败为 3。普通确定切片收尾只产生 inconclusive + single_intent_slice_finished，整体目标 not_evaluated，不计算 partial/achieved。
+
+事件导出使用专用可终止进程，从 SQLite Checkpoint 水位内读取已提交事件。JSONL 字段为 protocol_version、task_run_id、sequence、type、timestamp、status、details。新文件独占创建、不覆盖；每次写入及 flush/fsync 总等待 2 秒，超时立即终止导出，SQLite 不回滚。JSONL 可能保留未确认尾行，重放以 SQLite 为准。replay 返回单个 JSON 的 events 数组及 next_sequence，after_sequence 为排他游标，limit=1..512。
+
+resume 只使用持久化 ID，不接受新的 TaskRequest。继续新工具派发必须提供当前授权文件（与上述 authorization 对象同形）。未知模型或工具结果直接返回 4、不派发；未知导入只在 `--verify-import` 时读回原路径并核对原摘要，不重新写入，也不依赖来源文件仍在。仅核验无需授权；核验后继续执行需提供 authorization。终态 resume 为只读；`--cleanup-only` 才重试清理且不要求授权。已确认不存在的容器可完成清理；重启后仍运行且旧 stop 状态无法确认时保持 5，不重复 stop。
+
+外部 cancel 写入该运行目录的取消请求，由持锁工作进程执行 Controller 的终态提交与清理；无人运行时由 cancel 取得锁并接管取消。最多等待 5 秒，尚未确认则返回 4/5。Ctrl+C/Windows Ctrl+Break 协作取消，主进程在约 4.1 秒边界终止本次 worker 及其后代，给最终只读结果和输出留出时间。Windows Job Object 在允许 worker 开始外部工作前绑定，覆盖模型/MCP 子进程；迟到模型响应不派发工具或写 Fact。该保证依赖本机进程终止和状态盘可响应，无法确认时不宣称清理成功。
+
+真实文件检查使用 `file -E`（镜像未支持旧 `--error` 长选项）。已有 T3/T4 旧固定脚本仅允许作为历史证据核对，新派发只接受修正后的精确脚本；不重写历史收据。

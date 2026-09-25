@@ -771,6 +771,17 @@ def validate_control_event(
     if any(not isinstance(key, str) for key in details):
         raise ValueError("RuntimeEvent.details keys must be strings")
     allowed_fields = {"operation", "entity_ids", "result"}
+    if operation == "finish_task_run":
+        allowed_fields.add("reason")
+        if "reason" in details and (
+            details["reason"] != "single_intent_slice_finished"
+            or event.status is not TaskRunStatus.INCONCLUSIVE
+            or len(state_changes) != 1
+            or not isinstance(state_changes[0], UpsertTaskRun)
+            or state_changes[0].status is not TaskRunStatus.INCONCLUSIVE
+            or state_changes[0].failure_reason != details["reason"]
+        ):
+            raise ValueError("invalid single Intent slice conclusion event")
     if operation == "bind_intent_goal":
         allowed_fields.add("import_id")
     if operation == "commit_verified_file_type_fact":

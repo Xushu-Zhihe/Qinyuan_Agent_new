@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 qinyuan-agent = "agent:main"
+qinyuan-agent-new = "agent:main"
 
 [tool.setuptools]
 include-package-data = true

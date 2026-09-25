@@ -257,17 +257,19 @@ class TaskRunController(LegacyTaskRunController):
         mutation_id: str | None = None,
         *,
         source_root: str | None = None,
+        task_run_id: str | None = None,
     ) -> Any:
         if self._persistent is None:
             if (
                 effective_model_backend is not None
                 or mutation_id is not None
                 or source_root is not None
+                or task_run_id is not None
             ):
                 raise InvalidTransition("persistent dependencies are required for this start signature")
             return super().start(request)
         return self._start_persistent(
-            request, effective_model_backend, mutation_id, source_root
+            request, effective_model_backend, mutation_id, source_root, task_run_id
         )
 
     def _start_persistent(
@@ -276,6 +278,7 @@ class TaskRunController(LegacyTaskRunController):
         effective_model_backend: ModelBackend | str | None,
         mutation_id: str | None,
         source_root: str | None,
+        task_run_id: str | None = None,
     ) -> CommittedOperation:
         deps = self._require_persistent()
         if self._persistent_task_run_id is not None or self._closed:
@@ -296,7 +299,10 @@ class TaskRunController(LegacyTaskRunController):
             raise TaskRequestError("TaskRequest model_backend conflicts with effective_model_backend")
         source_root = _validate_source_root(source_root)
 
-        task_run_id = str(uuid.uuid4())
+        supplied_task_id = task_run_id is not None
+        task_run_id = str(uuid.uuid4()) if task_run_id is None else _validate_mutation_id(task_run_id)
+        if supplied_task_id and deps.store.load_task_run(task_run_id) is not None:
+            raise InvalidTransition("TaskRun ID already exists; use attach")
         deps.registry.claim(task_run_id, self)
         self._registry_released = False
         sandbox_id: str | None = None
@@ -1063,8 +1069,12 @@ class TaskRunController(LegacyTaskRunController):
         self,
         status: TaskRunStatus,
         mutation_id: str | None = None,
+        *,
+        reason: str | None = None,
     ) -> Any:
         if self._persistent is None:
+            if reason is not None:
+                raise InvalidTransition("slice conclusion requires persistence")
             if mutation_id is not None:
                 raise InvalidTransition(
                     "mutation_id is only supported with persistent dependencies"
@@ -1072,10 +1082,16 @@ class TaskRunController(LegacyTaskRunController):
             return super().conclude(status)
         if status not in {TaskRunStatus.PARTIAL, TaskRunStatus.INCONCLUSIVE}:
             raise InvalidTransition("conclude only accepts partial or inconclusive")
+        if reason is not None:
+            if reason != "single_intent_slice_finished" or status is not TaskRunStatus.INCONCLUSIVE:
+                raise InvalidTransition("invalid slice conclusion")
+            if any(e.status in {ExecutionStatus.PENDING, ExecutionStatus.RUNNING}
+                   for e in self.control_state.executions):
+                raise InvalidTransition("slice has unresolved executions")
         return self._finish_public(
             status,
             mutation_id=mutation_id,
-            failure_reason=None,
+            failure_reason=reason,
         )
 
     def _require_bound_state(self) -> tuple[Any, ControlStateSnapshot]:
@@ -1128,6 +1144,11 @@ class TaskRunController(LegacyTaskRunController):
             self._assert_finish_replay(
                 replay, {status.value, TaskRunStatus.DEADLINE_EXCEEDED.value}
             )
+            if (replay.event.status is not TaskRunStatus.DEADLINE_EXCEEDED
+                    and (failure_reason == "single_intent_slice_finished"
+                         or replay.event.details.get("reason") == "single_intent_slice_finished")
+                    and replay.event.details.get("reason") != failure_reason):
+                raise IdempotencyConflictError("terminal reason differs from original commit")
             return CommittedOperation.from_commit(replay)
         self._require_persistent()
         if task_run.status in TERMINAL_STATUSES:
@@ -1185,6 +1206,7 @@ class TaskRunController(LegacyTaskRunController):
                 "operation": "finish_task_run",
                 "entity_ids": [task_run.task_run_id],
                 "result": status.value,
+                **({"reason": failure_reason} if failure_reason == "single_intent_slice_finished" else {}),
             },
         )
         mutation = ControlMutation.create(

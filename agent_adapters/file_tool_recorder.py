@@ -33,14 +33,15 @@ def _encode(value: object) -> bytes:
 
 class FileToolRecorder:
     def __init__(
-        self, directory: Path, *, sensitive_values: tuple[str, ...] = ()
+        self, directory: Path, *, sensitive_values: tuple[str, ...] = (), read_only: bool = False
     ) -> None:
         if not isinstance(sensitive_values, tuple) or any(
             not isinstance(v, str) or not v for v in sensitive_values
         ):
             raise ValueError("sensitive_values must contain non-empty strings")
         self.directory = directory.resolve()
-        self.directory.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            self.directory.mkdir(parents=True, exist_ok=True)
         self._sensitive = tuple(sorted(sensitive_values, key=len, reverse=True))
 
     def _path(self, kind: str, reference: str) -> Path:

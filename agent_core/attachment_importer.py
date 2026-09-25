@@ -27,6 +27,14 @@ from agent_core.modeling import CancellationToken
 from agent_core.runtime import TaskRunStatus
 
 
+def validate_local_attachment_source(source_root: str, local_path: str) -> None:
+    """Preflight using the same bounded source checks as dispatch.
+
+    This grants no import receipt; import_attachment reads and validates again.
+    """
+    _read_source(source_root, local_path)
+
+
 class AttachmentImportControllerPort(Protocol):
     @property
     def control_state(self) -> ControlStateSnapshot: ...

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from agent_core.file_inspection import (
     FILE_TOOL,
+    LEGACY_FILE_INSPECTION_SCRIPT,
     inspection_arguments,
     validate_inspection_path,
 )
@@ -48,3 +49,10 @@ class FileToolPolicy:
         if command != expected:
             return PolicyDecision(False, "mcp_command_rejected")
         return PolicyDecision(True, "command_authorized")
+
+    def validate_recorded_command(self, request: ToolRequest, command: MCPCommand) -> PolicyDecision:
+        """Evidence compatibility does not grant permission for a new dispatch."""
+        current = self.validate_command(request, command)
+        legacy = MCPCommand("python3", ("-I", "-c", LEGACY_FILE_INSPECTION_SCRIPT,
+                            validate_inspection_path(request.path)), request.timeout_seconds)
+        return current if current.allowed or command != legacy else PolicyDecision(True, "historical_command_verified")

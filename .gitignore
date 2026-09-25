@@ -37,6 +37,11 @@ __pycache__/
 
 .test
 tests
+!/tests/
+/tests/*
+!/tests/test_t5_cli.py
+!/tests/test_t5_adapters.py
+!/tests/test_t5_recovery.py
 Architecture.md
 interface.md
 protocol.md

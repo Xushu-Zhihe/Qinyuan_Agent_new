@@ -4,7 +4,7 @@
 
 本文整理 `Qinyuan_Agent_confirmed_flow.svg`、仓库中已经验证的实现及明确标注的后续已确认边界。
 
-2026-09-24 用户确认本项目定位为独立的自动化渗透测试 Agent，T5 调整为 CLI 与事件；后续独立转换器负责多题目获取、调用 Agent 和平台 flag 提交。该决定已同步至流程图，替代原图中可选 qinyuan-bat 转接入口的旧约定。
+2026-09-24 用户确认本项目定位为独立的自动化渗透测试 Agent。T5 分为 CLI/事件模拟检查点和真实单 Intent 文件识别两个阶段，真实模型、真实 Docker 与实际附件链路是最终验收目标；完整 TaskRun 调度及真实单题解题闭环留在 T6。后续独立转换器负责多题目获取、调用 Agent 和平台 flag 提交。该决定已同步至流程图，替代原图中可选 qinyuan-bat 转接入口的旧约定。
 
 首期控制链描述设计目标，尚未完成端到端链路。2026-09-11 用户依据已有实现及 `323 passed` 记录确认 T3 的 `ToolGateway -> Policy -> MCP -> Sandbox` 切片验收通过；真实 Docker、完整 Agent 链路、其他 MCP、Fact 验证、GoalEvaluator、CLI 均不计入 T3 完成。完整流程图中的 Stage、Procedure 和 RAG 相关能力仍是后续设计边界，不能从图形位置推导出未确认的业务规则。
 
@@ -27,7 +27,7 @@ CLI
   -> TaskResult 或下一轮 Intent
 ```
 
-CLI 和 Python API 的应用入口统一归属 `AgentApplication`，首期实际入口仍只确认 CLI。本仓库拥有 TaskRun 内的唯一调度权，内部调度、重试、状态机和业务判断由 Agent 负责；外部调用方通过待确认的公共入口调用 Agent，不复制其内部控制逻辑。T5 不实现 qinyuan-bat 专用转接。
+CLI 和 Python API 的应用入口统一归属 `AgentApplication`，首期实际入口仍只确认 CLI。本仓库拥有 TaskRun 内的唯一调度权，内部调度、重试、状态机和业务判断由 Agent 负责；外部调用方通过 protocol.md 中 T5 v1 公共入口调用 Agent，不复制其内部控制逻辑。T5 不实现 qinyuan-bat 专用转接。
 
 `RunSupervisor` 持有一次 TaskRun 的整体循环。`TaskRun` 是一道题目的一次完整解题实例，接收请求后创建全局唯一 Sandbox；该 Sandbox 被同一 TaskRun 的所有 Intent 轮复用，在完成、取消或 Deadline 后销毁。新的运行必须创建新的 TaskRun 和 Sandbox。
 
@@ -45,10 +45,28 @@ CLI 和 Python API 的应用入口统一归属 `AgentApplication`，首期实际
 
 | 组成 | 已确认职责 | 尚未确认的部分 |
 | --- | --- | --- |
-| Qinyuan_Agent_new | 独立自动化渗透；拥有 TaskRun 内的执行、证据、Fact 验证、目标判断和结果生成职责 | 完整 TaskRun 链路尚未验收，CLI 输入输出、事件、退出码及外部 `resume/cancel` 契约待确认 |
+| Qinyuan_Agent_new | 独立自动化渗透；拥有 TaskRun 内的执行、证据、Fact 验证、目标判断和结果生成职责 | 完整 TaskRun 链路留在 T6；T5 v1 CLI/事件/退出/恢复契约已确认并实现 |
 | 后续独立转换器 | 自动获取多道题目、调用 `qinyuan-agent-new`、向题目平台提交 flag | 平台与认证、题目/附件映射、调用方式、批次调度/并发/重试、提交去重、回执处理及部署方式 |
 
 转换器是后续独立交付，不属于当前 Agent 内部模块或 T5 验收范围。Agent 不依赖转换器的批次状态或平台协议；转换器也不直接改写 Agent 的控制面或驱动其内部工具链。Agent 结果与平台提交回执属于不同边界，二者的字段和状态映射需在后续协议确认时明确。
+
+## T5 两阶段接入与 T6 边界
+
+第一阶段使用现有模拟模型、真实本机 File MCP、模拟 Docker 和真实持久化验证 CLI 的输入、输出、事件、错误和取消，仅作为开发检查点。第二阶段补齐真实模型适配器及真实 Docker 附件导入，使用实际附件验证工具执行、独立证据保存、Fact 验证和当前 Intent 结果；只有实际通过该链路才达到 T5 的最终验收目标。
+
+两阶段均复用现有 Controller、IntentToolCallingLoop、ToolGateway、Policy 和证据边界。模型与 Docker 适配器位于外围，CLI 的装配归 AgentApplication，不因此引入第二套调度或扩大工具权限。真实模型入口已确认使用项目 `.env` 的 DeepSeek API，Codex CLI 本轮不接入；T5 v1 请求、超时/取消、Docker 验收附件和 CLI 字段已逐项确认，详见 protocol.md。
+
+已确认的 CLI 调用形态为同步 `qinyuan-agent-new run-intent --request <JSON 文件|->`，stdout 为一个版本化最终 JSON，可选 `--events` 导出持久化控制事件 JSONL。普通单 Intent 切片明确停止且无待恢复未知副作用时，TaskRun 以 `inconclusive` 收尾，整体目标记为 `not_evaluated`，收尾原因是 `single_intent_slice_finished`；Intent 判断与 Sandbox 清理结果独立报告。取消/Deadline 保留原终态，未知副作用先显式恢复。字段及错误/退出/恢复协议已冻结为 T5 v1，详见 protocol.md。
+
+文件类型识别成功只支持当前 Intent，不能证明“找到 flag”或完成整题。T6 才补齐多 Intent 尝试、失败回溯、任务目标判断和最终 TaskResult，并验收真实单题解题闭环；平台取题及提交 flag 仍归后续独立转换器。T1～T4 的历史模拟验收不会因本次范围确认升级为真实验收。
+
+2026-09-25 用户确认 T5 的两次历史真实效果复核通过，整体目标仍为 `not_evaluated`；本次完整独立复验因 Windows 管道/临时目录权限受阻，真实 Docker 和重新构建也受阻，不能宣告本次全部通过。历史与本次证据分别记录在 TODO。
+
+## T6 手工测试与后续独立前端
+
+2026-09-25 用户确认 T6 继续以 CLI 验收真实单题闭环，并补齐可供自行复测的请求示例、命令、预期结果及事件/证据检查步骤。具体操作随 T6 契约逐项确认，不将单 Intent 成功视为整题完成。
+
+前端单独安排在 T6 闭环稳定之后，不属于 T6 完成条件；T7 的 Stage、Procedure、RAG 继续延期。题目/附件提交、进度、执行过程与证据查看、取消/恢复是前端待讨论的功能范围，页面、部署、访问权限和调用协议均未冻结。前端通过确认后的应用边界操作 Agent，沿用既有调度、Policy、证据和生命周期所有权，不直接改写控制面；本次不新增服务端入口或传输协议。
 
 ## 模块边界与依赖方向
 
@@ -112,3 +130,10 @@ T1 新提交先在外层投影并复核整组变更后的候选状态及证据�
 `IntentToolCallingLoop.run` 从已绑定目标的 Intent 开始，采用一个单步骤 Plan，成功 Execution 后完成 Plan，再验证/提交文件类型 Fact，最后请求 Controller 仅完成 Intent。schema 6 声明与模型台账均为独立事务，不推进 Checkpoint；副作用仍经过 Controller 或 ToolGateway。已完成工具调用按原动作 ID 复用，新的重复检查被拒；未知结果不重派。模型适配器在工作线程等待，取消或 Deadline 后台账保留未知，迟到结果不产生副作用。
 
 越界、多步骤和成功检查后的新检查动作分别抛出独立拒绝码；它们停止本次 run，领域状态可能仍 running，上层必须处理，不能自动反复调用。stop、候选不支持、预算耗尽与模型错误也不自行提交 Intent 失败或 TaskRun 完成。Gateway 既有失败状态和 Controller 取消/Deadline 路径保留；明确环境故障最多一次显式重试。
+
+
+### T5 实现边界（2026-09-25）
+
+`agent.py -> agent_adapters.cli -> AgentApplication` 是本轮应用入口。父进程只负责参数校验、最终输出、事件导出和取消时限；唯一持锁 worker 组装并调用原 Controller/IntentToolCallingLoop/ToolGateway，不另建业务状态机。外部模型 HTTP 和 JSONL 文件写入使用可终止子进程；Windows Job Object 约束 worker 与其模型/MCP 后代。状态读取使用 SQLite 只读一致快照及独立证据验证。
+
+`DeepSeekModelAdapter` 使用官方 HTTPS JSON 接口、不暴露 tools、不重试网络错误；`ImportableTaskRunSandbox` 用固定程序通过 stdin 导入并读回 SHA-256，保留已有沙箱准入和执行锁。所有资源操作仍在外围。`RecordedSandbox` 记录清理成功/未确认，不能替代 TaskRun 或 Intent 结论。模拟夹具、真实配置和验收记录分开保存。T5 不实现完整 TaskResult、多 Intent 或 flag 判断。

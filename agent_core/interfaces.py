@@ -59,6 +59,9 @@ class TaskRunLifecyclePort(Protocol):
         request: TaskRequest,
         effective_model_backend: ModelBackend,
         mutation_id: str,
+        *,
+        source_root: str | None = None,
+        task_run_id: str | None = None,
     ) -> CommittedOperation: ...
 
     def attach(self, task_run_id: str) -> ControlStateSnapshot: ...
@@ -80,7 +83,7 @@ class TaskRunLifecyclePort(Protocol):
     def cancel(self, mutation_id: str) -> CommittedOperation: ...
 
     def conclude(
-        self, status: TaskRunStatus, mutation_id: str
+        self, status: TaskRunStatus, mutation_id: str, *, reason: str | None = None
     ) -> CommittedOperation: ...
 
     def recover_task_run(self, mutation_id: str) -> RecoveryResult: ...

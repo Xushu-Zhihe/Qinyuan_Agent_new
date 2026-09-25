@@ -29,9 +29,10 @@ def _encode(value: object) -> bytes:
 
 
 class FileAttachmentImportRecorder:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, *, read_only: bool = False) -> None:
         self.directory = directory.resolve()
-        self.directory.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            self.directory.mkdir(parents=True, exist_ok=True)
         self._thread_lock = RLock()
 
     @contextmanager
