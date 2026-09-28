@@ -123,20 +123,37 @@ class TurnWorkingCopy:
             consumed_failures = {
                 item.evidence_ref for item in self._state.failure_summaries
             }
-            if last.plan_validation_id not in consumed_failures:
-                raise DomainTransitionError(
-                    "previous PlanValidationRecord must be consumed before retry"
+            environment_retry = (
+                last.plan_validation_id in consumed_failures
+                and last.status is PlanValidationStatus.FAILED
+                and last.failure_type in {
+                    FailureType.ENVIRONMENT_FAULT,
+                    FailureType.STEP_TIMEOUT,
+                }
+            )
+            timeout_retry = any(
+                item.plan_id == record.plan_id
+                and item.step_index == record.step_index
+                and item.command_ref == last.command_ref
+                and item.status is ExecutionStatus.TIMED_OUT
+                and any(
+                    failure.evidence_ref == item.execution_id
+                    and failure.failure_type is FailureType.STEP_TIMEOUT
+                    for failure in self._state.failure_summaries
                 )
-            if (
-                last.status is not PlanValidationStatus.FAILED
-                or last.failure_type is not FailureType.ENVIRONMENT_FAULT
-            ):
+                for item in self._state.executions
+            )
+            if not environment_retry and not timeout_retry:
+                if last.status is PlanValidationStatus.FAILED and last.plan_validation_id not in consumed_failures:
+                    raise DomainTransitionError(
+                        "previous failed validation must be consumed before retry"
+                    )
                 raise DomainTransitionError(
-                    "only an environment fault permits command generation retry"
+                    "previous validation has no eligible command retry"
                 )
             if record.attempt != 2:
                 raise DomainTransitionError(
-                    "command generation permits only one environment retry"
+                    "command generation permits only one retry"
                 )
         return self._operation(
             "append_plan_validation_record",
@@ -212,6 +229,14 @@ class TurnWorkingCopy:
             ),
         )
 
+    def record_step_timeout(self, *, execution_id: str, output_ref: str) -> TurnOperation:
+        return self._prepare(
+            "record_step_timeout",
+            lambda manager: manager.record_step_timeout(
+                execution_id=execution_id, output_ref=output_ref
+            ).value,
+        )
+
     def record_target_mismatch(
         self, *, plan_id: str, evidence_ref: str, short_reason: str
     ) -> TurnOperation:
@@ -224,6 +249,22 @@ class TurnWorkingCopy:
                     short_reason=short_reason,
                 ).value
             ),
+        )
+
+    def mark_intent_inconclusive(self, *, intent_id: str) -> TurnOperation:
+        return self._prepare(
+            "mark_intent_inconclusive",
+            lambda manager: manager.mark_intent_inconclusive(intent_id=intent_id).value,
+        )
+
+    def record_model_error(
+        self, *, intent_id: str, short_reason: str = "model_error"
+    ) -> TurnOperation:
+        return self._prepare(
+            "record_model_error",
+            lambda manager: manager.record_model_error(
+                intent_id=intent_id, short_reason=short_reason
+            ).value,
         )
 
     def create_fact(self, fact: Fact) -> TurnOperation:
@@ -302,6 +343,7 @@ class TurnWorkingCopy:
                     if result == "task_failed"
                     else task.failure_reason,
                     source_root=task.source_root,
+                    target_network=task.target_network,
                 ),
             )
         return self._operation(operation, changes, result)

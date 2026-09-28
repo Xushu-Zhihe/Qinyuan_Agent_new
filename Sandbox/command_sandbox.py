@@ -1,0 +1,62 @@
+"""TaskRun Sandbox profile for an isolated command workspace."""
+
+from __future__ import annotations
+
+from uuid import UUID
+
+from Sandbox.task_run_sandbox import TaskRunSandbox
+
+REAPER_SCRIPT = """import os,time
+while True:
+    try: os.waitpid(-1,0)
+    except ChildProcessError: time.sleep(0.05)
+"""
+
+
+class T6TaskRunSandbox(TaskRunSandbox):
+    def __init__(self, runtime, *, private_network: str | None = None) -> None:
+        super().__init__(runtime)
+        if private_network is not None:
+            prefix = "qinyuan-t6-in-"
+            try:
+                task_id = UUID(private_network[len(prefix) :])
+            except (ValueError, AttributeError) as exc:
+                raise ValueError("invalid_t6_private_network") from exc
+            if (
+                not private_network.startswith(prefix)
+                or task_id.version != 4
+                or private_network != prefix + str(task_id)
+            ):
+                raise ValueError("invalid_t6_private_network")
+        self.private_network = private_network
+
+    def configure_target_network(self, task_run_id: str, binding) -> None:
+        self._validate_task_id(task_run_id)
+        if binding.target_url is None:
+            raise ValueError("invalid_t6_target_network_binding")
+        name = "qinyuan-t6-in-" + task_run_id
+        with self._lock:
+            if self._attempted or self._bindings or self._closed:
+                raise ValueError("t6_sandbox_already_bound")
+            if self.private_network is not None and self.private_network != name:
+                raise ValueError("t6_private_network_conflict")
+            self.private_network = name
+
+    def _spec(self) -> dict[str, object]:
+        spec = super()._spec()
+        # Timeout cleanup kills orphaned model processes too. PID 1 must reap
+        # their exit status so repeated steps cannot exhaust the process limit.
+        spec["command"] = ["python3", "-I", "-c", REAPER_SCRIPT]
+        if self.private_network is not None:
+            spec["network_mode"] = self.private_network
+        spec["tmpfs"] = {
+            "/workspace": (
+                f"rw,noexec,nosuid,nodev,size={self._settings.workspace_size},"
+                "uid=0,gid=0,mode=0755"
+            ),
+            "/workspace/work": (
+                f"rw,exec,nosuid,nodev,size={self._settings.workspace_size},"
+                "uid=10001,gid=10001,mode=0700"
+            ),
+        }
+        return spec

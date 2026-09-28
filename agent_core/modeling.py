@@ -130,6 +130,9 @@ class ModelRequest:
     correction_of_model_request_id: str | None = None
     short_reason: str | None = None
     action_context: IntentActionContext | None = None
+    registration_mutation_id: str | None = None
+    base_checkpoint_sequence: int | None = None
+    context_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.model_request_id, "model_request_id")
@@ -176,6 +179,14 @@ class ModelRequest:
                 raise ModelContractError("Intent action context belongs to another Intent")
         elif self.intent is not None or self.action_context is not None:
             raise ModelContractError("intent_generation must not include Intent context")
+        if self.request_type is not ModelRequestType.INTENT_GENERATION and any(
+            value is not None for value in (
+                self.registration_mutation_id,
+                self.base_checkpoint_sequence,
+                self.context_sha256,
+            )
+        ):
+            raise ModelContractError("registration fields require intent_generation")
 
         correction_fields = (
             self.correction_of_model_request_id,
@@ -575,18 +586,19 @@ class ModelInvocationCoordinator:
         self, request: ModelRequest
     ) -> tuple[ModelResponse | ModelError, bool] | None:
         audit = self._audit
-        if audit is not None and request.request_type is not ModelRequestType.INTENT_GENERATION:
+        if audit is not None:
             from agent_core.model_invocation_audit import (
                 ModelInvocationRecoveryRequired,
                 ModelInvocationStart,
             )
 
-            assert request.intent is not None
+            scope_id = (request.intent.intent_id if request.intent is not None
+                        else request.turn_id)
             existing = next(
                 (
                     item
                     for item in audit.list_model_invocations(
-                        request.task_run_id, request.intent.intent_id
+                        request.task_run_id, scope_id
                     )
                     if item.start.model_request_id == request.model_request_id
                 ),
@@ -595,11 +607,15 @@ class ModelInvocationCoordinator:
             start = ModelInvocationStart(
                 request.model_request_id,
                 request.task_run_id,
-                request.intent.intent_id,
+                scope_id,
                 request.request_type,
                 request.action_context.plan_id if request.action_context else None,
                 request.correction_of_model_request_id,
                 existing.start.started_at if existing is not None else self._clock(),
+                request.registration_mutation_id,
+                request.base_checkpoint_sequence,
+                request.context_sha256,
+                request.turn_target if request.request_type is ModelRequestType.INTENT_GENERATION else None,
             )
             previous = audit.begin_model_invocation(start)
             if previous is not None:
@@ -634,11 +650,9 @@ class ModelInvocationCoordinator:
             except StructuredResponseValidationError as issue:
                 result = ModelError(kind=issue.kind, short_reason=issue.short_reason)
                 kind = "invalid_structure"
-        if audit is not None and request.request_type is not ModelRequestType.INTENT_GENERATION:
+        if audit is not None:
             from agent_core.model_invocation_audit import ModelInvocationCompletion
 
-            assert kind != "intent_generation"
-            assert isinstance(result, (PlanGenerationResponse, IntentActionResponse, ModelError))
             audit.complete_model_invocation(
                 ModelInvocationCompletion(request.model_request_id, self._clock(), kind, result)
             )
@@ -689,11 +703,12 @@ class ModelInvocationCoordinator:
         short_reason: str,
     ) -> ModelRequest:
         correction_id = str(uuid.uuid4())
-        if self._audit is not None and request.intent is not None:
+        if self._audit is not None:
+            scope_id = request.intent.intent_id if request.intent is not None else request.turn_id
             previous = [
                 item.start.model_request_id
                 for item in self._audit.list_model_invocations(
-                    request.task_run_id, request.intent.intent_id
+                    request.task_run_id, scope_id
                 )
                 if item.start.correction_of_model_request_id == request.model_request_id
             ]

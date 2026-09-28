@@ -38,6 +38,7 @@ from agent_core.tool_gateway import ToolGateway
 from agent_core.tool_policy import FileToolPolicy
 from agent_core.turn_manager import TurnManager
 from agent_core.turn_working_copy import TurnWorkingCopy
+from Sandbox.target_network import T6TargetNetworkError
 from Sandbox.task_run_sandbox import TaskRunSandboxError
 from Sandbox.tool_runtime import TaskRunToolRuntime
 
@@ -68,6 +69,9 @@ class RecordedSandbox:
 
     def create(self, task_run_id):
         return self.sandbox.create(task_run_id)
+
+    def configure_target_network(self, task_run_id, binding):
+        return self.sandbox.configure_target_network(task_run_id, binding)
 
     def bind(self, task_run_id, sandbox_id, *, terminal):
         return self.sandbox.bind(task_run_id, sandbox_id, terminal=terminal)
@@ -485,6 +489,13 @@ def safe_error(exc):
             "outcome": exc.outcome,
             "task_run_id": exc.task_run_id,
             "sandbox_ids": list(exc.sandbox_ids),
+        }
+    if isinstance(exc, T6TargetNetworkError):
+        return {
+            "code": "target_network_error",
+            "phase": exc.phase,
+            "outcome": exc.outcome,
+            "resource_ids": list(exc.resource_ids),
         }
     if isinstance(exc, AttachmentImportRejected):
         return {"code": "attachment_rejected", "reason": exc.code}

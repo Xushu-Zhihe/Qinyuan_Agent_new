@@ -677,7 +677,7 @@ def test_unknown_execution_outcome_makes_the_plan_inconclusive() -> None:
     assert manager.failures[-1].failure_type is FailureType.OUTCOME_UNKNOWN
 
 
-def test_model_error_fails_the_turn_and_task_run() -> None:
+def test_model_error_preserves_the_turn_and_task_run() -> None:
     manager, evidence, _ = make_manager()
     turn, intents = register_turn(manager, intent_specs=(("intent-a", 1),))
     manager.select_next_intent(turn.turn_id)
@@ -694,11 +694,11 @@ def test_model_error_fails_the_turn_and_task_run() -> None:
     )
     assert manager.record_command_generation_failure(
         plan_validation_id="validation-1",
-    ) is FailureAction.TASK_FAILED
-    assert manager.plans["plan-1"].status is PlanStatus.FAILED
-    assert intents[0].status is IntentStatus.FAILED
-    assert turn.status is TurnStatus.FAILED
-    assert manager._controller.task_run.status is TaskRunStatus.FAILED
+    ) is FailureAction.MODEL_ERROR
+    assert manager.plans["plan-1"].status is PlanStatus.RUNNING
+    assert intents[0].status is IntentStatus.RUNNING
+    assert turn.status is TurnStatus.RUNNING
+    assert manager._controller.task_run.status is TaskRunStatus.RUNNING
 
 
 def test_verified_fact_completes_its_intent_and_turn() -> None:

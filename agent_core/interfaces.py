@@ -33,6 +33,7 @@ from agent_core.modeling import (
     ModelResponse,
 )
 from agent_core.runtime import SandboxPort, TaskRunSandboxPort, TaskRunStatus
+from agent_core.supervisor_contracts import IntentRunnerPort
 from agent_core.intent_loop import IntentLoopResult
 from agent_core.tool_contracts import (
     ScopedToolGatewayPort, ToolPolicyPort, ToolCommandPlannerPort,
@@ -142,7 +143,9 @@ class IntentToolCallingLoopPort(Protocol):
 
 
 class RunSupervisorPort(Protocol):
-    """Owns the TaskRun loop; scheduling and stop semantics remain pending."""
+    """Owns the T6 TaskRun loop and depth-first stop semantics."""
+
+    async def run(self, cancellation_token: CancellationToken | None = None) -> object: ...
 
 
 class StagePlannerPort(Protocol):
@@ -218,6 +221,7 @@ __all__ = [
     "ProcedureRunnerPort",
     "ProcedureSelectorPort",
     "RunSupervisorPort",
+    "IntentRunnerPort",
     "SandboxRuntimePort",
     "StagePlannerPort",
     "PlanValidationEvidencePort",

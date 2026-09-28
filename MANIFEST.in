@@ -1,0 +1,6 @@
+prune tests
+prune .test
+prune runner-smoke-data
+prune MCPs/Dirsearch_Mcp/test
+recursive-include frontend *.html *.js *.css
+global-exclude *.pyc __pycache__

@@ -28,6 +28,7 @@ from agent_core import (
     TaskRunNotFoundError,
     TaskRunSnapshot,
     TaskRunStatus,
+    TargetNetworkBinding,
     SqliteControlStore,
     ExecutionStatus,
     IntentStatus,
@@ -202,6 +203,74 @@ def controller_database_path() -> Path:
         / "runtime-work"
         / f"controller-{uuid4()}.sqlite3"
     )
+
+
+def test_t6_target_resources_bind_atomically_and_cleanup_after_sandbox() -> None:
+    calls: list[str] = []
+
+    class NetworkSandbox(FakeSandbox):
+        def configure_target_network(self, task_run_id, binding):
+            calls.append("sandbox_configure")
+            assert binding.target_url == "http://example.test:8080"
+
+        def create(self, task_run_id):
+            calls.append("sandbox_create")
+            return super().create(task_run_id)
+
+        def destroy(self, sandbox_id):
+            calls.append("sandbox_destroy")
+            return super().destroy(sandbox_id)
+
+        def bind(self, task_run_id, sandbox_id, *, terminal):
+            calls.append("sandbox_bind")
+
+        def quiesce(self, sandbox_id):
+            calls.append("sandbox_quiesce")
+
+    class Network:
+        def create(self, task_run_id, target_url):
+            calls.append("network_create")
+            return TargetNetworkBinding(
+                "a" * 64, "b" * 64, "c" * 64, "d" * 64, target_url
+            )
+
+        def bind(self, task_run_id, binding, *, terminal):
+            calls.append("network_bind")
+
+        def destroy(self, task_run_id, binding):
+            calls.append("network_destroy")
+
+    clock = FakeClock()
+    sandbox = NetworkSandbox()
+    network = Network()
+    with SqliteControlStore.open(controller_database_path(), clock=clock) as store:
+        repository = ControlStateRepository(store, EmptyEvidence())
+        controller = TaskRunController(
+            sandbox,
+            clock=clock,
+            store=store,
+            repository=repository,
+            registry=TaskRunControllerRegistry(),
+            target_network_adapter=network,
+        )
+        task_id = str(uuid4())
+        controller.start(request(), ModelBackend.CODEX_CLI, str(uuid4()), task_run_id=task_id)
+        assert calls[:3] == ["network_create", "sandbox_configure", "sandbox_create"]
+        assert store.load_task_run(task_id).target_network.forwarder_id == "c" * 64
+
+        resumed = TaskRunController(
+            NetworkSandbox(),
+            clock=clock,
+            store=store,
+            repository=repository,
+            registry=TaskRunControllerRegistry(),
+            target_network_adapter=network,
+        )
+        resumed.attach(task_id)
+        assert calls.index("network_bind") < calls.index("sandbox_bind")
+        controller.conclude(TaskRunStatus.INCONCLUSIVE, str(uuid4()))
+        assert calls[-3:] == ["sandbox_quiesce", "sandbox_destroy", "network_destroy"]
+        controller.close()
 
 
 @pytest.fixture

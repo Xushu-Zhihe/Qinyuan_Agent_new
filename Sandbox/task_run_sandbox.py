@@ -140,8 +140,9 @@ class TaskRunSandbox:
         host = attrs.get("HostConfig") or {}
         net = attrs.get("NetworkSettings") or {}
         labels = config.get("Labels") or {}
+        expected_network = self._spec()["network_mode"]
         expected_host = {
-            "NetworkMode": "none",
+            "NetworkMode": expected_network,
             "ReadonlyRootfs": True,
             "Privileged": False,
             "AutoRemove": False,
@@ -158,7 +159,7 @@ class TaskRunSandbox:
             or attrs.get("Image") != self._image()
             or config.get("User") != "10001:10001"
             or config.get("WorkingDir") != "/workspace"
-            or config.get("Cmd") != ["sleep", "infinity"]
+            or config.get("Cmd") != self._spec()["command"]
             or config.get("Volumes")
             or any(host.get(k) != v for k, v in expected_host.items())
             or any(
@@ -177,7 +178,7 @@ class TaskRunSandbox:
             )
             or host.get("PidMode") == "host"
             or host.get("IpcMode") == "host"
-            or set((net.get("Networks") or {}).keys()) != {"none"}
+            or set((net.get("Networks") or {}).keys()) != {expected_network}
             or any((net.get("Ports") or {}).values())
             or any(m.get("Type") != "tmpfs" for m in attrs.get("Mounts", ()))
         )

@@ -18,7 +18,7 @@ CLI
   -> direct ModelReasoner
   -> Scoped ToolGateway
   -> Policy
-  -> MCP Manager
+  -> 专用 MCP Manager 或直接 Bash
   -> 同一个 Sandbox 执行实际 command
   -> ExecutionRecorder
   -> FactVerifier
@@ -35,7 +35,7 @@ CLI 和 Python API 的应用入口统一归属 `AgentApplication`，首期实际
 
 `ModelReasoner` 生成已确认的 Intent、Plan 或单项 Intent 动作候选。模型不能直接执行命令、写入控制面或提交 Fact；模型调用经过现有供应商无关 `ModelAdapter`、截止时间、取消、结构校验和一次纠正流程。首期只实现 direct 路径。
 
-工具调用沿单向边界流动：`ToolGateway -> Policy -> MCP Manager -> Sandbox`。Policy 必须在产生副作用前完成权限和目标范围检查。MCP 负责把工具请求转换为实际 command；命令在 TaskRun 的同一 Sandbox 中执行。环境故障、MCP/Sandbox/Docker 故障和目标任务失败必须由执行记录区分，环境故障不能直接加入策略失败集合。
+工具调用沿单向边界流动：专用 MCP 工具使用 `ToolGateway -> Policy -> MCP Manager -> Sandbox`；通用脚本使用 `T6CommandGateway -> Policy -> Sandbox`，由可信侧构造唯一 `bash -c` argv，绕过 MCP。Policy 必须在产生副作用前完成权限和目标范围检查。两条路径都在 TaskRun 的同一 Sandbox 中执行，环境故障、Sandbox/Docker 故障和目标任务失败必须由执行记录区分，环境故障不能直接加入策略失败集合。
 
 `ExecutionRecorder` 保存执行记录、stdout/stderr 和 Artifact 引用。原始输出不能直接成为 Fact。`FactVerifier` 依据后置条件、证据、目标范围和时效验证候选 Fact；只有验证后的事实才能由 `AtomicCommitter` 与事件、Checkpoint 一起原子提交。SQLite 控制面是已冻结状态的事实来源，内存只缓存已提交快照。
 
@@ -121,7 +121,9 @@ StagePlanner、ProcedureSelector、ProcedureRunner 和 RAG 只保留边界。它
 
 自动重载失败后，当前 Registry 所有者可调用 `reload_state()`，经 Repository 重新读取并复核完整状态和外部证据，成功后恢复缓存。该入口不写库、不调用 Sandbox；终态清理和释放注册仍分别调用 `cleanup_sandbox()`、`close()`。失败保留缓存失效及现有所有权，业务重放不承担恢复职责。
 
-SQLite 保存 `TaskRun / Turn / Intent / Plan / PlanStep / Execution / Fact / FailureSummary / PlanValidationRecord / RuntimeEvent / Checkpoint`；schema 2 增加一对一 `intent_goals` 表，schema 3 为 TaskRun 增加可空且不可变的 `source_root`，schema 4 为 Fact 增加不可变、可空的 `verification_ref`，schema 5 增加独立的 `model_invocations` 调用台账，schema 6 增加 `intent_plan_applications` 和 `intent_action_applications`，在副作用前固定 Plan、ToolRequest、证明、Fact 与 mutation ID。旧库逐版原子迁移并保留原记录；旧 Intent 不自动补目标，旧 TaskRun 不补猜来源目录，旧 Fact 不补造证明，旧模型调用不回填。控制状态、一个事件和一个 Checkpoint 在同一事务提交；模型调用开始/完成在独立事务记录，不推进控制面 Checkpoint。数据库不保存实际 command、stdout/stderr、附件内容、Token 或模型原始响应。
+SQLite 保存 `TaskRun / Turn / Intent / Plan / PlanStep / Execution / Fact / FailureSummary / PlanValidationRecord / RuntimeEvent / Checkpoint`；schema 2 增加一对一 `intent_goals` 表，schema 3 为 TaskRun 增加可空且不可变的 `source_root`，schema 4 为 Fact 增加不可变、可空的 `verification_ref`，schema 5 增加独立的 `model_invocations` 调用台账，schema 6 增加 `intent_plan_applications` 和 `intent_action_applications`，在副作用前固定 Plan、ToolRequest、证明、Fact 与 mutation ID；schema 7 增加目标网络绑定，schema 8 增加轮级 `turn_model_invocations` 台账，schema 9 允许同一 Intent 串行保存多个有序短 Plan，schema 10 增加 T6 模型动作元数据台账，固定上下文摘要与资源 ID，结果只存证据摘要。旧库逐版原子迁移并保留原记录；旧 Intent 不自动补目标，旧 TaskRun 不补猜来源目录，旧 Fact 不补造证明，旧模型调用不回填。控制状态、一个事件和一个 Checkpoint 在同一事务提交；模型调用开始/完成在独立事务记录，不推进控制面 Checkpoint。数据库不保存实际 command、stdout/stderr、附件内容、Token、T6 脚本、stdin、候选原文或模型原始响应。
+
+T6-5 外层入口为 `run-task` v2：`TaskApplication` 将受审计的有序 Intent 生成、`RunSupervisor`、`IncrementalIntentRunner`、通用脚本 Gateway、短 Plan 条件验证与候选证据组装在同一 TaskRun 内。模拟和真实模式共用控制状态及证据规则；T6-6 接入单一公网目标的 TaskRun 专属隔离转发，零附件目标题也可启动。`TaskResult` 从只读控制快照与证据重建，区分 verified 观察 Fact、pending 候选、暂停、恢复要求和清理结果；无独立答案校验器时整体目标固定为 `not_evaluated`。工作台已接入该 `run-task --mode real`，只负责启动、取消和只读投影，不拥有或改写控制面状态。真实目标网络待用户验收。
 
 T1 新提交先在外层投影并复核整组变更后的候选状态及证据；Store 在事务中检查修改前后的归属、不变父级和运行状态组合。SQLite 不调用证据服务。已提交 mutation 的重放只读取首次提交结果，不查询证据或重复 Sandbox 副作用。提交后重载失败明确报告已提交及缓存失效；更强证据保留保证不属于当前控制面契约，详见 `protocol.md`。
 
@@ -137,3 +139,17 @@ T1 新提交先在外层投影并复核整组变更后的候选状态及证据�
 `agent.py -> agent_adapters.cli -> AgentApplication` 是本轮应用入口。父进程只负责参数校验、最终输出、事件导出和取消时限；唯一持锁 worker 组装并调用原 Controller/IntentToolCallingLoop/ToolGateway，不另建业务状态机。外部模型 HTTP 和 JSONL 文件写入使用可终止子进程；Windows Job Object 约束 worker 与其模型/MCP 后代。状态读取使用 SQLite 只读一致快照及独立证据验证。
 
 `DeepSeekModelAdapter` 使用官方 HTTPS JSON 接口、不暴露 tools、不重试网络错误；`ImportableTaskRunSandbox` 用固定程序通过 stdin 导入并读回 SHA-256，保留已有沙箱准入和执行锁。所有资源操作仍在外围。`RecordedSandbox` 记录清理成功/未确认，不能替代 TaskRun 或 Intent 结论。模拟夹具、真实配置和验收记录分开保存。T5 不实现完整 TaskResult、多 Intent 或 flag 判断。
+
+### T6-3 有序 Intent 生成边界（2026-09-26）
+
+`OrderedIntentGenerator` 从已提交的有界 Fact/目标失败上下文建立 direct 模型请求。schema 8 的轮级台账在调用前固定模型请求、Checkpoint、上下文摘要、Turn 注册 mutation 与目标；一次结构纠正的调用分别审计。候选及错误在单次完成事务中保存，候选不设置数量上限。保存的成功结果经当前状态与上下文复核后，使用固定 mutation 将有序 Turn/Intent、事件及 Checkpoint 经 Controller 原子注册。结果已保存而注册未完成时只重用结果；调用已开始但结果未保存时停止派发，等待显式恢复。取消、Deadline 或控制状态变化后的旧结果不得注册。该入口已由 T6-5 `run-task` 和工作台真实模式组装；它不负责 TaskRun 的答案判断。
+
+### T6-4 深度优先调度边界（2026-09-26）
+
+`RunSupervisor` 读取已提交快照，按 Turn sequence 和 Intent priority 顺序选择一个 Intent，先经 Controller 原子提交 `running`，再调用 `IntentRunnerPort`。Runner 只返回带 TaskRun/Intent 归属的结构化结果；调度器不执行工具、不解析模型文本、不凭退出码判断目标。
+
+完整证据确认目标不匹配时，当前 Intent/Plan 记为失败并继续同一 Turn 的兄弟候选；候选全部失败后由显式生成器注册下一独立 Turn，生成器读取已提交 Fact 和分类失败摘要，不新增 `parent_turn_id`。结果未知分为两类：仍有 running Execution 或未完成工具收据时返回 `recovery_required`，保持原始 running 状态并禁止继续派发；Execution 已结束但后置条件无法判断时才将 Intent/Turn 标为 `inconclusive`。模型错误保留有界原因并写入失败摘要，Intent/Turn/TaskRun 均保持原状态，停止调度且不尝试兄弟候选。该调度切片已由 T6-5 `run-task` 接入；工作台只显示其持久化状态，GoalEvaluator/独立答案校验器仍未配置。
+
+已提交的模型错误摘要是该 Intent 的停止标记；恢复时 `RunSupervisor` 只读返回相同原因，不再次调用 Runner/模型，也不选择兄弟候选。
+
+已处于 `inconclusive` 的最新 Turn 也是停止标记；再次调度只读返回暂停结果，不生成新 Turn。轮级模型错误由持久调用台账复用，未应用的成功结果以原固定 ID 注册，不重复调用模型。

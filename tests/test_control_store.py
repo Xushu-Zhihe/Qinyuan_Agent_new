@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from agent_core import (
     StorageError,
     TaskRequest,
     TaskRunStatus,
+    TargetNetworkBinding,
     IntentStatus,
     UpsertIntent,
     UpsertTaskRun,
@@ -57,6 +59,7 @@ def make_start_mutation(
     base_checkpoint_sequence: int = 0,
     sandbox_id: str = "sandbox-1",
     source_root: str | None = None,
+    target_network: TargetNetworkBinding | None = None,
     started_at: float = 1_700_000_000.0,
     event_timestamp: float = 1_700_000_000.0,
     operation: str = "start_task_run",
@@ -73,6 +76,7 @@ def make_start_mutation(
         status=TaskRunStatus.RUNNING,
         sandbox_id=sandbox_id,
         source_root=source_root,
+        target_network=target_network,
     )
     return ControlMutation.create(
         task_run_id=task_run_id,
@@ -191,7 +195,7 @@ def test_open_creates_parent_and_applies_confirmed_pragmas(
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_versions"
-            ).fetchone()[0] == 6
+            ).fetchone()[0] == 10
             assert connection.execute(
                 "SELECT COUNT(*) FROM intent_goals"
             ).fetchone()[0] == 0
@@ -224,6 +228,7 @@ def test_schema_1_upgrade_preserves_committed_control_state(
         state = upgraded.load_control_state_rows("task-run-1")
         assert state is not None
         assert state.task_run.source_root is None
+        assert state.task_run.target_network is None
         assert state.task_run.request.goal == mutation.request.goal
         assert upgraded.commit(mutation).replayed is True
         verification = sqlite3.connect(database_path)
@@ -239,7 +244,7 @@ def test_schema_1_upgrade_preserves_committed_control_state(
             ) == old_checkpoint_row
             assert verification.execute(
                 "SELECT version FROM schema_versions ORDER BY version"
-            ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,)]
+            ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)]
             assert verification.execute(
                 "SELECT COUNT(*) FROM intent_goals"
             ).fetchone()[0] == 0
@@ -286,7 +291,7 @@ def test_schema_2_upgrade_adds_nullable_source_root_without_losing_state(
             ] == old_task_row
             assert verification.execute(
                 "SELECT version FROM schema_versions ORDER BY version"
-            ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,)]
+            ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)]
             assert verification.execute(
                 "SELECT source_root FROM task_runs WHERE task_run_id = ?",
                 ("task-run-1",),
@@ -456,9 +461,67 @@ def test_schema_3_upgrade_preserves_legacy_fact_without_verification_ref(
         ).fetchone() == ("legacy fact", "verified", None)
         assert verification.execute(
             "SELECT version FROM schema_versions ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)]
     finally:
         verification.close()
+
+
+def test_schema_8_upgrade_preserves_plan_children_and_allows_next_sequence(
+    database_path: Path,
+) -> None:
+    import agent_core.sqlite_control_store as sqlite_store_module
+
+    clock = FakeUtcClock()
+    with closing(sqlite3.connect(database_path, isolation_level=None)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        for version in range(1, 9):
+            connection.executescript(getattr(sqlite_store_module, f"MIGRATION_{version}"))
+            connection.execute(
+                "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                (version, clock.now),
+            )
+        seed_legacy_start(connection, make_start_mutation())
+        connection.execute(
+            "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?)",
+            ("turn-1", "task-run-1", 1, "inspect", '["intent-1"]', "running"),
+        )
+        connection.execute(
+            "INSERT INTO intents VALUES (?, ?, ?, ?, ?, ?)",
+            ("intent-1", "turn-1", "inspect", 1, None, "running"),
+        )
+        connection.execute(
+            "INSERT INTO plans VALUES (?, ?, ?)",
+            ("plan-1", "intent-1", "completed"),
+        )
+        connection.execute(
+            "INSERT INTO plan_steps VALUES (?, ?, ?)",
+            ("plan-1", 0, "probe"),
+        )
+        connection.execute(
+            "INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?)",
+            ("execution-1", "plan-1", 0, "command-1", "succeeded", "output-1"),
+        )
+        connection.execute(
+            "INSERT INTO facts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("fact-1", "turn-1", "observation", "execution-1", "verified", 1, 0, None),
+        )
+
+    with open_store(database_path, clock) as upgraded:
+        state = upgraded.load_control_state_rows("task-run-1")
+        assert state is not None
+        assert state.plans[0].plan_id == "plan-1"
+        assert state.executions[0].plan_id == "plan-1"
+        assert state.facts[0].source_ref == "execution-1"
+        with closing(sqlite3.connect(database_path, isolation_level=None)) as verification:
+            verification.execute("PRAGMA foreign_keys = ON")
+            assert verification.execute("PRAGMA foreign_key_check").fetchall() == []
+            assert verification.execute(
+                "SELECT sequence FROM plans WHERE plan_id = 'plan-1'"
+            ).fetchone() == (1,)
+            verification.execute(
+                "INSERT INTO plans(plan_id, intent_id, sequence, status) VALUES (?, ?, ?, ?)",
+                ("plan-2", "intent-1", 2, "pending"),
+            )
 
 
 def test_schema_4_upgrade_failure_preserves_schema_3(
@@ -852,3 +915,36 @@ def test_committed_source_root_cannot_be_replaced(
         with pytest.raises(StorageError, match="immutable TaskRun"):
             store.commit(invalid)
         assert store.load_task_run("task-run-1").source_root == "C:\\source"
+
+
+def test_target_network_binding_commits_with_task_and_is_immutable(
+    database_path: Path,
+) -> None:
+    binding = TargetNetworkBinding(
+        private_network_id="a" * 64,
+        egress_network_id="b" * 64,
+        forwarder_id="c" * 64,
+        configuration_sha256="d" * 64,
+        target_url="http://example.test:8080",
+    )
+    with open_store(database_path, FakeUtcClock()) as store:
+        store.commit(make_start_mutation(target_network=binding))
+        assert store.load_task_run("task-run-1").target_network == binding
+        invalid = make_start_mutation(
+            mutation_id=str(uuid.uuid4()),
+            base_checkpoint_sequence=1,
+            target_network=None,
+        )
+        with pytest.raises(StorageError, match="immutable TaskRun"):
+            store.commit(invalid)
+        assert store.load_task_run("task-run-1").target_network == binding
+
+    connection = sqlite3.connect(database_path)
+    try:
+        row = connection.execute(
+            "SELECT target_network_json FROM task_runs WHERE task_run_id=?",
+            ("task-run-1",),
+        ).fetchone()
+        assert row is not None and row[0] == canonical_json(binding.to_dict())
+    finally:
+        connection.close()

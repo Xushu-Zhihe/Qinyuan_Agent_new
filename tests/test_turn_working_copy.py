@@ -32,7 +32,6 @@ from agent_core import (
     PlanStep,
     PlanValidationRecordDraft,
     PlanValidationStatus,
-    SandboxCleanupError,
     SqliteControlStore,
     StaleControlStateError,
     StorageError,
@@ -302,6 +301,29 @@ def test_success_chain_is_committed_and_recoverable_without_new_sandbox(scenario
     assert s.sandbox.calls == ["create", "destroy"]
 
 
+def test_serial_short_plans_keep_order_and_survive_reopen(scenario):
+    s = scenario
+    intent_id = s.start_plan("probe-1")
+    with pytest.raises(DomainTransitionError, match="previous Plan must be completed"):
+        s.work.register_plan(Plan("probe-2", intent_id, (PlanStep("next probe"),)))
+
+    s.succeed_execution("execution-1", plan_id="probe-1")
+    s.commit(s.work.register_plan(Plan("probe-2", intent_id, (PlanStep("next probe"),))))
+    s.commit(s.work.start_plan("probe-2"))
+    s.succeed_execution("execution-2", plan_id="probe-2")
+    s.reopen()
+
+    assert [item.plan_id for item in s.state.plans] == ["probe-1", "probe-2"]
+    assert [item.status for item in s.state.plans] == [
+        PlanStatus.COMPLETED, PlanStatus.COMPLETED,
+    ]
+    with sqlite3.connect(s.path) as connection:
+        assert connection.execute(
+            "SELECT plan_id, sequence FROM plans WHERE intent_id = ? ORDER BY sequence",
+            (intent_id,),
+        ).fetchall() == [("probe-1", 1), ("probe-2", 2)]
+
+
 def test_same_prepared_delta_replays_but_changed_content_conflicts(scenario):
     s = scenario
     s.start_plan()
@@ -360,18 +382,18 @@ def test_failure_transaction_rolls_back_every_parent_summary_event_and_checkpoin
     assert s.sandbox.calls == ["create"]
     monkeypatch.setattr(s.store, "_insert_event", original)
     result = s.commit(operation)
-    assert result.value == "task_failed"
+    assert result.value == "model_error"
     assert result.commit.event.type == "control_state_committed"
-    assert s.state.task_run.status is TaskRunStatus.FAILED
-    assert s.state.task_run.finished_at == s.clock.now
-    assert s.state.plans[0].status is PlanStatus.FAILED
-    assert s.state.intents[0].status is IntentStatus.FAILED
-    assert s.state.turns[0].status is TurnStatus.FAILED
+    assert s.state.task_run.status is TaskRunStatus.RUNNING
+    assert s.state.task_run.finished_at is None
+    assert s.state.plans[0].status is PlanStatus.RUNNING
+    assert s.state.intents[0].status is IntentStatus.RUNNING
+    assert s.state.turns[0].status is TurnStatus.RUNNING
     assert s.counts() == tuple(value + 1 for value in counts)
-    assert s.sandbox.calls == ["create", "destroy"]
+    assert s.sandbox.calls == ["create"]
 
 
-def test_terminal_commit_replay_does_not_repeat_failed_cleanup(scenario):
+def test_model_error_replay_does_not_trigger_cleanup(scenario):
     s = scenario
     s.start_plan()
     record = s.validation(failure=FailureType.MODEL_ERROR)
@@ -379,14 +401,12 @@ def test_terminal_commit_replay_does_not_repeat_failed_cleanup(scenario):
     operation = s.work.record_command_generation_failure(
         plan_validation_id=record.plan_validation_id
     )
-    s.sandbox.fail_destroy = True
     mutation_id = str(uuid4())
-    with pytest.raises(SandboxCleanupError):
-        s.commit(operation, mutation_id)
+    first = s.commit(operation, mutation_id)
+    assert first.value == "model_error"
     counts = s.counts()
     calls = list(s.sandbox.calls)
-    assert s.state.task_run.status is TaskRunStatus.FAILED
-    s.sandbox.fail_destroy = False
+    assert s.state.task_run.status is TaskRunStatus.RUNNING
     assert s.commit(operation, mutation_id).commit.replayed
     assert s.counts() == counts
     assert s.sandbox.calls == calls
@@ -520,6 +540,69 @@ def test_execution_retry_is_bounded_across_restarts(scenario, retry_result):
     assert s.sandbox.calls == ["create"]
 
 
+def test_t6_step_timeout_allows_one_changed_command_across_restart(scenario):
+    s = scenario
+    s.start_plan()
+    first, _ = s.create_execution()
+    s.commit(s.work.start_execution(first.execution_id))
+    assert s.commit(
+        s.work.record_step_timeout(
+            execution_id=first.execution_id,
+            output_ref=s.output(first.execution_id),
+        )
+    ).value == "retry_step_command"
+    s.reopen()
+
+    second_validation = replace(
+        s.validation("validation-2", attempt=2),
+        command_ref="command-adjusted",
+    )
+    s.evidence.commands.add(second_validation.command_ref)
+    s.commit(s.work.append_plan_validation_record(second_validation))
+    second = Execution("execution-2", "plan-1", 0, second_validation.command_ref)
+    s.commit(
+        s.work.create_execution(
+            second, plan_validation_id=second_validation.plan_validation_id
+        )
+    )
+    s.commit(s.work.start_execution(second.execution_id))
+    assert s.commit(
+        s.work.record_step_timeout(
+            execution_id=second.execution_id,
+            output_ref=s.output(second.execution_id),
+        )
+    ).value == "try_next_intent"
+    s.reopen()
+    assert s.state.intents[0].status is IntentStatus.FAILED
+    assert s.state.plans[0].status is PlanStatus.FAILED
+    assert [item.failure_type for item in s.state.failure_summaries] == [
+        FailureType.STEP_TIMEOUT,
+        FailureType.STEP_TIMEOUT,
+    ]
+
+
+def test_t6_mcp_budget_timeout_counts_without_docker_execution(scenario):
+    s = scenario
+    s.start_plan()
+    first = s.validation("validation-budget-1", failure=FailureType.STEP_TIMEOUT)
+    s.commit(s.work.append_plan_validation_record(first))
+    assert s.commit(
+        s.work.record_command_generation_failure(plan_validation_id=first.plan_validation_id)
+    ).value == "retry_step_command"
+    assert not s.state.executions
+    s.reopen()
+
+    second = s.validation(
+        "validation-budget-2", attempt=2, failure=FailureType.STEP_TIMEOUT
+    )
+    s.commit(s.work.append_plan_validation_record(second))
+    assert s.commit(
+        s.work.record_command_generation_failure(plan_validation_id=second.plan_validation_id)
+    ).value == "try_next_intent"
+    assert not s.state.executions
+    assert s.state.intents[0].status is IntentStatus.FAILED
+
+
 def test_execution_serialization_also_applies_to_different_steps(scenario):
     s = scenario
     s.start_plan(steps=2)
@@ -538,7 +621,7 @@ def test_execution_serialization_also_applies_to_different_steps(scenario):
         (FailureType.POLICY_REJECTED, PlanStatus.FAILED),
         (FailureType.PARAMETER_ERROR, PlanStatus.FAILED),
         (FailureType.OUTCOME_UNKNOWN, PlanStatus.INCONCLUSIVE),
-        (FailureType.MODEL_ERROR, PlanStatus.FAILED),
+        (FailureType.MODEL_ERROR, PlanStatus.RUNNING),
     ],
 )
 @pytest.mark.parametrize("phase", ["command", "execution"])
@@ -573,7 +656,9 @@ def test_failure_routing_is_atomic_and_only_target_mismatch_enters_context(
         == ()
     )
     if failure is FailureType.MODEL_ERROR:
-        assert s.state.task_run.status is TaskRunStatus.FAILED
+        assert s.state.task_run.status is TaskRunStatus.RUNNING
+        assert s.state.intents[0].status is IntentStatus.RUNNING
+        assert s.state.turns[0].status is TurnStatus.RUNNING
     else:
         selected = s.commit(s.work.select_next_intent(s.turn_id)).value
         assert selected == s.state.intents[1].intent_id

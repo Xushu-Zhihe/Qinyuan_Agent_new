@@ -1,0 +1,266 @@
+"use strict";
+
+// Presentation only: no scheduling, state transitions, or success inference.
+const RunView = (() => {
+  const get = (id) => document.getElementById(id);
+  const labels = { pending: "待执行", running: "运行中", succeeded: "已通过", completed: "已完成", failed: "失败", inconclusive: "无法判定", timed_out: "超时", cancelled: "已取消", rejected: "已拒绝", starting: "启动中", cancelling: "取消与清理中", cleaning: "资源清理中", cleanup_confirmed: "资源已清理", paused: "已暂停 · Sandbox 保留", recovery_required: "需要显式恢复", deadline_exceeded: "总时限已到", finished: "已结束" };
+  const actionLabels = { probe: "提出下一次探测", complete_intent: "提出完成 Intent", abandon_intent: "放弃当前 Intent", candidate_flag: "提交待验证候选", awaiting_response: "等待模型响应", model_error: "模型错误", invalid_structure: "结构校验失败" };
+  let current = null;
+  let filter = null;
+  let cache = new Map();
+  let generation = 0;
+  let activeTab = "detail";
+  let graphZoom = null;
+  const label = (value) => labels[value] || value || "—";
+  const short = (value) => value ? value.slice(0, 8) : "—";
+  const node = (tag, text, className) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el; };
+  const empty = (container, text) => container.append(node("p", text, "run-empty"));
+  const time = (value) => value ? new Date(typeof value === "number" ? value * 1000 : value).toLocaleTimeString("zh-CN", { hour12: false }) : "等待提交";
+  const code = (title, value) => { const box = node("div", undefined, "run-code"); box.append(node("strong", title), node("pre", value || "（空）")); return box; };
+  function detail(key, title) { const el = node("details", undefined, "run-event"); el.dataset.key = key; el.append(node("summary", title)); return el; }
+  function badge(status) { const el = node("span", label(status), "run-badge"); if (Object.hasOwn(labels, status)) el.dataset.status = status; return el; }
+  function metric(title, value) { const el = node("div", undefined, "run-metric"); el.append(node("span", title), node("strong", value)); return el; }
+  function reset() { generation += 1; current = null; filter = null; cache = new Map(); graphZoom = null; setTab("detail"); get("run-read-error").hidden = true; }
+  function render(data) {
+    if (current?.run?.run_id !== data.run?.run_id) { generation += 1; cache.clear(); filter = null; }
+    current = data;
+    const { run, events } = data;
+    const progress = data.progress || run?.result || {};
+    const live = ["starting", "running", "cancelling", "cleaning"].includes(run?.status);
+    get("run-dashboard").hidden = !run; get("run-raw").hidden = !run;
+    get("run-status").textContent = run ? `${label(run.status)} · ${progress.task_run_id || run.agent_task_run_id || run.run_id}` : "保存题目与模型配置后，可开始真实运行。";
+    const executions = progress.executions || [];
+    const activeExecution = executions.find((item) => ["pending", "running"].includes(item.status));
+    const activeIntent = (progress.turns || []).flatMap((turn) => turn.intents).find((item) => item.status === "running");
+    let phase = label(run?.status);
+    if (run?.status === "cleaning") phase = "清理 Sandbox 资源";
+    else if (live && run.status !== "cancelling") phase = activeExecution ? "等待命令结果" : activeIntent ? "推进当前 Intent" : "准备运行 / 生成下一轮";
+    let remaining = "—";
+    if (progress.task_run?.deadline_at) {
+      const seconds = Math.max(0, Math.ceil(progress.task_run.deadline_at - Date.now() / 1000));
+      remaining = progress.task_run.finished_at ? "已结束" : `${Math.floor(seconds / 60)}分 ${seconds % 60}秒`;
+    }
+    get("run-summary").replaceChildren(metric("当前阶段", phase), metric("剩余总时限", remaining), metric("已验证观察", String(progress.verified_facts?.length || 0)), metric("待验证候选", String(progress.pending_candidates?.length || 0)), metric("整题目标", "未验证"));
+    get("run-result").textContent = JSON.stringify({ ...data, challengeId: undefined }, null, 2);
+    draw(progress, live);
+  }
+  function setTab(name) {
+    activeTab = name;
+    for (const tab of ["detail", "evidence", "log"]) {
+      const selected = tab === name;
+      get(`run-tab-${tab}`).classList.toggle("active", selected);
+      get(`run-tab-${tab}`).setAttribute("aria-selected", String(selected));
+      get(`run-pane-${tab}`).hidden = !selected;
+    }
+  }
+  function applyGraphScale() {
+    const host = get("run-graph");
+    const plane = host.firstElementChild;
+    const board = plane?.firstElementChild;
+    if (!board || !host.clientWidth || !host.clientHeight) return;
+    const width = board.scrollWidth;
+    const height = board.scrollHeight;
+    const fitted = Math.min(1.25, (host.clientWidth - 24) / width, (host.clientHeight - 24) / height);
+    const scale = graphZoom ?? Math.max(0.65, fitted);
+    board.style.transform = `scale(${scale})`;
+    plane.style.width = `${Math.ceil(width * scale)}px`;
+    plane.style.height = `${Math.ceil(height * scale)}px`;
+    get("graph-zoom-level").textContent = `${Math.round(scale * 100)}%`;
+    get("graph-zoom-level").dataset.scale = String(scale);
+  }
+  function zoomGraph(delta) {
+    const visible = Number(get("graph-zoom-level").dataset.scale) || 1;
+    graphZoom = Math.min(1.8, Math.max(0.65, Math.round((visible + delta) * 10) / 10));
+    applyGraphScale();
+  }
+  function draw(progress, live) {
+    const opened = new Set(Array.from(get("run-dashboard").querySelectorAll("details[open]")).map((el) => el.dataset.key));
+    const scrolls = Array.from(get("run-dashboard").querySelectorAll(".run-scroll")).map((el) => ({ top: el.scrollTop, left: el.scrollLeft }));
+    renderGraph(progress);
+    renderDetail(progress);
+    renderTimeline(progress, opened);
+    renderEvidence(progress, live);
+    Array.from(get("run-dashboard").querySelectorAll(".run-scroll")).forEach((el, i) => { el.scrollTop = scrolls[i].top; el.scrollLeft = scrolls[i].left; });
+  }
+  function select(value) { filter = value; setTab("detail"); draw(current.progress || current.run?.result || {}, ["starting", "running", "cancelling", "cleaning"].includes(current.run?.status)); }
+  function graphButton(title, subtitle, value, status, kind) {
+    const button = node("button", undefined, `graph-node graph-${kind}`); button.type = "button";
+    button.classList.toggle("selected", filter?.id === value.id);
+    button.append(node("strong", title), node("small", subtitle), badge(status));
+    button.addEventListener("click", () => select(value));
+    return button;
+  }
+  function renderGraph(progress) {
+    const host = get("run-graph"); host.replaceChildren();
+    const plane = node("div", undefined, "graph-plane");
+    const board = node("div", undefined, "graph-board");
+    const wires = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    wires.classList.add("graph-wires"); wires.setAttribute("aria-hidden", "true");
+    wires.innerHTML = '<defs><marker id="graph-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0 L7 3.5 L0 7" fill="none" stroke="currentColor" stroke-width="1.5"/></marker></defs>';
+    board.append(wires);
+    const root = graphButton("TaskRun", progress.task_run_id || current.run?.agent_task_run_id || "运行中", { id: null, type: "task", title: "TaskRun" }, progress.task_run?.status, "task");
+    board.append(root);
+    const turnNodes = [];
+    for (const turn of progress.turns || []) {
+      const row = node("div", undefined, "graph-row");
+      const turnNode = graphButton(`Turn ${turn.sequence}`, `${turn.intents.length} 个 Intent`, { id: turn.turn_id, type: "turn", title: `Turn ${turn.sequence}` }, turn.status, "turn");
+      const intents = node("div", undefined, "graph-intents");
+      const intentNodes = [];
+      for (const intent of [...turn.intents].sort((a, b) => a.priority - b.priority)) {
+        const plans = (progress.plans || []).filter((plan) => plan.intent_id === intent.intent_id);
+        const item = graphButton(`Intent ${intent.priority}`, intent.description, { id: intent.intent_id, type: "intent", title: `Turn ${turn.sequence} / Intent ${intent.priority}` }, intent.status, "intent");
+        item.title = `${intent.description}\n${plans.length} 个短 Plan`;
+        intents.append(item); intentNodes.push(item);
+      }
+      if (!intentNodes.length) empty(intents, "尚无 Intent");
+      row.append(turnNode, intents); board.append(row);
+      turnNodes.push({ turn: turnNode, intents: intentNodes });
+    }
+    if (!turnNodes.length) board.append(node("p", "等待首轮 Intent 提交。", "graph-empty"));
+    plane.append(board); host.append(plane);
+    requestAnimationFrame(() => {
+      if (!board.isConnected) return;
+      wires.replaceChildren(wires.firstElementChild);
+      wires.setAttribute("width", String(board.scrollWidth)); wires.setAttribute("height", String(board.scrollHeight));
+      const bounds = board.getBoundingClientRect();
+      const point = (el, side) => { const r = el.getBoundingClientRect(); return { x: (side === "right" ? r.right : side === "left" ? r.left : r.left + r.width / 2) - bounds.left, y: (side === "top" ? r.top : side === "bottom" ? r.bottom : r.top + r.height / 2) - bounds.top }; };
+      const connect = (from, to, kind) => {
+        const a = point(from, kind === "sequence" ? "bottom" : "right");
+        const b = point(to, kind === "sequence" ? "top" : "left");
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        const bend = kind === "sequence" ? `M${a.x} ${a.y} L${a.x} ${b.y - 12} L${b.x} ${b.y - 12} L${b.x} ${b.y}` : `M${a.x} ${a.y} C${a.x + 38} ${a.y} ${b.x - 38} ${b.y} ${b.x} ${b.y}`;
+        path.setAttribute("d", bend); path.setAttribute("class", kind === "sequence" ? "graph-edge sequence" : "graph-edge"); path.setAttribute("marker-end", "url(#graph-arrow)"); wires.append(path);
+      };
+      if (turnNodes.length) connect(root, turnNodes[0].turn, "owner");
+      turnNodes.forEach((group, index) => { if (index) connect(turnNodes[index - 1].turn, group.turn, "sequence"); group.intents.forEach((intent) => connect(group.turn, intent, "owner")); });
+      applyGraphScale();
+    });
+  }
+  function renderDetail(progress) {
+    const host = get("run-detail"); host.replaceChildren();
+    const turns = progress.turns || [];
+    const selectedTurn = turns.find((turn) => turn.turn_id === filter?.id);
+    const intents = turns.flatMap((turn) => turn.intents.map((intent) => ({ ...intent, turn })));
+    const selectedIntent = intents.find((intent) => intent.intent_id === filter?.id)
+      || (filter ? null : intents.find((intent) => intent.status === "running") || intents.at(-1));
+    if (selectedIntent) {
+      const plans = (progress.plans || []).filter((plan) => plan.intent_id === selectedIntent.intent_id);
+      const planIds = new Set(plans.map((plan) => plan.plan_id));
+      const executions = (progress.executions || []).filter((execution) => planIds.has(execution.plan_id));
+      const executionIds = new Set(executions.map((execution) => execution.execution_id));
+      const facts = (progress.verified_facts || []).filter((fact) => executionIds.has(fact.source_ref));
+      host.append(node("strong", `Turn ${selectedIntent.turn.sequence} / Intent ${selectedIntent.priority}`, "detail-title"), badge(selectedIntent.status), node("p", selectedIntent.description, "detail-description"));
+      host.append(node("p", `${plans.length} 个短 Plan · ${executions.length} 次执行 · ${facts.length} 条已验证观察`, "run-meta"));
+      for (const plan of plans) {
+        const item = detail(`detail-${plan.plan_id}`, `Plan ${short(plan.plan_id)} · ${label(plan.status)}`);
+        for (const condition of plan.conditions || []) item.append(node("p", condition.literal !== undefined ? `${condition.stream} 包含：${condition.literal}` : `${condition.path} SHA-256 = ${condition.expected_sha256}`, "run-condition"));
+        host.append(item);
+      }
+      host.append(node("p", selectedIntent.intent_id, "run-ref"));
+    } else if (selectedTurn) {
+      host.append(node("strong", `Turn ${selectedTurn.sequence}`, "detail-title"), badge(selectedTurn.status), node("p", `${selectedTurn.intents.length} 个已提交 Intent`, "run-meta"), node("p", selectedTurn.turn_id, "run-ref"));
+    } else {
+      host.append(node("strong", "TaskRun", "detail-title"), badge(progress.task_run?.status), node("p", `${turns.length} 轮已提交`, "run-meta"));
+    }
+  }
+  function renderTimeline(progress, opened) {
+    const timeline = get("run-timeline"); timeline.replaceChildren();
+    get("timeline-scope").textContent = filter?.title || "全部已提交记录";
+    get("clear-run-filter").hidden = !filter;
+    get("clear-run-filter").onclick = () => select(null);
+    const plans = new Map((progress.plans || []).map((item) => [item.plan_id, item]));
+    const intentTurns = new Map((progress.turns || []).flatMap((turn) => turn.intents.map((intent) => [intent.intent_id, turn.turn_id])));
+    const fits = (planId, intentId) => !filter || filter.type === "task" || (filter.type === "plan" ? planId === filter.id : filter.type === "turn" ? intentTurns.get(intentId || plans.get(planId)?.intent_id) === filter.id : (intentId || plans.get(planId)?.intent_id) === filter.id);
+    const entries = [];
+    for (const action of progress.actions || []) {
+      if (filter?.type === "plan" || !fits(null, action.intent_id)) continue;
+      const item = detail(`action-${action.model_request_id}`, `${time(action.started_at)} · ${actionLabels[action.kind] || action.kind}`);
+      item.append(node("p", `Intent ${short(action.intent_id)} · ${action.applied_at ? "已应用" : action.finished_at ? "结果已记录，尚未应用" : "调用尚未完成"}`, "run-meta"));
+      item.append(node("p", action.model_request_id, "run-ref"));
+      entries.push({ at: action.started_at, el: item });
+    }
+    for (const execution of progress.executions || []) {
+      if (!fits(execution.plan_id)) continue;
+      const item = detail(`execution-${execution.execution_id}`, `${time(execution.started_at)} · Bash · ${execution.status === "succeeded" ? "执行已结束" : label(execution.status)}${execution.exit_code !== undefined && execution.exit_code !== null ? ` · exit ${execution.exit_code}` : ""}`);
+      item.append(node("p", `Plan ${short(execution.plan_id)} · step ${execution.step_index} · ${execution.execution_id}`, "run-ref"));
+      const body = node("div"); item.append(body);
+      const key = `${execution.execution_id}:${execution.status}`;
+      const load = async () => {
+        if (!item.open || body.dataset.loaded) return;
+        body.dataset.loaded = "true"; empty(body, "读取命令证据…");
+        const captured = generation;
+        try {
+          let value = cache.get(key);
+          if (!value) {
+            const response = await fetch(`/api/challenges/${current.challengeId}/executions/${execution.execution_id}`);
+            value = await response.json(); if (!response.ok) throw new Error(value.error || `request_${response.status}`);
+            if (captured !== generation) return; cache.set(key, value);
+          }
+          if (captured !== generation) return;
+          body.replaceChildren(node("p", `${value.working_directory} · 有效上限 ${value.effective_timeout_seconds} 秒`, "run-meta"), code("脚本", value.script));
+          if (value.output) {
+            const output = value.output;
+            body.append(node("p", `未验证的原始观察 · ${output.dispatched ? "已派发" : "未派发"} · ${output.termination_confirmed ? "停止已确认" : "停止未确认"}${output.stream_complete ? "" : " · 输出不完整"}`, "run-meta"));
+            body.append(code(`stdout${output.stdout_truncated ? " · 已截断" : ""}`, output.stdout), code(`stderr${output.stderr_truncated ? " · 已截断" : ""}`, output.stderr));
+          } else empty(body, "尚无已提交输出。");
+        } catch (error) { body.replaceChildren(node("p", `证据读取失败：${error.message}`, "run-read-error")); delete body.dataset.loaded; }
+      };
+      item.addEventListener("toggle", load);
+      if (opened.has(item.dataset.key)) { item.open = true; load(); }
+      entries.push({ at: execution.started_at || Number.MAX_SAFE_INTEGER, el: item });
+    }
+    if (!filter || filter.type === "task") for (const event of current.events || []) {
+      const item = detail(`event-${event.sequence}`, `${time(event.timestamp)} · ${event.details?.operation || event.type} · ${label(event.status)}`);
+      item.append(code(`已提交事件 #${event.sequence}`, JSON.stringify(event.details, null, 2)));
+      entries.push({ at: typeof event.timestamp === "number" ? event.timestamp : Date.parse(event.timestamp) / 1000, el: item });
+    }
+    entries.sort((a, b) => a.at - b.at);
+    for (const entry of entries) { if (opened.has(entry.el.dataset.key)) entry.el.open = true; timeline.append(entry.el); }
+    if (!entries.length) empty(timeline, "暂无已提交的动作或执行记录。");
+  }
+  function renderEvidence(progress, live) {
+    const stop = get("run-stop"); stop.replaceChildren();
+    if (progress.recovery?.reason === "state_or_evidence_unreadable") stop.append(node("strong", "状态或证据读取失败，当前视图无法确认"));
+    else if (live) stop.append(node("strong", "运行中，持续读取已提交状态"));
+    else if (current.run?.status === "paused") stop.append(node("strong", "已暂停，Sandbox 保留"));
+    else if (current.run?.status === "recovery_required" || progress.recovery?.required) stop.append(node("strong", "需要显式恢复 · 未自动重新执行"));
+    else stop.append(node("strong", label(current.run?.status)));
+    if (!live && progress.stop) stop.append(node("p", `${progress.stop.reason || progress.stop.kind || "调度已停止"}`, "run-condition"), code("停止记录", JSON.stringify(progress.stop, null, 2)));
+    if (!live && progress.recovery?.required) stop.append(node("p", progress.recovery.reason, "run-condition"));
+    if (!live) stop.append(node("p", `清理：${progress.cleanup?.status || "未确认"}`, "run-meta"));
+    for (const error of [...(progress.errors || []), ...(current.run?.result?.errors || [])]) stop.append(node("p", error.code || error.category, "run-read-error"));
+    const facts = get("run-facts"); facts.replaceChildren();
+    for (const fact of progress.verified_facts || []) { const item = node("article", undefined, "run-fact"); item.append(node("p", fact.content), node("p", `Fact ${fact.fact_id}\nExecution ${fact.source_ref}`, "run-ref")); facts.append(item); }
+    if (!facts.children.length) empty(facts, "尚无已验证观察。原始输出不会自动成为 Fact。");
+    const candidates = get("run-candidates"); candidates.replaceChildren();
+    for (const candidate of progress.pending_candidates || []) { const item = node("article", undefined, "run-candidate"); item.append(node("pre", candidate.value), node("p", `未验证 · 来源 ${candidate.source_execution_ids.join(", ")}`, "run-ref")); candidates.append(item); }
+    if (!candidates.children.length) empty(candidates, "尚无待验证候选。");
+    const failures = get("run-failures"); failures.replaceChildren();
+    for (const failure of progress.failure_summaries || []) { const item = node("article", undefined, "run-failure"); item.append(node("strong", failure.failure_type), node("p", failure.short_reason), node("p", failure.evidence_ref, "run-ref")); failures.append(item); }
+    if (!failures.children.length) empty(failures, "尚无已提交失败摘要。");
+  }
+  document.addEventListener("DOMContentLoaded", () => {
+    for (const tab of ["detail", "evidence", "log"]) get(`run-tab-${tab}`).addEventListener("click", () => setTab(tab));
+    get("graph-zoom-out").addEventListener("click", () => zoomGraph(-0.1));
+    get("graph-zoom-in").addEventListener("click", () => zoomGraph(0.1));
+    get("graph-fit").addEventListener("click", () => { graphZoom = null; applyGraphScale(); });
+    const graph = get("run-graph");
+    let drag = null;
+    graph.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || event.target.closest?.(".graph-node")) return;
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: graph.scrollLeft, top: graph.scrollTop };
+      graph.setPointerCapture(event.pointerId);
+      graph.classList.add("dragging");
+    });
+    graph.addEventListener("pointermove", (event) => {
+      if (!drag || drag.id !== event.pointerId) return;
+      graph.scrollLeft = drag.left - (event.clientX - drag.x);
+      graph.scrollTop = drag.top - (event.clientY - drag.y);
+    });
+    const endDrag = (event) => { if (drag?.id === event.pointerId) { drag = null; graph.classList.remove("dragging"); } };
+    graph.addEventListener("pointerup", endDrag);
+    graph.addEventListener("pointercancel", endDrag);
+    window.addEventListener("resize", () => { if (graphZoom === null) applyGraphScale(); });
+  });
+  return { render, reset };
+})();

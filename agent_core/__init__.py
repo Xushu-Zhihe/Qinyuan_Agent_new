@@ -111,6 +111,7 @@ from agent_core.control_store import (
     StorageError,
     TaskRunNotFoundError,
     TaskRunSnapshot,
+    TargetNetworkBinding,
     TurnRegistration,
     TurnOperation,
     TurnSnapshot,
@@ -132,6 +133,16 @@ from agent_core.control_state_repository import (
     RecoveryResult,
 )
 from agent_core.turn_working_copy import TurnWorkingCopy
+from agent_core.supervisor_contracts import (
+    IntentRunResult,
+    IntentRunnerPort,
+    TurnGeneratorPort,
+)
+from agent_core.run_supervisor import (
+    RunSupervisor,
+    SupervisorRecoveryRequired,
+    SupervisorResult,
+)
 
 from agent_core.interfaces import (
     AgentApplicationPort,
@@ -271,9 +282,16 @@ __all__ = [
     "StorageError",
     "TaskRunNotFoundError",
     "TaskRunSnapshot",
+    "TargetNetworkBinding",
     "TurnRegistration",
     "TurnOperation",
     "TurnWorkingCopy",
+    "IntentRunnerPort",
+    "IntentRunResult",
+    "TurnGeneratorPort",
+    "RunSupervisor",
+    "SupervisorRecoveryRequired",
+    "SupervisorResult",
     "TurnSnapshot",
     "UpsertExecution",
     "UpsertFact",

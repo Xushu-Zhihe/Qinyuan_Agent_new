@@ -22,6 +22,7 @@ from agent_core.control_store import (
     StorageError,
     TaskRunNotFoundError,
     TaskRunSnapshot,
+    TargetNetworkBinding,
     TurnRegistration,
     TurnOperation,
     UpsertExecution,
@@ -38,6 +39,11 @@ from agent_core.file_type_fact import FileTypeFactCandidate, fact_content
 from agent_core.file_type_verifier import (
     FileTypeProofEvidencePort,
     FileTypeVerificationError,
+)
+from agent_core.observation_proof import (
+    ObservationProofError,
+    T6ObservationProofEvidencePort,
+    observation_fact_content,
 )
 from agent_core.intent_goals import FileTypeIntentGoal, IntentGoalBindingError
 from agent_core.intent_goal_evaluator import (
@@ -193,7 +199,9 @@ class TaskRunController(LegacyTaskRunController):
         registry: TaskRunControllerRegistry | None = None,
         attachment_imports: AttachmentImportEvidencePort | None = None,
         file_type_proofs: FileTypeProofEvidencePort | None = None,
+        t6_observation_proofs: T6ObservationProofEvidencePort | None = None,
         intent_goal_evaluator: IntentGoalEvaluatorPort | None = None,
+        target_network_adapter: Any | None = None,
     ) -> None:
         super().__init__(sandbox, clock=clock if callable(clock) else _clock_now_wrapper(clock))
         supplied = (store, repository, registry)
@@ -214,7 +222,10 @@ class TaskRunController(LegacyTaskRunController):
         self._closed = False
         self._attachment_imports = attachment_imports
         self._file_type_proofs = file_type_proofs
+        self._t6_observation_proofs = t6_observation_proofs
         self._intent_goal_evaluator = intent_goal_evaluator
+        self._target_network = target_network_adapter
+        self._target_network_destroyed = False
 
     def _now_utc(self) -> float:
         return _clock_now(self._clock)
@@ -269,7 +280,7 @@ class TaskRunController(LegacyTaskRunController):
                 raise InvalidTransition("persistent dependencies are required for this start signature")
             return super().start(request)
         return self._start_persistent(
-            request, effective_model_backend, mutation_id, source_root, task_run_id
+            request, effective_model_backend, mutation_id, source_root, task_run_id,
         )
 
     def _start_persistent(
@@ -306,10 +317,20 @@ class TaskRunController(LegacyTaskRunController):
         deps.registry.claim(task_run_id, self)
         self._registry_released = False
         sandbox_id: str | None = None
+        target_network: TargetNetworkBinding | None = None
         committed = False
         try:
             started_at = self._now_utc()
             deadline_at = started_at + request.deadline_seconds
+            if self._target_network is not None:
+                endpoints = request.target.endpoints
+                if len(endpoints) != 1:
+                    raise TaskRequestError("T6 target network requires exactly one endpoint")
+                target_network = self._target_network.create(task_run_id, endpoints[0].url)
+                configure = getattr(self._sandbox, "configure_target_network", None)
+                if not callable(configure):
+                    raise InvalidTransition("Sandbox cannot bind a T6 target network")
+                configure(task_run_id, target_network)
             sandbox_id = deps_sandbox_create(self._sandbox, task_run_id)
             change = UpsertTaskRun(
                 task_run_id=task_run_id,
@@ -320,6 +341,7 @@ class TaskRunController(LegacyTaskRunController):
                 status=TaskRunStatus.RUNNING,
                 sandbox_id=sandbox_id,
                 source_root=source_root,
+                target_network=target_network,
             )
             event = RuntimeEvent(
                 type="task_run_started",
@@ -354,6 +376,7 @@ class TaskRunController(LegacyTaskRunController):
             self._persistent_snapshot = task_snapshot
             self._persistent_state = state
             self._sandbox_destroyed = False
+            self._target_network_destroyed = False
             return CommittedOperation(value=task_run_id, commit=commit)
         except Exception as exc:
             if committed:
@@ -374,6 +397,19 @@ class TaskRunController(LegacyTaskRunController):
                         original_error=exc,
                         cleanup_error=cleanup_exc,
                     ) from cleanup_exc
+            if target_network is not None:
+                try:
+                    network = self._target_network
+                    if network is None:
+                        raise InvalidTransition("target network is not configured")
+                    network.destroy(task_run_id, target_network)
+                except Exception as cleanup_exc:
+                    raise SandboxCleanupError(
+                        sandbox_id or target_network.forwarder_id,
+                        "compensating target network destroy failed after start failure",
+                        original_error=exc,
+                        cleanup_error=cleanup_exc,
+                    ) from cleanup_exc
             raise
 
     def attach(self, task_run_id: str) -> ControlStateSnapshot:
@@ -390,6 +426,18 @@ class TaskRunController(LegacyTaskRunController):
             if snapshot is None or state is None:
                 raise TaskRunNotFoundError(f"TaskRun does not exist: {task_run_id}")
             if isinstance(self._sandbox, TaskRunSandboxPort):
+                if snapshot.target_network is not None:
+                    if self._target_network is None:
+                        raise InvalidTransition("T6 target network adapter is required")
+                    self._target_network.bind(
+                        task_run_id,
+                        snapshot.target_network,
+                        terminal=snapshot.status in TERMINAL_STATUSES,
+                    )
+                    configure = getattr(self._sandbox, "configure_target_network", None)
+                    if not callable(configure):
+                        raise InvalidTransition("Sandbox cannot bind a T6 target network")
+                    configure(task_run_id, snapshot.target_network)
                 self._sandbox.bind(
                     task_run_id, snapshot.sandbox_id,
                     terminal=snapshot.status in TERMINAL_STATUSES,
@@ -397,6 +445,7 @@ class TaskRunController(LegacyTaskRunController):
             self._persistent_task_run_id = task_run_id
             self._persistent_snapshot = snapshot
             self._persistent_state = state
+            self._target_network_destroyed = False
             self._sandbox_destroyed = False
             return state
         except Exception:
@@ -766,6 +815,101 @@ class TaskRunController(LegacyTaskRunController):
         self._reload_after_commit(commit)
         return CommittedOperation.from_commit(commit)
 
+    def commit_verified_t6_observation(
+        self,
+        intent_id: str,
+        proof_id: str,
+        fact_id: str,
+        mutation_id: str,
+        *,
+        complete_intent: bool = True,
+    ) -> CommittedOperation:
+        """Record a checked observation, optionally finishing only its Intent."""
+        _validate_mutation_id(proof_id)
+        _validate_mutation_id(fact_id)
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, state = self._require_bound_state()
+        deps = self._require_persistent()
+        operation = (
+            "commit_verified_t6_observation" if complete_intent
+            else "commit_verified_t6_fact"
+        )
+        entity_ids = [fact_id, intent_id] if complete_intent else [fact_id]
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            fact = next((f for f in state.facts if f.fact_id == fact_id), None)
+            if (
+                replay.event.details.get("operation") != operation
+                or replay.event.details.get("entity_ids") != entity_ids
+                or fact is None or fact.verification_ref != f"t6:{proof_id}"
+            ):
+                raise IdempotencyConflictError("mutation_id belongs to another T6 observation")
+            return CommittedOperation.from_commit(replay)
+        if self._t6_observation_proofs is None:
+            raise InvalidTransition("T6 observation proof verifier is not configured")
+        proof = self._t6_observation_proofs.read_proof(proof_id)
+        if proof is None:
+            raise ObservationProofError("proof_missing")
+        if proof.intent_id != intent_id or proof.task_run_id != task_run.task_run_id:
+            raise ObservationProofError("proof_scope_mismatch")
+        intent = next((i for i in state.intents if i.intent_id == intent_id), None)
+        turn = next((t for t in state.turns if intent is not None and t.turn_id == intent.turn_id), None)
+        if intent is None or turn is None:
+            raise ObservationProofError("state_conflict")
+        now = self._now_utc()
+        fact_change = UpsertFact(
+            fact_id, intent.turn_id,
+            observation_fact_content(proof_id, len(proof.execution_ids)),
+            proof.source_execution_id, FactStatus.VERIFIED, f"t6:{proof_id}",
+        )
+        changes = (fact_change,) + ((
+            UpsertIntent(
+                intent_id, intent.turn_id,
+                intent.description,
+                intent.priority,
+                intent.intent_type,
+                IntentStatus.SUCCEEDED,
+            ),
+        ) if complete_intent else ())
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.RUNNING,
+            details={
+                "operation": operation,
+                "entity_ids": entity_ids,
+                "result": fact_id,
+                "intent_id": intent_id,
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation=operation,
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            state_changes=changes,
+            event=event,
+        )
+        if (
+            self._closed or self._registry_released
+            or task_run.status is not TaskRunStatus.RUNNING
+            or now >= task_run.deadline_at
+            or intent.status is not IntentStatus.RUNNING
+            or turn.status is not TurnStatus.RUNNING
+            or any(f.fact_id == fact_id for f in state.facts)
+        ):
+            raise ObservationProofError("state_conflict")
+        verified = self._t6_observation_proofs.lookup(proof.source_execution_id, proof_id)
+        if verified.task_run_id != task_run.task_run_id:
+            raise ObservationProofError("proof_task_mismatch")
+        deps.repository.validate_candidate(state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        return CommittedOperation.from_commit(commit)
+
     def complete_satisfied_intent(
         self,
         intent_id: str,
@@ -855,6 +999,104 @@ class TaskRunController(LegacyTaskRunController):
         self._reload_after_commit(commit)
         return CommittedOperation.from_commit(commit)
 
+    def complete_verified_t6_intent(
+        self,
+        intent_id: str,
+        fact_ids: tuple[str, ...],
+        mutation_id: str,
+    ) -> CommittedOperation:
+        """Complete an Intent from its last proved short Plan, not from a claim."""
+
+        mutation_id = _validate_mutation_id(mutation_id)
+        if (
+            not isinstance(fact_ids, tuple) or not fact_ids
+            or any(not isinstance(value, str) or not value for value in fact_ids)
+            or len(set(fact_ids)) != len(fact_ids)
+        ):
+            raise ObservationProofError("invalid_supporting_facts")
+        task_run, state = self._require_bound_state()
+        deps = self._require_persistent()
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            if (
+                replay.event.details.get("operation") != "complete_verified_t6_intent"
+                or replay.event.details.get("entity_ids") != [intent_id]
+                or replay.event.details.get("verified_fact_ids") != list(fact_ids)
+            ):
+                raise IdempotencyConflictError("mutation_id belongs to another Intent completion")
+            return CommittedOperation.from_commit(replay)
+
+        now = self._now_utc()
+        intent = next((item for item in state.intents if item.intent_id == intent_id), None)
+        turn = next((item for item in state.turns if intent is not None and item.turn_id == intent.turn_id), None)
+        plans = [item for item in state.plans if item.intent_id == intent_id]
+        if (
+            self._closed or self._registry_released
+            or task_run.status is not TaskRunStatus.RUNNING
+            or now >= task_run.deadline_at
+            or intent is None or intent.status is not IntentStatus.RUNNING
+            or turn is None or turn.status is not TurnStatus.RUNNING
+            or not plans or plans[-1].status is not PlanStatus.COMPLETED
+            or self._t6_observation_proofs is None
+        ):
+            raise ObservationProofError("state_conflict")
+
+        latest_verifiable_id = self._t6_observation_proofs.latest_verifiable_plan(
+            state, intent_id,
+        )
+        latest_supported = False
+        for fact_id in fact_ids:
+            fact = next((item for item in state.facts if item.fact_id == fact_id), None)
+            if (
+                fact is None or fact.status is not FactStatus.VERIFIED
+                or fact.turn_id != intent.turn_id
+                or fact.verification_ref is None
+                or not fact.verification_ref.startswith("t6:")
+            ):
+                raise ObservationProofError("supporting_fact_unverified")
+            proof_id = fact.verification_ref.removeprefix("t6:")
+            proof = self._t6_observation_proofs.read_proof(proof_id)
+            if (
+                proof is None or proof.task_run_id != task_run.task_run_id
+                or proof.intent_id != intent_id
+                or proof.source_execution_id != fact.source_ref
+            ):
+                raise ObservationProofError("supporting_fact_scope_mismatch")
+            self._t6_observation_proofs.lookup(fact.source_ref, proof_id)
+            latest_supported |= proof.plan_id == latest_verifiable_id
+        if not latest_supported:
+            raise ObservationProofError("latest_plan_has_no_verified_fact")
+
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.RUNNING,
+            details={
+                "operation": "complete_verified_t6_intent",
+                "entity_ids": [intent_id],
+                "result": "succeeded",
+                "verified_fact_ids": list(fact_ids),
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation="complete_verified_t6_intent",
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            state_changes=(UpsertIntent(
+                intent.intent_id, intent.turn_id, intent.description,
+                intent.priority, intent.intent_type, IntentStatus.SUCCEEDED,
+            ),),
+            event=event,
+        )
+        deps.repository.validate_candidate(state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        return CommittedOperation.from_commit(commit)
+
     def mark_candidate_found(
         self,
         mutation_id: str | None = None,
@@ -904,6 +1146,7 @@ class TaskRunController(LegacyTaskRunController):
             finished_at=None,
             failure_reason=task_run.failure_reason,
             source_root=task_run.source_root,
+            target_network=task_run.target_network,
         )
         event = RuntimeEvent(
             type="completion_confirmation_requested",
@@ -1196,6 +1439,7 @@ class TaskRunController(LegacyTaskRunController):
             finished_at=now,
             failure_reason=failure_reason,
             source_root=task_run.source_root,
+            target_network=task_run.target_network,
         )
         event = RuntimeEvent(
             type="task_run_finished",
@@ -1258,6 +1502,10 @@ class TaskRunController(LegacyTaskRunController):
                 state.task_run.sandbox_id != self._persistent_snapshot.sandbox_id
             ):
                 raise StorageError("reloaded control state changed the bound Sandbox ID")
+            if self._persistent_snapshot is not None and (
+                state.task_run.target_network != self._persistent_snapshot.target_network
+            ):
+                raise StorageError("reloaded control state changed the target network")
             if self._persistent_state is not None and (
                 state.latest_checkpoint.sequence
                 < self._persistent_state.latest_checkpoint.sequence
@@ -1286,42 +1534,56 @@ class TaskRunController(LegacyTaskRunController):
         """Clean a persisted terminal TaskRun after its commit is durable."""
 
         task_run, state = self._require_bound_state()
-        if task_run.sandbox_id is None or self._sandbox_destroyed:
-            return
-        if isinstance(self._sandbox, TaskRunSandboxPort):
-            self._sandbox.quiesce(task_run.sandbox_id)
-        active_execution = any(
-            item.status is ExecutionStatus.RUNNING for item in state.executions
-        )
-        should_interrupt = (
-            task_run.status
-            in {TaskRunStatus.DEADLINE_EXCEEDED, TaskRunStatus.CANCELLED}
-            or active_execution
-        )
-        interrupt_error: BaseException | None = None
-        destroy_error: BaseException | None = None
-        if should_interrupt:
-            try:
-                self._sandbox.interrupt(task_run.sandbox_id)
-            except BaseException as exc:  # cleanup must still attempt destroy
-                interrupt_error = exc
-        try:
-            self._sandbox.destroy(task_run.sandbox_id)
-            self._sandbox_destroyed = True
-        except BaseException as exc:
-            destroy_error = exc
-        if interrupt_error is not None or destroy_error is not None:
-            reason = (
-                "sandbox interrupt failed"
-                if interrupt_error is not None and destroy_error is None
-                else "sandbox destroy failed"
+        if task_run.sandbox_id is not None and not self._sandbox_destroyed:
+            if isinstance(self._sandbox, TaskRunSandboxPort):
+                self._sandbox.quiesce(task_run.sandbox_id)
+            active_execution = any(
+                item.status is ExecutionStatus.RUNNING for item in state.executions
             )
-            raise SandboxCleanupError(
-                task_run.sandbox_id,
-                reason,
-                original_error=interrupt_error,
-                cleanup_error=destroy_error,
-            ) from (destroy_error or interrupt_error)
+            should_interrupt = (
+                task_run.status
+                in {TaskRunStatus.DEADLINE_EXCEEDED, TaskRunStatus.CANCELLED}
+                or active_execution
+            )
+            interrupt_error: BaseException | None = None
+            destroy_error: BaseException | None = None
+            if should_interrupt:
+                try:
+                    self._sandbox.interrupt(task_run.sandbox_id)
+                except BaseException as exc:  # cleanup must still attempt destroy
+                    interrupt_error = exc
+            try:
+                self._sandbox.destroy(task_run.sandbox_id)
+                self._sandbox_destroyed = True
+            except BaseException as exc:
+                destroy_error = exc
+            if interrupt_error is not None or destroy_error is not None:
+                reason = (
+                    "sandbox interrupt failed"
+                    if interrupt_error is not None and destroy_error is None
+                    else "sandbox destroy failed"
+                )
+                raise SandboxCleanupError(
+                    task_run.sandbox_id,
+                    reason,
+                    original_error=interrupt_error,
+                    cleanup_error=destroy_error,
+                ) from (destroy_error or interrupt_error)
+        if task_run.target_network is not None and not self._target_network_destroyed:
+            if self._target_network is None:
+                raise SandboxCleanupError(
+                    task_run.sandbox_id,
+                    "target network adapter is missing",
+                )
+            try:
+                self._target_network.destroy(task_run.task_run_id, task_run.target_network)
+                self._target_network_destroyed = True
+            except BaseException as exc:
+                raise SandboxCleanupError(
+                    task_run.sandbox_id,
+                    "target network destroy failed",
+                    cleanup_error=exc,
+                ) from exc
 
     def recover_task_run(self, mutation_id: str) -> RecoveryResult:
         """Persist the confirmed crash-recovery transition for one attached task."""
@@ -1431,6 +1693,7 @@ class TaskRunController(LegacyTaskRunController):
             finished_at=now,
             failure_reason="unfinished_execution_detected_during_recovery",
             source_root=task_run.source_root,
+            target_network=task_run.target_network,
         )
         plan_change = UpsertPlan(
             plan_id=plan.plan_id,

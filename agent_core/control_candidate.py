@@ -96,6 +96,7 @@ def project_candidate(
                 "deadline_at",
                 "sandbox_id",
                 "source_root",
+                "target_network",
             ):
                 if getattr(change, name) != getattr(task, name):
                     raise StorageError("immutable TaskRun fields cannot be modified")
@@ -111,6 +112,7 @@ def project_candidate(
                 change.finished_at,
                 change.failure_reason,
                 change.source_root,
+                change.target_network,
             )
         elif isinstance(change, UpsertTurn):
             entity_id = change.turn_id
@@ -305,7 +307,12 @@ def validate_control_ownership(rows: ControlStateRows) -> None:
                 "PlanValidationRecord parents must belong to this TaskRun"
             )
     if any(
-        item.evidence_ref not in executions and item.evidence_ref not in validations
+        item.evidence_ref not in executions
+        and item.evidence_ref not in validations
+        and not (
+            item.failure_type.value == "model_error"
+            and item.evidence_ref in intents
+        )
         for item in rows.failure_summaries
     ):
         raise StorageError("FailureSummary evidence must belong to this TaskRun")

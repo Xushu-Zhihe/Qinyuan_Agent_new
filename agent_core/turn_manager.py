@@ -155,19 +155,19 @@ class TurnManager:
                     (record.plan_id, record.step_index, record.command_ref)
                 ] = record.plan_validation_id
             if consumed:
-                key = (record.plan_id, record.step_index)
-                expected_attempt = manager._plan_validation_attempts.get(key, 0) + 1
+                validation_key = (record.plan_id, record.step_index)
+                expected_attempt = manager._plan_validation_attempts.get(validation_key, 0) + 1
                 if record.attempt != expected_attempt:
                     raise DomainError("consumed PlanValidationRecord attempts are not contiguous")
-                manager._plan_validation_attempts[key] = record.attempt
+                manager._plan_validation_attempts[validation_key] = record.attempt
                 manager._consumed_plan_validation_ids.add(record.plan_validation_id)
 
         for failure in state.failure_summaries:
             execution = manager.executions.get(failure.evidence_ref)
             if execution is not None and failure.failure_type is FailureType.ENVIRONMENT_FAULT:
-                key = (execution.plan_id, execution.step_index, execution.command_ref)
-                manager._execution_retry_counts[key] = manager._execution_retry_counts.get(key, 0) + 1
-                manager._execution_retry_commands[key[:2]] = execution.command_ref
+                retry_key = (execution.plan_id, execution.step_index, execution.command_ref)
+                manager._execution_retry_counts[retry_key] = manager._execution_retry_counts.get(retry_key, 0) + 1
+                manager._execution_retry_commands[retry_key[:2]] = execution.command_ref
         return manager
 
     @property
@@ -223,12 +223,7 @@ class TurnManager:
             )
 
         task_run_id = state.task_run.task_run_id
-        turn_id = str(
-            uuid.uuid5(
-                _TURN_REGISTRATION_NAMESPACE,
-                f"{task_run_id}:{mutation_id}:turn:0",
-            )
-        )
+        turn_id = TurnManager.registration_turn_id(task_run_id, mutation_id)
         intent_ids = tuple(
             str(
                 uuid.uuid5(
@@ -276,6 +271,14 @@ class TurnManager:
             state_changes=changes,
         )
 
+    @staticmethod
+    def registration_turn_id(task_run_id: str, mutation_id: str) -> str:
+        """Return the stable Turn ID used by a registered model generation."""
+        return str(uuid.uuid5(
+            _TURN_REGISTRATION_NAMESPACE,
+            f"{task_run_id}:{mutation_id}:turn:0",
+        ))
+
     def register_turn(self, turn: Turn, intents: Iterable[Intent]) -> None:
         self._require_running_task()
         if turn.task_run_id != self.task_run_id:
@@ -314,8 +317,9 @@ class TurnManager:
             raise DomainError("Plan intent_id does not reference an existing Intent")
         if plan.plan_id in self.plans:
             raise DomainError("duplicate plan_id")
-        if any(item.intent_id == plan.intent_id for item in self.plans.values()):
-            raise DomainError("an Intent may only contain one Plan")
+        prior = [item for item in self.plans.values() if item.intent_id == plan.intent_id]
+        if prior and prior[-1].status is not PlanStatus.COMPLETED:
+            raise DomainTransitionError("previous Plan must be completed before another Plan")
         if plan.status is not PlanStatus.PENDING:
             raise DomainTransitionError("Plan must start as pending")
         self.plans[plan.plan_id] = plan
@@ -404,6 +408,10 @@ class TurnManager:
             if validation.attempt == 1:
                 return FailureAction.RETRY_COMMAND_GENERATION
             return self._make_plan_inconclusive(plan)
+        if failure_type is FailureType.STEP_TIMEOUT:
+            if validation.attempt == 1:
+                return FailureAction.RETRY_STEP_COMMAND
+            return self._make_plan_failed(plan)
         if failure_type in {FailureType.POLICY_REJECTED, FailureType.PARAMETER_ERROR}:
             return self._make_plan_failed(plan)
         if failure_type is FailureType.MODEL_ERROR:
@@ -531,6 +539,41 @@ class TurnManager:
             return self._fail_task_for_model_error(plan)
         return self._make_plan_inconclusive(plan)
 
+    def record_step_timeout(
+        self, *, execution_id: str, output_ref: str
+    ) -> FailureAction:
+        """A confirmed T6 timeout permits one changed command for the same step."""
+        execution = self._execution(execution_id)
+        earlier = 0
+        for item in self.failures:
+            if item.failure_type is not FailureType.STEP_TIMEOUT:
+                continue
+            previous_execution = self.executions.get(item.evidence_ref)
+            if previous_execution is not None:
+                same_step = (
+                    previous_execution.plan_id == execution.plan_id
+                    and previous_execution.step_index == execution.step_index
+                )
+            else:
+                validation = self._plan_validation_evidence.lookup(item.evidence_ref)
+                same_step = (
+                    validation is not None
+                    and validation.plan_id == execution.plan_id
+                    and validation.step_index == execution.step_index
+                )
+            earlier += bool(same_step)
+        if earlier > 1:
+            raise DomainTransitionError("step timeout retry limit exceeded")
+        self.complete_execution(
+            execution_id=execution_id,
+            status=ExecutionStatus.TIMED_OUT,
+            output_ref=output_ref,
+        )
+        self._add_failure(FailureType.STEP_TIMEOUT, "step_timed_out", execution_id)
+        if earlier == 0:
+            return FailureAction.RETRY_STEP_COMMAND
+        return self._make_plan_failed(self._plan(execution.plan_id))
+
     def record_target_mismatch(
         self,
         *,
@@ -555,6 +598,38 @@ class TurnManager:
         intent = self._intent(plan.intent_id)
         intent.status = IntentStatus.FAILED
         return self._after_terminal_intent(intent)
+
+    def mark_intent_inconclusive(self, *, intent_id: str) -> FailureAction:
+        """Stop dispatch after an outcome that cannot be safely classified."""
+
+        self._require_running_task()
+        intent = self._intent(intent_id)
+        if intent.status is not IntentStatus.RUNNING:
+            raise DomainTransitionError("only a running Intent can be inconclusive")
+        intent.status = IntentStatus.INCONCLUSIVE
+        turn = self._turn(intent.turn_id)
+        turn.status = TurnStatus.INCONCLUSIVE
+        self._active_turn_id = None
+        return FailureAction.TURN_INCONCLUSIVE
+
+    def record_model_error(
+        self, *, intent_id: str, short_reason: str = "model_error"
+    ) -> FailureAction:
+        """Record a model failure without changing any lifecycle state.
+
+        The model audit is the durable source for replaying the same error.
+        This control operation adds a bounded classification for inspection,
+        while the running Intent/Turn/TaskRun remain the recovery anchor.
+        """
+
+        self._require_running_task()
+        if not isinstance(short_reason, str) or not short_reason.strip():
+            raise DomainError("model error reason must be non-empty")
+        intent = self._intent(intent_id)
+        if intent.status is not IntentStatus.RUNNING:
+            raise DomainTransitionError("only a running Intent can record model error")
+        self._add_failure(FailureType.MODEL_ERROR, short_reason, intent_id)
+        return FailureAction.MODEL_ERROR
 
     def create_fact(self, fact: Fact) -> Fact:
         self._require_running_task()
@@ -623,6 +698,8 @@ class TurnManager:
             raise DomainTransitionError("only a running Intent can succeed")
         if fact.status is not FactStatus.VERIFIED or fact.turn_id != intent.turn_id:
             raise DomainError("Intent requires a verified Fact from its Turn")
+        if fact.verification_ref is not None and fact.verification_ref.startswith("t6:"):
+            raise DomainError("T6 observation requires trusted latest-Plan completion")
         source_execution = self._execution(fact.source_ref)
         source_plan = self._plan(source_execution.plan_id)
         if source_plan.intent_id != intent.intent_id:
@@ -677,14 +754,10 @@ class TurnManager:
         return self._after_terminal_intent(intent)
 
     def _fail_task_for_model_error(self, plan: Plan) -> FailureAction:
-        plan.status = PlanStatus.FAILED
-        intent = self._intent(plan.intent_id)
-        intent.status = IntentStatus.FAILED
-        turn = self._turn(intent.turn_id)
-        turn.status = TurnStatus.FAILED
-        self._active_turn_id = None
-        self._controller.model_failed("model_error")
-        return FailureAction.TASK_FAILED
+        # The caller has already recorded the classified model failure.
+        # Keep the Plan and its parents running for explicit recovery.
+        self._intent(plan.intent_id)
+        return FailureAction.MODEL_ERROR
 
     def _after_terminal_intent(self, intent: Intent) -> FailureAction:
         turn = self._turn(intent.turn_id)
@@ -693,6 +766,31 @@ class TurnManager:
             for intent_id in turn.intent_ids
         ):
             return FailureAction.TRY_NEXT_INTENT
+        target_mismatch_intents: set[str] = set()
+        for failure in self.failures:
+            if failure.failure_type is not FailureType.TARGET_MISMATCH:
+                continue
+            execution = self.executions.get(failure.evidence_ref)
+            if execution is not None:
+                plan = self.plans.get(execution.plan_id)
+                if plan is not None:
+                    target_mismatch_intents.add(plan.intent_id)
+                continue
+            validation = self._plan_validation_evidence.lookup(failure.evidence_ref)
+            if validation is not None:
+                plan = self.plans.get(validation.plan_id)
+                if plan is not None:
+                    target_mismatch_intents.add(plan.intent_id)
+        if (
+            all(
+                self.intents[intent_id].status is IntentStatus.FAILED
+                for intent_id in turn.intent_ids
+            )
+            and set(turn.intent_ids) <= target_mismatch_intents
+        ):
+            turn.status = TurnStatus.FAILED
+            self._active_turn_id = None
+            return FailureAction.TURN_FAILED
         turn.status = TurnStatus.INCONCLUSIVE
         self._active_turn_id = None
         return FailureAction.TURN_INCONCLUSIVE
@@ -703,7 +801,19 @@ class TurnManager:
         short_reason: str,
         evidence_ref: str,
     ) -> None:
-        if (
+        if failure_type is FailureType.MODEL_ERROR:
+            # Model failures are tied to the running Intent.  The durable
+            # model-invocation ledger carries the full request/response audit;
+            # the control summary keeps only its bounded category and reason.
+            # Lower-level plan/execution failure routing may use its own
+            # already-committed validation or Execution evidence.
+            if (
+                evidence_ref not in self.intents
+                and evidence_ref not in self.executions
+                and self._plan_validation_evidence.lookup(evidence_ref) is None
+            ):
+                raise DomainError("model failure evidence_ref must reference its Intent or evidence")
+        elif (
             evidence_ref not in self.executions
             and self._plan_validation_evidence.lookup(evidence_ref) is None
         ):

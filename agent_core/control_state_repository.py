@@ -22,6 +22,7 @@ from agent_core.domain import (
     FailureSummary,
     FailureType,
     FactStatus,
+    PlanStatus,
     PlanValidationStatus,
     TurnStatus,
 )
@@ -30,6 +31,10 @@ from agent_core.file_type_fact import fact_content
 from agent_core.file_type_verifier import (
     FileTypeProofEvidence,
     FileTypeProofEvidencePort,
+)
+from agent_core.observation_proof import (
+    T6ObservationProofEvidencePort,
+    observation_fact_content,
 )
 
 
@@ -58,10 +63,12 @@ class ControlStateRepository:
         store: ControlStore,
         execution_evidence: ExecutionEvidencePort,
         file_type_proofs: FileTypeProofEvidencePort | None = None,
+        t6_observation_proofs: T6ObservationProofEvidencePort | None = None,
     ) -> None:
         self._store = store
         self._execution_evidence = execution_evidence
         self._file_type_proofs = file_type_proofs
+        self._t6_observation_proofs = t6_observation_proofs
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None:
         return self._store.load_task_run(task_run_id)
@@ -102,7 +109,11 @@ class ControlStateRepository:
                 if execution.status not in EXECUTION_TERMINAL_STATUSES:
                     raise StorageError("Fact source Execution must be terminal")
                 evidence = (
-                    self._verified_file_type_evidence(
+                    self._verified_t6_evidence(
+                        change.source_ref, change.verification_ref.removeprefix("t6:")
+                    ) if change.verification_ref is not None
+                    and change.verification_ref.startswith("t6:")
+                    else self._verified_file_type_evidence(
                         change.source_ref, change.verification_ref
                     )
                     if change.verification_ref is not None
@@ -112,7 +123,8 @@ class ControlStateRepository:
                     raise StorageError("Fact source Execution evidence is unavailable")
                 if change.status is FactStatus.VERIFIED and (
                     evidence.task_run_id != rows.task_run.task_run_id
-                    or evidence.target_ref not in targets
+                    or (evidence.target_ref not in targets
+                        and not (change.verification_ref or "").startswith("t6:"))
                     or not rows.task_run.started_at <= evidence.observed_at <= rows.task_run.deadline_at
                 ):
                     raise StorageError("verified Fact evidence is outside its TaskRun scope or time range")
@@ -120,6 +132,16 @@ class ControlStateRepository:
             raise
         except Exception as exc:
             raise StorageError(f"candidate validation failed before commit: {exc}") from exc
+
+    def _verified_t6_evidence(
+        self, execution_id: str, proof_id: str
+    ) -> ExecutionEvidence:
+        if self._t6_observation_proofs is None:
+            raise StorageError("T6 observation proof evidence is not configured")
+        try:
+            return self._t6_observation_proofs.lookup(execution_id, proof_id)
+        except Exception as exc:
+            raise StorageError("T6 observation proof evidence is unavailable") from exc
 
     def load_control_state(
         self,
@@ -231,32 +253,28 @@ class ControlStateRepository:
             if tuple(intents_by_turn[registered_turn.turn_id]) != registered_turn.intent_ids:
                 raise StorageError("Turn.intent_ids do not match its persisted Intents")
 
-        plan_by_intent: dict[str, str] = {}
+        plan_by_intent: dict[str, PlanStatus] = {}
         for registered_plan in rows.plans:
             if registered_plan.intent_id not in intents:
                 raise StorageError("Plan references an unknown Intent")
-            if registered_plan.intent_id in plan_by_intent:
-                raise StorageError("an Intent contains multiple Plans")
-            plan_by_intent[registered_plan.intent_id] = registered_plan.plan_id
+            previous_status = plan_by_intent.get(registered_plan.intent_id)
+            if previous_status is not None and previous_status is not PlanStatus.COMPLETED:
+                raise StorageError("a later Plan follows an unfinished Plan")
+            plan_by_intent[registered_plan.intent_id] = registered_plan.status
             registered_plan.to_domain()
 
         command_results: dict[str, bool] = {}
         output_results: dict[str, bool] = {}
-        execution_commands: dict[tuple[str, int], str] = {}
+        execution_commands: dict[tuple[str, int], set[str]] = {}
         for stored_execution in rows.executions:
             plan = plans.get(stored_execution.plan_id)
             if plan is None:
                 raise StorageError("Execution references an unknown Plan")
             if not 0 <= stored_execution.step_index < len(plan.steps):
                 raise StorageError("Execution step_index is outside its Plan")
-            previous_command = execution_commands.setdefault(
-                (stored_execution.plan_id, stored_execution.step_index),
-                stored_execution.command_ref,
-            )
-            if previous_command != stored_execution.command_ref:
-                raise StorageError(
-                    "Execution retry chain contains inconsistent command_ref values"
-                )
+            execution_commands.setdefault(
+                (stored_execution.plan_id, stored_execution.step_index), set()
+            ).add(stored_execution.command_ref)
             stored_execution.to_domain()
             self._require_reference(
                 "command",
@@ -271,7 +289,7 @@ class ControlStateRepository:
                     output_results,
                 )
 
-        successful_validations: dict[tuple[str, int], str] = {}
+        successful_validations: dict[tuple[str, int], list[str]] = {}
         attempts: dict[tuple[str, int | None], list[int]] = {}
         for stored_validation in rows.plan_validation_records:
             plan = plans.get(stored_validation.plan_id)
@@ -292,12 +310,10 @@ class ControlStateRepository:
                 and stored_validation.step_index is not None
             ):
                 success_key = (stored_validation.plan_id, stored_validation.step_index)
-                if success_key in successful_validations:
-                    raise StorageError(
-                        "a Plan step contains multiple successful command records"
-                    )
                 assert stored_validation.command_ref is not None
-                successful_validations[success_key] = stored_validation.command_ref
+                successful_validations.setdefault(success_key, []).append(
+                    stored_validation.command_ref
+                )
                 self._require_reference(
                     "command",
                     stored_validation.command_ref,
@@ -309,8 +325,27 @@ class ControlStateRepository:
                     "PlanValidationRecord attempts must be contiguous from one"
                 )
 
-        for execution_key, command_ref in execution_commands.items():
-            if successful_validations.get(execution_key) != command_ref:
+        for key, commands in successful_validations.items():
+            if len(commands) > 2 or len(commands) != len(set(commands)):
+                raise StorageError("Plan step contains invalid command retry records")
+            if len(commands) == 2:
+                first = [
+                    item for item in rows.executions
+                    if (item.plan_id, item.step_index, item.command_ref)
+                    == (*key, commands[0])
+                ]
+                if (
+                    len(first) != 1
+                    or first[0].status is not ExecutionStatus.TIMED_OUT
+                    or not any(
+                        failure.evidence_ref == first[0].execution_id
+                        and failure.failure_type is FailureType.STEP_TIMEOUT
+                        for failure in rows.failure_summaries
+                    )
+                ):
+                    raise StorageError("changed command lacks a confirmed step timeout")
+        for execution_key, command_refs in execution_commands.items():
+            if not command_refs.issubset(set(successful_validations.get(execution_key, ()))):
                 raise StorageError(
                     "Execution does not match its successful command generation record"
                 )
@@ -326,6 +361,23 @@ class ControlStateRepository:
                 raise StorageError("Fact source Execution belongs to another Turn")
             fact.to_domain()
             if fact.verification_ref is not None:
+                if fact.verification_ref.startswith("t6:"):
+                    if self._t6_observation_proofs is None:
+                        raise StorageError("T6 observation proof evidence is not configured")
+                    proof, evidence = self._t6_observation_proofs.read_verified(
+                        fact.source_ref, fact.verification_ref.removeprefix("t6:")
+                    )
+                    if (
+                        fact.status is not FactStatus.VERIFIED
+                        or proof.intent_id != source_intent.intent_id
+                        or proof.task_run_id != task_run_id
+                        or fact.content != observation_fact_content(
+                            proof.proof_id, len(proof.execution_ids)
+                        )
+                        or evidence.task_run_id != task_run_id
+                    ):
+                        raise StorageError("T6 observation Fact proof does not match control state")
+                    continue
                 verified = self._file_type_proof(
                     fact.source_ref, fact.verification_ref
                 )
@@ -349,7 +401,11 @@ class ControlStateRepository:
         for summary in rows.failure_summaries:
             execution = executions.get(summary.evidence_ref)
             validation = validations.get(summary.evidence_ref)
-            if execution is None and validation is None:
+            model_error_for_intent = (
+                summary.failure_type is FailureType.MODEL_ERROR
+                and any(item.intent_id == summary.evidence_ref for item in rows.intents)
+            )
+            if execution is None and validation is None and not model_error_for_intent:
                 raise StorageError("FailureSummary references missing evidence")
             summary.to_domain()
 

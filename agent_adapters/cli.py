@@ -52,12 +52,20 @@ def parser():
     run.add_argument("--env-file", default=".env")
     run.add_argument("--state-dir", required=True)
     run.add_argument("--events")
+    task = commands.add_parser("run-task")
+    task.add_argument("--request", required=True)
+    task.add_argument("--mode", choices=("real", "simulated"), required=True)
+    task.add_argument("--fixture", help="ordered v2 fixture, simulated mode only")
+    task.add_argument("--env-file", default=".env")
+    task.add_argument("--state-dir", required=True)
+    task.add_argument("--events")
     for command in ("resume", "cancel", "status", "replay"):
         item = commands.add_parser(command)
         item.add_argument("--task-run-id", required=True)
         item.add_argument("--state-dir", required=True)
         if command == "resume":
             item.add_argument("--authorization")
+            item.add_argument("--fixture", help="append-only v2 simulated fixture")
             group = item.add_mutually_exclusive_group()
             group.add_argument("--cleanup-only", action="store_true")
             group.add_argument("--verify-import", action="store_true")
@@ -70,6 +78,10 @@ def parser():
 
 def _snapshot(directory, declaration):
     try:
+        if declaration["protocol_version"] == 2:
+            from agent_adapters.task_result import snapshot_task_result
+
+            return snapshot_task_result(directory, declaration)
         return snapshot_result(directory, declaration)
     except Exception as exc:  # noqa: BLE001 -- sanitized CLI/process boundary
         result = base_result(declaration["task_run_id"], declaration["mode"])
@@ -103,16 +115,15 @@ def _worker(
     directory = Path(directory_text)
     try:
         with run_lock(directory):
-            _owned_operation(
-                directory,
-                declaration,
-                cancel,
-                operation,
-                auth,
-                settings,
-                output_name,
-                verify_import,
-            )
+            if declaration["protocol_version"] == 2:
+                _owned_task_operation(
+                    directory, declaration, cancel, operation, settings, output_name,
+                )
+            else:
+                _owned_operation(
+                    directory, declaration, cancel, operation, auth, settings,
+                    output_name, verify_import,
+                )
     except ValueError as exc:
         if str(exc) != "task_run_busy":
             raise
@@ -120,6 +131,45 @@ def _worker(
         result["errors"].append({"code": "task_run_busy"})
         result["exit_code"] = 4
         immutable_write(directory / output_name, result)
+
+
+def _owned_task_operation(directory, declaration, cancel, operation, settings, output_name):
+    from agent_adapters.task_application import TaskApplication
+
+    app = None
+    errors = []
+    try:
+        token = Cancellation(cancel, directory)
+        app = TaskApplication(directory, declaration, token, settings=settings)
+        if operation == "cancel":
+            app.controller.attach(declaration["task_run_id"])
+            if app.state.task_run.status not in TERMINAL_STATUSES:
+                app.controller.cancel(declaration["ids"]["cancel"])
+        elif operation == "cleanup":
+            app.controller.attach(declaration["task_run_id"])
+            app.controller.cleanup_sandbox()
+        elif operation == "recover-import":
+            app.controller.attach(declaration["task_run_id"])
+            app.recover_imports()
+        else:
+            asyncio.run(app.execute(start=operation == "start"))
+    except Exception as exc:  # noqa: BLE001 -- sanitized process boundary
+        errors.append(safe_error(exc))
+        if operation == "start" and app is not None and app.store.load_task_run(
+            declaration["task_run_id"]
+        ) is None:
+            immutable_write(directory / "start-failure.json", errors[-1])
+    finally:
+        if app is not None:
+            try:
+                app.close()
+            except Exception as exc:  # noqa: BLE001 -- cleanup result is separate
+                errors.append(safe_error(exc))
+    result = _snapshot(directory, declaration)
+    result["errors"].extend(errors)
+    if errors and result["exit_code"] == 4:
+        result["exit_code"] = 5
+    immutable_write(directory / output_name, result)
 
 
 def _owned_operation(
@@ -315,6 +365,10 @@ def supervise(
 
 def dispatch(args):
     settings = None
+    if args.command == "run-task":
+        from agent_adapters.task_cli import dispatch_run_task
+
+        return dispatch_run_task(args)
     if args.command == "run-intent":
         value = (
             parse_json(sys.stdin.buffer.read(1024 * 1024 + 1))
@@ -330,7 +384,7 @@ def dispatch(args):
         else:
             if args.fixture:
                 raise ValueError("fixture_forbidden_in_real_mode")
-            settings = DeepSeekSettings.from_env_file(Path(args.env_file))
+            settings = DeepSeekSettings.from_runtime_env(Path(args.env_file))
             if settings.api_key in encode(value).decode("ascii"):
                 raise ValueError("credentials_in_request_rejected")
         # Existing importer performs the same checks again at dispatch (TOCTOU).
@@ -381,6 +435,10 @@ def dispatch(args):
     declaration = immutable_read(directory / "run.json")
     if declaration["task_run_id"] != args.task_run_id:
         raise ValueError("run_identity_mismatch")
+    if declaration["protocol_version"] == 2:
+        from agent_adapters.task_cli import dispatch_existing
+
+        return dispatch_existing(args, directory, declaration)
     if args.command == "replay":
         events = read_events(
             directory / "control.sqlite",
@@ -441,7 +499,7 @@ def dispatch(args):
     if auth is None and not args.verify_import:
         raise ValueError("current_authorization_required")
     if declaration["mode"] == "real" and auth is not None:
-        settings = DeepSeekSettings.from_env_file(Path(declaration["env_file"]))
+        settings = DeepSeekSettings.from_runtime_env(Path(declaration["env_file"]))
     return supervise(
         directory,
         declaration,

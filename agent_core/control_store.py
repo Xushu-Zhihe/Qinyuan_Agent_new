@@ -117,6 +117,53 @@ def task_request_payload(request: TaskRequest) -> dict[str, object]:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetNetworkBinding:
+    private_network_id: str
+    egress_network_id: str
+    forwarder_id: str
+    configuration_sha256: str
+    target_url: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "private_network_id",
+            "egress_network_id",
+            "forwarder_id",
+            "configuration_sha256",
+        ):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+            ):
+                raise ValueError(f"TargetNetworkBinding.{name} must be SHA-256 hex")
+        _non_empty(self.target_url, "TargetNetworkBinding.target_url")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "private_network_id": self.private_network_id,
+            "egress_network_id": self.egress_network_id,
+            "forwarder_id": self.forwarder_id,
+            "configuration_sha256": self.configuration_sha256,
+            "target_url": self.target_url,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> TargetNetworkBinding:
+        fields = {
+            "private_network_id",
+            "egress_network_id",
+            "forwarder_id",
+            "configuration_sha256",
+            "target_url",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("invalid TargetNetworkBinding fields")
+        return cls(**value)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
 class UpsertTaskRun:
     task_run_id: str
     request: TaskRequest
@@ -129,6 +176,7 @@ class UpsertTaskRun:
     finished_at: float | None = None
     failure_reason: str | None = None
     source_root: str | None = None
+    target_network: TargetNetworkBinding | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.task_run_id, "UpsertTaskRun.task_run_id")
@@ -140,6 +188,12 @@ class UpsertTaskRun:
             or "\x00" in self.source_root
         ):
             raise ValueError("UpsertTaskRun.source_root must be a path or None")
+        if self.target_network is not None and (
+            not isinstance(self.target_network, TargetNetworkBinding)
+            or tuple(item.url for item in self.request.target.endpoints)
+            != (self.target_network.target_url,)
+        ):
+            raise ValueError("UpsertTaskRun target network must match its sole endpoint")
         if not isinstance(self.effective_model_backend, ModelBackend):
             raise ValueError(
                 "UpsertTaskRun.effective_model_backend must be a ModelBackend"
@@ -487,7 +541,8 @@ TURN_OPERATIONS = frozenset({
     "append_plan_validation_record", "create_execution", "start_execution",
     "complete_execution", "create_fact", "verify_fact", "succeed_intent_with_fact",
     "complete_turn", "record_command_generation_failure", "record_execution_failure",
-    "record_target_mismatch", "finish_task_run",
+    "record_step_timeout", "record_target_mismatch", "mark_intent_inconclusive",
+    "record_model_error", "finish_task_run",
 })
 
 
@@ -523,7 +578,11 @@ class TurnOperation:
             if self.operation == "finish_task_run":
                 if task.status not in {TaskRunStatus.PARTIAL, TaskRunStatus.INCONCLUSIVE}:
                     raise ValueError("Turn conclusion must be partial or inconclusive")
-            elif self.operation not in {"record_execution_failure", "record_command_generation_failure"} or (
+            elif self.operation not in {
+                "record_execution_failure",
+                "record_command_generation_failure",
+                "record_model_error",
+            } or (
                 task.status is not TaskRunStatus.FAILED or self.result != "task_failed"
             ):
                 raise ValueError("only model failure may terminate a TaskRun in a Turn operation")
@@ -622,6 +681,14 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             event_type=_CONTROL_EVENT_TYPE,
             dynamic_result_entity="fact",
         ),
+        "commit_verified_t6_observation": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="fact",
+        ),
+        "commit_verified_t6_fact": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="fact",
+        ),
         "verify_fact": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"verified", "rejected"}),
@@ -634,6 +701,10 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"succeeded"}),
         ),
+        "complete_verified_t6_intent": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"succeeded"}),
+        ),
         "complete_turn": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"completed"}),
@@ -643,8 +714,11 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             allowed_results=frozenset(
                 {
                     "retry_command_generation",
+                    "retry_step_command",
                     "try_next_intent",
+                    "turn_failed",
                     "turn_inconclusive",
+                    "model_error",
                     "task_failed",
                 }
             ),
@@ -655,16 +729,37 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
                 {
                     "retry_execution",
                     "try_next_intent",
+                    "turn_failed",
                     "turn_inconclusive",
+                    "model_error",
                     "task_failed",
+                }
+            ),
+        ),
+        "record_step_timeout": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset(
+                {
+                    "retry_step_command",
+                    "try_next_intent",
+                    "turn_failed",
+                    "turn_inconclusive",
                 }
             ),
         ),
         "record_target_mismatch": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset(
-                {"try_next_intent", "turn_inconclusive"}
+                {"try_next_intent", "turn_failed", "turn_inconclusive"}
             ),
+        ),
+        "mark_intent_inconclusive": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"turn_inconclusive"}),
+        ),
+        "record_model_error": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"model_error"}),
         ),
         "recover_running_execution_as_inconclusive": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
@@ -754,17 +849,35 @@ def validate_control_event(
         or state_changes[0].verification_ref is None
     ):
         raise ValueError("file-type Fact commit requires one verified Fact with proof")
-    if operation == "complete_satisfied_intent" and (
+    if operation == "commit_verified_t6_observation" and (
+        len(state_changes) != 2
+        or not isinstance(state_changes[0], UpsertFact)
+        or not isinstance(state_changes[1], UpsertIntent)
+        or state_changes[0].status is not FactStatus.VERIFIED
+        or state_changes[1].status is not IntentStatus.SUCCEEDED
+        or state_changes[0].verification_ref is None
+        or not state_changes[0].verification_ref.startswith("t6:")
+    ):
+        raise ValueError("T6 observation requires one verified Fact and succeeded Intent")
+    if operation == "commit_verified_t6_fact" and (
+        len(state_changes) != 1
+        or not isinstance(state_changes[0], UpsertFact)
+        or state_changes[0].status is not FactStatus.VERIFIED
+        or state_changes[0].verification_ref is None
+        or not state_changes[0].verification_ref.startswith("t6:")
+    ):
+        raise ValueError("T6 Fact requires one verified observation with proof")
+    if operation in {"complete_satisfied_intent", "complete_verified_t6_intent"} and (
         len(state_changes) != 1
         or not isinstance(state_changes[0], UpsertIntent)
         or state_changes[0].status is not IntentStatus.SUCCEEDED
     ):
         raise ValueError("Intent completion requires one succeeded Intent change")
-    if operation != "commit_verified_file_type_fact" and any(
+    if operation not in {"commit_verified_file_type_fact", "commit_verified_t6_observation", "commit_verified_t6_fact"} and any(
         isinstance(change, UpsertFact) and change.verification_ref is not None
         for change in state_changes
     ):
-        raise ValueError("a Fact proof reference requires the dedicated file-type operation")
+        raise ValueError("a Fact proof reference requires a dedicated verified operation")
     if not isinstance(event.details, Mapping):
         raise ValueError("RuntimeEvent.details must be a JSON object")
     details = dict(event.details)
@@ -786,7 +899,9 @@ def validate_control_event(
         allowed_fields.add("import_id")
     if operation == "commit_verified_file_type_fact":
         allowed_fields.update({"intent_id", "path", "observed_type"})
-    if operation == "complete_satisfied_intent":
+    if operation in {"commit_verified_t6_observation", "commit_verified_t6_fact"}:
+        allowed_fields.add("intent_id")
+    if operation in {"complete_satisfied_intent", "complete_verified_t6_intent"}:
         allowed_fields.add("verified_fact_ids")
     unknown_fields = set(details) - allowed_fields
     if unknown_fields:
@@ -808,7 +923,27 @@ def validate_control_event(
             or change.content != FACT_PREFIX + details["observed_type"]
         ):
             raise ValueError("file-type Fact event does not match its content")
-    if operation == "complete_satisfied_intent":
+    if operation in {"commit_verified_t6_observation", "commit_verified_t6_fact"}:
+        fact = state_changes[0]
+        assert isinstance(fact, UpsertFact)
+        assert fact.verification_ref is not None
+        _uuid4(fact.fact_id, "UpsertFact.fact_id")
+        _uuid4(fact.verification_ref.removeprefix("t6:"), "UpsertFact.verification_ref")
+        intent_id = (
+            state_changes[1].intent_id
+            if operation == "commit_verified_t6_observation"
+            and isinstance(state_changes[1], UpsertIntent)
+            else details.get("intent_id")
+        )
+        observation_entity_ids = [fact.fact_id, intent_id] if operation == "commit_verified_t6_observation" else [fact.fact_id]
+        if (
+            not isinstance(intent_id, str)
+            or details.get("intent_id") != intent_id
+            or details.get("entity_ids") != observation_entity_ids
+            or details.get("result") != fact.fact_id
+        ):
+            raise ValueError("T6 observation event does not match its state changes")
+    if operation in {"complete_satisfied_intent", "complete_verified_t6_intent"}:
         change = state_changes[0]
         assert isinstance(change, UpsertIntent)
         fact_ids = details.get("verified_fact_ids")
@@ -1054,6 +1189,7 @@ class TaskRunSnapshot:
     finished_at: float | None
     failure_reason: str | None
     source_root: str | None = None
+    target_network: TargetNetworkBinding | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1199,6 +1335,12 @@ class ControlStateSnapshot:
 class ControlStore(Protocol):
     def commit(self, mutation: ControlMutation) -> ControlCommitResult: ...
 
+    def committed_mutations_after(
+        self, task_run_id: str, checkpoint_sequence: int,
+    ) -> tuple[tuple[str, ControlCommitResult], ...]:
+        """Read the commits used to reconcile an interrupted action."""
+        ...
+
     def load_committed_mutation(
         self,
         task_run_id: str,
@@ -1240,6 +1382,8 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
         }
         if change.source_root is not None:
             payload["source_root"] = change.source_root
+        if change.target_network is not None:
+            payload["target_network"] = change.target_network.to_dict()
         return payload
     if isinstance(change, UpsertTurn):
         return {
@@ -1288,7 +1432,7 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
             "output_ref": change.output_ref,
         }
     if isinstance(change, UpsertFact):
-        data = {
+        data: dict[str, object] = {
             "type": "upsert_fact",
             "fact_id": change.fact_id,
             "turn_id": change.turn_id,
@@ -1326,7 +1470,7 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
 
 
 def control_mutation_fingerprint(mutation: ControlMutation) -> str:
-    if mutation.operation == "complete_satisfied_intent":
+    if mutation.operation in {"complete_satisfied_intent", "complete_verified_t6_intent"}:
         (change,) = mutation.state_changes
         assert isinstance(change, UpsertIntent)
         return hashlib.sha256(
@@ -1367,6 +1511,21 @@ def control_mutation_fingerprint(mutation: ControlMutation) -> str:
                     "execution_id": change.source_ref,
                     "proof_id": change.verification_ref,
                     "fact_id": change.fact_id,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+    if mutation.operation in {"commit_verified_t6_observation", "commit_verified_t6_fact"}:
+        fact = mutation.state_changes[0]
+        assert isinstance(fact, UpsertFact)
+        return hashlib.sha256(
+            canonical_json(
+                {
+                    "operation": mutation.operation,
+                    "task_run_id": mutation.task_run_id,
+                    "intent_id": mutation.event.details["intent_id"],
+                    "execution_id": fact.source_ref,
+                    "proof_id": fact.verification_ref,
+                    "fact_id": fact.fact_id,
                 }
             ).encode("utf-8")
         ).hexdigest()

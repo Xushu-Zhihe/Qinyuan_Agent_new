@@ -58,8 +58,8 @@ CLI 外形已确认为同步 `qinyuan-agent-new run-intent --request <JSON 文�
 2. `RunSupervisorPort`：循环驱动、动态 Intent、路径耗尽、Budget 和终止返回值。
 3. `StagePlannerPort`：StageContext、前置/后置条件、时间片和计划返回值。
 4. `ProcedureSelectorPort` / `ProcedureRunnerPort`：ProcedureFact 字段、版本、匹配排序、校验失败和执行失败路径。
-5. `ToolGatewayPort` / `PolicyPort`：T3 File Tool 已确认，其他 Tool 的权限粒度与 Scope/ROE 仍需确认。
-6. `MCPManagerPort` / `SandboxRuntimePort`：T3 方法已确认，其他 Tool、远程 MCP 和真实 Docker 验收仍需确认。
+5. `ToolGatewayPort` / `PolicyPort`：T3 File Tool 已确认；T6 通用脚本新增 `T6CommandGateway`，其权限粒度与 Scope/ROE 仅限本轮已确认的 Sandbox 边界。
+6. `MCPManagerPort` / `SandboxRuntimePort`：专用 MCP 仍使用 T3 方法；通用脚本直接进入 T6 Sandbox，其他 Tool、远程 MCP 和真实 Docker 验收仍需确认。
 7. `ExecutionRecorderPort`：T3 执行记录、保留、截断、Hash 与脱敏已确认；一般 Artifact 的扩展字段和清理 API 仍待后续确认。
 8. 通用 `FactVerifierPort` / TaskRun `GoalEvaluatorPort`：任意事实与整体任务判断仍待确认；T4 文件类型验证器和只读 IntentGoalEvaluatorPort 已实现，不以此扩大到通用目标判断。
 9. `EventPort`：事件类型、顺序、持久化、重放、订阅和背压。
@@ -93,7 +93,43 @@ CLI 外形已确认为同步 `qinyuan-agent-new run-intent --request <JSON 文�
 | `SandboxRuntimePort` | async `execute(SandboxExecutionRequest) -> SandboxExecutionResult`；`quiesce(sandbox_id)` 关闭新执行准入 |
 | `ExecutionRecorderPort` | begin、save/load_command、save/read_record、finish，以及既有 ExecutionEvidencePort 的查询 |
 
+### T6 直接脚本切片（2026-09-25）
+
+`T6CommandGateway.call(SandboxCommandRequest, SandboxCommandAuthorization, CancellationToken)` 在可信侧完成 Policy 校验后直接调用 `T6CommandSandboxPort.execute(AuthorizedCommand, CancellationToken)`；它不启动 MCP。`AuthorizedCommand` 只允许结构化的 `("bash", "-c", script)`，工作目录固定在 `/workspace/work` 及其真实子目录。脚本最多 64 KiB，stdin 最多 1 MiB，stdout/stderr 各保存最多 64 KiB，单步有效时限取请求、60 秒步骤预算和 TaskRun 剩余时限的最小值，且不超过 300 秒。
+
+Sandbox 只接受经摘要校验的工作副本执行；原始输入保持只读且不可执行。直接执行的完整退出（包括非零退出码）记录为 `completed`，由后置条件验证器判断其内容；只有可信侧时限和已确认的进程清理才能产生 `step_timeout`。派发后无法确认结果的记录为 `outcome_unknown`，阻止新的派发并等待显式恢复。已确认超时允许同一 Plan 步最多一次改命令重试。
+
+`IntentPostconditions` 由模型在执行前提出，可信侧核对当前 TaskRun/Intent/Plan 与步骤索引后不可覆盖地保存。首版 `OutputContains(step_index, stream, literal)` 与 `FileSha256(step_index, path, expected_sha256)` 全部满足才返回 `satisfied`；任一证据不完整、文件摘要观察未知或 Execution 未完成返回 `inconclusive`，完整证据确认不满足才返回 `not_satisfied`。文件条件表示整个 Plan 结束时的 SHA-256，输出条件仍绑定指定步骤。`T6FileDigest` 以普通工具 UID 执行固定只读程序，拒绝工作区路径穿越、符号链接及非普通文件；首次摘要观察不可覆盖，未知观察不自动重读。
+
+`T6ObservationProofVerifier.issue(intent_id, proof_id, plan_id=None)` 依据该 Plan 已固定的条件、Execution 和已保存的文件摘要观察签发独立不可覆盖证明；`lookup(execution_id, proof_id)` 只读复核，绝不重新执行 Bash 或重新读取文件。`TaskRunController.commit_verified_t6_observation(intent_id, proof_id, fact_id, mutation_id, complete_intent=True)` 经可信侧与 `ControlStateRepository` 二次复核，原子提交 verified 观察 Fact、事件和 Checkpoint；`complete_intent=False` 时 Intent 保持 running，默认值保留 T6-2 的 Fact/Intent 同事务完成行为。证明引用使用 `t6:<UUID>` 与文件类型专用证明区分。此入口不评估候选 flag 正确性，也不改变 TaskRun 状态；v2 Runner 和工作台真实模式均已接入，工作台只做控制和只读投影。
+
+T6-5 的内层动作解析入口为 `parse_t6_action(raw)`，只接受 `probe`、`complete_intent`、`abandon_intent`、`candidate_flag` 四种严格字段形状；它只解析提议，不执行副作用。`PendingCandidateRecorder.record(state, intent_id, action, candidate_id, created_at)` 复核当前 Intent 的已完成 Execution 及命令收据后，保存不可覆盖的 pending 候选；`grouped_pending_candidates` 仅供结果展示按原文合并来源。`TaskRunController.complete_verified_t6_intent(intent_id, fact_ids, mutation_id)` 只在引用的已验证 Fact 归属当前 Intent，且包含最新可验证短 Plan 的证明时原子完成 Intent。通用旧入口拒绝使用 T6 观察 Fact 绕过该检查。schema 10 的 `T6ActionJournal` 在模型调用前经 `SqliteControlStore.begin_t6_action` 固定当前 Checkpoint、上下文摘要和资源 ID，结构化动作写入 `T6ActionEvidenceStore` 后仅将摘要提交到数据库；`resume_unapplied` 只读复用完整证据，证据已写而完成标记未写时补记同一结果，只有开始记录时要求显式恢复。该审计切片已由 `IncrementalIntentRunner` 与 `run-task` 组装。
+
+`recent_t6_observations(state, intent_id, commands)` 只读取当前 Intent 最近最多 8 条已结束 Execution 的完成收据，返回按先后顺序排列的有界观察；结构化 JSON 合计不超过 16 KiB。非法 UTF-8 字节转义为 `\xNN`，保留原始截断标记并单独标记上下文裁剪。任何仍运行的 Execution 或缺失、不匹配的完成收据都会阻止生成下一次模型上下文。Runner 已将其接入每次动作请求。
+
+`build_action_model_request` 从已提交的运行中 Intent、已完成短 Plan、可信模型上下文以及有界 Execution/候选收据构造 `T6ActionModelRequest`。`AuditedT6ActionModel.propose` 在模型调用前登记 schema 10 资源 ID，严格解析动作并保存不可覆盖结果；未知模型调用不重发，结构错误最多纠正一次。已保存但未应用的动作返回原资源 ID，供 Runner 核对控制面副作用。Runner 已接入此入口；Bash 仍只能经 Gateway 派发。
+
+`recent_pending_candidate_context(state, intent_id, store, commands)` 返回当前 Intent 最近最多 8 条 pending 候选摘要，JSON 总量不超过 16 KiB。完整原文按最新优先纳入；放不下的条目以 `value=None`、SHA-256 和来源 ID 表示，并标识省略；每条重新核对已完成命令收据。候选上下文不改变候选台账或整题状态。
+
+### T6-3 有序 Intent 生成（2026-09-26）
+
+`OrderedIntentGenerator.generate(task_run_id, turn_target, registration_mutation_id, cancellation_token)` 为内部异步入口；`resume_unapplied(task_run_id, cancellation_token)` 从台账查找同一未注册轮，不猜测新的请求 ID。`turn_target` 与 UUID4 mutation 来自可信调度调用方；服务从 Repository 读取已提交、有界的 Fact 和目标失败摘要，构造 `intent_generation` 请求。`ModelInvocationCoordinator` 在每次调用前经同一 `SqliteControlStore` 登记轮级审计；单次结构纠正也独立登记。schema 8 的 `turn_model_invocations` 保存唯一模型调用、Checkpoint、上下文 SHA-256、注册 mutation、确定性 Turn ID、完成结果或错误，不保存原始提示/响应。候选非空，按模型顺序持久化；不额外限制每轮数量。结果完成与固定注册标识在同一审计事务内；Turn/Intent、事件和 Checkpoint 仍由 Controller 另一次原子提交。未知调用、先前结果未应用、上下文/状态变化均阻止新派发或旧结果应用。该入口不执行 Intent，也不改变 TaskRun 目标状态。
+
 `FileToolRecorder(directory, sensitive_values=())` 显式接收证据目录与敏感值。`EvidenceStorageError` 表示证据写入/完整性/请求指纹冲突；`ToolRecoveryRequired` 表示已有不完整请求、历史执行未确认停止等情况，禁止借重试该请求重新派发命令。Controller 的提交后重载错误仍原样保留，不包装成工具失败。
+
+### T6-4 深度优先调度（2026-09-26）
+
+`RunSupervisor` 只通过 `TaskRunController` 和 `TurnWorkingCopy` 推进控制面。它从最小 sequence 的 pending/running Turn 选择 priority 最小的 pending Intent，先原子提交 `Intent.running`，再调用窄小的 `IntentRunnerPort.run(intent_id) -> IntentRunResult`。Runner 必须返回带 TaskRun/Intent 归属的结构化结果；调度器不从模型文本或退出码推断领域结论。
+
+`IntentRunResult` 的结果为 `succeeded`、`target_mismatch`、`inconclusive`、`recovery_required` 和 `model_error`。`succeeded` 要求 Runner 已提交当前 Intent 的 succeeded，调度器随后完成 Turn；`target_mismatch` 要求已完成 Plan 与 Execution 证据，提交分类失败并继续同一 Turn 的兄弟候选；兄弟候选全部完整失败时，通过显式 `TurnGeneratorPort` 生成下一独立 Turn，生成器从已提交 Fact 与目标失败摘要构造上下文，不需要 `parent_turn_id`。`inconclusive` 只用于 Execution 已结束但后置条件无法判断，原子标记 Intent/Turn 并停止派发；`recovery_required` 用于仍有 running Execution 或未完成工具收据，保留原始 running 状态并禁止继续派发，等待显式恢复；`model_error` 将错误原因写入审计/失败摘要，Intent/Turn/TaskRun 均保持原状态，停止调度且不尝试兄弟候选。
+
+已提交的 `model_error` 失败摘要是该 Intent 的停止标记；恢复时调度器只读返回相同原因，不再次调用 Runner/模型，也不选择兄弟候选。
+
+最新 Turn 已为 `inconclusive` 时，再次调用调度器只读返回 `paused_inconclusive`，不生成下一 Turn。`AuditedTurnGenerator` 先复用未应用的轮级模型台账；已完成的错误只读回放，已保存的候选用原注册 ID 提交，调用未完成则要求显式恢复。
+
+Runner 仅接收本次调度新提交为 running 的 Intent；若调度器读到先前已 running 的 Intent，则只读返回 `recovery_required`。这一约束避免未知执行因调度器重启而再次派发。
+
+调度器不执行 Bash、MCP 或答案校验，也不把 verified Fact 升级为 TaskRun achieved。控制库的 mutation 重放仍沿用现有幂等和 Checkpoint 规则；v2 CLI、临时 TaskResult、工作台只读投影及 T6-6 单一公网目标网络适配器已接入。独立答案校验器和真实环境验收仍待后续。
 
 本轮只确认上述 Python 内部类型及本地证据文件，不冻结 CLI、外部 TaskResult 或通用远程 wire protocol。T3 不提供删除运行中证据的 API；调用方应在不再需要审计或控制面恢复后显式清理整份证据目录。
 

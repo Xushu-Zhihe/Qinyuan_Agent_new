@@ -27,6 +27,7 @@ from agent_core.control_store import (
     StateChange,
     StorageError,
     TaskRunSnapshot,
+    TargetNetworkBinding,
     TurnSnapshot,
     UpsertExecution,
     UpsertFact,
@@ -73,9 +74,17 @@ from agent_core.model_invocation_audit import (
     result_from_payload,
     result_payload,
 )
+from agent_core.action_audit import (
+    ActionAuditConflict,
+    ActionInvocationCompletion,
+    ActionInvocationRecord,
+    ActionInvocationStart,
+    ActionRecoveryRequired,
+    ActionResourceIds,
+)
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 10
 
 
 MIGRATION_1 = """
@@ -282,6 +291,86 @@ CREATE TABLE intent_action_applications (
 );
 """
 
+MIGRATION_7 = """
+ALTER TABLE task_runs ADD COLUMN target_network_json TEXT;
+"""
+
+MIGRATION_8 = """
+CREATE TABLE turn_model_invocations (
+    model_request_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    turn_id TEXT NOT NULL,
+    registration_mutation_id TEXT NOT NULL,
+    base_checkpoint_sequence INTEGER NOT NULL,
+    context_sha256 TEXT NOT NULL,
+    turn_target TEXT NOT NULL,
+    correction_of_model_request_id TEXT UNIQUE REFERENCES turn_model_invocations(model_request_id),
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    result_kind TEXT CHECK (result_kind IN ('intent_generation', 'invalid_structure', 'model_error')),
+    result_json TEXT,
+    CHECK ((finished_at IS NULL AND result_kind IS NULL AND result_json IS NULL)
+        OR (finished_at IS NOT NULL AND result_kind IS NOT NULL AND result_json IS NOT NULL))
+);
+CREATE INDEX idx_turn_model_invocations_scope
+ON turn_model_invocations(task_run_id, turn_id, started_at);
+"""
+
+MIGRATION_9 = """
+CREATE TABLE plans_v9 (
+    plan_id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    status TEXT NOT NULL,
+    UNIQUE(intent_id, sequence)
+);
+INSERT INTO plans_v9(plan_id, intent_id, sequence, status)
+SELECT plan_id, intent_id, 1, status FROM plans;
+DROP TABLE plans;
+ALTER TABLE plans_v9 RENAME TO plans;
+CREATE TABLE intent_plan_applications_v9 (
+    model_request_id TEXT PRIMARY KEY REFERENCES model_invocations(model_request_id),
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    plan_id TEXT NOT NULL UNIQUE,
+    application_json TEXT NOT NULL
+);
+INSERT INTO intent_plan_applications_v9
+SELECT * FROM intent_plan_applications;
+DROP TABLE intent_plan_applications;
+ALTER TABLE intent_plan_applications_v9 RENAME TO intent_plan_applications;
+CREATE INDEX idx_intent_plan_applications_scope
+ON intent_plan_applications(task_run_id, intent_id);
+"""
+
+MIGRATION_10 = """
+CREATE TABLE t6_action_invocations (
+    model_request_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    base_checkpoint_sequence INTEGER NOT NULL CHECK (base_checkpoint_sequence > 0),
+    context_sha256 TEXT NOT NULL,
+    resource_ids_json TEXT NOT NULL,
+    correction_of_model_request_id TEXT UNIQUE REFERENCES t6_action_invocations(model_request_id),
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    result_kind TEXT CHECK (result_kind IN ('action', 'invalid_structure', 'model_error')),
+    result_sha256 TEXT,
+    applied_at REAL,
+    CHECK ((finished_at IS NULL AND result_kind IS NULL AND result_sha256 IS NULL)
+        OR (finished_at IS NOT NULL AND result_kind IS NOT NULL AND result_sha256 IS NOT NULL)),
+    CHECK (applied_at IS NULL OR finished_at IS NOT NULL)
+);
+CREATE INDEX idx_t6_action_invocations_scope
+ON t6_action_invocations(task_run_id, intent_id, started_at);
+CREATE TABLE t6_action_resource_ids (
+    resource_id TEXT PRIMARY KEY,
+    model_request_id TEXT NOT NULL REFERENCES t6_action_invocations(model_request_id),
+    resource_kind TEXT NOT NULL,
+    UNIQUE(model_request_id, resource_kind)
+);
+"""
+
 
 class SqliteControlStore:
     """SQLite implementation of the control-plane transaction boundary."""
@@ -364,6 +453,9 @@ class SqliteControlStore:
 
     def _migrate(self) -> None:
         try:
+            # SQLite cannot remove the old UNIQUE(intent_id) with ALTER TABLE.
+            # Rebuild in one transaction and check every child reference before commit.
+            self._connection.execute("PRAGMA foreign_keys = OFF")
             self._connection.execute("BEGIN IMMEDIATE")
             table_exists = self._connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_versions'"
@@ -422,6 +514,36 @@ class SqliteControlStore:
                     "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                     (6, self._now()),
                 )
+            if version < 7:
+                for statement in _sql_statements(MIGRATION_7):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (7, self._now()),
+                )
+            if version < 8:
+                for statement in _sql_statements(MIGRATION_8):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (8, self._now()),
+                )
+            if version < 9:
+                for statement in _sql_statements(MIGRATION_9):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (9, self._now()),
+                )
+            if version < 10:
+                for statement in _sql_statements(MIGRATION_10):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (10, self._now()),
+                )
+            if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
         except StorageError:
             self._rollback_quietly()
@@ -429,12 +551,200 @@ class SqliteControlStore:
         except sqlite3.Error as exc:
             self._rollback_quietly()
             raise StorageError(f"SQLite schema migration failed: {exc}") from exc
+        finally:
+            self._connection.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _t6_action_from_row(row: sqlite3.Row) -> ActionInvocationRecord:
+        start = ActionInvocationStart(
+            row["model_request_id"], row["task_run_id"], row["intent_id"],
+            row["base_checkpoint_sequence"], row["context_sha256"],
+            ActionResourceIds(**json.loads(row["resource_ids_json"])),
+            row["started_at"], row["correction_of_model_request_id"],
+        )
+        completion = None
+        if row["finished_at"] is not None:
+            completion = ActionInvocationCompletion(
+                start.model_request_id, row["finished_at"], row["result_kind"],
+                row["result_sha256"],
+            )
+        return ActionInvocationRecord(start, completion, row["applied_at"])
+
+    def begin_t6_action(
+        self, start: ActionInvocationStart,
+    ) -> ActionInvocationRecord | None:
+        if not isinstance(start, ActionInvocationStart):
+            raise TypeError("start must be an ActionInvocationStart")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self._connection.execute(
+                "SELECT * FROM t6_action_invocations WHERE model_request_id = ?",
+                (start.model_request_id,),
+            ).fetchone()
+            if existing is not None:
+                record = self._t6_action_from_row(existing)
+                if record.start != start:
+                    raise ActionAuditConflict("model request ID has different action fields")
+                self._connection.commit()
+                return record
+            owner = self._connection.execute(
+                """SELECT task_runs.status AS task_status, task_runs.started_at,
+                          task_runs.deadline_at, intents.status AS intent_status
+                   FROM intents JOIN turns ON turns.turn_id = intents.turn_id
+                   JOIN task_runs ON task_runs.task_run_id = turns.task_run_id
+                   WHERE intents.intent_id = ? AND task_runs.task_run_id = ?""",
+                (start.intent_id, start.task_run_id),
+            ).fetchone()
+            checkpoint = self._connection.execute(
+                "SELECT MAX(sequence) FROM checkpoints WHERE task_run_id = ?",
+                (start.task_run_id,),
+            ).fetchone()[0]
+            if (owner is None or owner["task_status"] != TaskRunStatus.RUNNING.value
+                or owner["intent_status"] != IntentStatus.RUNNING.value
+                or not owner["started_at"] <= start.started_at < owner["deadline_at"]
+                or checkpoint != start.base_checkpoint_sequence):
+                raise ActionAuditConflict("action is outside its running checkpoint")
+            prior_rows = self._connection.execute(
+                """SELECT * FROM t6_action_invocations
+                   WHERE task_run_id = ? AND intent_id = ? ORDER BY rowid""",
+                (start.task_run_id, start.intent_id),
+            ).fetchall()
+            if prior_rows:
+                prior = self._t6_action_from_row(prior_rows[-1])
+                if prior.completion is None or prior.applied_at is None:
+                    raise ActionRecoveryRequired("prior model action remains unapplied")
+                if prior.completion.result_kind == "model_error":
+                    raise ActionAuditConflict("prior model error stops this Intent")
+                if prior.completion.result_kind == "invalid_structure":
+                    if (start.correction_of_model_request_id != prior.start.model_request_id
+                        or prior.start.correction_of_model_request_id is not None
+                        or start.base_checkpoint_sequence != prior.start.base_checkpoint_sequence
+                        or start.context_sha256 != prior.start.context_sha256):
+                        raise ActionAuditConflict("only one matching structure correction is allowed")
+                elif start.correction_of_model_request_id is not None:
+                    raise ActionAuditConflict("correction requires an invalid structure")
+            elif start.correction_of_model_request_id is not None:
+                raise ActionAuditConflict("correction has no original action")
+            self._connection.execute(
+                """INSERT INTO t6_action_invocations(
+                    model_request_id, task_run_id, intent_id, base_checkpoint_sequence,
+                    context_sha256, resource_ids_json, correction_of_model_request_id,
+                    started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (start.model_request_id, start.task_run_id, start.intent_id,
+                 start.base_checkpoint_sequence, start.context_sha256,
+                 canonical_json(asdict(start.resource_ids)),
+                 start.correction_of_model_request_id, start.started_at),
+            )
+            for resource_kind, resource_id in asdict(start.resource_ids).items():
+                self._connection.execute(
+                    """INSERT INTO t6_action_resource_ids(
+                        resource_id, model_request_id, resource_kind
+                    ) VALUES (?, ?, ?)""",
+                    (resource_id, start.model_request_id, resource_kind),
+                )
+            self._connection.commit()
+            return None
+        except (ActionAuditConflict, ActionRecoveryRequired, StorageError):
+            self._rollback_quietly()
+            raise
+        except sqlite3.IntegrityError as exc:
+            self._rollback_quietly()
+            raise ActionAuditConflict("T6 action resource ID is already claimed") from exc
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            self._rollback_quietly()
+            raise StorageError("could not begin T6 model action") from exc
+
+    def complete_t6_action(
+        self, completion: ActionInvocationCompletion,
+    ) -> ActionInvocationRecord:
+        if not isinstance(completion, ActionInvocationCompletion):
+            raise TypeError("completion must be an ActionInvocationCompletion")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            row = self._connection.execute(
+                "SELECT * FROM t6_action_invocations WHERE model_request_id = ?",
+                (completion.model_request_id,),
+            ).fetchone()
+            if row is None:
+                raise ActionAuditConflict("model action was not started")
+            previous = self._t6_action_from_row(row)
+            if previous.completion is not None:
+                if previous.completion != completion:
+                    raise ActionAuditConflict("model action has another result")
+                self._connection.commit()
+                return previous
+            if completion.finished_at < previous.start.started_at:
+                raise ActionAuditConflict("action result precedes its invocation")
+            self._connection.execute(
+                """UPDATE t6_action_invocations
+                   SET finished_at = ?, result_kind = ?, result_sha256 = ?
+                   WHERE model_request_id = ? AND finished_at IS NULL""",
+                (completion.finished_at, completion.result_kind,
+                 completion.result_sha256, completion.model_request_id),
+            )
+            self._connection.commit()
+            return ActionInvocationRecord(previous.start, completion, None)
+        except (ActionAuditConflict, StorageError):
+            self._rollback_quietly()
+            raise
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            self._rollback_quietly()
+            raise StorageError("could not complete T6 model action") from exc
+
+    def mark_t6_action_applied(
+        self, model_request_id: str, applied_at: float,
+    ) -> ActionInvocationRecord:
+        if not isinstance(applied_at, (int, float)) or not math.isfinite(applied_at):
+            raise ValueError("invalid_action_applied_time")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            row = self._connection.execute(
+                "SELECT * FROM t6_action_invocations WHERE model_request_id = ?",
+                (model_request_id,),
+            ).fetchone()
+            if row is None:
+                raise ActionAuditConflict("model action was not started")
+            previous = self._t6_action_from_row(row)
+            if previous.completion is None or applied_at < previous.completion.finished_at:
+                raise ActionAuditConflict("model action has no applicable result")
+            if previous.applied_at is not None:
+                if previous.applied_at != applied_at:
+                    raise ActionAuditConflict("model action already has another application time")
+                self._connection.commit()
+                return previous
+            self._connection.execute(
+                "UPDATE t6_action_invocations SET applied_at = ? WHERE model_request_id = ?",
+                (applied_at, model_request_id),
+            )
+            self._connection.commit()
+            return ActionInvocationRecord(previous.start, previous.completion, applied_at)
+        except (ActionAuditConflict, StorageError):
+            self._rollback_quietly()
+            raise
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            self._rollback_quietly()
+            raise StorageError("could not mark T6 model action applied") from exc
+
+    def list_t6_actions(
+        self, task_run_id: str, intent_id: str,
+    ) -> tuple[ActionInvocationRecord, ...]:
+        try:
+            rows = self._connection.execute(
+                """SELECT * FROM t6_action_invocations
+                   WHERE task_run_id = ? AND intent_id = ? ORDER BY rowid""",
+                (task_run_id, intent_id),
+            ).fetchall()
+            return tuple(self._t6_action_from_row(row) for row in rows)
+        except (sqlite3.Error, ValueError, TypeError, KeyError) as exc:
+            raise StorageError("could not read T6 model actions") from exc
 
     def begin_model_invocation(
         self, start: ModelInvocationStart
     ) -> ModelInvocationRecord | None:
         if not isinstance(start, ModelInvocationStart):
             raise TypeError("start must be a ModelInvocationStart")
+        if start.request_type is ModelRequestType.INTENT_GENERATION:
+            return self._begin_turn_model_invocation(start)
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             previous = self._connection.execute(
@@ -552,11 +862,175 @@ class SqliteControlStore:
             self._rollback_quietly()
             raise StorageError("could not begin model invocation") from exc
 
+    def _begin_turn_model_invocation(
+        self, start: ModelInvocationStart
+    ) -> ModelInvocationRecord | None:
+        from agent_core.turn_manager import TurnManager
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            row = self._connection.execute(
+                "SELECT * FROM turn_model_invocations WHERE model_request_id = ?",
+                (start.model_request_id,),
+            ).fetchone()
+            if row is not None:
+                previous = self._turn_invocation_from_row(row)
+                if previous.start != start:
+                    raise ModelInvocationConflict("model_request_id has different Turn generation fields")
+                self._connection.commit()
+                return previous
+            if start.intent_id != TurnManager.registration_turn_id(
+                start.task_run_id, start.registration_mutation_id
+            ):
+                raise ModelInvocationConflict("Turn ID does not match registration mutation")
+            owner = self._connection.execute(
+                "SELECT status, started_at, deadline_at FROM task_runs WHERE task_run_id = ?",
+                (start.task_run_id,),
+            ).fetchone()
+            checkpoint = self._connection.execute(
+                "SELECT MAX(sequence) FROM checkpoints WHERE task_run_id = ?",
+                (start.task_run_id,),
+            ).fetchone()[0]
+            if (owner is None or owner["status"] != TaskRunStatus.RUNNING.value
+                or not owner["started_at"] <= start.started_at < owner["deadline_at"]
+                or checkpoint != start.base_checkpoint_sequence):
+                raise ModelInvocationConflict("Turn generation is outside its running checkpoint")
+            if self._connection.execute(
+                "SELECT 1 FROM turns WHERE task_run_id = ? AND status NOT IN (?, ?, ?) LIMIT 1",
+                (start.task_run_id, TurnStatus.COMPLETED.value,
+                 TurnStatus.INCONCLUSIVE.value, TurnStatus.FAILED.value),
+            ).fetchone():
+                raise ModelInvocationConflict("a prior Turn is still active")
+            if self._connection.execute(
+                """SELECT 1 FROM turn_model_invocations AS invocation
+                   WHERE invocation.task_run_id = ? AND invocation.registration_mutation_id != ?
+                   AND NOT EXISTS (SELECT 1 FROM turns WHERE turn_id = invocation.turn_id)
+                   LIMIT 1""",
+                (start.task_run_id, start.registration_mutation_id),
+            ).fetchone():
+                raise ModelInvocationRecoveryRequired("an earlier Turn generation remains unapplied")
+            if self._connection.execute(
+                """SELECT 1 FROM turn_model_invocations WHERE task_run_id = ?
+                   AND turn_id = ? AND finished_at IS NULL LIMIT 1""",
+                (start.task_run_id, start.intent_id),
+            ).fetchone():
+                raise ModelInvocationRecoveryRequired("an earlier Turn model call has no committed result")
+            if start.correction_of_model_request_id is not None:
+                original = self._connection.execute(
+                    "SELECT * FROM turn_model_invocations WHERE model_request_id = ?",
+                    (start.correction_of_model_request_id,),
+                ).fetchone()
+                if (original is None or original["turn_id"] != start.intent_id
+                    or original["result_kind"] != "invalid_structure"
+                    or any(original[field] != getattr(start, field) for field in (
+                        "registration_mutation_id", "base_checkpoint_sequence",
+                        "context_sha256", "turn_target"))):
+                    raise ModelInvocationConflict("Turn correction does not match an invalid result")
+            elif self._connection.execute(
+                "SELECT 1 FROM turn_model_invocations WHERE task_run_id = ? AND turn_id = ? LIMIT 1",
+                (start.task_run_id, start.intent_id),
+            ).fetchone():
+                raise ModelInvocationConflict("Turn generation was already started")
+            self._connection.execute(
+                """INSERT INTO turn_model_invocations(
+                    model_request_id, task_run_id, turn_id, registration_mutation_id,
+                    base_checkpoint_sequence, context_sha256, turn_target,
+                    correction_of_model_request_id, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (start.model_request_id, start.task_run_id, start.intent_id,
+                 start.registration_mutation_id, start.base_checkpoint_sequence,
+                 start.context_sha256, start.turn_target,
+                 start.correction_of_model_request_id, start.started_at),
+            )
+            self._connection.commit()
+            return None
+        except (ModelInvocationConflict, ModelInvocationRecoveryRequired, StorageError):
+            self._rollback_quietly()
+            raise
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            self._rollback_quietly()
+            raise StorageError("could not begin Turn model invocation") from exc
+
+    def _complete_turn_model_invocation(
+        self, completion: ModelInvocationCompletion
+    ) -> ModelInvocationRecord:
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            row = self._connection.execute(
+                "SELECT * FROM turn_model_invocations WHERE model_request_id = ?",
+                (completion.model_request_id,),
+            ).fetchone()
+            if row is None:
+                raise ModelInvocationConflict("Turn model invocation was not started")
+            previous = self._turn_invocation_from_row(row)
+            if previous.completion is not None:
+                if previous.completion != completion:
+                    raise ModelInvocationConflict("Turn model invocation has another result")
+                self._connection.commit()
+                return previous
+            if (completion.finished_at < previous.start.started_at
+                or completion.result_kind not in {
+                    "intent_generation", "invalid_structure", "model_error"
+                }):
+                raise ModelInvocationConflict("model result does not match Turn generation")
+            self._connection.execute(
+                """UPDATE turn_model_invocations
+                   SET finished_at = ?, result_kind = ?, result_json = ?
+                   WHERE model_request_id = ? AND finished_at IS NULL""",
+                (completion.finished_at, completion.result_kind,
+                 canonical_json(result_payload(completion)), completion.model_request_id),
+            )
+            self._connection.commit()
+            return ModelInvocationRecord(previous.start, completion)
+        except (ModelInvocationConflict, StorageError):
+            self._rollback_quietly()
+            raise
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            self._rollback_quietly()
+            raise StorageError("could not complete Turn model invocation") from exc
+
+    @staticmethod
+    def _turn_invocation_from_row(row: sqlite3.Row) -> ModelInvocationRecord:
+        start = ModelInvocationStart(
+            row["model_request_id"], row["task_run_id"], row["turn_id"],
+            ModelRequestType.INTENT_GENERATION, None,
+            row["correction_of_model_request_id"], row["started_at"],
+            row["registration_mutation_id"], row["base_checkpoint_sequence"],
+            row["context_sha256"], row["turn_target"],
+        )
+        if row["finished_at"] is None:
+            return ModelInvocationRecord(start, None)
+        completion = ModelInvocationCompletion(
+            start.model_request_id, row["finished_at"], row["result_kind"],
+            result_from_payload(row["result_kind"], json.loads(row["result_json"])),
+        )
+        return ModelInvocationRecord(start, completion)
+
+    def list_unapplied_turn_generations(
+        self, task_run_id: str
+    ) -> tuple[ModelInvocationRecord, ...]:
+        try:
+            rows = self._connection.execute(
+                """SELECT * FROM turn_model_invocations AS invocation
+                   WHERE invocation.task_run_id = ?
+                   AND NOT EXISTS (SELECT 1 FROM turns WHERE turn_id = invocation.turn_id)
+                   ORDER BY started_at, rowid""",
+                (task_run_id,),
+            ).fetchall()
+            return tuple(self._turn_invocation_from_row(row) for row in rows)
+        except (sqlite3.Error, ValueError, TypeError, KeyError) as exc:
+            raise StorageError("could not read unapplied Turn model calls") from exc
+
     def complete_model_invocation(
         self, completion: ModelInvocationCompletion
     ) -> ModelInvocationRecord:
         if not isinstance(completion, ModelInvocationCompletion):
             raise TypeError("completion must be a ModelInvocationCompletion")
+        if self._connection.execute(
+            "SELECT 1 FROM turn_model_invocations WHERE model_request_id = ?",
+            (completion.model_request_id,),
+        ).fetchone():
+            return self._complete_turn_model_invocation(completion)
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             row = self._connection.execute(
@@ -606,6 +1080,12 @@ class SqliteControlStore:
         self, task_run_id: str, intent_id: str
     ) -> tuple[ModelInvocationRecord, ...]:
         try:
+            turn_rows = self._connection.execute(
+                "SELECT * FROM turn_model_invocations WHERE task_run_id = ? AND turn_id = ? ORDER BY started_at, rowid",
+                (task_run_id, intent_id),
+            ).fetchall()
+            if turn_rows:
+                return tuple(self._turn_invocation_from_row(row) for row in turn_rows)
             rows = self._connection.execute(
                 """
                 SELECT * FROM model_invocations
@@ -928,6 +1408,27 @@ class SqliteControlStore:
                 f"could not load committed mutation: {exc}"
             ) from exc
 
+    def committed_mutations_after(
+        self, task_run_id: str, checkpoint_sequence: int,
+    ) -> tuple[tuple[str, ControlCommitResult], ...]:
+        if type(checkpoint_sequence) is not int or checkpoint_sequence < 1:
+            raise ValueError("invalid_action_checkpoint")
+        try:
+            rows = self._connection.execute(
+                "SELECT mutation_id, event_sequence, checkpoint_sequence "
+                "FROM control_mutations WHERE task_run_id = ? "
+                "AND checkpoint_sequence > ? ORDER BY checkpoint_sequence",
+                (task_run_id, checkpoint_sequence),
+            ).fetchall()
+            return tuple(
+                (row["mutation_id"], self._load_commit_result(
+                    task_run_id, row["event_sequence"], row["checkpoint_sequence"],
+                    replayed=True,
+                )) for row in rows
+            )
+        except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("could not reconcile action commits") from exc
+
     def load_intent_goal(self, intent_id: str) -> PersistedIntentGoal | None:
         try:
             row = self._connection.execute(
@@ -1092,7 +1593,7 @@ class SqliteControlStore:
                 JOIN intents ON intents.intent_id = plans.intent_id
                 JOIN turns ON turns.turn_id = intents.turn_id
                 WHERE turns.task_run_id = ?
-                ORDER BY turns.sequence, intents.priority, plans.plan_id
+                ORDER BY turns.sequence, intents.priority, plans.sequence
                 """,
                 (task_run_id,),
             ).fetchall()
@@ -1122,8 +1623,8 @@ class SqliteControlStore:
                     JOIN intents ON intents.intent_id = plans.intent_id
                     JOIN turns ON turns.turn_id = intents.turn_id
                     WHERE turns.task_run_id = ?
-                    ORDER BY turns.sequence, intents.priority, plans.plan_id,
-                             executions.step_index, executions.execution_id
+                    ORDER BY turns.sequence, intents.priority, plans.sequence,
+                             executions.rowid
                     """,
                     (task_run_id,),
                 )
@@ -1249,6 +1750,11 @@ class SqliteControlStore:
             ),
             failure_reason=row["failure_reason"],
             source_root=row["source_root"],
+            target_network=(
+                TargetNetworkBinding.from_dict(json.loads(row["target_network_json"]))
+                if row["target_network_json"] is not None
+                else None
+            ),
         )
 
     def _load_plan_steps(self, plan_id: str) -> tuple[PlanStep, ...]:
@@ -1289,7 +1795,7 @@ class SqliteControlStore:
             elif isinstance(change, UpsertExecution):
                 self._upsert_execution(change)
             elif isinstance(change, UpsertFact):
-                if mutation.operation == "commit_verified_file_type_fact" and self._connection.execute(
+                if mutation.operation in {"commit_verified_file_type_fact", "commit_verified_t6_observation", "commit_verified_t6_fact"} and self._connection.execute(
                     "SELECT 1 FROM facts WHERE fact_id = ?", (change.fact_id,)
                 ).fetchone() is not None:
                     raise StorageError("file-type Fact commit must insert a new Fact")
@@ -1374,7 +1880,13 @@ class SqliteControlStore:
             if self._task_run_for_execution(change.source_ref) != task_run_id:
                 raise StorageError("Fact source Execution belongs to another TaskRun")
         elif isinstance(change, AppendFailureSummary):
-            if not self._failure_evidence_exists(task_run_id, change.evidence_ref):
+            model_error_for_intent = (
+                change.failure_type.value == "model_error"
+                and self._task_run_for_intent(change.evidence_ref) == task_run_id
+            )
+            if not model_error_for_intent and not self._failure_evidence_exists(
+                task_run_id, change.evidence_ref
+            ):
                 raise StorageError("FailureSummary evidence must belong to its TaskRun")
             return
         elif isinstance(change, AppendPlanValidationRecord):
@@ -1395,7 +1907,7 @@ class SqliteControlStore:
         previous = self._connection.execute(
             """
             SELECT request_json, effective_model_backend, started_at, deadline_at,
-                   sandbox_id, source_root
+                   sandbox_id, source_root, target_network_json
             FROM task_runs WHERE task_run_id = ?
             """,
             (change.task_run_id,),
@@ -1407,6 +1919,11 @@ class SqliteControlStore:
             change.deadline_at,
             change.sandbox_id,
             change.source_root,
+            (
+                canonical_json(change.target_network.to_dict())
+                if change.target_network is not None
+                else None
+            ),
         )
         if previous is not None and tuple(previous) != immutable_values:
             raise StorageError("immutable TaskRun fields cannot be modified")
@@ -1415,8 +1932,9 @@ class SqliteControlStore:
             INSERT INTO task_runs(
                 task_run_id, request_json, goal, target_json, deadline_seconds,
                 effective_model_backend, started_at, deadline_at, status, sandbox_id,
-                confirmation_deadline, finished_at, failure_reason, source_root
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confirmation_deadline, finished_at, failure_reason, source_root,
+                target_network_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_run_id) DO UPDATE SET
                 status = excluded.status,
                 confirmation_deadline = excluded.confirmation_deadline,
@@ -1438,6 +1956,11 @@ class SqliteControlStore:
                 change.finished_at,
                 change.failure_reason,
                 change.source_root,
+                (
+                    canonical_json(change.target_network.to_dict())
+                    if change.target_network is not None
+                    else None
+                ),
             ),
         )
 
@@ -1559,13 +2082,20 @@ class SqliteControlStore:
         )
         if stored_steps and tuple(tuple(row) for row in stored_steps) != expected_steps:
             raise StorageError("Plan steps are immutable after first save")
-        self._connection.execute(
-            """
-            INSERT INTO plans(plan_id, intent_id, status) VALUES (?, ?, ?)
-            ON CONFLICT(plan_id) DO UPDATE SET status = excluded.status
-            """,
-            (change.plan_id, change.intent_id, change.status.value),
-        )
+        if existing is None:
+            self._connection.execute(
+                """
+                INSERT INTO plans(plan_id, intent_id, sequence, status)
+                SELECT ?, ?, COALESCE(MAX(sequence), 0) + 1, ?
+                FROM plans WHERE intent_id = ?
+                """,
+                (change.plan_id, change.intent_id, change.status.value, change.intent_id),
+            )
+        else:
+            self._connection.execute(
+                "UPDATE plans SET status = ? WHERE plan_id = ?",
+                (change.status.value, change.plan_id),
+            )
         if not stored_steps:
             self._connection.executemany(
                 """
@@ -1661,7 +2191,13 @@ class SqliteControlStore:
         event_sequence: int,
         ordinal: int,
     ) -> None:
-        if not self._failure_evidence_exists(task_run_id, change.evidence_ref):
+        model_error_for_intent = (
+            change.failure_type.value == "model_error"
+            and self._task_run_for_intent(change.evidence_ref) == task_run_id
+        )
+        if not model_error_for_intent and not self._failure_evidence_exists(
+            task_run_id, change.evidence_ref
+        ):
             raise StorageError(
                 "FailureSummary evidence_ref must reference committed evidence"
             )

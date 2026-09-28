@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Qinyuan Agent | 本地工作台</title>
+    <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./run.css">
+    <script src="./run-view.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="rail" aria-label="主导航">
+        <div class="brand"><span class="brand-mark">Q</span><div><strong>Qinyuan Agent</strong><small>本地测试工作台</small></div></div>
+        <nav class="nav">
+          <button class="nav-item active" type="button" data-view="tasks"><span class="nav-icon">▤</span>题目管理</button>
+          <button class="nav-item" type="button" data-view="model"><span class="nav-icon">◈</span>模型配置</button>
+        </nav>
+        <div class="rail-foot"><span class="status-dot"></span><strong id="service-status">连接检查中</strong><p>本服务只监听回环地址。模型密钥只保留在服务进程内存。</p></div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar"><div class="crumb">本地工作台 <span>/</span> <b id="current-view">题目管理</b></div><div class="top-actions"><span class="connection"><span class="status-dot"></span><span id="connection-text">检查服务</span></span><button id="refresh" class="quiet-button" type="button" title="刷新任务列表">↻ 刷新</button></div></header>
+
+        <section id="tasks-view" class="view active">
+          <div class="page-head"><div><p class="eyebrow">TASK RUN PREPARATION</p><h1>题目管理</h1><p class="subheading">每题独立保存附件和可选的公网目标。</p></div><button id="new-task" class="primary-button" type="button">＋ 新建题目</button></div>
+          <div class="notice"><span class="notice-mark">!</span><div><strong>执行状态来自真实 Agent 进程</strong><p>附件可选，运行总量最多 64 MiB。已验证观察、Intent 完成和候选 flag 分别记录；整题目标尚未验证。</p></div></div>
+          <section class="task-list-panel section-block"><div class="section-heading"><div><span class="section-index">01</span><h2>题目列表</h2></div><label class="toggle-label"><input id="show-archived" type="checkbox"><span>显示归档</span></label></div><div id="task-list" class="task-list"><div class="empty-state">正在读取任务...</div></div></section>
+        </section>
+
+        <section id="detail-view" class="view detail-view" hidden>
+          <div class="detail-heading"><button id="back-to-tasks" class="quiet-button" type="button">← 返回题目列表</button><div class="detail-heading-main"><div><p class="eyebrow">TASK DETAIL</p><h1 id="detail-task-title">新建题目</h1></div><span id="detail-task-status" class="section-meta"></span></div></div>
+          <section id="run-panel" class="run-panel" hidden aria-labelledby="run-title">
+            <header class="run-header">
+              <div><p class="eyebrow">TASK RUN</p><h2 id="run-title">解题过程</h2><p id="run-status" class="run-status" aria-live="polite">尚未运行</p></div>
+              <div class="run-actions"><button id="start-run" class="primary-button" type="button">开始 Agent</button><button id="cancel-run" class="danger-button" type="button" hidden>取消运行</button><button id="cleanup-run" class="secondary-button" type="button" hidden>重试资源清理</button></div>
+            </header>
+            <div id="run-summary" class="run-summary"></div>
+            <p id="run-read-error" class="run-read-error" role="status" hidden></p>
+            <div id="run-dashboard" class="run-dashboard" hidden>
+              <section class="run-column graph-column" aria-label="解题关系画布">
+                <header class="graph-heading">
+                  <div><h3>解题关系图</h3><p>实线：归属　虚线：轮次顺序；不表示 Intent 间的因果依赖</p></div>
+                  <div class="graph-tools" aria-label="画布缩放">
+                    <button id="graph-zoom-out" type="button" title="缩小画布" aria-label="缩小画布">−</button>
+                    <output id="graph-zoom-level" aria-live="off">100%</output>
+                    <button id="graph-zoom-in" type="button" title="放大画布" aria-label="放大画布">＋</button>
+                    <button id="graph-fit" type="button">适配画布</button>
+                  </div>
+                </header>
+                <div id="run-graph" class="run-scroll graph-viewport" aria-label="已提交的 TaskRun、Turn 和 Intent 关系图"></div>
+              </section>
+              <aside class="run-column detail-column" aria-label="解题记录面板">
+                <div class="run-tabs" role="tablist" aria-label="解题记录">
+                  <button id="run-tab-detail" type="button" role="tab" aria-controls="run-pane-detail" aria-selected="true" class="active">详情</button>
+                  <button id="run-tab-evidence" type="button" role="tab" aria-controls="run-pane-evidence" aria-selected="false">证据</button>
+                  <button id="run-tab-log" type="button" role="tab" aria-controls="run-pane-log" aria-selected="false">日志</button>
+                </div>
+                <div id="run-pane-detail" class="run-pane run-scroll" role="tabpanel" aria-labelledby="run-tab-detail"><section id="run-detail"></section><section id="run-stop" class="run-stop"></section></div>
+                <div id="run-pane-evidence" class="run-pane run-scroll" role="tabpanel" aria-labelledby="run-tab-evidence" hidden><h4>已验证观察 · Facts</h4><div id="run-facts"></div><h4>待验证候选 · Pending</h4><div id="run-candidates"></div><h4>分类失败摘要</h4><div id="run-failures"></div></div>
+                <div id="run-pane-log" class="run-pane" role="tabpanel" aria-labelledby="run-tab-log" hidden><div class="timeline-heading"><strong>执行时间线</strong><span id="timeline-scope">全部</span><button id="clear-run-filter" class="quiet-button" type="button" hidden>查看全部记录</button></div><div id="run-timeline" class="run-scroll"></div></div>
+              </aside>
+            </div>
+            <details id="run-raw" class="run-raw" hidden><summary>查看原始结果与事件</summary><pre id="run-result" class="run-result"></pre></details>
+          </section>
+          <section class="editor-panel section-block" aria-labelledby="editor-title"><div class="section-heading"><div><span class="section-index">02</span><h2 id="editor-title">新建题目</h2></div><span id="editor-state" class="section-meta">尚未保存</span></div><form id="task-form"><input id="task-id" type="hidden"><div class="field-grid"><label class="field field-wide"><span>题目名称</span><input id="task-title" required maxlength="160" placeholder="例如：Girlfriends' notebooks"></label><label class="field"><span>题型</span><select id="task-category"><option value="pwn">Pwn</option><option value="reverse">Reverse</option><option value="web">Web</option><option value="misc">Misc</option><option value="crypto">Crypto</option><option value="other">其他</option></select></label><label class="field"><span>总时限（分钟）</span><input id="task-deadline" type="number" min="1" value="60"></label><label class="field"><span>单步上限（秒）</span><input id="step-timeout" type="number" min="1" max="300" value="60"></label><label class="field field-wide"><span>远程目标白名单 <em>可选</em></span><input id="task-endpoint" type="url" maxlength="2048" placeholder="tcp://host:24009 或 http://host:24009/"><small>仅允许带端口的公网目标；可不上传附件直接运行目标题。</small></label><label class="field field-wide"><span>题目说明</span><textarea id="task-description" rows="5" maxlength="16000" placeholder="粘贴题面、已知限制和假 Flag 提示。不要填写 API Key。"></textarea></label></div><div class="attachments-heading"><div><strong>附件</strong><span id="attachment-count">0 / 16</span></div><label class="secondary-button file-button">选择文件<input id="attachments" type="file" multiple hidden></label></div><p class="field-help">允许 0–16 个文件，不设置应用层文件大小上限；上传采用流式写入，磁盘不足或截止时间会明确失败。</p><div id="attachment-list" class="attachment-list"><div class="empty-inline">没有附件也可以保存题目。</div></div><div class="form-actions"><button id="save-task" class="primary-button" type="submit">保存题目</button><button id="cancel-edit" class="secondary-button" type="button">返回列表</button></div></form><div id="task-actions" class="task-actions" hidden><div class="action-row"><button id="archive-task" class="secondary-button" type="button">归档</button><button id="restore-task" class="secondary-button" type="button" hidden>取消归档</button><button id="purge-task" class="danger-button" type="button" hidden>永久清理</button></div></div></section>
+        </section>
+
+        <section id="model-view" class="view" hidden>
+          <div class="page-head"><div><p class="eyebrow">PROCESS MEMORY ONLY</p><h1>模型配置</h1><p class="subheading">选择 DeepSeek 或自定义 OpenAI Chat Completions 兼容端点。</p></div><span class="phase-pill">Key 不落盘</span></div>
+          <div class="model-grid"><section class="section-block"><div class="section-heading"><div><span class="section-index">01</span><h2>供应商</h2></div><span id="model-state" class="section-meta">未读取</span></div><form id="model-form"><label class="field"><span>接口类型</span><select id="model-provider"><option value="deepseek">DeepSeek</option><option value="openai_compatible">自定义 OpenAI 兼容</option></select></label><label class="field"><span>模型名称</span><input id="model-name" required maxlength="128" placeholder="deepseek-chat"></label><label class="field"><span>Base URL</span><input id="model-url" required maxlength="2048" spellcheck="false" placeholder="https://api.deepseek.com"></label><label class="field"><span>API Key</span><input id="model-key" type="password" autocomplete="new-password" required placeholder="仅发送到本地服务内存"></label><div class="form-actions"><button class="primary-button" type="submit">应用配置</button><button id="clear-key" class="secondary-button" type="button">清除内存 Key</button></div></form></section><aside class="side-note"><h2>配置边界</h2><p>服务进程重启后必须重新填写 Key。页面不使用 localStorage、草稿文件或 URL 保存密钥。</p><dl><div><dt>协议</dt><dd>OpenAI Chat Completions JSON</dd></div><div><dt>DeepSeek</dt><dd>仅 HTTPS 官方地址</dd></div><div><dt>自定义端点</dt><dd>仅 HTTPS，无凭据嵌入</dd></div></dl></aside></div>
+        </section>
+      </main>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

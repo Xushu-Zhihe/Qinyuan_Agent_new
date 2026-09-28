@@ -63,6 +63,7 @@ class PlanValidationStatus(StrEnum):
 
 class FailureType(StrEnum):
     TARGET_MISMATCH = "target_mismatch"
+    STEP_TIMEOUT = "step_timeout"
     ENVIRONMENT_FAULT = "environment_fault"
     POLICY_REJECTED = "policy_rejected"
     PARAMETER_ERROR = "parameter_error"
@@ -73,8 +74,11 @@ class FailureType(StrEnum):
 class FailureAction(StrEnum):
     RETRY_COMMAND_GENERATION = "retry_command_generation"
     RETRY_EXECUTION = "retry_execution"
+    RETRY_STEP_COMMAND = "retry_step_command"
     TRY_NEXT_INTENT = "try_next_intent"
+    TURN_FAILED = "turn_failed"
     TURN_INCONCLUSIVE = "turn_inconclusive"
+    MODEL_ERROR = "model_error"
     TASK_FAILED = "task_failed"
 
 

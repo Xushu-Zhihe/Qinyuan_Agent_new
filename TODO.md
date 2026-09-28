@@ -5,7 +5,7 @@
 
 ## 1. 项目目标
 
-构建一个独立的自动化渗透测试 Agent（Qinyuan_Agent_new），由本仓库拥有 TaskRun 内的调度权。它接收一次题目任务，创建一个 TaskRun 和一个专属 Sandbox，在同一 Sandbox 内按 Intent 的可能性顺序逐个进行深度优先尝试；首期由 direct 模型生成方案，经 ToolGateway、Policy、MCP Manager 和 Sandbox 执行，记录可追溯证据，验证后提交 Fact，直到目标完成或输出有边界的结果。
+构建一个独立的自动化渗透测试 Agent（Qinyuan_Agent_new），由本仓库拥有 TaskRun 内的调度权。它接收一次题目任务，创建一个 TaskRun 和一个专属 Sandbox，在同一 Sandbox 内按 Intent 的可能性顺序逐个进行深度优先尝试；首期由 direct 模型生成方案，专用工具经 ToolGateway、Policy、MCP Manager 和 Sandbox 执行，通用 Bash 经 T6CommandGateway、Policy 直接进入 Sandbox；记录可追溯证据，验证后提交 Fact，直到目标完成或输出有边界的结果。
 
 多题目的自动获取、调用 `qinyuan-agent-new` 和向题目平台提交 flag，由后续独立转换器负责。本项目当前聚焦 Agent 能力与公共调用入口，T5 不再包含 qinyuan-bat 专用转接。转换器的接口和运行规则需另行确认。
 
@@ -13,7 +13,7 @@
 
 ```text
 CLI -> TaskRun -> 一个 Sandbox -> Intent 深度优先
-    -> direct Model -> ToolGateway -> Policy -> MCP -> Sandbox
+    -> direct Model -> ToolGateway -> Policy -> (专用 MCP 或通用脚本) -> Sandbox
     -> ExecutionRecord/Artifact -> ResultFact -> GoalEvaluator
     -> TaskResult 或下一轮 Intent
 ```
@@ -37,7 +37,7 @@ CLI -> TaskRun -> 一个 Sandbox -> Intent 深度优先
 3. `TaskRun` 是一道题目的一次完整解题实例。接收后创建全局唯一 Sandbox；所有 Intent 轮复用它，完成、取消或 Deadline 后销毁；重新运行必须创建新的 TaskRun 和 Sandbox。
 4. 同一轮的 Intent 按生成模型给出的可能性顺序逐个尝试，采用深度优先回溯；首期不并行操作同一 Sandbox。 `intent_type` 可作为元数据，首期不改变调度。
 5. 首期只走 direct 方案。RAG、retrieve_first、匹配阈值、候选仲裁、双 LLM 并行和 RAG 强制路径均延期。
-6. 工具路径固定为 `ToolGateway -> Policy -> MCP Manager -> Sandbox`。Policy 必须在副作用前完成权限和目标范围检查。
+6. 专用工具路径为 `ToolGateway -> Policy -> MCP Manager -> Sandbox`；T6 通用脚本路径为 `T6CommandGateway -> Policy -> Sandbox`。Policy 必须在副作用前完成权限和目标范围检查。
 7. 环境故障（本机、MCP、Sandbox、Docker）与目标任务失败必须按记录区分。环境故障保留重新申请/调用路径，不能直接加入策略失败集合。
 8. 原始 stdout/stderr 不能直接成为 `ResultFact`。Fact 必须经过后置条件、证据、目标范围和时效验证，再由原子提交边界写入。
 9. SQLite 是已冻结控制面的唯一事实来源；状态、一个 RuntimeEvent 和一个 Checkpoint 在同一事务提交。内存只缓存已提交快照。
@@ -181,15 +181,52 @@ T5 不兼容预定的 qinyuan-bat wire protocol，不实现平台取题/提交�
 
 2026-09-25 用户确认：T6 继续以 CLI 为入口，增加供用户自行复测的手工测试步骤；前端单列在 T6 闭环稳定之后，不作为 T6 完成条件。
 
+2026-09-25 执行流对照见 `T6_flow_audit.md`：该记录描述的是当时工作台仅调用 T5 单附件文件识别的旧状态。当前工作台已改为调用 T6 `run-task --mode real`，保留只读进度、取消和暂停后清理边界；目标网络隔离仍归 T6-6。
+
+2026-09-25 已完成 T6 通用脚本第一切片：`T6CommandGateway -> Policy -> T6 Sandbox` 直接执行任意 Bash，专用 MCP 不参与；请求收据、命令摘要、字节输出和 `ExecutionRecord` 可重放且不可覆盖。正常非零退出提交为已结束 Execution，留给后置条件验证器；可信超时清理后同一步只允许一次改命令重试，未知结果阻止新派发。聚焦测试 **33 passed**；本次未接通完整 T6 CLI/多 Intent/GoalEvaluator/TaskResult，真实 Docker 隔离和真实题目仍未验收。
+
+随后按用户确认增加两类执行前固定且全部满足的通用后置条件：指定步骤 stdout/stderr 包含原文，或 Plan 结束时工作区普通文件 SHA-256 等于预声明摘要。三态验证区分 `satisfied`、`not_satisfied` 和 `inconclusive`；文件哈希使用普通 UID 的固定只读程序，拒绝符号链接，首次观察不可覆盖。真实 Docker 无网络探针已验证任意 Bash 的二进制输出、非零退出码、超时清理（含进程回收）、工作区复用、64 KiB 双流上限、文件哈希、符号链接拒绝和容器精确删除，报告在 `.test/t6-direct/docker-report.json`。
+
+本批（2026-09-26）新增独立通用观察证明及 Controller 原子提交：全部固定条件满足后，已保存的证明、Execution 与文件摘要观察被再次复核，单次事务提交 verified 观察 Fact 与当前 Intent 成功。Fact 仅陈述观察成立；候选 flag 仍 pending；未配置独立答案校验器时不自动把整题置为 achieved。已修正超时重试后的证据选择、证明重复保存，以及摘要进程创建结果未知时未关闭派发入口的问题。聚焦测试 **38 passed**，覆盖事务回滚、幂等重放、证据损坏/缺失、取消/Deadline 后拒绝提交和摘要未知结果；日志 `.test/t6-final/focused.log`。全套回归 **558 passed、1 skipped、1 failed**：唯一失败为旧的真实本机 File MCP 集成测试 `test_real_mcp_loop_commits_fact_and_only_completes_intent` 返回 `tool_failed`，单项复测 **1 passed**，失败原因尚未确定，不能将本次全套写成通过。日志 `.test/t6-final/regression.log`、`.test/t6-final/mcp.log`。新证明/后置条件文件 Ruff、证明接口限定 mypy 通过；共享旧模块 Ruff 仍有历史告警。当前源码 wheel/sdist 构建成功，见 `.test/t6-final/build.log`。**多 Intent CLI、GoalEvaluator、TaskResult、真实目标网络仍未接入或验收。**
+
+历史回归 **535 passed、1 skipped、1 failed** 的迁移夹具问题已定位并修正：模拟 schema 5 时须同时移除 schema 6/7 版本记录和 schema 7 的 `target_network_json` 列。修正后迁移单测通过；完整回归结果以上文最新记录为准。
+
 - [ ] 在 T6 功能及 CLI 契约逐项确认后，补齐真实单题请求示例、题目/附件准备、环境与授权前置条件、实际命令和预期结果；不能将 T5 的 `run-intent` 示例当作完整解题命令。
 - [ ] 手工测试说明覆盖题目提交、运行进度与事件读取、执行过程与证据检查、最终结果核对，以及取消/恢复和失败后的处理；具体操作以届时确认的 T6 契约为准。
 - [ ] 为可重复测试明确 `.test/` 下的专用产物目录、TaskRun 标识和验收证据位置，区分单 Intent 满足、整题目标完成和 Sandbox 清理结果；保留 `.venv/`。
 
+#### T6 分批交付安排（2026-09-25 用户确认）
+
+下表的“代码批次”只划分实施和验收范围，不是 Agent 的运行轮数。TaskRun 的 Intent 执行轮不设置轮数上限；当前及可回溯父轮候选耗尽后，保留分类失败摘要并生成新轮，直到总 Deadline 或用户取消。模型/外部结果未知仍停在显式恢复边界。现有模型与 Turn 注册契约只要求候选列表非空；本次不新增“每轮最多 4 个 Intent”限制。
+
+| 代码批次 | 对应流程图路径与最小交付 | 状态与验收证据 |
+| --- | --- | --- |
+| T6-1 执行与工作区基础 | Policy → 通用 Bash/Sandbox → Execution；附件原件只读、工作副本校验、单步时限与证据 | 已有代码、聚焦测试与禁网 Docker 探针；真实目标网络留待 T6-6 |
+| T6-2 观察 Fact 与 Intent 完成 | 执行前固定后置条件 → 独立证明 → 原子 Fact/Intent/Checkpoint | **本批实现与聚焦验证完成**：38 项通过；完整回归一次 MCP 失败、单项复测通过，保留未消除的不稳定项 |
+| T6-3 可恢复的有序 Intent 生成 | 已提交 Fact/失败上下文 → direct 模型 → 有序 Intent 列表持久化 | 内部链路已实现：schema 8 轮级调用台账、逐调用结构纠正、有序候选与固定注册 ID、崩溃后只读重用；已由 T6-5 `run-task` 和工作台真实模式组装 |
+| T6-4 深度优先调度 | 当前最高优先级 Intent → Plan/执行 → 成功后下一轮；失败回溯同层/父轮 | **调度切片已接入 T6-5**：`RunSupervisor + IntentRunnerPort` 按 priority 深度优先推进；完整目标失败生成新 sequence；未完成执行返回 `recovery_required` 并保留 running；已结束但条件无法判断才暂停为 `inconclusive`；模型错误由审计/失败摘要只读回放并停止调度。工作台只投影该状态 |
+| T6-5 完整 CLI 与临时整题结果 | CLI → TaskRun/Sandbox → 调度 → pending 候选/已验证观察 → TaskResult/清理 | **代码链路已接通，真实验收待用户执行**：`run-task` v2 和工作台真实模式以逐步 Bash 动作串联短 Plan、独立 Fact、候选台账和 Supervisor；`status/replay/resume/cancel` 复用持久运行目录。真实模式仅接本地附件，原件导入和工作副本分别留收据，暂停保留 TaskRun/Sandbox，取消或 Deadline 走清理；无答案校验器时不宣称整题 achieved。真实 Docker、真实模型由用户手工验收，目标网络归 T6-6 |
+| T6-6 真实闭环验收 | 受控目标网络、附件执行、真实模型、多 Intent/回溯、最终状态及精确资源清理 | 单一公网目标、精确授权、零附件目标题、隔离转发和 Intent 关系图已接线；真实 Docker/模型/目标链路及资源清理由用户按 README 手工验收，不以模拟测试代替 |
+
+每批只实现并验收该批目标，再更新实际结果与下一批缺口。Stage/Procedure/RAG 仍归 T7；前端继续复用正式应用入口。
+
+T6-5 本地模拟验证覆盖 `run-task → status → replay → cancel`、追加夹具后恢复、精确授权预检、文件快照条件、动作证据损坏、导入源文件消失后的只读恢复、运行中取消等待，以及状态读取不创建证据目录。2026-09-27 最终全量回归 **649 passed、1 skipped**；本批代码定向 mypy、Ruff E9/F/I、wheel/sdist 构建和 `git diff --check` 通过。真实 Docker/模型由用户按 README 手工复测，不以模拟结果替代。
+
 ### 独立前端建设（T6 闭环稳定后）
 
-状态：**排期方向已确认，功能与交互待逐项确认**（2026-09-25）。前端单独交付，方便用户自行提交任务和查看运行情况；不并入 T6，不改变 T7 的延期状态。
+状态：**本地工作台已接入 T6 `run-task --mode real`**（2026-09-27）。服务监听 `127.0.0.1`，提供题目/附件持久化、归档与永久清理、内存模型配置和浏览器管理页面；开始 Agent 只启动 CLI，网页通过只读接口显示 TaskRun→Turn→Intent 关系、短 Plan、Execution、Fact、pending 候选和停止原因，不改写 Agent 控制面。每题支持 0～16 个附件，运行时合计最多 64 MiB；零附件须提供公网目标。运行中题目只能取消，暂停保留 Sandbox，取消后清理。目标专用网络隔离已接线，真实网络验收由用户执行。
 
-拟讨论范围：题目与附件提交、运行进度、执行过程与证据查看、取消和恢复。以上是待确认的界面需求，不表示功能或协议已经冻结。页面范围、部署方式、访问权限、Agent 调用入口及事件展示方式须先与用户确认，再实现；本次不选前端框架，也不新增 HTTP/WebSocket 等协议。
+2026-09-27 T6-6 构造检查：本地模拟、动作与工作台聚焦测试首次 **35 passed、2 failed**（旧网络夹具仍用回环地址）；夹具改为公网字面量后网络聚焦 **4 passed**，新增恢复映射单项 **1 passed**。前端 JS 语法、Python 编译、定向 Ruff E9/F/I、wheel/sdist 和 `git diff --check` 通过；未重跑全套回归。真实 Docker、模型、DNS 与目标访问未执行；用户手工验收结果待补。
+
+模型配置支持 DeepSeek 和自定义 HTTPS OpenAI Chat Completions 端点；API Key 只保留在本地服务进程内存，GET、数据库、日志、草稿和浏览器存储均不返回或保存。T6 Runner 的默认总时限为 60 分钟、单步 60 秒、调用次数不设上限；Sandbox 允许经 Policy 审核的 bash/二进制分析工具和工作目录写入；有目标时网络只允许该题白名单端点，无目标时完全禁网。不开放宿主网络、入站端口、宿主挂载或 Docker socket。
+
+结果规则已确认：模型输出的候选 flag 和证据先记录为 `pending`，不能只因匹配 flag 形状或命中疑似假 Flag 就结束；没有独立验证时继续尝试直到预算耗尽或用户取消，最终由用户自行验证。仓库此前没有假 Flag 规则，题目说明中的相关描述只作为不可信输入提供给模型，不能自动变成校验器。
+
+启动：`uv run python -m agent_adapters.workbench --port 4174 --data-dir workbench_data`。本切片测试位于 `tests/test_workbench.py`，不连接真实模型、Docker 或题目。
+
+2026-09-27 工作台后续修正：题目列表进入独立全宽详情视图，解题图仍只表达已提交归属和轮次顺序；永久清理按钮仅在归档后显示。已终止 TaskRun 若资源清理未确认，可显式调用 CLI `resume --cleanup-only`，清理成功后工作台标为 `cleanup_confirmed` 并允许归档，原有证据恢复信息仍保留。Intent 生成提示明确同轮候选是可独立尝试的替代方向，下一轮继续从已验证 Fact 和目标失败摘要形成上下文。本次仅做静态检查、浏览器布局和模拟清理状态检查；未启动真实 Agent、Docker、模型或目标网络。
+
+拟讨论范围：T6 任务的运行进度、执行过程与证据查看、取消和恢复。当前工作台已接入 T6 CLI；页面是控制面和证据的只读投影，不改变 `Turn / Intent / Plan / Execution / Fact` 的所有权或状态转移。
 
 ### T7：Stage、Procedure、RAG
 

@@ -1,10 +1,11 @@
-"""Durable, provider-neutral records for T4 model calls."""
+"""Durable, provider-neutral records for model calls."""
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, Mapping, Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from agent_core.domain import PlanStep
@@ -12,6 +13,8 @@ from agent_core.modeling import (
     FileTypeCandidateAction,
     InspectFileAction,
     IntentActionResponse,
+    IntentCandidate,
+    IntentGenerationResponse,
     ModelError,
     ModelErrorKind,
     ModelRequestType,
@@ -21,12 +24,11 @@ from agent_core.modeling import (
     parse_intent_action,
 )
 
+AuditedResult = IntentGenerationResponse | PlanGenerationResponse | IntentActionResponse | ModelError
+AuditedResultKind = Literal["intent_generation", "plan", "intent_action", "invalid_structure", "model_error"]
 
-AuditedResult = PlanGenerationResponse | IntentActionResponse | ModelError
-AuditedResultKind = Literal["plan", "intent_action", "invalid_structure", "model_error"]
 
-
-def _uuid4(value: str, field: str) -> None:
+def _uuid4(value: str | None, field: str) -> None:
     try:
         parsed = UUID(value)
     except (TypeError, ValueError, AttributeError) as exc:
@@ -44,20 +46,44 @@ class ModelInvocationStart:
     plan_id: str | None
     correction_of_model_request_id: str | None
     started_at: float
+    registration_mutation_id: str | None = None
+    base_checkpoint_sequence: int | None = None
+    context_sha256: str | None = None
+    turn_target: str | None = None
 
     def __post_init__(self) -> None:
         _uuid4(self.model_request_id, "model_request_id")
         _uuid4(self.task_run_id, "task_run_id")
         if not isinstance(self.intent_id, str) or not self.intent_id:
             raise ValueError("intent_id is required")
-        if self.request_type not in {
-            ModelRequestType.PLAN_GENERATION, ModelRequestType.INTENT_ACTION
-        }:
-            raise ValueError("T4 audit only records Plan and Intent actions")
+        if not isinstance(self.request_type, ModelRequestType):
+            raise TypeError("unsupported model request type")
         if (self.plan_id is None) != (
-            self.request_type is ModelRequestType.PLAN_GENERATION
+            self.request_type is not ModelRequestType.INTENT_ACTION
         ):
             raise ValueError("Plan ID is required only for intent_action")
+        generation_fields = (
+            self.registration_mutation_id,
+            self.base_checkpoint_sequence,
+            self.context_sha256,
+            self.turn_target,
+        )
+        if self.request_type is ModelRequestType.INTENT_GENERATION:
+            try:
+                turn_id = UUID(self.intent_id)
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ValueError("turn_id must be a canonical UUID5") from exc
+            if turn_id.version != 5 or str(turn_id) != self.intent_id:
+                raise ValueError("turn_id must be a canonical UUID5")
+            _uuid4(self.registration_mutation_id, "registration_mutation_id")
+            if type(self.base_checkpoint_sequence) is not int or self.base_checkpoint_sequence < 1:
+                raise ValueError("base_checkpoint_sequence must be positive")
+            if not isinstance(self.context_sha256, str) or len(self.context_sha256) != 64 or any(c not in "0123456789abcdef" for c in self.context_sha256):
+                raise ValueError("context_sha256 must be lowercase SHA-256")
+            if not isinstance(self.turn_target, str) or not self.turn_target.strip():
+                raise ValueError("turn_target is required")
+        elif any(value is not None for value in generation_fields):
+            raise ValueError("turn generation fields require intent_generation")
         if self.correction_of_model_request_id is not None:
             _uuid4(self.correction_of_model_request_id, "correction_of_model_request_id")
         if not isinstance(self.started_at, (int, float)) or not math.isfinite(
@@ -79,6 +105,10 @@ class ModelInvocationCompletion:
             self.finished_at
         ):
             raise ValueError("finished_at must be finite")
+        if self.result_kind == "intent_generation" and isinstance(
+            self.result, IntentGenerationResponse
+        ) and self.result.candidates:
+            return
         if self.result_kind == "plan" and isinstance(
             self.result, PlanGenerationResponse
         ):
@@ -128,6 +158,10 @@ class ModelInvocationAuditPort(Protocol):
 
 def result_payload(completion: ModelInvocationCompletion) -> dict[str, object]:
     result = completion.result
+    if isinstance(result, IntentGenerationResponse):
+        return {"candidates": [{"description": candidate.description,
+                                "intent_type": candidate.intent_type}
+                               for candidate in result.candidates]}
     if isinstance(result, PlanGenerationResponse):
         return {"steps": [{"description": step.description} for step in result.candidate.steps]}
     if isinstance(result, IntentActionResponse):
@@ -153,7 +187,16 @@ def result_payload(completion: ModelInvocationCompletion) -> dict[str, object]:
 
 def result_from_payload(kind: AuditedResultKind, payload: object) -> AuditedResult:
     if not isinstance(payload, Mapping):
-        raise ValueError("model invocation result must be an object")
+        raise TypeError("model invocation result must be an object")
+    if kind == "intent_generation":
+        if set(payload) != {"candidates"} or not isinstance(payload["candidates"], list) or not payload["candidates"]:
+            raise ValueError("invalid persisted Intent candidates")
+        candidates = []
+        for item in payload["candidates"]:
+            if not isinstance(item, Mapping) or set(item) != {"description", "intent_type"}:
+                raise ValueError("invalid persisted Intent candidate")
+            candidates.append(IntentCandidate(item["description"], item["intent_type"]))
+        return IntentGenerationResponse(tuple(candidates))
     if kind == "plan":
         if set(payload) != {"steps"} or not isinstance(payload["steps"], list):
             raise ValueError("invalid persisted Plan summary")
