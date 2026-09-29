@@ -15,9 +15,12 @@ from agent_core.controller import TaskRunController, TaskRunControllerRegistry
 from agent_core.domain import (
     ExecutionStatus,
     FailureAction,
+    FailureType,
     IntentStatus,
     Plan,
+    PlanStatus,
     PlanStep,
+    TurnStatus,
 )
 from agent_core.modeling import IntentCandidate
 from agent_core.runtime import TERMINAL_STATUSES, TaskRunStatus
@@ -50,6 +53,7 @@ class Commands:
         self.stdout_truncated = False
         self.timeout = False
         self.confirmed = True
+        self.stream_complete = True
         self.error = None
         self.on_execute = lambda: None
 
@@ -67,7 +71,7 @@ class Commands:
             False,
             self.timeout,
             self.confirmed,
-            True,
+            self.stream_complete,
             True,
         )
 
@@ -253,6 +257,36 @@ def test_unconfirmed_timeout_blocks_new_id_and_replay_is_read_only(scenario):
     assert s.commands.quiesced
     s.gateway = s.new_gateway()
     assert s.call(request) == first
+    with pytest.raises(T6CommandRecoveryRequired):
+        s.call()
+    assert len(s.commands.calls) == 1
+
+
+def test_incomplete_stream_after_zero_exit_requires_recovery(scenario):
+    s = scenario
+    s.commands.stream_complete = False
+    request = s.request()
+    first = s.call(request)
+
+    assert first.record.status == "outcome_unknown"
+    assert first.record.dispatched
+    assert first.record.exit_code == 0
+    assert first.record.termination_confirmed
+    assert not first.record.stream_complete
+    assert first.action is FailureAction.RECOVERY_REQUIRED
+    assert s.state.executions[0].status is ExecutionStatus.FAILED
+    assert s.state.plans[0].status is PlanStatus.RUNNING
+    assert s.state.intents[0].status is IntentStatus.RUNNING
+    assert s.state.turns[0].status is TurnStatus.RUNNING
+    assert [
+        (failure.failure_type, failure.short_reason, failure.evidence_ref)
+        for failure in s.state.failure_summaries
+    ] == [(FailureType.OUTCOME_UNKNOWN, "outcome_unknown", request.request_id)]
+
+    state = s.state
+    s.gateway = s.new_gateway()
+    assert s.call(request) == first
+    assert s.state == state
     with pytest.raises(T6CommandRecoveryRequired):
         s.call()
     assert len(s.commands.calls) == 1

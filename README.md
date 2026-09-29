@@ -68,9 +68,12 @@ uv run qinyuan-agent-new replay --task-run-id <UUID> --state-dir .test/t6-manual
 uv run qinyuan-agent-new resume --task-run-id <UUID> --state-dir .test/t6-manual/real-runs --authorization authorization-v2.json
 uv run qinyuan-agent-new resume --task-run-id <UUID> --state-dir .test/t6-manual/real-runs --verify-import
 uv run qinyuan-agent-new cancel --task-run-id <UUID> --state-dir .test/t6-manual/real-runs
+uv run qinyuan-agent-new resume --task-run-id <UUID> --state-dir .test/t6-manual/real-runs --cleanup-only
 ```
 
-`--verify-import` 仅用于报告 `import_outcome_unknown` 的真实运行，只读核对原件或工作副本，之后需另行 `resume --authorization`。普通暂停、夹具耗尽或模型错误返回 4；取消且清理确认返回 130；Deadline 返回 3；未知副作用、损坏证据或清理未确认返回 5。真实运行中检查 `verified_facts` 的证明、`pending_candidates` 的来源、`recovery` 与 `cleanup`，不要把退出码或候选文本当作整题成功。
+`--verify-import` 仅用于报告 `import_outcome_unknown` 的真实运行，只读核对原件或工作副本，之后需另行 `resume --authorization`。普通暂停、夹具耗尽或模型错误返回 4；取消且无历史未知结果、清理确认时返回 130；Deadline 返回 3；未知副作用、损坏证据或清理未确认返回 5。真实运行中检查 `verified_facts` 的证明、`pending_candidates` 的来源、`recovery` 与 `cleanup`，不要把退出码或候选文本当作整题成功。
+
+`execution_outcome_unknown` 不会自动重新派发命令。工作台可对仍在运行态的 TaskRun 显式“结束并清理”；CLI 用 `cancel` 终结任务，若终态仍显示 `cleanup:not_confirmed`，再用 `resume --cleanup-only` 重试资源清理。有远程目标时，只有执行 Sandbox 和目标转发网络两份清理收据均确认，才显示整体清理成功。
 
 ## T6-6 公网目标手工复测（操作者执行）
 

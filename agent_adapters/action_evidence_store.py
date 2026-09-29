@@ -10,7 +10,12 @@ from agent_adapters.command_recorder import T6CommandRecorder, T6EvidenceError
 from agent_core.control_store import canonical_json
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.action_audit import ActionResult, ActionResultKind
-from agent_core.actions import T6ActionError, action_payload, parse_t6_action
+from agent_core.actions import (
+    T6ActionError,
+    T6ActionValidationCode,
+    action_payload,
+    parse_t6_action,
+)
 
 
 def _digest(value: dict[str, object]) -> str:
@@ -39,8 +44,17 @@ class T6ActionEvidenceStore:
                 raise ValueError("action_result_kind_mismatch")
             if kind == "invalid_structure" and result.kind is not ModelErrorKind.INVALID_RESPONSE:
                 raise ValueError("invalid_structure_error_kind")
-            payload = {"kind": result.kind.value, "short_reason": result.short_reason,
-                       "evidence_ref": result.evidence_ref}
+            payload = {
+                "kind": result.kind.value,
+                "short_reason": result.short_reason,
+                "evidence_ref": result.evidence_ref,
+            }
+            if result.validation_code is not None:
+                try:
+                    validation_code = T6ActionValidationCode(result.validation_code).value
+                except ValueError as exc:
+                    raise ValueError("invalid_t6_validation_code") from exc
+                payload["validation_code"] = validation_code
         value: dict[str, object] = {
             "model_request_id": model_request_id, "finished_at": finished_at,
             "result_kind": kind, "result": payload,
@@ -67,13 +81,20 @@ class T6ActionEvidenceStore:
                 result: ActionResult = parse_t6_action(value["result"])
             elif kind in {"invalid_structure", "model_error"}:
                 payload = value["result"]
-                if not isinstance(payload, dict) or set(payload) != {
-                    "kind", "short_reason", "evidence_ref",
-                }:
+                if not isinstance(payload, dict) or set(payload) not in (
+                    {"kind", "short_reason", "evidence_ref"},
+                    {"kind", "short_reason", "evidence_ref", "validation_code"},
+                ):
                     raise ValueError("invalid_action_error")
+                validation_code = payload.get("validation_code")
+                if "validation_code" in payload:
+                    try:
+                        T6ActionValidationCode(validation_code)
+                    except ValueError as exc:
+                        raise ValueError("invalid_t6_validation_code") from exc
                 error = ModelError(
                     ModelErrorKind(payload["kind"]), payload["short_reason"],
-                    payload["evidence_ref"],
+                    payload["evidence_ref"], validation_code,
                 )
                 if kind == "invalid_structure" and error.kind is not ModelErrorKind.INVALID_RESPONSE:
                     raise ValueError("invalid_structure_error_kind")

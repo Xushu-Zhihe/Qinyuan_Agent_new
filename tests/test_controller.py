@@ -273,6 +273,81 @@ def test_t6_target_resources_bind_atomically_and_cleanup_after_sandbox() -> None
         controller.close()
 
 
+def test_explicit_cancel_attaches_without_reopening_execution_when_target_is_unavailable() -> None:
+    calls: list[str] = []
+
+    class NetworkSandbox(FakeSandbox):
+        def configure_target_network(self, _task_run_id, _binding):
+            pass
+
+        def bind(self, _task_run_id, _sandbox_id, *, terminal):
+            calls.append(f"sandbox_bind:{terminal}")
+
+        def quiesce(self, _sandbox_id):
+            calls.append("sandbox_quiesce")
+
+        def destroy(self, sandbox_id):
+            calls.append("sandbox_destroy")
+            super().destroy(sandbox_id)
+
+    class Network:
+        fail_destroy = True
+
+        def create(self, _task_run_id, target_url):
+            return TargetNetworkBinding(
+                "a" * 64, "b" * 64, "c" * 64, "d" * 64, target_url
+            )
+
+        def bind(self, _task_run_id, _binding, *, terminal):
+            calls.append(f"network_bind:{terminal}")
+            if not terminal:
+                raise RuntimeError("active forwarder unavailable")
+
+        def destroy(self, _task_run_id, binding):
+            assert binding.forwarder_id == "c" * 64
+            calls.append("network_destroy")
+            if self.fail_destroy:
+                raise RuntimeError("network cleanup unconfirmed")
+
+    clock = FakeClock()
+    network = Network()
+    with SqliteControlStore.open(controller_database_path(), clock=clock) as store:
+        repository = ControlStateRepository(store, EmptyEvidence())
+
+        def owner():
+            return TaskRunController(
+                NetworkSandbox(), clock=clock, store=store,
+                repository=repository, registry=TaskRunControllerRegistry(),
+                target_network_adapter=network,
+            )
+
+        task_id = str(uuid4())
+        started = owner()
+        started.start(request(), ModelBackend.CODEX_CLI, str(uuid4()), task_run_id=task_id)
+
+        # Fresh registries model separate CLI processes after the paused run.
+        strict = owner()
+        with pytest.raises(RuntimeError, match="active forwarder unavailable"):
+            strict.attach(task_id)
+        assert store.load_task_run(task_id).status is TaskRunStatus.RUNNING
+
+        cancelling = owner()
+        cancelling.attach_for_cancellation(task_id)
+        assert "network_bind:True" in calls
+        assert "sandbox_bind:True" in calls
+        assert "sandbox_bind:False" not in calls
+        with pytest.raises(SandboxCleanupError):
+            cancelling.cancel(str(uuid4()))
+        assert store.load_task_run(task_id).status is TaskRunStatus.CANCELLED
+        assert calls.index("sandbox_destroy") < calls.index("network_destroy")
+
+        network.fail_destroy = False
+        cancelling.cleanup_sandbox()
+        assert calls.count("sandbox_destroy") == 1
+        assert calls.count("network_destroy") == 2
+        cancelling.close()
+
+
 @pytest.fixture
 def source_root() -> Path:
     path = controller_database_path().parent / f"source-{uuid4()}"

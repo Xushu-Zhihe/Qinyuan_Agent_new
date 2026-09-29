@@ -16,6 +16,7 @@ IntentRunOutcome = Literal[
     "inconclusive",
     "recovery_required",
     "model_error",
+    "action_rejected",
 ]
 
 
@@ -48,6 +49,7 @@ class IntentRunResult:
             "inconclusive",
             "recovery_required",
             "model_error",
+            "action_rejected",
         }:
             raise ValueError("unsupported Intent runner outcome")
         if self.outcome in {"target_mismatch", "target_mismatch_committed", "step_timeout"}:

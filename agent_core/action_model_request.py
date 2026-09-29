@@ -9,7 +9,8 @@ from agent_core.contracts import Target
 from agent_core.control_state_repository import ModelContextSnapshot
 from agent_core.control_store import ControlStateSnapshot
 from agent_core.domain import (
-    ExecutionStatus, FailureSummary, FailureType, IntentStatus, PlanStatus, TurnStatus,
+    ExecutionStatus, FactStatus, FailureSummary, FailureType, IntentStatus,
+    PlanStatus, TurnStatus,
 )
 from agent_core.intent_postconditions import (
     OutputContains, Postcondition, PostconditionStorePort,
@@ -63,6 +64,8 @@ class T6ActionModelRequest:
     retry_probe: RetryProbeContext | None = None
     correction_of_model_request_id: str | None = None
     short_reason: str | None = None
+    intent_verified_fact_ids: tuple[str, ...] = ()
+    latest_verifiable_plan_fact_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -94,6 +97,22 @@ class T6ActionModelRequest:
             raise ValueError("incomplete_action_correction")
         if self.short_reason is not None and not self.short_reason.strip():
             raise ValueError("empty_action_correction")
+        visible_fact_ids = {item.fact_id for item in self.verified_facts}
+        if (
+            not isinstance(self.intent_verified_fact_ids, tuple)
+            or not isinstance(self.latest_verifiable_plan_fact_ids, tuple)
+            or any(not isinstance(item, str) for item in self.intent_verified_fact_ids)
+            or any(not isinstance(item, str) for item in self.latest_verifiable_plan_fact_ids)
+            or
+            len(self.intent_verified_fact_ids) != len(set(self.intent_verified_fact_ids))
+            or any(item not in visible_fact_ids for item in self.intent_verified_fact_ids)
+            or len(self.latest_verifiable_plan_fact_ids)
+            != len(set(self.latest_verifiable_plan_fact_ids))
+            or not set(self.latest_verifiable_plan_fact_ids).issubset(
+                self.intent_verified_fact_ids
+            )
+        ):
+            raise ValueError("invalid_completion_fact_ids")
 
     def context_payload(self) -> dict[str, object]:
         return {
@@ -105,6 +124,10 @@ class T6ActionModelRequest:
             "target": self.target.to_dict(),
             "intent_description": self.intent_description,
             "verified_facts": [asdict(item) for item in self.verified_facts],
+            "intent_verified_fact_ids": list(self.intent_verified_fact_ids),
+            "latest_verifiable_plan_fact_ids": list(
+                self.latest_verifiable_plan_fact_ids
+            ),
             "failure_summaries": [
                 {
                     "failure_type": item.failure_type.value,
@@ -119,6 +142,58 @@ class T6ActionModelRequest:
             "correction_of_model_request_id": self.correction_of_model_request_id,
             "short_reason": self.short_reason,
         }
+
+
+def _completion_fact_ids(
+    state: ControlStateSnapshot,
+    context: ModelContextSnapshot,
+    intent_id: str,
+    turn_id: str,
+    plans,
+    postconditions: PostconditionStorePort | None,
+    *,
+    retrying: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Expose only visible, committed T6 Facts owned by this Intent."""
+
+    visible_ids = {fact.fact_id for fact in context.facts}
+    plan_ids = {plan.plan_id for plan in plans}
+    execution_plan_ids = {
+        execution.execution_id: execution.plan_id
+        for execution in state.executions
+        if execution.plan_id in plan_ids
+    }
+    scoped = tuple(
+        (fact.fact_id, execution_plan_ids[fact.source_ref])
+        for fact in state.facts
+        if fact.fact_id in visible_ids
+        and fact.status is FactStatus.VERIFIED
+        and fact.turn_id == turn_id
+        and fact.verification_ref is not None
+        and fact.verification_ref.startswith("t6:")
+        and fact.source_ref in execution_plan_ids
+    )
+    intent_ids = tuple(fact_id for fact_id, _ in scoped)
+    if retrying or postconditions is None:
+        return intent_ids, ()
+
+    latest_plan_id = None
+    for plan in reversed(plans):
+        binding = postconditions.read(plan.plan_id, intent_id)
+        if binding is None:
+            continue
+        if (
+            binding.task_run_id != state.task_run.task_run_id
+            or binding.intent_id != intent_id
+            or binding.plan_id != plan.plan_id
+        ):
+            raise ValueError("t6_action_context_not_ready")
+        latest_plan_id = plan.plan_id
+        break
+    latest_ids = tuple(
+        fact_id for fact_id, plan_id in scoped if plan_id == latest_plan_id
+    )
+    return intent_ids, latest_ids
 
 
 def build_action_model_request(
@@ -210,6 +285,10 @@ def build_action_model_request(
         )
     elif plans and plans[-1].status is not PlanStatus.COMPLETED:
         raise ValueError("t6_action_context_not_ready")
+    intent_fact_ids, latest_fact_ids = _completion_fact_ids(
+        state, context, intent_id, intent.turn_id, plans, postconditions,
+        retrying=retry is not None,
+    )
     return T6ActionModelRequest(
         model_request_id,
         state.task_run.task_run_id,
@@ -223,4 +302,6 @@ def build_action_model_request(
         recent_t6_observations(state, intent_id, commands),
         recent_pending_candidate_context(state, intent_id, candidates, commands),
         retry,
+        intent_verified_fact_ids=intent_fact_ids,
+        latest_verifiable_plan_fact_ids=latest_fact_ids,
     )

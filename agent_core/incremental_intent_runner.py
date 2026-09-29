@@ -15,12 +15,14 @@ from agent_core.command_gateway import T6CommandGateway
 from agent_core.control_state_repository import ControlStateRepository
 from agent_core.control_store import ControlStore
 from agent_core.controller import TaskRunController
-from agent_core.domain import ExecutionStatus, FailureType, IntentStatus, Plan, PlanStatus, PlanStep
+from agent_core.domain import (
+    ExecutionStatus, FactStatus, FailureType, IntentStatus, Plan, PlanStatus, PlanStep,
+)
 from agent_core.intent_postconditions import (
     CheckStatus, IntentPostconditions, T6PostconditionVerifier,
 )
 from agent_core.modeling import CancellationToken, ModelError
-from agent_core.observation_proof import T6ObservationProofVerifier
+from agent_core.observation_proof import ObservationProofError, T6ObservationProofVerifier
 from agent_core.pending_candidates import PendingCandidateRecorder, PendingCandidateStorePort
 from agent_core.runtime import TaskRunStatus
 from agent_core.supervisor_contracts import IntentRunOutcome, IntentRunResult
@@ -265,9 +267,45 @@ class IncrementalIntentRunner:
             self.journal.mark_applied(record.start.model_request_id, self.clock())
             return None
         if isinstance(action, CompleteIntentAction):
-            self.controller.complete_verified_t6_intent(
-                intent_id, action.fact_ids, ids.complete_intent_mutation_id,
-            )
+            intent = next((item for item in self.state.intents
+                           if item.intent_id == intent_id), None)
+            if (self.state.task_run.status is TaskRunStatus.RUNNING
+                    and intent is not None and intent.status is IntentStatus.RUNNING):
+                plan_ids = {item.plan_id for item in self.state.plans
+                            if item.intent_id == intent_id}
+                execution_ids = {item.execution_id for item in self.state.executions
+                                 if item.plan_id in plan_ids}
+                available_fact_ids = {
+                    item.fact_id for item in self.state.facts
+                    if item.status is FactStatus.VERIFIED
+                    and item.turn_id == intent.turn_id
+                    and item.verification_ref is not None
+                    and item.verification_ref.startswith("t6:")
+                    and item.source_ref in execution_ids
+                }
+                if not set(action.fact_ids) <= available_fact_ids:
+                    return self._result(
+                        intent_id, "action_rejected", reason="invalid_t6_fact_reference",
+                    )
+            try:
+                self.controller.complete_verified_t6_intent(
+                    intent_id, action.fact_ids, ids.complete_intent_mutation_id,
+                )
+            except ObservationProofError as exc:
+                reason = str(exc)
+                if reason in {"no_verifiable_plan", "latest_plan_has_no_verified_fact"}:
+                    return self._result(intent_id, "action_rejected", reason=reason)
+                # A proof that was present in the model context but can no
+                # longer be read or scoped is an evidence-recovery boundary,
+                # not a reason to retry the action or classify it as unknown.
+                recovery_reason = (
+                    "observation_proof_" + reason
+                    if reason and reason.replace("_", "").isalnum()
+                    else "observation_proof_unavailable"
+                )[:256]
+                return self._result(
+                    intent_id, "recovery_required", reason=recovery_reason,
+                )
             self.journal.mark_applied(record.start.model_request_id, self.clock())
             return self._result(intent_id, "succeeded")
         if isinstance(action, AbandonIntentAction):

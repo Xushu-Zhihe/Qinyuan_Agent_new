@@ -177,8 +177,8 @@ class Runner:
 
     def cancel(self, challenge_id: str):
         run = self._current(challenge_id)
-        if run and run["status"] == "paused":
-            return self._cancel_paused(challenge_id)
+        if run and run["status"] in {"paused", "recovery_required"}:
+            return self._cancel_stopped(challenge_id)
         if not run or run["status"] not in {"starting", "running", "cancelling"}:
             raise WorkbenchError("challenge_not_running", 409)
         with self.workbench.lock, self._lock:
@@ -192,13 +192,23 @@ class Runner:
                 immutable_write(agent_dir / "cancel-request.json", {"task_run_id": agent_dir.name})
         return self.status(challenge_id)
 
-    def _cancel_paused(self, challenge_id: str):
+    def _cancel_stopped(self, challenge_id: str):
         # Explicit user cancellation re-enters the CLI lifecycle boundary. It
         # never resumes the model, changes control rows, or calls Docker here.
         with self.workbench.lock:
             run = self._current(challenge_id)
-            if run["status"] != "paused":
-                raise WorkbenchError("challenge_not_paused", 409)
+            if run is None or run["status"] not in {"paused", "recovery_required"}:
+                raise WorkbenchError("challenge_not_running", 409)
+            if run["status"] == "recovery_required":
+                result = run.get("result")
+                task = result.get("task_run") if isinstance(result, dict) else None
+                if (not isinstance(result, dict)
+                        or result.get("protocol_version") != 2
+                        or not run["agent_task_run_id"]
+                        or result.get("task_run_id") != run["agent_task_run_id"]
+                        or not isinstance(task, dict)
+                        or task.get("status") not in {"running", "awaiting_confirmation"}):
+                    raise WorkbenchError("cancel_not_available", 409)
             directory = Path(run["directory"])
             agent_dir = self._find_agent_directory(directory)
             if agent_dir is None or agent_dir.name != run["agent_task_run_id"]:
@@ -376,9 +386,11 @@ class Runner:
             result["errors"] = [{"code": "agent_process_stderr"}]
         agent_status = (result.get("task_run") or {}).get("status")
         exit_code = int(result.get("exit_code", 4))
-        if (active.cleanup_only and result.get("protocol_version") == 2
+        if (result.get("protocol_version") == 2
                 and agent_status in TERMINAL_STATUSES
-                and result.get("cleanup", {}).get("status") == "succeeded"):
+                and result.get("cleanup", {}).get("status") == "succeeded"
+                and (active.cleanup_only or exit_code in (4, 5)
+                     or result.get("recovery", {}).get("required"))):
             status = "cleanup_confirmed"
         elif exit_code == 2 and result.get("task_run_id") is None:
             status = "failed"

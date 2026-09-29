@@ -109,6 +109,8 @@ T6-5 的内层动作解析入口为 `parse_t6_action(raw)`，只接受 `probe`�
 
 `build_action_model_request` 从已提交的运行中 Intent、已完成短 Plan、可信模型上下文以及有界 Execution/候选收据构造 `T6ActionModelRequest`。`AuditedT6ActionModel.propose` 在模型调用前登记 schema 10 资源 ID，严格解析动作并保存不可覆盖结果；未知模型调用不重发，结构错误最多纠正一次。已保存但未应用的动作返回原资源 ID，供 Runner 核对控制面副作用。Runner 已接入此入口；Bash 仍只能经 Gateway 派发。
 
+`T6ActionModelRequest.verified_facts` 是 TaskRun 范围的已提交规划上下文；`intent_verified_fact_ids` 单列本 Intent 可引用的 verified 观察 Fact ID，`latest_verifiable_plan_fact_ids` 单列其中属于最新可验证短 Plan 的支持 ID。只有后两者约束 `complete_intent`，且后者必须非空；无可用 ID 时模型不得提出完成动作。模型建议不能替代 Controller 对 Fact 证明和归属的最终复核。
+
 `recent_pending_candidate_context(state, intent_id, store, commands)` 返回当前 Intent 最近最多 8 条 pending 候选摘要，JSON 总量不超过 16 KiB。完整原文按最新优先纳入；放不下的条目以 `value=None`、SHA-256 和来源 ID 表示，并标识省略；每条重新核对已完成命令收据。候选上下文不改变候选台账或整题状态。
 
 ### T6-3 有序 Intent 生成（2026-09-26）
@@ -121,13 +123,15 @@ T6-5 的内层动作解析入口为 `parse_t6_action(raw)`，只接受 `probe`�
 
 `RunSupervisor` 只通过 `TaskRunController` 和 `TurnWorkingCopy` 推进控制面。它从最小 sequence 的 pending/running Turn 选择 priority 最小的 pending Intent，先原子提交 `Intent.running`，再调用窄小的 `IntentRunnerPort.run(intent_id) -> IntentRunResult`。Runner 必须返回带 TaskRun/Intent 归属的结构化结果；调度器不从模型文本或退出码推断领域结论。
 
-`IntentRunResult` 的结果为 `succeeded`、`target_mismatch`、`inconclusive`、`recovery_required` 和 `model_error`。`succeeded` 要求 Runner 已提交当前 Intent 的 succeeded，调度器随后完成 Turn；`target_mismatch` 要求已完成 Plan 与 Execution 证据，提交分类失败并继续同一 Turn 的兄弟候选；兄弟候选全部完整失败时，通过显式 `TurnGeneratorPort` 生成下一独立 Turn，生成器从已提交 Fact 与目标失败摘要构造上下文，不需要 `parent_turn_id`。`inconclusive` 只用于 Execution 已结束但后置条件无法判断，原子标记 Intent/Turn 并停止派发；`recovery_required` 用于仍有 running Execution 或未完成工具收据，保留原始 running 状态并禁止继续派发，等待显式恢复；`model_error` 将错误原因写入审计/失败摘要，Intent/Turn/TaskRun 均保持原状态，停止调度且不尝试兄弟候选。
+`IntentRunResult` 的结果包括 `succeeded`、`target_mismatch`、`inconclusive`、`recovery_required`、`model_error` 和 `action_rejected`。`succeeded` 要求 Runner 已提交当前 Intent 的 succeeded，调度器随后完成 Turn；`target_mismatch` 要求已完成 Plan 与 Execution 证据，提交分类失败并继续同一 Turn 的兄弟候选；兄弟候选全部完整失败时，通过显式 `TurnGeneratorPort` 生成下一独立 Turn，生成器从已提交 Fact 与目标失败摘要构造上下文，不需要 `parent_turn_id`。`inconclusive` 只用于 Execution 已结束但后置条件无法判断，原子标记 Intent/Turn 并停止派发；`recovery_required` 用于仍有 running Execution 或未完成工具收据，保留原始 running 状态并禁止继续派发，等待显式恢复；`model_error` 将错误原因写入审计/失败摘要，Intent/Turn/TaskRun 均保持原状态，停止调度且不尝试兄弟候选。
+
+`action_rejected` 专指结构合法的 `complete_intent` 引用无效 Fact、没有可验证 Plan 或最新可验证 Plan 缺少支持 Fact，分别返回固定原因码 `invalid_t6_fact_reference`、`no_verifiable_plan`、`latest_plan_has_no_verified_fact`。Runner 不标记原动作 applied，`RunSupervisor` 保留 running 的 TaskRun/Turn/Intent 并停止派发；应用层以 `dispatch-stop-*.json` 收据持久化停止码，显式 `resume` 复用原动作并只读复现同一拒绝，不重新调用模型或派发命令。该拒绝不生成 `TARGET_MISMATCH` 或 `MODEL_ERROR` 失败摘要，也不自动改成 `abandon_intent`；证据缺失、损坏或归属冲突仍进入恢复边界。
 
 已提交的 `model_error` 失败摘要是该 Intent 的停止标记；恢复时调度器只读返回相同原因，不再次调用 Runner/模型，也不选择兄弟候选。
 
 最新 Turn 已为 `inconclusive` 时，再次调用调度器只读返回 `paused_inconclusive`，不生成下一 Turn。`AuditedTurnGenerator` 先复用未应用的轮级模型台账；已完成的错误只读回放，已保存的候选用原注册 ID 提交，调用未完成则要求显式恢复。
 
-Runner 仅接收本次调度新提交为 running 的 Intent；若调度器读到先前已 running 的 Intent，则只读返回 `recovery_required`。这一约束避免未知执行因调度器重启而再次派发。
+`Runner.run` 仅接收本次调度新提交为 running 的 Intent；调度器读到先前已 running 的 Intent 时，先核对持久化停止/审计信息，通过显式 `Runner.resume` 复用未应用的已保存动作并返回原 `action_rejected`，不重新调用模型或派发命令。没有可确认的安全续接条件时返回 `recovery_required`；已提交的模型错误摘要仍只读回放。这一约束避免未知执行因调度器重启而再次派发。
 
 调度器不执行 Bash、MCP 或答案校验，也不把 verified Fact 升级为 TaskRun achieved。控制库的 mutation 重放仍沿用现有幂等和 Checkpoint 规则；v2 CLI、临时 TaskResult、工作台只读投影及 T6-6 单一公网目标网络适配器已接入。独立答案校验器和真实环境验收仍待后续。
 

@@ -107,13 +107,21 @@ def test_simulated_remote_target_runs_without_attachment(tmp_path):
     raw["authorization"]["allowed_target_urls"] = ["tcp://example.org:31337"]
     (tmp_path / "request.json").write_text(json.dumps(raw), encoding="utf-8")
     (tmp_path / "fixture.json").write_text(json.dumps(fixture()), encoding="utf-8")
+    state = tmp_path / "state"
     status, result = _call(
         tmp_path, "run-task", "--request", "request.json", "--mode", "simulated",
-        "--fixture", "fixture.json", "--state-dir", str(tmp_path / "state"),
+        "--fixture", "fixture.json", "--state-dir", str(state),
     )
     assert status == 4
     assert result["task_run"]["status"] == "running"
     assert result["overall_goal"]["outcome"] == "not_evaluated"
+
+    status, cancelled = _call(tmp_path, "cancel", "--task-run-id", result["task_run_id"],
+                              "--state-dir", str(state))
+    assert status == 130
+    assert cancelled["task_run"]["status"] == "cancelled"
+    assert cancelled["cleanup"]["status"] == "succeeded"
+    assert cancelled["cleanup"]["target_network_confirmed"] is True
 
 
 def test_unknown_target_network_creation_does_not_claim_cleanup(tmp_path):

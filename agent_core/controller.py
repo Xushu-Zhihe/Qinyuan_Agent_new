@@ -413,6 +413,20 @@ class TaskRunController(LegacyTaskRunController):
             raise
 
     def attach(self, task_run_id: str) -> ControlStateSnapshot:
+        return self._attach(task_run_id, cancellation_only=False)
+
+    def attach_for_cancellation(self, task_run_id: str) -> ControlStateSnapshot:
+        """Bind persisted resources without admitting work before explicit cancel.
+
+        A broken active resource must not prevent the TaskRun from reaching its
+        terminal state. Resource ownership is still checked during cleanup.
+        """
+
+        return self._attach(task_run_id, cancellation_only=True)
+
+    def _attach(
+        self, task_run_id: str, *, cancellation_only: bool
+    ) -> ControlStateSnapshot:
         deps = self._require_persistent()
         if self._persistent_task_run_id is not None or self._closed:
             raise InvalidTransition("TaskRunController can only start or attach once")
@@ -426,13 +440,16 @@ class TaskRunController(LegacyTaskRunController):
             if snapshot is None or state is None:
                 raise TaskRunNotFoundError(f"TaskRun does not exist: {task_run_id}")
             if isinstance(self._sandbox, TaskRunSandboxPort):
+                non_executing = (
+                    cancellation_only or snapshot.status in TERMINAL_STATUSES
+                )
                 if snapshot.target_network is not None:
                     if self._target_network is None:
                         raise InvalidTransition("T6 target network adapter is required")
                     self._target_network.bind(
                         task_run_id,
                         snapshot.target_network,
-                        terminal=snapshot.status in TERMINAL_STATUSES,
+                        terminal=non_executing,
                     )
                     configure = getattr(self._sandbox, "configure_target_network", None)
                     if not callable(configure):
@@ -440,7 +457,7 @@ class TaskRunController(LegacyTaskRunController):
                     configure(task_run_id, snapshot.target_network)
                 self._sandbox.bind(
                     task_run_id, snapshot.sandbox_id,
-                    terminal=snapshot.status in TERMINAL_STATUSES,
+                    terminal=non_executing,
                 )
             self._persistent_task_run_id = task_run_id
             self._persistent_snapshot = snapshot

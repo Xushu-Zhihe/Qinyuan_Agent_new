@@ -162,6 +162,8 @@ Sandbox 的正常结束以可信侧观察到进程停止和完整输出流为准
 
 T6-5 模型动作字段：`probe` 含 `script`、可选 `stdin_base64`、`working_directory`、`timeout_seconds`、`conditions`，空条件为探索型；每个短 Plan 仅第 0 步，条件为输出原文或文件 SHA-256，复用既定 64 KiB 脚本、1 MiB stdin、32 条条件和单步时间上限。`complete_intent` 含非空 `fact_ids`，必须包含当前 Intent 最新可验证短 Plan 的 verified observation Fact；`abandon_intent` 含已完成 `execution_id` 与最多 256 字的 `short_reason`；`candidate_flag` 含非空且最多 4096 字节的 `value` 与已完成 `execution_id`。未知字段拒绝。pending 候选逐条保留原文、来源与时间，展示时按原文合并去重来源，不校验或提交平台。schema 10 的动作调用先登记唯一 ID、Intent、Checkpoint、上下文摘要和固定资源 ID；完整结果先存不可覆盖证据文件，再向控制库提交结果种类与 SHA-256。只有开始记录则停止等待显式恢复；有完整证据而无完成记录时只补记同一结果；已完成但未应用时只读复用，不重问模型或重派命令。每 Intent 动作调用不设次数上限，一次结构纠正单独记账。v2 Runner/CLI 和工作台真实模式已接线，真实 Docker/模型仍由用户手工验收。
 
+T6-5 的 `model_error`/`invalid_structure` 动作证据仅可附加代码定义的 `validation_code`（如 `provider_json_invalid`、`action_field_missing`），不保存原始模型回复、提示词、字段值、密钥、脚本或附件内容。CLI 记录位于 `<state-dir>/<task_run_id>/actions/model-action-<model_request_id>.json`；使用默认数据目录的工作台时，对应路径为 `workbench_data/runs/<workbench_run_id>/agent-state/<task_run_id>/actions/model-action-<model_request_id>.json`。该字段仅新运行可产生，旧的三字段错误记录仍可读取；出现字段时必须是固定枚举值。
+
 下一次 T6 模型动作的只读执行观察按已提交 Plan sequence 和 Execution 登记顺序选最近最多 8 条，完整结构化观察的 JSON 总量最多 16 KiB，从最新记录向前分配。stdout/stderr 以 UTF-8 展示，非法字节和不可见控制字节用 `\xNN` 转义；每条保留 Execution ID、控制状态、退出码、原始双流截断标记，另用 `context_clipped` 标出上下文裁剪。观察仍是未验证数据；命令完成收据缺失、归属不符或有未结束 Execution 时停止建立上下文，不能让模型据缺失证据继续派发。构建器已接入 T6 模型请求与 Runner。
 
 pending 候选的下一次模型上下文另限当前 Intent 最近最多 8 条，结构化 JSON 总量最多 16 KiB。按最新优先保留完整原文；超过预算的记录只给 candidate_id、来源 Execution ID 和原文 SHA-256，`value=null` 明确表示原文未提供，并以 `history_clipped` 标识省略。每条都标记 `pending`，读取时重新核对来源 Execution 与完成收据。该限制只作用于模型上下文，不删除原始候选台账，不验证候选正确性。
@@ -178,7 +180,7 @@ T6 模型动作通道与 T5 分开：T6 HTTP/JSON 响应最多 2 MiB，输出 to
 
 附件路径相对于启动 CLI 时的工作目录。首次导入后，原件留在只读 `/workspace/input`，可信侧复制并校验 `/workspace/work`；随后模型可以修改或生成工作区程序。`simulated` 需要独立夹具 `turns/actions/commands`，每条 command 可含命令后完整 `work_files` 快照；只有夹具允许 `$latest_verified_fact` 和 `$latest_completed_execution` 占位符。夹具耗尽返回暂停，可保持既有序列前缀后追加并用 `resume --authorization <JSON文件> --fixture <扩展夹具>` 显式恢复。
 
-`status` 只读控制状态与证据，`replay` 只读事件；`resume` 必须提供与初始请求完全相同的授权 JSON。真实导入有未决声明时仅 `resume --verify-import` 做 Sandbox 读回校验，不重新上传，也不自动继续模型。暂停保留 TaskRun、Sandbox 和证据；`cancel` 才结束并清理。TaskResult 的 `overall_goal.outcome` 在无独立答案校验器时固定为 `not_evaluated`，候选 flag 仅为 pending。退出码：暂停/夹具耗尽/模型错误为 4，取消且清理确认 130，Deadline 为 3，未知副作用、损坏证据或清理未确认是 5；不以 0 宣告整题成功。真实 Docker、真实模型和目标网络的端到端验收不由模拟测试证明。
+`status` 只读控制状态与证据，`replay` 只读事件；`resume` 必须提供与初始请求完全相同的授权 JSON。真实导入有未决声明时仅 `resume --verify-import` 做 Sandbox 读回校验，不重新上传，也不自动继续模型。暂停保留 TaskRun、Sandbox 和证据；`cancel` 才结束并清理。TaskResult 的 `overall_goal.outcome` 在无独立答案校验器时固定为 `not_evaluated`，候选 flag 仅为 pending。退出码：暂停/夹具耗尽/模型错误为 4，取消且无历史未知结果、清理确认时为 130，Deadline 为 3，未知副作用、损坏证据或清理未确认是 5；不以 0 宣告整题成功。真实 Docker、真实模型和目标网络的端到端验收不由模拟测试证明。
 
 T6-6 扩展 v2 目标输入：`target.endpoints` 可省略或恰有一条显式端口的 `http://`、`https://`、`tcp://` URL；填写时 `authorization.allowed_target_urls` 必须恰为该 URL 的单元素数组，未填写时必须为空数组。可用 0～16 个本地附件，但零附件时必须有目标。目标 IP 仅允许公网；域名解析在转发容器每次连接时重新检查公网结果。真实模式在启动 TaskRun 前创建专属外联和内部网络及固定转发容器，Sandbox 仅接内部网络；无目标仍为 `network_mode=none`。目标网络创建结果未知时返回恢复要求，不宣称无需清理。该代码链路尚未经过真实环境验收。
 
@@ -188,13 +190,17 @@ T6-3 的内部 Intent 生成协议：可信侧先选定注册 mutation 和轮目
 
 `RunSupervisor` 在每次派发前读取最新控制快照，按 Turn sequence 和 Intent priority 选择唯一目标，并先提交 `Intent.running`。执行器只通过 `IntentRunnerPort.run(intent_id)` 返回带归属的 `IntentRunResult`；调度器不解析模型自由文本，也不把 Bash 退出码直接当作目标结论。
 
-结果分类固定为五类：`succeeded` 必须已经有 verified Intent 状态，随后完成 Turn；`target_mismatch` 必须带已完成 Plan 和 Execution 证据，写入 `TARGET_MISMATCH` 失败摘要后继续兄弟候选；同一 Turn 的候选全部失败时调用显式 Turn 生成器，生成独立 sequence，模型上下文只读取已提交 Fact 和分类失败摘要，不维护 `parent_turn_id`；`inconclusive` 只用于 Execution 已结束但后置条件无法判断，将当前 Intent/Turn 设为 inconclusive 并停止新派发；`recovery_required` 用于仍有 running Execution 或未完成工具收据，保留原始 running 状态并禁止继续派发，等待显式恢复；`model_error` 将错误原因写入审计/失败摘要，Intent/Turn/TaskRun 均保持原状态，停止调度且不尝试兄弟候选。归属不符或缺少所需证据均进入恢复边界，不自动重派。
+执行结果分类固定为五类：`succeeded` 必须已经有 verified Intent 状态，随后完成 Turn；`target_mismatch` 必须带已完成 Plan 和 Execution 证据，写入 `TARGET_MISMATCH` 失败摘要后继续兄弟候选；同一 Turn 的候选全部失败时调用显式 Turn 生成器，生成独立 sequence，模型上下文只读取已提交 Fact 和分类失败摘要，不维护 `parent_turn_id`；`inconclusive` 只用于 Execution 已结束但后置条件无法判断，将当前 Intent/Turn 设为 inconclusive 并停止新派发；`recovery_required` 用于仍有 running Execution、未完成工具收据或已派发命令的 `outcome_unknown`，保留 Plan/Intent/Turn 的 running 恢复锚点并禁止继续派发，等待显式处理；`model_error` 将错误原因写入审计/失败摘要，Intent/Turn/TaskRun 均保持原状态，停止调度且不尝试兄弟候选。另有独立的动作分类 `action_rejected`，用于可信侧确定性拒绝结构合法但不可应用的 `complete_intent`；归属不符或缺少执行证据均进入恢复边界，不自动重派。
+
+T6 命令已派发但输出流未确认完整时，即使观察到退出码 0，也记录 `outcome_unknown` 和对应失败摘要；Execution 记为 failed，Plan/Intent/Turn 保持 running 作为恢复锚点，调度停止且不自动重派。旧运行中已提交的 `outcome_unknown` 不因代码更新而补认成功或改写状态；取消并清理是显式终结路径，不恢复丢失的输出。显式 `cancel` 可将持久化的运行中资源以禁止执行模式挂载，先提交终态再逐项核对归属并清理；普通 `resume` 仍须通过活动资源配置校验。清理无法确认时保留 `not_confirmed`，不得宣称取消已完成清理。T4 的历史失败分类不随此 T6 特例改变。
+
+有远程目标的 TaskRun 清理成功需同时具备执行 Sandbox 的 `cleanup.json` 与绑定目标转发器、网络的 `target-network-cleanup.json` 成功收据。旧运行若只有前者，整体清理仍显示 `not_confirmed`，需显式 `resume --cleanup-only` 对原绑定资源重试；无远程目标的既有清理收据保持有效。
 
 同一 Intent 已有 `MODEL_ERROR` 失败摘要时，恢复调度只读返回该摘要的有界原因，不再次调用 Runner/模型，也不选择兄弟候选；要继续必须由后续明确的恢复协议定义。
 
 最新 Turn 为 `inconclusive` 时，重入只读返回暂停，不生成新轮。轮级模型错误在调用台账中保留并只读重放；轮级调用未完成时要求显式恢复，不生成新请求 ID。
 
-每次 Runner 派发都必须由本次调度新提交 `Intent.running` 开始。再次进入调度器发现已是 running 的 Intent 时，除已提交的模型错误摘要可只读回放外，统一返回 `recovery_required`，不再次调用 Runner；恢复或继续执行的入口留待后续显式协议。
+每次新的 Runner 派发都必须由本次调度新提交 `Intent.running` 开始。再次进入调度器发现已是 running 的 Intent 时，先核对持久化停止/审计信息：已保存且未应用的 `action_rejected` 动作通过显式 `resume` 只读复用并返回相同拒绝，不再次调用模型或派发命令；没有可确认的安全续接条件时返回 `recovery_required`。已提交的模型错误摘要仍只读回放。
 
 本批只接通状态调度和确定性分类测试。通用 Bash、专用 MCP、真实模型、答案校验器、CLI/工作台装配及最终 TaskResult 仍不属于 T6-4 验收。
 

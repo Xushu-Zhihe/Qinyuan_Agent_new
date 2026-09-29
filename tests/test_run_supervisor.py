@@ -514,6 +514,22 @@ def test_model_error_is_replayed_without_dispatching_again(tmp_path: Path) -> No
     assert runner.calls == 1
 
 
+def test_action_rejection_pauses_without_changing_intent_or_trying_sibling(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path, count=2)
+    runner = ScriptedRunner(scenario, ["action_rejected"])
+    result = asyncio.run(RunSupervisor(scenario.controller, scenario.evidence, runner).run())
+
+    assert result.stop == "action_rejected"
+    assert result.reason == "action_rejected"
+    assert len(runner.calls) == 1
+    assert scenario.state.task_run.status is TaskRunStatus.RUNNING
+    assert scenario.state.turns[0].status is TurnStatus.RUNNING
+    assert [item.status for item in scenario.state.intents] == [
+        IntentStatus.RUNNING, IntentStatus.PENDING,
+    ]
+    assert not scenario.state.failure_summaries
+
+
 def test_recovery_required_preserves_running_intent_and_turn(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path, count=1)
     runner = ScriptedRunner(scenario, ["recovery_required"])

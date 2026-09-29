@@ -355,6 +355,7 @@ class T6CommandGateway:
                                     == "environment_fault",
                                 ),
                                 short_reason=status,
+                                preserve_running_on_unknown=status == "outcome_unknown",
                             )
                         )
                         action = FailureAction(commit.value)

@@ -13,6 +13,7 @@ from agent_adapters.observation_proof_store import T6ObservationProofStore
 from agent_adapters.pending_candidate_store import PendingCandidateStore
 from agent_adapters.postcondition_store import T6PostconditionStore
 from agent_adapters.run_files import immutable_read
+from agent_adapters.target_network_cleanup import target_network_cleanup_receipt
 from agent_core.action_audit import T6ActionJournal
 from agent_core.control_state_repository import ControlStateRepository
 from agent_core.observation_proof import T6ObservationProofVerifier
@@ -107,6 +108,21 @@ def _snapshot_task_result(directory: Path, declaration: dict, *, progress: bool 
             result["exit_code"] = 5
             return result
         task = state.task_run
+
+        if result["cleanup"]["status"] == "succeeded":
+            if result["cleanup"].get("sandbox_id") != task.sandbox_id:
+                result["cleanup"] = {"status": "not_confirmed"}
+            elif task.target_network is not None:
+                target_receipt = directory / "target-network-cleanup.json"
+                if (
+                    not target_receipt.exists()
+                    or immutable_read(target_receipt)
+                    != target_network_cleanup_receipt(task_id, task.target_network)
+                ):
+                    result["cleanup"] = {"status": "not_confirmed"}
+                else:
+                    result["cleanup"]["target_network_confirmed"] = True
+
         result["task_run"] = {
             "status": task.status.value,
             "reason": task.failure_reason,
@@ -167,6 +183,11 @@ def _snapshot_task_result(directory: Path, declaration: dict, *, progress: bool 
         if stop_files:
             stops = [immutable_read(path) for path in stop_files]
             result["stop"] = max(stops, key=lambda item: item["at"])
+            if result["stop"].get("stop") == "recovery_required":
+                result["recovery"] = {
+                    "required": True,
+                    "reason": result["stop"].get("reason") or "recovery_required",
+                }
         if task.status in TERMINAL_STATUSES:
             if result["cleanup"]["status"] != "succeeded" or result["recovery"]["required"]:
                 result["exit_code"] = 5

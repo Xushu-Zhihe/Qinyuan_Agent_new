@@ -20,7 +20,14 @@ from agent_core.action_audit import (
     ActionResourceIds,
     T6ActionJournal,
 )
-from agent_core.actions import ProbeAction, T6Action, T6ActionError, parse_t6_action
+from agent_core.actions import (
+    ProbeAction,
+    T6Action,
+    T6ActionError,
+    T6ActionValidationCode,
+    T6ActionValidationFailure,
+    parse_t6_action,
+)
 from agent_core.action_model_request import T6ActionModelRequest
 
 
@@ -42,6 +49,18 @@ def action_context_sha256(request: T6ActionModelRequest) -> str:
     payload = request.context_payload()
     for name in (
         "model_request_id", "correction_of_model_request_id", "short_reason",
+    ):
+        payload.pop(name)
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _legacy_action_context_sha256(request: T6ActionModelRequest) -> str:
+    """Recognize pre-completion-scope context during an existing correction."""
+
+    payload = request.context_payload()
+    for name in (
+        "model_request_id", "correction_of_model_request_id", "short_reason",
+        "intent_verified_fact_ids", "latest_verifiable_plan_fact_ids",
     ):
         payload.pop(name)
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
@@ -87,6 +106,7 @@ class AuditedT6ActionModel:
         if cancellation_token.is_cancelled or self._clock() >= deadline_at:
             raise ActionRecoveryRequired("model action no longer has a live budget")
 
+        context_digest = action_context_sha256(request)
         history = self._journal.list_for_intent(request.task_run_id, request.intent_id)
         if history and history[-1].completion is not None:
             if history[-1].completion.result_kind == "model_error":
@@ -103,13 +123,21 @@ class AuditedT6ActionModel:
                 )
                 if (
                     checkpoint_sequence != prior.start.base_checkpoint_sequence
-                    or action_context_sha256(request) != prior.start.context_sha256
+                    or (
+                        context_digest != prior.start.context_sha256
+                        and _legacy_action_context_sha256(request)
+                        != prior.start.context_sha256
+                    )
                 ):
                     raise ActionRecoveryRequired("structure correction context changed")
+                # The existing audit requires the correction to retain its
+                # original digest. Only the new trusted completion-ID fields
+                # may have been added since that audit was recorded.
+                context_digest = prior.start.context_sha256
 
         start = ActionInvocationStart(
             request.model_request_id, request.task_run_id, request.intent_id,
-            checkpoint_sequence, action_context_sha256(request),
+            checkpoint_sequence, context_digest,
             ActionResourceIds.create(), self._clock(),
             request.correction_of_model_request_id,
         )
@@ -128,6 +156,16 @@ class AuditedT6ActionModel:
             if isinstance(raw, ModelError):
                 result = raw
                 kind = "model_error"
+            elif isinstance(raw, T6ActionValidationFailure):
+                result = ModelError(
+                    ModelErrorKind.INVALID_RESPONSE,
+                    "invalid_t6_action_structure",
+                    validation_code=raw.code.value,
+                )
+                kind = (
+                    "model_error" if request.correction_of_model_request_id is not None
+                    else "invalid_structure"
+                )
             else:
                 try:
                     result = parse_t6_action(raw)
@@ -135,10 +173,27 @@ class AuditedT6ActionModel:
                         not isinstance(result, ProbeAction)
                         or result.conditions != request.retry_probe.conditions
                     ):
-                        raise T6ActionError("retry_probe_conditions_changed")
+                        raise T6ActionError(
+                            "retry_probe_conditions_changed",
+                            validation_code=T6ActionValidationCode.RETRY_CONDITIONS_INVALID,
+                        )
                     kind = "action"
-                except (T6ActionError, TypeError, ValueError):
-                    result = ModelError(ModelErrorKind.INVALID_RESPONSE, "invalid_t6_action_structure")
+                except T6ActionError as exc:
+                    result = ModelError(
+                        ModelErrorKind.INVALID_RESPONSE,
+                        "invalid_t6_action_structure",
+                        validation_code=exc.validation_code.value,
+                    )
+                    kind = (
+                        "model_error" if request.correction_of_model_request_id is not None
+                        else "invalid_structure"
+                    )
+                except (TypeError, ValueError):
+                    result = ModelError(
+                        ModelErrorKind.INVALID_RESPONSE,
+                        "invalid_t6_action_structure",
+                        validation_code=T6ActionValidationCode.ACTION_VALUE_INVALID.value,
+                    )
                     kind = (
                         "model_error" if request.correction_of_model_request_id is not None
                         else "invalid_structure"

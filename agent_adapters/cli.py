@@ -142,7 +142,7 @@ def _owned_task_operation(directory, declaration, cancel, operation, settings, o
         token = Cancellation(cancel, directory)
         app = TaskApplication(directory, declaration, token, settings=settings)
         if operation == "cancel":
-            app.controller.attach(declaration["task_run_id"])
+            app.controller.attach_for_cancellation(declaration["task_run_id"])
             if app.state.task_run.status not in TERMINAL_STATUSES:
                 app.controller.cancel(declaration["ids"]["cancel"])
         elif operation == "cleanup":

@@ -163,6 +163,8 @@ def test_terminal_recovery_uses_explicit_cleanup_only_before_archive(tmp_path):
         run_id, status="recovery_required", exit_code=5,
         result=result, agent_task_run_id=task_id,
     )
+    with pytest.raises(WorkbenchError, match="cancel_not_available"):
+        workbench.runner.cancel(challenge_id)
     with patch("agent_adapters.workbench_runner.subprocess.Popen", return_value=FakeProcess()) as popen, patch(
         "agent_adapters.workbench_runner.threading.Thread", NoThread
     ):
@@ -214,6 +216,8 @@ def test_no_agent_result_requires_recovery(tmp_path):
     )
     workbench.runner._watch(run_id)
     assert workbench.runner.status(challenge_id)["status"] == "recovery_required"
+    with pytest.raises(WorkbenchError, match="cancel_not_available"):
+        workbench.runner.cancel(challenge_id)
 
 
 def test_start_uses_v2_real_cli_and_independent_bash_budget(tmp_path):
@@ -302,6 +306,138 @@ def test_paused_v2_can_cancel_through_cli_without_resuming_model(tmp_path):
     assert popen.call_count == 1
     assert popen.call_args.args[0][3:6] == ["cancel", "--task-run-id", task_id]
     assert "resume" not in popen.call_args.args[0]
+
+
+@pytest.mark.parametrize("terminal_status", ["cancelled", "deadline_exceeded"])
+def test_recovery_required_v2_can_explicitly_end_and_cleanup(tmp_path, terminal_status):
+    workbench, challenge_id = prepared_workbench(tmp_path)
+    run_id, task_id = str(uuid4()), str(uuid4())
+    directory = workbench.runner.root / run_id
+    agent_directory = directory / "agent-state" / task_id
+    agent_directory.mkdir(parents=True)
+    (agent_directory / "run.json").write_text("{}", encoding="utf-8")
+    workbench._insert_run(run_id, challenge_id, directory)
+    result = {
+        "protocol_version": 2, "task_run_id": task_id,
+        "task_run": {"status": "running"},
+        "cleanup": {"status": "not_confirmed"},
+        "recovery": {"required": True, "reason": "execution_outcome_unknown"},
+        "exit_code": 5,
+    }
+    workbench._finish_run(
+        run_id, status="recovery_required", exit_code=5,
+        result=result, agent_task_run_id=task_id,
+    )
+    with pytest.raises(WorkbenchError, match="cancel_running_challenge_first"):
+        workbench.archive(challenge_id)
+    with pytest.raises(WorkbenchError, match="cleanup_not_available"):
+        workbench.runner.cleanup(challenge_id)
+    with patch("agent_adapters.workbench_runner.subprocess.Popen", return_value=FakeProcess()) as popen, patch(
+        "agent_adapters.workbench_runner.threading.Thread", NoThread
+    ):
+        assert workbench.runner.cancel(challenge_id)["status"] == "cancelling"
+    assert popen.call_count == 1
+    assert popen.call_args.args[0][3:6] == ["cancel", "--task-run-id", task_id]
+    assert "resume" not in popen.call_args.args[0]
+    ended = result | {
+        "task_run": {"status": terminal_status},
+        "cleanup": {"status": "succeeded"},
+    }
+    process = workbench.runner._active[run_id].process
+    process.result = ended
+    process.returncode = 5
+    (directory / "agent.stdout.log").write_text(json.dumps(ended), encoding="utf-8")
+    workbench.runner._watch(run_id)
+    finished = workbench.runner.status(challenge_id)
+    assert finished["status"] == "cleanup_confirmed"
+    assert finished["result"]["recovery"] == result["recovery"]
+    assert workbench.archive(challenge_id)["archived"] is True
+
+
+def test_historical_terminal_cleanup_success_is_projected_without_rewriting_run(tmp_path):
+    workbench, challenge_id = prepared_workbench(tmp_path)
+    run_id, task_id = str(uuid4()), str(uuid4())
+    directory = workbench.runner.root / run_id
+    directory.mkdir()
+    workbench._insert_run(run_id, challenge_id, directory)
+    result = {
+        "protocol_version": 2, "task_run_id": task_id,
+        "task_run": {"status": "cancelled"},
+        "cleanup": {"status": "succeeded"},
+        "recovery": {"required": True, "reason": "execution_outcome_unknown"},
+        "exit_code": 5,
+    }
+    workbench._finish_run(
+        run_id, status="recovery_required", exit_code=5,
+        result=result, agent_task_run_id=task_id,
+    )
+    restarted = Workbench(tmp_path)
+    assert restarted.get(challenge_id)["status"] == "cleanup_confirmed"
+    assert restarted.runner.status(challenge_id)["status"] == "cleanup_confirmed"
+    with restarted._db() as db:
+        assert db.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()[0] == "recovery_required"
+    assert restarted.archive(challenge_id)["archived"] is True
+
+
+def test_historical_remote_cleanup_requires_explicit_network_cleanup(tmp_path):
+    workbench, challenge_id = prepared_workbench(tmp_path)
+    challenge = workbench.get(challenge_id)
+    fields = {key: challenge[key] for key in (
+        "title", "category", "description", "deadline_minutes", "step_timeout_seconds"
+    )}
+    workbench.update(challenge_id, fields | {"endpoint": "tcp://example.org:24009"})
+    run_id, task_id = str(uuid4()), str(uuid4())
+    directory = workbench.runner.root / run_id
+    agent_directory = directory / "agent-state" / task_id
+    agent_directory.mkdir(parents=True)
+    (agent_directory / "run.json").write_text("{}", encoding="utf-8")
+    workbench._insert_run(run_id, challenge_id, directory)
+    old_result = {
+        "protocol_version": 2, "task_run_id": task_id,
+        "task_run": {"status": "cancelled"},
+        "cleanup": {"status": "succeeded"},
+        "recovery": {"required": True, "reason": "execution_outcome_unknown"},
+        "exit_code": 5,
+    }
+    workbench._finish_run(
+        run_id, status="cleanup_confirmed", exit_code=5,
+        result=old_result, agent_task_run_id=task_id,
+    )
+
+    restarted = Workbench(tmp_path)
+    projected = restarted.get(challenge_id)
+    assert projected["status"] == projected["run"]["status"] == "recovery_required"
+    assert projected["run"]["result"]["cleanup"]["status"] == "not_confirmed"
+    with restarted._db() as db:
+        stored = db.execute("SELECT status,result_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        assert stored["status"] == "cleanup_confirmed"
+        assert json.loads(stored["result_json"])["cleanup"]["status"] == "succeeded"
+    with pytest.raises(WorkbenchError, match="cancel_running_challenge_first"):
+        restarted.archive(challenge_id)
+    with restarted._db() as db:
+        db.execute("UPDATE challenges SET archived=1 WHERE id=?", (challenge_id,))
+    with pytest.raises(WorkbenchError, match="archive_terminal_challenge_first"):
+        restarted.purge(challenge_id, "one")
+    restarted.restore(challenge_id)
+
+    with patch("agent_adapters.workbench_runner.subprocess.Popen", return_value=FakeProcess()) as popen, patch(
+        "agent_adapters.workbench_runner.threading.Thread", NoThread
+    ):
+        assert restarted.runner.cleanup(challenge_id)["status"] == "cleaning"
+    assert popen.call_args.args[0][3:] == [
+        "resume", "--task-run-id", task_id, "--state-dir",
+        str(agent_directory.parent), "--cleanup-only",
+    ]
+    confirmed = old_result | {"cleanup": {
+        "status": "succeeded", "target_network_confirmed": True,
+    }}
+    process = restarted.runner._active[run_id].process
+    process.result = confirmed
+    process.returncode = 5
+    (directory / "agent.stdout.log").write_text(json.dumps(confirmed), encoding="utf-8")
+    restarted.runner._watch(run_id)
+    assert restarted.runner.status(challenge_id)["status"] == "cleanup_confirmed"
+    assert restarted.archive(challenge_id)["archived"] is True
 
 
 def test_newer_run_status_is_not_overwritten_by_old_result(tmp_path):

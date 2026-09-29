@@ -125,6 +125,8 @@ SQLite 保存 `TaskRun / Turn / Intent / Plan / PlanStep / Execution / Fact / Fa
 
 T6-5 外层入口为 `run-task` v2：`TaskApplication` 将受审计的有序 Intent 生成、`RunSupervisor`、`IncrementalIntentRunner`、通用脚本 Gateway、短 Plan 条件验证与候选证据组装在同一 TaskRun 内。模拟和真实模式共用控制状态及证据规则；T6-6 接入单一公网目标的 TaskRun 专属隔离转发，零附件目标题也可启动。`TaskResult` 从只读控制快照与证据重建，区分 verified 观察 Fact、pending 候选、暂停、恢复要求和清理结果；无独立答案校验器时整体目标固定为 `not_evaluated`。工作台已接入该 `run-task --mode real`，只负责启动、取消和只读投影，不拥有或改写控制面状态。真实目标网络待用户验收。
 
+T6 动作模型请求分别提供 TaskRun 已提交的 verified Fact 规划上下文、当前 Intent 可引用的 Fact ID 和最新可验证短 Plan 的支持 Fact ID。任务级 Fact 不自动取得当前 Intent 的完成权限；最新可验证 Plan 没有支持 Fact 时，模型不得提出 `complete_intent`。可信侧仍须在提交前复核 Fact、证明和归属，不能凭模型引用完成 Intent。
+
 T1 新提交先在外层投影并复核整组变更后的候选状态及证据；Store 在事务中检查修改前后的归属、不变父级和运行状态组合。SQLite 不调用证据服务。已提交 mutation 的重放只读取首次提交结果，不查询证据或重复 Sandbox 副作用。提交后重载失败明确报告已提交及缓存失效；更强证据保留保证不属于当前控制面契约，详见 `protocol.md`。
 
 ## T4 单 Intent 恢复边界（2026-09-24）
@@ -149,6 +151,8 @@ T1 新提交先在外层投影并复核整组变更后的候选状态及证据�
 `RunSupervisor` 读取已提交快照，按 Turn sequence 和 Intent priority 顺序选择一个 Intent，先经 Controller 原子提交 `running`，再调用 `IntentRunnerPort`。Runner 只返回带 TaskRun/Intent 归属的结构化结果；调度器不执行工具、不解析模型文本、不凭退出码判断目标。
 
 完整证据确认目标不匹配时，当前 Intent/Plan 记为失败并继续同一 Turn 的兄弟候选；候选全部失败后由显式生成器注册下一独立 Turn，生成器读取已提交 Fact 和分类失败摘要，不新增 `parent_turn_id`。结果未知分为两类：仍有 running Execution 或未完成工具收据时返回 `recovery_required`，保持原始 running 状态并禁止继续派发；Execution 已结束但后置条件无法判断时才将 Intent/Turn 标为 `inconclusive`。模型错误保留有界原因并写入失败摘要，Intent/Turn/TaskRun 均保持原状态，停止调度且不尝试兄弟候选。该调度切片已由 T6-5 `run-task` 接入；工作台只显示其持久化状态，GoalEvaluator/独立答案校验器仍未配置。
+
+结构合法但引用无效 Fact、无可验证 Plan 或最新可验证 Plan 缺少支持 Fact 的 `complete_intent` 属于确定性 `action_rejected`，与执行结果未知、证据损坏及目标不匹配分开。停止原因写入运行目录的 `dispatch-stop-*.json` 收据；原动作仍以未应用状态留在审计台账，TaskRun、Turn、Intent 保持 running，本次调度暂停。显式 `resume` 只复用原动作并返回相同拒绝，不增加模型调用或命令派发，也不自动改为 `abandon_intent`；该拒绝不写入目标失败摘要。
 
 已提交的模型错误摘要是该 Intent 的停止标记；恢复时 `RunSupervisor` 只读返回相同原因，不再次调用 Runner/模型，也不选择兄弟候选。
 

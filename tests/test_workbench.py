@@ -8,7 +8,7 @@ import tempfile
 import threading
 from pathlib import Path
 
-from agent_adapters.workbench import Workbench, WorkbenchServer
+from agent_adapters.workbench import Handler, Workbench, WorkbenchServer
 
 
 def call(port, method, path, body=None, *, origin=None):
@@ -37,6 +37,28 @@ def challenge(name="one"):
         "deadline_minutes": 60,
         "step_timeout_seconds": 60,
     }
+
+
+def test_client_disconnect_while_sending_progress_does_not_write_another_response():
+    class DisconnectedWriter:
+        calls = 0
+
+        def write(self, _data):
+            self.calls += 1
+            if self.calls >= 2:
+                raise ConnectionAbortedError(10053, "client disconnected")
+
+    handler = object.__new__(Handler)
+    handler.requestline = "GET /api/challenges/test/progress HTTP/1.1"
+    handler.request_version = "HTTP/1.1"
+    handler.close_connection = False
+    handler.wfile = DisconnectedWriter()
+    handler._dispatch = lambda: handler._send(200, {"progress": None})
+
+    handler._handle()
+
+    assert handler.wfile.calls == 2
+    assert handler.close_connection is True
 
 
 def test_workbench_lifecycle_and_secret_boundary():

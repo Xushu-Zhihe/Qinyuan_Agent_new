@@ -215,6 +215,7 @@ class TurnWorkingCopy:
         output_ref: str,
         observation: FailureObservation,
         short_reason: str,
+        preserve_running_on_unknown: bool = False,
     ) -> TurnOperation:
         return self._prepare(
             "record_execution_failure",
@@ -225,6 +226,7 @@ class TurnWorkingCopy:
                     output_ref=output_ref,
                     observation=observation,
                     short_reason=short_reason,
+                    preserve_running_on_unknown=preserve_running_on_unknown,
                 ).value
             ),
         )

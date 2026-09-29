@@ -30,6 +30,7 @@ from agent_core.turn_working_copy import TurnWorkingCopy
 SupervisorStop = Literal[
     "turn_completed", "next_intent", "next_turn", "paused_inconclusive",
     "model_error", "deadline_exceeded", "cancelled", "no_work", "recovery_required",
+    "action_rejected",
 ]
 
 
@@ -346,6 +347,13 @@ class RunSupervisor:
             )
             return SupervisorResult(task_id, "model_error", turn_id, intent_id,
                                     reason=result.reason or "model_error")
+        if result.outcome == "action_rejected":
+            intent = next(item for item in self._state.intents if item.intent_id == intent_id)
+            turn = next(item for item in self._state.turns if item.turn_id == turn_id)
+            if intent.status is not IntentStatus.RUNNING or turn.status is not TurnStatus.RUNNING:
+                raise SupervisorRecoveryRequired("action_rejected_without_running_parents")
+            return SupervisorResult(task_id, "action_rejected", turn_id, intent_id,
+                                    reason=result.reason or "invalid_t6_completion_action")
         raise SupervisorRecoveryRequired("unsupported_runner_outcome")
 
     async def _generate_next(

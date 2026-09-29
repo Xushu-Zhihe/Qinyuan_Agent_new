@@ -7,6 +7,8 @@ import base64
 import hashlib
 from uuid import uuid4
 
+import pytest
+
 from test_tool_gateway import Token
 
 from agent_adapters.attachment_import_journal import T6ImportClaim, T6ImportJournal
@@ -14,6 +16,7 @@ from agent_adapters.run_files import immutable_write
 from agent_adapters.task_application import TaskApplication, prepare_attachments
 from agent_adapters.task_contract import TaskRunRequest, validate_task_fixture
 from agent_adapters.task_result import snapshot_task_result
+from agent_core.controller import SandboxCleanupError
 from Sandbox.command_attachment import T6AttachmentReadback
 
 
@@ -100,6 +103,115 @@ def test_whole_task_simulation_pauses_without_claiming_goal(tmp_path):
     assert after["task_run"]["status"] == "cancelled"
     assert after["cleanup"]["status"] == "succeeded"
     assert after["exit_code"] == 130
+
+
+def test_unverified_complete_action_is_rejected_without_replaying_work(tmp_path, monkeypatch):
+    data = declaration(tmp_path)
+    data["fixture"] = validate_task_fixture({
+        "turns": [{"candidates": [{"description": "inspect the sample"}]}],
+        "actions": [
+            {"kind": "probe", "script": f"printf observation-{index}",
+             "working_directory": "/workspace/work", "timeout_seconds": 30,
+             "conditions": []}
+            for index in range(5)
+        ] + [{"kind": "complete_intent", "fact_ids": [str(uuid4())]}],
+        "commands": [
+            {"exit_code": 0, "stdout_base64": base64.b64encode(b"observed\n").decode(),
+             "stderr_base64": ""}
+            for _ in range(5)
+        ],
+    })
+    directory = tmp_path / "run"
+    directory.mkdir()
+    immutable_write(directory / "run.json", data)
+    app = TaskApplication(directory, data, Token())
+    try:
+        asyncio.run(app.execute(start=True))
+        intent = app.state.intents[0]
+        actions = app.journal.list_for_intent(data["task_run_id"], intent.intent_id)
+        assert len(actions) == 6 and actions[-1].applied_at is None
+        assert len(app.state.executions) == 5
+        assert all(item.status.value == "succeeded" for item in app.state.executions)
+        assert not app.state.facts
+        assert intent.status.value == "running"
+    finally:
+        app.close()
+    result = snapshot_task_result(directory, data)
+    assert result["stop"]["stop"] == "action_rejected"
+    assert result["stop"]["reason"] == "invalid_t6_fact_reference"
+    assert result["recovery"] == {"required": False, "reason": None}
+    assert result["errors"] == []
+    assert result["exit_code"] == 4
+
+    resumed = TaskApplication(directory, data, Token())
+    try:
+        def unexpected_model(*_args, **_kwargs):
+            raise AssertionError("model must not be called for a saved rejected action")
+
+        async def unexpected_command(*_args, **_kwargs):
+            raise AssertionError("command must not be replayed for a rejected action")
+
+        monkeypatch.setattr(resumed.fixture_runtime, "invoke", unexpected_model)
+        monkeypatch.setattr(resumed.fixture_runtime, "execute", unexpected_command)
+        asyncio.run(resumed.execute(start=False))
+        assert len(resumed.journal.list_for_intent(
+            data["task_run_id"], resumed.state.intents[0].intent_id,
+        )) == 6
+        assert len(resumed.state.executions) == 5
+        assert not resumed.state.facts
+    finally:
+        resumed.close()
+
+
+def test_remote_cleanup_requires_both_resource_receipts(tmp_path, monkeypatch):
+    data = declaration(tmp_path)
+    data["request"]["task_request"]["target"] = {
+        "attachments": [], "endpoints": [{"url": "tcp://example.org:31337"}],
+    }
+    data["request"]["authorization"]["allowed_target_urls"] = [
+        "tcp://example.org:31337"
+    ]
+    data["attachments"] = []
+    data["ids"]["imports"] = []
+    data["ids"]["copies"] = []
+    directory = tmp_path / "remote-run"
+    directory.mkdir()
+    immutable_write(directory / "run.json", data)
+
+    started = TaskApplication(directory, data, Token())
+    try:
+        asyncio.run(started.execute(start=True))
+    finally:
+        started.close()
+
+    failed_cleanup = TaskApplication(directory, data, Token())
+    try:
+        failed_cleanup.controller.attach(data["task_run_id"])
+        def fail_target_destroy(_task_id, _binding):
+            raise RuntimeError("simulated network cleanup failure")
+
+        monkeypatch.setattr(failed_cleanup.controller._target_network.network,
+                            "destroy", fail_target_destroy)
+        with pytest.raises(SandboxCleanupError):
+            failed_cleanup.controller.cancel(data["ids"]["cancel"])
+    finally:
+        failed_cleanup.close()
+    partial = snapshot_task_result(directory, data)
+    assert partial["task_run"]["status"] == "cancelled"
+    assert (directory / "cleanup.json").exists()
+    assert partial["cleanup"]["status"] == "not_confirmed"
+    assert partial["exit_code"] == 5
+
+    retried = TaskApplication(directory, data, Token())
+    try:
+        retried.controller.attach(data["task_run_id"])
+        retried.controller.cleanup_sandbox()
+    finally:
+        retried.close()
+    complete = snapshot_task_result(directory, data)
+    assert complete["cleanup"]["status"] == "succeeded"
+    assert complete["cleanup"]["target_network_confirmed"] is True
+    assert complete["exit_code"] == 130
 
 
 def test_simulated_file_condition_uses_declared_work_snapshot(tmp_path):

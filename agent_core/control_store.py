@@ -728,6 +728,7 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             allowed_results=frozenset(
                 {
                     "retry_execution",
+                    "recovery_required",
                     "try_next_intent",
                     "turn_failed",
                     "turn_inconclusive",

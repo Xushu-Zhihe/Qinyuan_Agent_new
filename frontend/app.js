@@ -54,11 +54,12 @@ function selectTask(id, navigate = true) {
 }
 function renderRun(run, events = [], progress = null) {
   const active = ["starting", "running", "cancelling", "cleaning", "paused", "recovery_required"].includes(run?.status);
+  const recoverableCancel = run?.status === "recovery_required" && run?.result?.protocol_version === 2 && !!run?.agent_task_run_id && run?.result?.task_run_id === run?.agent_task_run_id && ["running", "awaiting_confirmation"].includes(run?.result?.task_run?.status);
   $("run-panel").hidden = !state.selected;
   $("start-run").hidden = !state.selected || active || !!state.tasks.find((task) => task.id === state.selected)?.archived;
-  $("cancel-run").hidden = !["starting", "running", "cancelling", "paused"].includes(run?.status);
+  $("cancel-run").hidden = !recoverableCancel && !["starting", "running", "cancelling", "paused"].includes(run?.status);
   $("cancel-run").disabled = run?.status === "cancelling";
-  $("cancel-run").textContent = run?.status === "paused" ? "取消并清理" : "取消运行";
+  $("cancel-run").textContent = recoverableCancel ? "结束并清理" : run?.status === "paused" ? "取消并清理" : "取消运行";
   const terminal = ["achieved", "assumed_achieved", "partial", "inconclusive", "failed", "cancelled", "deadline_exceeded"].includes(run?.result?.task_run?.status);
   $("cleanup-run").hidden = run?.status !== "recovery_required" || !terminal || run?.result?.cleanup?.status === "succeeded";
   RunView.render({ run, events, progress, challengeId: state.selected });

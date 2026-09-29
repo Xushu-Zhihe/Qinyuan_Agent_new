@@ -75,6 +75,7 @@ class FailureAction(StrEnum):
     RETRY_COMMAND_GENERATION = "retry_command_generation"
     RETRY_EXECUTION = "retry_execution"
     RETRY_STEP_COMMAND = "retry_step_command"
+    RECOVERY_REQUIRED = "recovery_required"
     TRY_NEXT_INTENT = "try_next_intent"
     TURN_FAILED = "turn_failed"
     TURN_INCONCLUSIVE = "turn_inconclusive"

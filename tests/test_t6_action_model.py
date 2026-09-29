@@ -18,9 +18,15 @@ from agent_adapters.deepseek_model import (
     t6_output_tokens_from_env,
 )
 from agent_core.contracts import Target
-from agent_core.modeling import ModelErrorKind
+from agent_core.modeling import FactSnapshot, ModelErrorKind
 from agent_core.pending_candidates import PendingCandidateContext
-from agent_core.actions import ProbeAction, T6ActionError, parse_t6_action
+from agent_core.actions import (
+    ProbeAction,
+    T6ActionError,
+    T6ActionValidationCode,
+    T6ActionValidationFailure,
+    parse_t6_action,
+)
 from agent_core.action_model_request import T6ActionModelRequest
 
 
@@ -47,12 +53,16 @@ def action_worker(pipe, settings, payload, timeout):
     assert payload["max_tokens"] == 8192
     assert "tools" not in payload
     prompt = payload["messages"][0]["content"]
-    for action in ("probe", "complete_intent", "abandon_intent", "candidate_flag"):
+    for action in ("probe", "abandon_intent", "candidate_flag"):
         assert f'"kind":"{action}"' in prompt
+    assert '"kind":"complete_intent"' not in prompt
+    assert "do not propose complete_intent" in prompt
     assert '"working_directory":"/workspace/work"' in prompt
     assert '"step_index":0' in prompt
     context = json.loads(payload["messages"][1]["content"])
     assert context["pending_candidates"] == {"entries": [], "history_clipped": False}
+    assert context["intent_verified_fact_ids"] == []
+    assert context["latest_verifiable_plan_fact_ids"] == []
     if context["correction_of_model_request_id"]:
         assert "previous action failed structure validation" in prompt
     pipe.send({"connected": True})
@@ -106,11 +116,24 @@ def test_t6_action_prompt_matches_parser_and_correction(monkeypatch):
         short_reason="invalid_t6_action_structure",
     )
     assert isinstance(parse_t6_action(adapter.invoke(corrected, 5, Token())), ProbeAction)
+    fact_id = str(uuid4())
+    with_fact = replace(
+        item,
+        verified_facts=(FactSnapshot(fact_id, "verified observation", "execution"),),
+        intent_verified_fact_ids=(fact_id,),
+        latest_verifiable_plan_fact_ids=(fact_id,),
+    )
+    assert isinstance(parse_t6_action(adapter.invoke(with_fact, 5, Token())), ProbeAction)
     for prompt in prompts:
-        for action in ("probe", "complete_intent", "abandon_intent", "candidate_flag"):
+        for action in ("probe", "abandon_intent", "candidate_flag"):
             assert f'"kind":"{action}"' in prompt
         assert '"working_directory":"/workspace/work"' in prompt
         assert '"step_index":0' in prompt
+    assert all('"kind":"complete_intent"' not in prompt for prompt in prompts[:2])
+    assert all("do not propose complete_intent" in prompt for prompt in prompts[:2])
+    assert '"kind":"complete_intent"' in prompts[2]
+    assert fact_id in prompts[2]
+    assert "include at least one ID from latest_verifiable_plan_fact_ids" in prompts[2]
     assert "previous action failed structure validation" not in prompts[0]
     assert "previous action failed structure validation" in prompts[1]
 
@@ -128,7 +151,46 @@ def test_t6_adapter_does_not_accept_unwrapped_or_invalid_actions():
         adapter.invoke(object(), 1, Token())
     with pytest.raises(T6ActionError):
         parse_t6_action({"kind": "probe", "script": "printf 'ok'", "unexpected": 1})
+    with pytest.raises(T6ActionError) as error:
+        parse_t6_action({"kind": "unknown"})
+    assert error.value.validation_code is T6ActionValidationCode.ACTION_KIND_INVALID
+    with pytest.raises(T6ActionError) as error:
+        parse_t6_action({})
+    assert error.value.validation_code is T6ActionValidationCode.ACTION_FIELD_MISSING
+    with pytest.raises(T6ActionError) as error:
+        parse_t6_action({"kind": "probe", "unexpected": True})
+    assert error.value.validation_code is T6ActionValidationCode.ACTION_FIELD_UNEXPECTED
     assert item.context_payload()["goal"] == "inspect the challenge"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        T6ActionValidationCode.PROVIDER_JSON_INVALID,
+        T6ActionValidationCode.PROVIDER_ENVELOPE_INVALID,
+        T6ActionValidationCode.PROVIDER_CHOICES_INVALID,
+        T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
+    ],
+)
+def test_t6_provider_diagnostics_are_fixed_and_unwrapped_action_is_checked(code):
+    item = request()
+    adapter = DeepSeekT6ActionAdapter(DeepSeekSettings("deepseek-test", "secret-value"))
+
+    def provider_failure(payload, timeout, token):
+        return T6ActionValidationFailure(code)
+
+    adapter._transport._invoke_payload = provider_failure
+    result = adapter.invoke(item, 5, Token())
+    assert result == T6ActionValidationFailure(code)
+
+    def invalid_envelope(payload, timeout, token):
+        return {"unexpected": {}}
+
+    adapter._transport._invoke_payload = invalid_envelope
+    result = adapter.invoke(item, 5, Token())
+    assert result == T6ActionValidationFailure(
+        T6ActionValidationCode.ACTION_ENVELOPE_INVALID
+    )
 
 
 def test_t6_output_token_setting_is_bounded(monkeypatch):

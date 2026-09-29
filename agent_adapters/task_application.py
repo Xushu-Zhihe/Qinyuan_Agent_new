@@ -24,6 +24,7 @@ from agent_adapters.pending_candidate_store import PendingCandidateStore
 from agent_adapters.postcondition_store import T6PostconditionStore
 from agent_adapters.run_files import immutable_write
 from agent_adapters.task_contract import TaskRunRequest
+from agent_adapters.target_network_cleanup import RecordedTargetNetwork
 from agent_adapters.task_simulation import (
     FixtureTurnGenerator,
     SimulatedTargetNetwork,
@@ -155,6 +156,8 @@ class TaskApplication:
             target_network = SimulatedTargetNetwork()
         else:
             self.sandbox = SimulatedTaskSandbox()
+        if target_network is not None:
+            target_network = RecordedTargetNetwork(target_network, directory)
         self.controller = TaskRunController(
             RecordedSandbox(self.sandbox, directory), clock=time.time,
             store=self.store, repository=self.repository,

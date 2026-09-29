@@ -319,6 +319,7 @@ class ModelError:
     kind: ModelErrorKind
     short_reason: str
     evidence_ref: str | None = None
+    validation_code: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ModelErrorKind):
@@ -326,11 +327,15 @@ class ModelError:
         _non_empty(self.short_reason, "short_reason")
         if self.evidence_ref is not None:
             _non_empty(self.evidence_ref, "evidence_ref")
+        if self.validation_code is not None:
+            _non_empty(self.validation_code, "validation_code")
 
     def to_dict(self) -> dict[str, str]:
         result = {"kind": self.kind.value, "short_reason": self.short_reason}
         if self.evidence_ref is not None:
             result["evidence_ref"] = self.evidence_ref
+        if self.validation_code is not None:
+            result["validation_code"] = self.validation_code
         return result
 
 

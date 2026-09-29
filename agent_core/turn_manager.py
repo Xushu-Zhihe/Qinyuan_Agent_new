@@ -511,9 +511,13 @@ class TurnManager:
         output_ref: str,
         observation: FailureObservation,
         short_reason: str,
+        preserve_running_on_unknown: bool = False,
     ) -> FailureAction:
         if status is ExecutionStatus.SUCCEEDED:
             raise DomainError("successful Execution cannot be recorded as a failure")
+        failure_type = classify_failure(observation)
+        if preserve_running_on_unknown and failure_type is not FailureType.OUTCOME_UNKNOWN:
+            raise DomainError("only an unknown outcome may preserve running parents")
         self.complete_execution(
             execution_id=execution_id,
             status=status,
@@ -521,8 +525,12 @@ class TurnManager:
         )
         execution = self._execution(execution_id)
         plan = self._plan(execution.plan_id)
-        failure_type = classify_failure(observation)
         self._add_failure(failure_type, short_reason, execution.execution_id)
+
+        if preserve_running_on_unknown:
+            # The Execution is terminal in the audit, but its output is not
+            # trusted. Keep the Plan/Intent/Turn as the recovery anchor.
+            return FailureAction.RECOVERY_REQUIRED
 
         if failure_type is FailureType.ENVIRONMENT_FAULT:
             retry_key = (plan.plan_id, execution.step_index)

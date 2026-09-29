@@ -6,6 +6,7 @@ import base64
 import binascii
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from typing import TypeAlias
 
 from agent_core.command_contracts import (
@@ -17,8 +18,38 @@ from agent_core.command_contracts import (
 from agent_core.intent_postconditions import FileSha256, OutputContains, Postcondition
 
 
+class T6ActionValidationCode(StrEnum):
+    """Bounded diagnostics for a rejected T6 model response."""
+
+    PROVIDER_JSON_INVALID = "provider_json_invalid"
+    PROVIDER_ENVELOPE_INVALID = "provider_envelope_invalid"
+    PROVIDER_CHOICES_INVALID = "provider_choices_invalid"
+    PROVIDER_CONTENT_INVALID = "provider_content_invalid"
+    ACTION_ENVELOPE_INVALID = "action_envelope_invalid"
+    ACTION_FIELDS_INVALID = "action_fields_invalid"
+    ACTION_FIELD_MISSING = "action_field_missing"
+    ACTION_FIELD_UNEXPECTED = "action_field_unexpected"
+    ACTION_KIND_INVALID = "action_kind_invalid"
+    ACTION_VALUE_INVALID = "action_value_invalid"
+    RETRY_CONDITIONS_INVALID = "retry_conditions_invalid"
+
+
+@dataclass(frozen=True, slots=True)
+class T6ActionValidationFailure:
+    """A diagnostic without retaining provider or model-controlled content."""
+
+    code: T6ActionValidationCode
+
+
 class T6ActionError(ValueError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        validation_code: T6ActionValidationCode = T6ActionValidationCode.ACTION_VALUE_INVALID,
+    ) -> None:
+        super().__init__(message)
+        self.validation_code = validation_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,14 +114,26 @@ def _fields(
     value: object, required: set[str], optional: set[str] | None = None
 ) -> Mapping:
     if not isinstance(value, Mapping):
-        raise T6ActionError("action_must_be_object")
+        raise T6ActionError(
+            "action_must_be_object",
+            validation_code=T6ActionValidationCode.ACTION_FIELDS_INVALID,
+        )
     keys = set(value)
-    if (
-        not all(isinstance(key, str) for key in keys)
-        or not required <= keys
-        or keys - required - (optional or set())
-    ):
-        raise T6ActionError("invalid_action_fields")
+    if not all(isinstance(key, str) for key in keys):
+        raise T6ActionError(
+            "invalid_action_fields",
+            validation_code=T6ActionValidationCode.ACTION_FIELDS_INVALID,
+        )
+    if not required <= keys:
+        raise T6ActionError(
+            "invalid_action_fields",
+            validation_code=T6ActionValidationCode.ACTION_FIELD_MISSING,
+        )
+    if keys - required - (optional or set()):
+        raise T6ActionError(
+            "invalid_action_fields",
+            validation_code=T6ActionValidationCode.ACTION_FIELD_UNEXPECTED,
+        )
     return value
 
 
@@ -115,6 +158,8 @@ def _condition(value: object) -> Postcondition:
         if item["kind"] == "file_sha256":
             _fields(item, {"kind", "step_index", "path", "expected_sha256"})
             return FileSha256(0, item["path"], item["expected_sha256"])
+    except T6ActionError:
+        raise
     except (TypeError, ValueError) as exc:
         raise T6ActionError("invalid_condition") from exc
     raise T6ActionError("invalid_condition_kind")
@@ -212,4 +257,7 @@ def parse_t6_action(raw: object) -> T6Action:
         if isinstance(exc, T6ActionError):
             raise
         raise T6ActionError("invalid_action_value") from exc
-    raise T6ActionError("unsupported_action_kind")
+    raise T6ActionError(
+        "unsupported_action_kind",
+        validation_code=T6ActionValidationCode.ACTION_KIND_INVALID,
+    )

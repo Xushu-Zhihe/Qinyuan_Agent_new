@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 
 import frontend
 from agent_adapters.workbench_contracts import ACTIVE_RUN_STATUSES, WorkbenchError
+from agent_core.runtime import TERMINAL_STATUSES
 
 FRONTEND = Path(frontend.__file__).resolve().parent
 MAX_JSON_BYTES = 64 * 1024
@@ -173,16 +174,37 @@ class Workbench:
             "FROM runs WHERE challenge_id=? ORDER BY rowid DESC LIMIT 1",
             (challenge_id,),
         ).fetchone()
-        result["run"] = self._run_dict(run) if run else None
+        result["run"] = self._run_dict(run, has_remote_target=bool(result["endpoint"])) if run else None
+        if result["run"] and result["run"]["status"] == "recovery_required":
+            result["status"] = "recovery_required"
+        elif result["status"] == "recovery_required" and result["run"] and result["run"]["status"] == "cleanup_confirmed":
+            result["status"] = "cleanup_confirmed"
         return result
 
     @staticmethod
-    def _run_dict(row):
+    def _run_dict(row, *, has_remote_target=False):
         if row is None:
             return None
         result = dict(row)
         result["cancel_requested"] = bool(result["cancel_requested"])
         result["result"] = json.loads(result.pop("result_json")) if result.get("result_json") else None
+        outcome = result["result"]
+        cleanup = outcome.get("cleanup") if isinstance(outcome, dict) else None
+        task = outcome.get("task_run") if isinstance(outcome, dict) else None
+        if (has_remote_target and result["status"] not in {"starting", "running", "cancelling", "cleaning"}
+                and isinstance(outcome, dict) and outcome.get("protocol_version") == 2
+                and isinstance(task, dict) and task.get("status") in TERMINAL_STATUSES
+                and isinstance(cleanup, dict) and cleanup.get("status") == "succeeded"
+                and cleanup.get("target_network_confirmed") is not True):
+            outcome["cleanup"] = {**cleanup, "status": "not_confirmed"}
+            result["status"] = "recovery_required"
+        if (result["status"] == "recovery_required" and isinstance(outcome, dict)
+                and outcome.get("protocol_version") == 2
+                and isinstance(outcome.get("task_run"), dict)
+                and outcome["task_run"].get("status") in TERMINAL_STATUSES
+                and isinstance(outcome.get("cleanup"), dict)
+                and outcome["cleanup"].get("status") == "succeeded"):
+            result["status"] = "cleanup_confirmed"
         return result
 
     def _insert_run(self, run_id, challenge_id, directory):
@@ -207,16 +229,22 @@ class Workbench:
     def _mark_cancel_requested(self, run_id):
         with self.lock, self._db() as db:
             db.execute(
-                "UPDATE runs SET cancel_requested=1,status='cancelling',updated_at=? WHERE run_id=? AND status IN ('starting','running','cancelling','paused')",
+                "UPDATE runs SET cancel_requested=1,status='cancelling',updated_at=? WHERE run_id=? AND status IN ('starting','running','cancelling','paused','recovery_required')",
                 (now(), run_id),
             )
             db.execute("UPDATE challenges SET status='cancelling',updated_at=? WHERE id=(SELECT challenge_id FROM runs WHERE run_id=? AND status='cancelling')", (now(), run_id))
 
     def _mark_cleanup_started(self, run_id):
         with self.lock, self._db() as db:
+            row = db.execute("SELECT challenge_id,status FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if row is None:
+                raise WorkbenchError("cleanup_not_available", HTTPStatus.CONFLICT)
+            current = self._get(db, row["challenge_id"])["run"]
+            if current is None or current["run_id"] != run_id or current["status"] != "recovery_required":
+                raise WorkbenchError("cleanup_not_available", HTTPStatus.CONFLICT)
             updated = db.execute(
-                "UPDATE runs SET status='cleaning',updated_at=? WHERE run_id=? AND status='recovery_required'",
-                (now(), run_id),
+                "UPDATE runs SET status='cleaning',updated_at=? WHERE run_id=? AND status=?",
+                (now(), run_id, row["status"]),
             )
             if updated.rowcount != 1:
                 raise WorkbenchError("cleanup_not_available", HTTPStatus.CONFLICT)
@@ -245,13 +273,7 @@ class Workbench:
 
     def _current_run(self, challenge_id):
         with self.lock, self._db() as db:
-            self._get(db, challenge_id)
-            row = db.execute(
-                "SELECT run_id,agent_task_run_id,status,directory,started_at,finished_at,exit_code,cancel_requested,result_json,updated_at "
-                "FROM runs WHERE challenge_id=? ORDER BY rowid DESC LIMIT 1",
-                (challenge_id,),
-            ).fetchone()
-            return self._run_dict(row)
+            return self._get(db, challenge_id)["run"]
 
     def list(self):
         with self.lock, self._db() as db:
@@ -436,14 +458,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, status, content, content_type="application/json; charset=utf-8"):
         data = content if isinstance(content, bytes) else json.dumps(content, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            self.close_connection = True
 
     def _json(self):
         if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
