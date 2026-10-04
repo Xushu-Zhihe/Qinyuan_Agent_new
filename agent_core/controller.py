@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import uuid
 from collections.abc import Callable
@@ -28,8 +30,8 @@ from agent_core.control_store import (
     IdempotencyConflictError,
     IntentGoalBindingResult,
     StaleControlStateError,
-    StorageError,
     StateChange,
+    StorageError,
     TargetNetworkBinding,
     TaskRunNotFoundError,
     TaskRunSnapshot,
@@ -43,12 +45,11 @@ from agent_core.control_store import (
     UpsertTaskRun,
     UpsertTurn,
 )
-from agent_core.dual_llm_contracts import D3CommitMetadata, D3RunConfig
-from agent_core.turn_contracts import (
-    D1RunConfig,
-    D1TurnBinding,
-    D1TurnEvaluatorPort,
-    D1TurnProof,
+from agent_core.d4_contracts import (
+    D4AuditCategory,
+    D4AuditEvent,
+    D4AuditOutcome,
+    D4RecoveryRequired,
 )
 from agent_core.domain import (
     ExecutionStatus,
@@ -57,6 +58,7 @@ from agent_core.domain import (
     PlanStatus,
     TurnStatus,
 )
+from agent_core.dual_llm_contracts import D3CommitMetadata, D3RunConfig
 from agent_core.file_inspection import FILE_TOOL
 from agent_core.file_type_fact import FileTypeFactCandidate, fact_content
 from agent_core.file_type_verifier import (
@@ -78,6 +80,7 @@ from agent_core.runtime import (
     TERMINAL_STATUSES,
     InvalidTransition,
     RuntimeEvent,
+    TaskRunSandboxInspectionPort,
     TaskRunSandboxPort,
     TaskRunStatus,
 )
@@ -85,6 +88,12 @@ from agent_core.runtime import (
     TaskRunController as LegacyTaskRunController,
 )
 from agent_core.tool_contracts import ToolAuthorization
+from agent_core.turn_contracts import (
+    D1RunConfig,
+    D1TurnBinding,
+    D1TurnEvaluatorPort,
+    D1TurnProof,
+)
 
 
 class ControllerRegistryError(RuntimeError):
@@ -265,6 +274,111 @@ class TaskRunController(LegacyTaskRunController):
         if self._cache_invalid:
             raise StorageError("controller cache is invalid; reload the TaskRun state")
         return self._persistent
+
+    def _d4_audit_api(self):
+        deps = self._persistent
+        task_run_id = self._persistent_task_run_id
+        if deps is None or task_run_id is None:
+            return None
+        load_config = getattr(deps.store, "load_d3_run_config", None)
+        config = load_config(task_run_id) if callable(load_config) else None
+        if config is None or getattr(config, "d4_budget", None) is None:
+            return None
+        record = getattr(deps.store, "record_d4_audit_event", None)
+        load = getattr(deps.store, "load_d4_audit_event", None)
+        events = getattr(deps.store, "list_d4_audit_events", None)
+        if not all(callable(item) for item in (record, load, events)):
+            raise D4RecoveryRequired("d4_audit_store_unavailable")
+        return task_run_id, record, load, events
+
+    def _record_d4_audit(
+        self,
+        category: D4AuditCategory,
+        outcome: D4AuditOutcome,
+        *,
+        evidence_ref: str,
+        related_ref: str,
+        evidence: Any,
+    ) -> D4AuditEvent | None:
+        api = self._d4_audit_api()
+        if api is None:
+            return None
+        task_run_id, record, load, _events = api
+        encoded = json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        evidence_sha256 = hashlib.sha256(encoded).hexdigest()
+        event_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"qinyuan-agent:d4:{task_run_id}:{related_ref}:{category}:{outcome}",
+            )
+        )
+        existing = load(event_id)
+        event = D4AuditEvent(
+            event_id,
+            task_run_id,
+            category,
+            outcome,
+            existing.occurred_at if existing is not None else self._now_utc(),
+            evidence_ref,
+            evidence_sha256,
+            related_ref,
+        )
+        if existing is not None and existing != event:
+            raise D4RecoveryRequired("d4_audit_event_binding_changed")
+        return record(event)
+
+    def _d4_cleanup_state(self, resource_ref: str) -> tuple[str, str | None]:
+        api = self._d4_audit_api()
+        if api is None:
+            return "never", None
+        task_run_id, _record, _load, list_events = api
+        state = "never"
+        attempt_id: str | None = None
+        for event in list_events(task_run_id):
+            if event.evidence_ref != resource_ref or event.related_ref is None:
+                continue
+            if event.category == "cleanup_started":
+                state = "pending"
+                attempt_id = event.related_ref
+            elif (
+                event.category in {"cleanup_completed", "cleanup_failed"}
+                and event.related_ref == attempt_id
+            ):
+                state = (
+                    "completed"
+                    if event.category == "cleanup_completed"
+                    else "unknown"
+                )
+        return state, attempt_id
+
+    def _verify_d4_cleanup_presence(
+        self, resource_ref: str, attempt_id: str
+    ) -> str:
+        task_run_id = self._persistent_task_run_id
+        if task_run_id is None:
+            raise InvalidTransition("cleanup presence check requires an attached TaskRun")
+        presence: D4AuditOutcome = "unknown"
+        if isinstance(self._sandbox, TaskRunSandboxInspectionPort):
+            try:
+                presence = self._sandbox.inspect_presence(task_run_id, resource_ref)
+            except Exception:  # noqa: BLE001 - an inspector failure means unknown.
+                presence = "unknown"
+        if presence not in {"present", "absent", "unknown"}:
+            presence = "unknown"
+        self._record_d4_audit(
+            "resource_presence_verified",
+            presence,
+            evidence_ref=resource_ref,
+            related_ref=attempt_id,
+            evidence={
+                "task_run_id": task_run_id,
+                "resource_ref": resource_ref,
+                "presence": presence,
+            },
+        )
+        return presence
 
     @property
     def task_run(self) -> Any:
@@ -1797,6 +1911,21 @@ class TaskRunController(LegacyTaskRunController):
                 self._assert_replay_operation(replay, "finish_task_run")
                 return CommittedOperation.from_commit(replay)
             raise InvalidTransition("cannot change a terminal TaskRun")
+        load_d3_config = getattr(deps.store, "load_d3_run_config", None)
+        config = (
+            load_d3_config(task_run.task_run_id)
+            if callable(load_d3_config)
+            else None
+        )
+        if config is not None and getattr(config, "d4_budget", None) is not None:
+            list_operations = getattr(deps.store, "list_d4_operations", None)
+            if not callable(list_operations):
+                raise D4RecoveryRequired("d4_operation_ledger_unavailable")
+            if any(
+                item.completion is None
+                for item in list_operations(task_run.task_run_id)
+            ):
+                raise D4RecoveryRequired("d4_operation_outcome_unknown")
         change = UpsertTaskRun(
             task_run_id=task_run.task_run_id,
             request=task_run.request,
@@ -1881,6 +2010,19 @@ class TaskRunController(LegacyTaskRunController):
                 < self._persistent_state.latest_checkpoint.sequence
             ):
                 raise StorageError("reloaded control state has a stale checkpoint")
+            checkpoint_ref = f"checkpoint:{state.latest_checkpoint.sequence}"
+            self._record_d4_audit(
+                "control_reload_confirmed",
+                "known",
+                evidence_ref=checkpoint_ref,
+                related_ref=checkpoint_ref,
+                evidence={
+                    "task_run_id": task_run_id,
+                    "checkpoint_sequence": state.latest_checkpoint.sequence,
+                    "task_run_status": state.task_run.status.value,
+                    "sandbox_id": state.task_run.sandbox_id,
+                },
+            )
         except Exception as exc:
             self._cache_invalid = True
             if isinstance(exc, StorageError):
@@ -1904,41 +2046,92 @@ class TaskRunController(LegacyTaskRunController):
         """Clean a persisted terminal TaskRun after its commit is durable."""
 
         task_run, state = self._require_bound_state()
-        if task_run.sandbox_id is not None and not self._sandbox_destroyed:
-            if isinstance(self._sandbox, TaskRunSandboxPort):
-                self._sandbox.quiesce(task_run.sandbox_id)
-            active_execution = any(
-                item.status is ExecutionStatus.RUNNING for item in state.executions
-            )
-            should_interrupt = (
-                task_run.status
-                in {TaskRunStatus.DEADLINE_EXCEEDED, TaskRunStatus.CANCELLED}
-                or active_execution
-            )
-            interrupt_error: BaseException | None = None
-            destroy_error: BaseException | None = None
-            if should_interrupt:
-                try:
-                    self._sandbox.interrupt(task_run.sandbox_id)
-                except BaseException as exc:  # cleanup must still attempt destroy
-                    interrupt_error = exc
-            try:
-                self._sandbox.destroy(task_run.sandbox_id)
+        if task_run.sandbox_id is not None:
+            d4_attempt_id: str | None = None
+            d4_state, prior_attempt_id = self._d4_cleanup_state(task_run.sandbox_id)
+            if d4_state == "completed":
                 self._sandbox_destroyed = True
-            except BaseException as exc:
-                destroy_error = exc
-            if interrupt_error is not None or destroy_error is not None:
-                reason = (
-                    "sandbox interrupt failed"
-                    if interrupt_error is not None and destroy_error is None
-                    else "sandbox destroy failed"
+            elif d4_state in {"pending", "unknown"}:
+                assert prior_attempt_id is not None
+                presence = self._verify_d4_cleanup_presence(
+                    task_run.sandbox_id, prior_attempt_id
                 )
-                raise SandboxCleanupError(
-                    task_run.sandbox_id,
-                    reason,
-                    original_error=interrupt_error,
-                    cleanup_error=destroy_error,
-                ) from (destroy_error or interrupt_error)
+                if presence == "absent":
+                    self._record_d4_audit(
+                        "cleanup_completed",
+                        "known",
+                        evidence_ref=task_run.sandbox_id,
+                        related_ref=prior_attempt_id,
+                        evidence={
+                            "task_run_id": task_run.task_run_id,
+                            "sandbox_id": task_run.sandbox_id,
+                            "resolved_by_presence_check": True,
+                        },
+                    )
+                    self._sandbox_destroyed = True
+                else:
+                    # The durable attempt remains unresolved until a readback
+                    # proves absence or a new cleanup attempt completes.
+                    self._sandbox_destroyed = False
+                    if presence == "unknown":
+                        raise SandboxCleanupError(
+                            task_run.sandbox_id,
+                            "prior cleanup outcome remains unknown",
+                            cleanup_error=D4RecoveryRequired(
+                                "d4_cleanup_presence_unknown"
+                            ),
+                        )
+            if not self._sandbox_destroyed:
+                d4_api = self._d4_audit_api()
+                if d4_api is not None:
+                    d4_attempt_id = str(uuid.uuid4())
+                    self._record_d4_audit(
+                        "cleanup_started",
+                        "known",
+                        evidence_ref=task_run.sandbox_id,
+                        related_ref=d4_attempt_id,
+                        evidence={
+                            "task_run_id": task_run.task_run_id,
+                            "sandbox_id": task_run.sandbox_id,
+                            "attempt_id": d4_attempt_id,
+                        },
+                    )
+            if not self._sandbox_destroyed:
+                try:
+                    self._cleanup_sandbox_resource(task_run, state)
+                except BaseException as exc:
+                    if d4_attempt_id is not None:
+                        self._record_d4_audit(
+                            "cleanup_failed",
+                            "unknown",
+                            evidence_ref=task_run.sandbox_id,
+                            related_ref=d4_attempt_id,
+                            evidence={
+                                "task_run_id": task_run.task_run_id,
+                                "sandbox_id": task_run.sandbox_id,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                        if not isinstance(exc, SandboxCleanupError):
+                            raise SandboxCleanupError(
+                                task_run.sandbox_id,
+                                "sandbox cleanup result is unknown",
+                                cleanup_error=exc,
+                            ) from exc
+                    raise
+                if d4_attempt_id is not None:
+                    self._record_d4_audit(
+                        "cleanup_completed",
+                        "known",
+                        evidence_ref=task_run.sandbox_id,
+                        related_ref=d4_attempt_id,
+                        evidence={
+                            "task_run_id": task_run.task_run_id,
+                            "sandbox_id": task_run.sandbox_id,
+                            "destroy_returned": True,
+                        },
+                    )
+
         if task_run.target_network is not None and not self._target_network_destroyed:
             if self._target_network is None:
                 raise SandboxCleanupError(
@@ -1954,6 +2147,45 @@ class TaskRunController(LegacyTaskRunController):
                     "target network destroy failed",
                     cleanup_error=exc,
                 ) from exc
+
+    def _cleanup_sandbox_resource(
+        self, task_run: TaskRunSnapshot, state: ControlStateSnapshot
+    ) -> None:
+        assert task_run.sandbox_id is not None
+        if isinstance(self._sandbox, TaskRunSandboxPort):
+            self._sandbox.quiesce(task_run.sandbox_id)
+        active_execution = any(
+            item.status is ExecutionStatus.RUNNING for item in state.executions
+        )
+        should_interrupt = (
+            task_run.status
+            in {TaskRunStatus.DEADLINE_EXCEEDED, TaskRunStatus.CANCELLED}
+            or active_execution
+        )
+        interrupt_error: BaseException | None = None
+        destroy_error: BaseException | None = None
+        if should_interrupt:
+            try:
+                self._sandbox.interrupt(task_run.sandbox_id)
+            except BaseException as exc:  # cleanup must still attempt destroy
+                interrupt_error = exc
+        try:
+            self._sandbox.destroy(task_run.sandbox_id)
+            self._sandbox_destroyed = True
+        except BaseException as exc:
+            destroy_error = exc
+        if interrupt_error is not None or destroy_error is not None:
+            reason = (
+                "sandbox interrupt failed"
+                if interrupt_error is not None and destroy_error is None
+                else "sandbox destroy failed"
+            )
+            raise SandboxCleanupError(
+                task_run.sandbox_id,
+                reason,
+                original_error=interrupt_error,
+                cleanup_error=destroy_error,
+            ) from (destroy_error or interrupt_error)
 
     def recover_task_run(self, mutation_id: str) -> RecoveryResult:
         """Persist the confirmed crash-recovery transition for one attached task."""
@@ -2141,6 +2373,19 @@ class TaskRunController(LegacyTaskRunController):
             )
             if snapshot is None or state is None:
                 raise StorageError("committed TaskRun could not be reloaded")
+            checkpoint_ref = f"checkpoint:{state.latest_checkpoint.sequence}"
+            self._record_d4_audit(
+                "control_reload_confirmed",
+                "known",
+                evidence_ref=checkpoint_ref,
+                related_ref=checkpoint_ref,
+                evidence={
+                    "task_run_id": self._persistent_task_run_id,
+                    "checkpoint_sequence": state.latest_checkpoint.sequence,
+                    "task_run_status": state.task_run.status.value,
+                    "sandbox_id": state.task_run.sandbox_id,
+                },
+            )
         except Exception as exc:
             self._cache_invalid = True
             if isinstance(exc, StorageError):

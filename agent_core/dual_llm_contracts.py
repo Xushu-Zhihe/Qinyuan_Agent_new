@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from typing import Literal
 from uuid import UUID
 
+from agent_core.d4_contracts import D4BudgetPolicy
 from agent_core.review_contracts import (
     D2AllowedActionKinds,
     D2Constraint,
@@ -84,7 +85,18 @@ def _time(value: object, name: str) -> None:
 
 
 def d3_payload(value: object) -> dict[str, object]:
-    return asdict(value) if is_dataclass(value) and not isinstance(value, type) else {}
+    payload = (
+        asdict(value) if is_dataclass(value) and not isinstance(value, type) else {}
+    )
+    if isinstance(value, D3RunConfig) and value.d4_budget is None:
+        payload.pop("d4_budget")
+    elif (
+        isinstance(value, D3CommitMetadata)
+        and value.config is not None
+        and value.config.d4_budget is None
+    ):
+        payload["config"].pop("d4_budget")
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +125,7 @@ class D3RunConfig:
     review_role_ref: str
     chain_id: str = "dual_llm_d3"
     contract_version: int = 1
+    d4_budget: D4BudgetPolicy | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -129,6 +142,10 @@ class D3RunConfig:
             raise TypeError("D3 requires frozen authorization")
         if self.review_role_ref != self.outer_role.role_config_ref:
             raise ValueError("D3 review must use the frozen outer role")
+        if self.d4_budget is not None and not isinstance(
+            self.d4_budget, D4BudgetPolicy
+        ):
+            raise TypeError("D4 requires a frozen budget policy")
         if (
             self.chain_id != "dual_llm_d3"
             or type(self.contract_version) is not int
@@ -138,15 +155,19 @@ class D3RunConfig:
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> D3RunConfig:
-        if set(value) != {
+        fields = {
             "outer_role",
             "inner_role",
             "authorization",
             "review_role_ref",
             "chain_id",
             "contract_version",
-        }:
+        }
+        if set(value) not in (fields, fields | {"d4_budget"}):
             raise ValueError("invalid D3RunConfig fields")
+        budget = value.get("d4_budget")
+        if budget is not None and not isinstance(budget, dict):
+            raise TypeError("invalid D4 budget policy")
         authorization = value["authorization"]
         if not isinstance(authorization, dict):
             raise TypeError("invalid D3 authorization")
@@ -165,6 +186,7 @@ class D3RunConfig:
             value["review_role_ref"],  # type: ignore[arg-type]
             value["chain_id"],  # type: ignore[arg-type]
             value["contract_version"],  # type: ignore[arg-type]
+            D4BudgetPolicy.from_dict(budget) if budget is not None else None,
         )
 
 

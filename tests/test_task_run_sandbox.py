@@ -273,6 +273,44 @@ def test_task_run_sandbox_bind_checks_exact_owner_and_configuration():
         adapter.bind(str(uuid4()), sandbox_id, terminal=False)
 
 
+def test_task_run_sandbox_inspect_presence_reports_owned_resource_without_cleanup():
+    runtime = FakeRuntime()
+    adapter = TaskRunSandbox(runtime)
+    task_run_id = str(uuid4())
+    sandbox_id = adapter.create(task_run_id)
+    before = effects(runtime)
+
+    assert adapter.inspect_presence(task_run_id, sandbox_id) == "present"
+    assert effects(runtime) == before == ["create", "start"]
+
+
+def test_task_run_sandbox_inspect_presence_reports_not_found_without_create_or_cleanup():
+    runtime = FakeRuntime()
+    adapter = TaskRunSandbox(runtime)
+
+    assert adapter.inspect_presence(str(uuid4()), "missing-container") == "absent"
+    assert effects(runtime) == []
+
+
+@pytest.mark.parametrize("failure", ["ownership", "inspect"])
+def test_task_run_sandbox_inspect_presence_reports_unknown_without_create_or_cleanup(failure):
+    runtime = FakeRuntime()
+    adapter = TaskRunSandbox(runtime)
+    task_run_id = str(uuid4())
+    sandbox_id = adapter.create(task_run_id)
+    if failure == "ownership":
+        inspected_task_run_id = str(uuid4())
+    else:
+        inspected_task_run_id = task_run_id
+        runtime.client.containers.containers_by_id[sandbox_id].inspect_error = TimeoutError(
+            "inspect unavailable"
+        )
+    before = effects(runtime)
+
+    assert adapter.inspect_presence(inspected_task_run_id, sandbox_id) == "unknown"
+    assert effects(runtime) == before == ["create", "start"]
+
+
 def test_task_run_sandbox_cancel_order_is_quiesce_stop_remove_and_is_idempotent():
     runtime = FakeRuntime()
     adapter = TaskRunSandbox(runtime)

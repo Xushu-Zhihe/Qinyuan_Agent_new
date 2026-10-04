@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import Literal, Protocol
 from uuid import UUID
@@ -42,9 +42,18 @@ D3ModelStage = Literal[
 
 
 class D3ProposalRejected(ValueError):
-    def __init__(self, code: str, *, structural: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        structural: bool = False,
+        retryable: bool = True,
+        model_request_id: str | None = None,
+    ) -> None:
         self.code = code
         self.structural = structural
+        self.retryable = retryable
+        self.model_request_id = model_request_id
         super().__init__(code)
 
 
@@ -285,6 +294,7 @@ class D3ModelRejection:
     model_request_id: str
     code: str
     recorded_at: float
+    retryable: bool = False
 
 
 class D3ModelEvidencePort(Protocol):
@@ -444,10 +454,23 @@ class D3AuditedModel:
         finally:
             stopped.set()
 
-    async def propose(self, request: D3ModelRequest, token: CancellationToken):
+    async def propose(
+        self,
+        request: D3ModelRequest,
+        token: CancellationToken,
+        *,
+        refresh: Callable[[D3ModelRequest], D3ModelRequest] | None = None,
+        validate: Callable[[D3ModelRequest, object], None] | None = None,
+    ):
         self._check(request)
+        d4_enabled = self.config.d4_budget is not None
+        if d4_enabled and (refresh is None or validate is None):
+            raise D3RecoveryRequired("d4_model_refresh_and_validation_required")
         current = request
-        for attempt in range(2):
+        d4_refinement = d4_enabled and refresh is not None
+        refinement_used = False
+
+        while True:
             evidence, _record = self._saved(current)
             if evidence is None:
                 state = self.controller.control_state
@@ -528,29 +551,117 @@ class D3AuditedModel:
                         checksum,
                     )
                 )
-            if evidence.outcome == "invalid_structure" and attempt == 0:
+
+            rejection_code = evidence.reason
+            retryable = False
+            if evidence.outcome == "accepted":
+                rejection = self.evidence.read_rejection(current.model_request_id)
+                rejection_code = rejection.code if rejection is not None else None
+                retryable = rejection.retryable if rejection is not None else False
+                if rejection_code is None:
+                    self._check(current)
+                    proposal = self._parse(current, evidence.raw)
+                    if validate is not None:
+                        try:
+                            validate(current, proposal)
+                        except D3ProposalRejected as exc:
+                            self.reject(
+                                current.model_request_id,
+                                exc.code,
+                                retryable=exc.retryable,
+                            )
+                            rejection_code = exc.code
+                            retryable = exc.retryable
+                    if rejection_code is None:
+                        return current.model_request_id, proposal
+            elif evidence.outcome in {"invalid_structure", "rejected"}:
+                try:
+                    self._parse(current, evidence.raw)
+                except D3ProposalRejected as exc:
+                    retryable = exc.retryable
+            else:
+                raise D3ProposalRejected(
+                    rejection_code or evidence.outcome,
+                    model_request_id=current.model_request_id,
+                )
+
+            legacy_structural_correction = (
+                not d4_refinement
+                and evidence.outcome == "invalid_structure"
+                and current.correction_of_model_request_id is None
+            )
+            can_refine = (
+                (
+                    d4_refinement
+                    and not refinement_used
+                    and refresh is not None
+                    and retryable
+                )
+                or legacy_structural_correction
+            ) and (
+                self.clock() < self.controller.control_state.task_run.deadline_at
+                and not token.is_cancelled
+                and self.controller.control_state.task_run.status.value == "running"
+            )
+            if can_refine:
+                if d4_refinement:
+                    if refresh is None:
+                        raise D3RecoveryRequired("d4_model_refresh_unavailable")
+                    refreshed = refresh(request)
+                else:
+                    refreshed = request
+                if (
+                    not isinstance(refreshed, D3ModelRequest)
+                    or refreshed.task_run_id != request.task_run_id
+                    or refreshed.stage != request.stage
+                    or refreshed.role != request.role
+                    or refreshed.role_config_ref != request.role_config_ref
+                    or refreshed.resource_ref != request.resource_ref
+                    or refreshed.correction_of_model_request_id is not None
+                ):
+                    raise D3RecoveryRequired("d3_refreshed_request_scope_changed")
+                refinement_id = stable_id(
+                    request.task_run_id,
+                    f"d3/{request.model_request_id}/correction",
+                )
+                prior_refinement = self.ledger.load_d3_operation(refinement_id)
                 current = replace(
-                    current,
-                    model_request_id=stable_id(
-                        request.task_run_id, f"d3/{request.model_request_id}/correction"
+                    refreshed,
+                    model_request_id=refinement_id,
+                    base_checkpoint_sequence=(
+                        prior_refinement.start.base_checkpoint_sequence
+                        if prior_refinement is not None
+                        else refreshed.base_checkpoint_sequence
                     ),
                     correction_of_model_request_id=current.model_request_id,
-                    rejection_code=evidence.reason,
+                    rejection_code=rejection_code,
                 )
+                self._check(current)
+                if (
+                    prior_refinement is None
+                    and current.base_checkpoint_sequence
+                    != self.controller.control_state.latest_checkpoint.sequence
+                ):
+                    raise D3RecoveryRequired("d3_refreshed_request_checkpoint_stale")
+                refinement_used = True
                 continue
+            if evidence.outcome == "accepted" and rejection_code is not None:
+                raise D3ProposalRejected(
+                    rejection_code, model_request_id=current.model_request_id
+                )
             if evidence.outcome != "accepted":
-                raise D3ProposalRejected(evidence.reason or evidence.outcome)
-            rejection = self.evidence.read_rejection(current.model_request_id)
-            if rejection is not None:
-                raise D3ProposalRejected(rejection.code)
-            self._check(current)
-            return current.model_request_id, self._parse(current, evidence.raw)
-        raise D3RecoveryRequired("d3_model_correction_unavailable")
+                raise D3ProposalRejected(
+                    rejection_code or evidence.outcome,
+                    model_request_id=current.model_request_id,
+                )
+            raise D3RecoveryRequired("d3_model_refinement_unavailable")
 
-    def reject(self, model_request_id: str, code: str) -> None:
+    def reject(
+        self, model_request_id: str, code: str, *, retryable: bool = False
+    ) -> None:
         evidence = self.evidence.read(model_request_id)
         if evidence is None or evidence.outcome != "accepted":
             raise D3RecoveryRequired("d3_rejection_requires_known_model_result")
         self.evidence.save_rejection(
-            D3ModelRejection(model_request_id, code, self.clock())
+            D3ModelRejection(model_request_id, code, self.clock(), retryable)
         )

@@ -71,6 +71,9 @@ tests
 !/tests/test_d2_chain.py
 !/tests/test_d2_control_store.py
 !/tests/test_d3_chain.py
+!/tests/test_d4_budget.py
+!/tests/test_d4_chain.py
+!/tests/test_d4_lifecycle.py
 Architecture.md
 interface.md
 protocol.md
@@ -81,7 +84,9 @@ runner-smoke-data
 .claude
 D0_baseline_and_D1_contract.md
 D1_acceptance.md
-Qinyuan_Agent_dual_llm_flow.svg
+!/Qinyuan_Agent_dual_llm_flow.svg
 D2_acceptance.md
 D3_acceptance.md
 D3_proposal.md
+D4_acceptance.md
+D4_proposal.md

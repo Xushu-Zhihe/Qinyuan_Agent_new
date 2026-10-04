@@ -116,6 +116,7 @@ class D3EvidenceValidator:
             for request_id in (base_id, correction_id)
             if (evidence := self.models.read(request_id)) is not None
             and evidence.outcome == "accepted"
+            and self.models.read_rejection(request_id) is None
         ]
         if len(accepted) != 1:
             raise D3RecoveryRequired("d3_fixed_action_proposal_missing")

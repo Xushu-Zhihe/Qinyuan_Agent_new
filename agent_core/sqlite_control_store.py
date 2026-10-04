@@ -8,6 +8,8 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
+from typing import cast
+from uuid import NAMESPACE_URL, uuid5
 
 from agent_core.action_audit import (
     ActionAuditConflict,
@@ -58,6 +60,31 @@ from agent_core.control_store import (
     task_request_payload,
     validate_control_event,
 )
+from agent_core.d4_contracts import (
+    D4_CATEGORY_LIMITS,
+    D4AuditCategory,
+    D4AuditEvent,
+    D4AuditOutcome,
+    D4BudgetExhausted,
+    D4BudgetUsage,
+    D4OperationCategory,
+    D4OperationCompletion,
+    D4OperationConflict,
+    D4OperationRecord,
+    D4OperationStart,
+    D4RecoveryRequired,
+)
+from agent_core.domain import (
+    ExecutionStatus,
+    FactStatus,
+    FailureType,
+    IntentStatus,
+    PlanStatus,
+    PlanStep,
+    PlanValidationRecord,
+    PlanValidationStatus,
+    TurnStatus,
+)
 from agent_core.dual_llm_contracts import (
     D3_CATEGORY_LIMITS,
     D3_SHA_STEP,
@@ -77,17 +104,6 @@ from agent_core.dual_llm_contracts import (
     D3RunConfig,
     D3TurnBinding,
     d3_payload,
-)
-from agent_core.domain import (
-    ExecutionStatus,
-    FactStatus,
-    FailureType,
-    IntentStatus,
-    PlanStatus,
-    PlanStep,
-    PlanValidationRecord,
-    PlanValidationStatus,
-    TurnStatus,
 )
 from agent_core.intent_action_application import (
     IntentActionApplication,
@@ -132,7 +148,37 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
+
+MIGRATION_14 = """
+CREATE TABLE d4_operations (
+    operation_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    category TEXT NOT NULL,
+    resource_ref TEXT NOT NULL,
+    charged INTEGER NOT NULL CHECK (charged IN (0, 1)),
+    start_json TEXT NOT NULL,
+    completion_json TEXT,
+    application_ref TEXT
+);
+CREATE INDEX idx_d4_operations_task_category
+ON d4_operations(task_run_id, category);
+CREATE TABLE d4_audit_events (
+    event_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    category TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    occurred_at REAL NOT NULL,
+    evidence_ref TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL,
+    related_ref TEXT,
+    event_json TEXT NOT NULL
+);
+CREATE INDEX idx_d4_audit_events_task_category
+ON d4_audit_events(task_run_id, category);
+CREATE INDEX idx_d4_audit_events_related
+ON d4_audit_events(task_run_id, related_ref);
+"""
 
 MIGRATION_11 = """
 CREATE TABLE d1_runs (
@@ -609,8 +655,8 @@ class SqliteControlStore:
         connection.row_factory = sqlite3.Row
         try:
             version = connection.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0]
-            if version not in {10, 11, 12, CURRENT_SCHEMA_VERSION}:
-                raise StorageError("read-only history requires supported schema 10, 11, 12 or 13")
+            if version not in {10, 11, 12, 13, CURRENT_SCHEMA_VERSION}:
+                raise StorageError("read-only history requires supported schema 10 through 14")
             connection.execute("BEGIN")
             store = cls(connection, database_path, clock=time.time)
             store._schema_version = int(version)
@@ -742,6 +788,13 @@ class SqliteControlStore:
                 self._connection.execute(
                     "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                     (13, self._now()),
+                )
+            if version < 14:
+                for statement in _sql_statements(MIGRATION_14):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (14, self._now()),
                 )
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
@@ -1646,6 +1699,501 @@ class SqliteControlStore:
             records.append(record)
         return tuple(records)
 
+    def load_d4_operation(self, operation_id: str) -> D4OperationRecord | None:
+        if self._schema_version < 14:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM d4_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        start = D4OperationStart(**json.loads(row["start_json"]))
+        completion = (
+            D4OperationCompletion(**json.loads(row["completion_json"]))
+            if row["completion_json"] is not None else None
+        )
+        if (
+            start.operation_id != row["operation_id"]
+            or start.task_run_id != row["task_run_id"]
+            or start.category != row["category"]
+            or start.resource_ref != row["resource_ref"]
+            or int(start.charged) != row["charged"]
+            or completion is not None and completion.operation_id != start.operation_id
+        ):
+            raise StorageError("D4 operation row differs from its typed record")
+        return D4OperationRecord(start, completion, row["application_ref"])
+
+    def list_d4_operations(self, task_run_id: str) -> tuple[D4OperationRecord, ...]:
+        if self._schema_version < 14:
+            return ()
+        rows = self._connection.execute(
+            "SELECT operation_id FROM d4_operations WHERE task_run_id = ? ORDER BY rowid",
+            (task_run_id,),
+        ).fetchall()
+        records = []
+        for row in rows:
+            record = self.load_d4_operation(row["operation_id"])
+            if record is None:
+                raise StorageError("D4 operation disappeared while listing")
+            records.append(record)
+        return tuple(records)
+
+    def load_d4_audit_event(self, event_id: str) -> D4AuditEvent | None:
+        if self._schema_version < 14:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM d4_audit_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        event = D4AuditEvent(**json.loads(row["event_json"]))
+        if (
+            event.event_id != row["event_id"]
+            or event.task_run_id != row["task_run_id"]
+            or event.category != row["category"]
+            or event.outcome != row["outcome"]
+            or event.occurred_at != row["occurred_at"]
+            or event.evidence_ref != row["evidence_ref"]
+            or event.evidence_sha256 != row["evidence_sha256"]
+            or event.related_ref != row["related_ref"]
+        ):
+            raise StorageError("D4 audit row differs from its typed event")
+        return event
+
+    def list_d4_audit_events(self, task_run_id: str) -> tuple[D4AuditEvent, ...]:
+        if self._schema_version < 14:
+            return ()
+        rows = self._connection.execute(
+            "SELECT event_id FROM d4_audit_events WHERE task_run_id = ? ORDER BY rowid",
+            (task_run_id,),
+        ).fetchall()
+        events = []
+        for row in rows:
+            event = self.load_d4_audit_event(row["event_id"])
+            if event is None:
+                raise StorageError("D4 audit event disappeared while listing")
+            events.append(event)
+        return tuple(events)
+
+    @staticmethod
+    def _d4_audit_event_id(
+        task_run_id: str,
+        related_ref: str,
+        category: str,
+        outcome: D4AuditOutcome | None = None,
+    ) -> str:
+        identity = f":{outcome}" if outcome is not None else ""
+        return str(
+            uuid5(
+                NAMESPACE_URL,
+                f"qinyuan-agent:d4:{task_run_id}:{related_ref}:{category}{identity}",
+            )
+        )
+
+    def _insert_d4_audit_event(self, event: D4AuditEvent) -> D4AuditEvent:
+        existing = self.load_d4_audit_event(event.event_id)
+        if existing is not None:
+            if existing != event:
+                raise D4OperationConflict("audit event ID belongs to another payload")
+            return existing
+        self._connection.execute(
+            """
+            INSERT INTO d4_audit_events(
+                event_id, task_run_id, category, outcome, occurred_at,
+                evidence_ref, evidence_sha256, related_ref, event_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                event.task_run_id,
+                event.category,
+                event.outcome,
+                event.occurred_at,
+                event.evidence_ref,
+                event.evidence_sha256,
+                event.related_ref,
+                canonical_json(asdict(event)),
+            ),
+        )
+        return event
+
+    def _control_commit_audit_event(
+        self,
+        mutation: ControlMutation,
+        category: D4AuditCategory,
+        outcome: D4AuditOutcome,
+        occurred_at: float,
+    ) -> D4AuditEvent:
+        return D4AuditEvent(
+            self._d4_audit_event_id(
+                mutation.task_run_id, mutation.mutation_id, category, outcome
+            ),
+            mutation.task_run_id,
+            category,
+            outcome,
+            occurred_at,
+            mutation.mutation_id,
+            mutation.request_fingerprint,
+            mutation.mutation_id,
+        )
+
+    def _prepare_control_commit_audit(
+        self, mutation: ControlMutation
+    ) -> D4AuditEvent | None:
+        config = self.load_d3_run_config(mutation.task_run_id)
+        d4_enabled = config is not None and config.d4_budget is not None
+        if not d4_enabled and mutation.d3 is not None:
+            d4_enabled = (
+                mutation.d3.config is not None
+                and mutation.d3.config.d4_budget is not None
+            )
+        if not d4_enabled:
+            return None
+        event_id = self._d4_audit_event_id(
+            mutation.task_run_id,
+            mutation.mutation_id,
+            "control_commit_started",
+            "known",
+        )
+        existing = self.load_d4_audit_event(event_id)
+        if existing is not None:
+            if (
+                existing.task_run_id != mutation.task_run_id
+                or existing.category != "control_commit_started"
+                or existing.outcome != "known"
+                or existing.evidence_ref != mutation.mutation_id
+                or existing.evidence_sha256 != mutation.request_fingerprint
+                or existing.related_ref != mutation.mutation_id
+            ):
+                raise D4OperationConflict("control commit start differs from its D4 audit")
+            return existing
+        event = self._control_commit_audit_event(
+            mutation, "control_commit_started", "known", self._now()
+        )
+        if config is not None and config.d4_budget is not None:
+            self.record_d4_audit_event(event)
+        return event
+
+    def _record_control_commit_failure(self, mutation: ControlMutation) -> None:
+        config = self.load_d3_run_config(mutation.task_run_id)
+        if config is None or config.d4_budget is None:
+            return
+        try:
+            row = self._connection.execute(
+                """
+                SELECT request_fingerprint FROM control_mutations
+                WHERE task_run_id = ? AND mutation_id = ?
+                """,
+                (mutation.task_run_id, mutation.mutation_id),
+            ).fetchone()
+            if row is not None and row["request_fingerprint"] == mutation.request_fingerprint:
+                category: D4AuditCategory = "control_commit_committed"
+                outcome: D4AuditOutcome = "known"
+            else:
+                category = "control_commit_failed"
+                outcome = "failed"
+        except sqlite3.Error:
+            category = "control_commit_failed"
+            outcome = "unknown"
+        event_id = self._d4_audit_event_id(
+            mutation.task_run_id, mutation.mutation_id, category, outcome
+        )
+        if self.load_d4_audit_event(event_id) is not None:
+            return
+        self.record_d4_audit_event(
+            self._control_commit_audit_event(
+                mutation, category, outcome, self._now()
+            )
+        )
+
+    def _abort_control_commit(self, mutation: ControlMutation, error: Exception) -> None:
+        self._rollback_quietly()
+        try:
+            self._record_control_commit_failure(mutation)
+        except Exception as audit_error:
+            error.add_note(f"D4 control commit audit could not be saved: {audit_error}")
+
+    def reconcile_d4_control_commit_audit(self, task_run_id: str) -> None:
+        """Close started commit audits from the SQLite transaction's durable outcome."""
+        events = self.list_d4_audit_events(task_run_id)
+        for started in events:
+            if (
+                started.category != "control_commit_started"
+                or started.related_ref is None
+            ):
+                continue
+            committed_id = self._d4_audit_event_id(
+                task_run_id,
+                started.related_ref,
+                "control_commit_committed",
+                "known",
+            )
+            failed_id = self._d4_audit_event_id(
+                task_run_id,
+                started.related_ref,
+                "control_commit_failed",
+                "failed",
+            )
+            if (
+                self.load_d4_audit_event(committed_id) is not None
+                or self.load_d4_audit_event(failed_id) is not None
+            ):
+                continue
+            row = self._connection.execute(
+                """
+                SELECT request_fingerprint FROM control_mutations
+                WHERE task_run_id = ? AND mutation_id = ?
+                """,
+                (task_run_id, started.related_ref),
+            ).fetchone()
+            if row is not None:
+                if row["request_fingerprint"] != started.evidence_sha256:
+                    raise D4OperationConflict("control mutation differs from its D4 audit")
+                resolved = D4AuditEvent(
+                    committed_id,
+                    task_run_id,
+                    "control_commit_committed",
+                    "known",
+                    self._now(),
+                    started.related_ref,
+                    started.evidence_sha256,
+                    started.related_ref,
+                )
+            else:
+                resolved = D4AuditEvent(
+                    failed_id,
+                    task_run_id,
+                    "control_commit_failed",
+                    "failed",
+                    self._now(),
+                    started.related_ref,
+                    started.evidence_sha256,
+                    started.related_ref,
+                )
+            self.record_d4_audit_event(resolved)
+
+    def record_d4_audit_event(self, event: D4AuditEvent) -> D4AuditEvent:
+        if not isinstance(event, D4AuditEvent):
+            raise TypeError("event must be D4AuditEvent")
+        config = self.load_d3_run_config(event.task_run_id)
+        if config is None or config.d4_budget is None:
+            raise D4OperationConflict("audit event requires a registered D4 TaskRun")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self.load_d4_audit_event(event.event_id)
+            if existing is not None:
+                if existing != event:
+                    raise D4OperationConflict("audit event ID belongs to another payload")
+                self._connection.commit()
+                return existing
+            self._insert_d4_audit_event(event)
+            self._connection.commit()
+            return event
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def d4_budget_usage(self, task_run_id: str) -> D4BudgetUsage:
+        config = self.load_d3_run_config(task_run_id)
+        if config is None or config.d4_budget is None:
+            raise D4OperationConflict("budget usage requires an explicitly registered D4 TaskRun")
+        records = self.list_d4_operations(task_run_id)
+        if any(record.start.budget_policy_ref != config.d4_budget.budget_policy_ref for record in records):
+            raise D4OperationConflict("operation budget differs from frozen configuration")
+        counts = tuple(
+            (category, sum(record.start.category == category for record in records))
+            for category in D4_CATEGORY_LIMITS
+        )
+        return D4BudgetUsage(
+            task_run_id,
+            config.d4_budget.budget_policy_ref,
+            sum(record.start.charged for record in records),
+            counts,
+            sum(not record.start.charged for record in records),
+        )
+
+    @staticmethod
+    def _d4_start_from_d3(start: D3OperationStart, config: D3RunConfig) -> D4OperationStart:
+        if config.d4_budget is None:
+            raise D4OperationConflict("D3 operation has no frozen D4 budget")
+        category = {"outer_model": "planning", "inner_model": "action"}.get(start.category, start.category)
+        return D4OperationStart(
+            start.operation_id, start.task_run_id, cast(D4OperationCategory, category),
+            start.started_at, start.base_checkpoint_sequence, start.context_sha256,
+            start.resource_ref, config.d4_budget.budget_policy_ref,
+            start.role, start.role_config_ref,
+        )
+
+    def _begin_d4_operation(self, start: D4OperationStart) -> D4OperationRecord | None:
+        """Admit a start inside the caller's transaction before any dispatch."""
+        config = self.load_d3_run_config(start.task_run_id)
+        if config is None or config.d4_budget is None:
+            raise D4OperationConflict("operation requires an explicitly registered D4 TaskRun")
+        if start.budget_policy_ref != config.d4_budget.budget_policy_ref:
+            raise D4OperationConflict("operation budget differs from frozen configuration")
+        if start.role is not None:
+            role = config.outer_role if start.role == "outer_planning" else config.inner_role
+            if start.role_config_ref != role.role_config_ref:
+                raise D4OperationConflict("model role differs from frozen configuration")
+        existing = self.load_d4_operation(start.operation_id)
+        if existing is not None:
+            if existing.start != start:
+                raise D4OperationConflict("operation ID belongs to another fixed request")
+            if existing.completion is None:
+                raise D4RecoveryRequired("operation result is unknown; do not dispatch again")
+            return existing
+        cancellation = self._connection.execute(
+            "SELECT 1 FROM d4_audit_events "
+            "WHERE task_run_id = ? AND category = 'cancellation_requested' LIMIT 1",
+            (start.task_run_id,),
+        ).fetchone()
+        if cancellation is not None:
+            raise D4RecoveryRequired("d4_cancellation_requested")
+        task = self.load_task_run(start.task_run_id)
+        if task is None:
+            raise D4OperationConflict("operation requires an explicitly registered D4 TaskRun")
+        checkpoint = self._connection.execute(
+            "SELECT MAX(sequence) FROM checkpoints WHERE task_run_id = ?",
+            (start.task_run_id,),
+        ).fetchone()[0]
+        if checkpoint != start.base_checkpoint_sequence:
+            raise StaleControlStateError("D4 operation was prepared from a stale checkpoint")
+        if (
+            task.status is not TaskRunStatus.RUNNING
+            or not task.started_at <= start.started_at < task.deadline_at
+            or self._now() >= task.deadline_at
+        ):
+            raise D4OperationConflict("operation requires a running TaskRun before Deadline")
+        records = self.list_d4_operations(start.task_run_id)
+        if any(record.completion is None for record in records):
+            raise D4RecoveryRequired("an earlier operation result remains unknown")
+        if start.charged:
+            if sum(record.start.charged for record in records) >= config.d4_budget.total:
+                raise D4BudgetExhausted("D4 total operation-start budget exhausted")
+            if sum(record.start.category == start.category for record in records) >= getattr(config.d4_budget, start.category):
+                raise D4BudgetExhausted(f"D4 {start.category} budget exhausted")
+        self._connection.execute(
+            "INSERT INTO d4_operations(operation_id, task_run_id, category, resource_ref, charged, start_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (start.operation_id, start.task_run_id, start.category, start.resource_ref,
+             int(start.charged), canonical_json(asdict(start))),
+        )
+        return None
+
+    def _d4_companion_for_d3(self, record: D3OperationRecord) -> D4OperationRecord | None:
+        config = self.load_d3_run_config(record.start.task_run_id)
+        if config is None:
+            raise D3OperationConflict("operation requires frozen D3 configuration")
+        if config.d4_budget is None:
+            return None
+        companion = self.load_d4_operation(record.start.operation_id)
+        if companion is None or companion.start != self._d4_start_from_d3(record.start, config):
+            raise D4OperationConflict("D3 operation differs from its D4 admission")
+        if (
+            companion.completion != (
+                D4OperationCompletion(**asdict(record.completion))
+                if record.completion is not None else None
+            )
+            or companion.application_ref != record.application_ref
+        ):
+            raise D4OperationConflict("D3 operation differs from its D4 completion or application")
+        return companion
+
+    def begin_d4_operation(self, start: D4OperationStart) -> D4OperationRecord | None:
+        if not isinstance(start, D4OperationStart):
+            raise TypeError("start must be D4OperationStart")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self._begin_d4_operation(start)
+            self._connection.commit()
+            return record
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def _complete_d4_operation(self, completion: D4OperationCompletion) -> D4OperationRecord:
+        record = self.load_d4_operation(completion.operation_id)
+        if record is None:
+            raise D4OperationConflict("completion has no admitted operation")
+        if completion.finished_at < record.start.started_at:
+            raise D4OperationConflict("completion precedes operation start")
+        if record.completion is not None and record.completion != completion:
+            raise D4OperationConflict("known operation completion is immutable")
+        if record.completion is None:
+            self._connection.execute(
+                "UPDATE d4_operations SET completion_json = ? WHERE operation_id = ?",
+                (canonical_json(asdict(completion)), completion.operation_id),
+            )
+        if record.start.category in {"planning", "action", "review", "refinement"}:
+            event = D4AuditEvent(
+                self._d4_audit_event_id(
+                    record.start.task_run_id,
+                    completion.operation_id,
+                    "proposal_evidence_saved",
+                    "known",
+                ),
+                record.start.task_run_id,
+                "proposal_evidence_saved",
+                "known",
+                completion.finished_at,
+                completion.evidence_ref,
+                completion.evidence_sha256,
+                completion.operation_id,
+            )
+            self._insert_d4_audit_event(event)
+        return D4OperationRecord(record.start, completion, record.application_ref)
+
+    def complete_d4_operation(self, completion: D4OperationCompletion) -> D4OperationRecord:
+        if not isinstance(completion, D4OperationCompletion):
+            raise TypeError("completion must be D4OperationCompletion")
+        companion = self.load_d3_operation(completion.operation_id)
+        if companion is not None:
+            self.complete_d3_operation(D3OperationCompletion(**asdict(completion)))
+            record = self.load_d4_operation(completion.operation_id)
+            if record is None:
+                raise D4OperationConflict("D3 operation has no D4 admission")
+            return record
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self._complete_d4_operation(completion)
+            self._connection.commit()
+            return record
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def _mark_d4_operation_applied(self, operation_id: str, application_ref: str) -> D4OperationRecord:
+        record = self.load_d4_operation(operation_id)
+        if record is None or record.completion is None:
+            raise D4RecoveryRequired("unknown operation cannot be applied")
+        if record.completion.result_kind != "completed":
+            raise D4OperationConflict("unsuccessful operation cannot be applied")
+        if record.application_ref is not None and record.application_ref != application_ref:
+            raise D4OperationConflict("operation application is immutable")
+        self._connection.execute(
+            "UPDATE d4_operations SET application_ref = ? WHERE operation_id = ?",
+            (application_ref, operation_id),
+        )
+        return D4OperationRecord(record.start, record.completion, application_ref)
+
+    def mark_d4_operation_applied(self, operation_id: str, application_ref: str) -> D4OperationRecord:
+        if not isinstance(application_ref, str) or not application_ref.strip():
+            raise ValueError("application_ref must be non-empty")
+        if self.load_d3_operation(operation_id) is not None:
+            self.mark_d3_operation_applied(operation_id, application_ref)
+            record = self.load_d4_operation(operation_id)
+            if record is None:
+                raise D4OperationConflict("D3 operation has no D4 admission")
+            return record
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self._mark_d4_operation_applied(operation_id, application_ref)
+            self._connection.commit()
+            return record
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
     def begin_d3_operation(self, start: D3OperationStart) -> D3OperationRecord | None:
         if not isinstance(start, D3OperationStart):
             raise TypeError("start must be D3OperationStart")
@@ -1657,6 +2205,7 @@ class SqliteControlStore:
                     raise D3OperationConflict("operation ID belongs to another fixed request")
                 if existing.completion is None:
                     raise D3RecoveryRequired("operation result is unknown; do not dispatch again")
+                self._d4_companion_for_d3(existing)
                 self._connection.commit()
                 return existing
             task = self.load_task_run(start.task_run_id)
@@ -1689,6 +2238,10 @@ class SqliteControlStore:
                 for record in records
             ):
                 raise D3OperationConflict("resource already has a fixed operation ID")
+            if config.d4_budget is not None:
+                companion = self._begin_d4_operation(self._d4_start_from_d3(start, config))
+                if companion is not None:
+                    raise D4OperationConflict("D4 admission has no matching D3 operation")
             limit = D3_CATEGORY_LIMITS[start.category]
             if limit is not None and sum(
                 record.start.category == start.category for record in records
@@ -1714,6 +2267,7 @@ class SqliteControlStore:
             record = self.load_d3_operation(completion.operation_id)
             if record is None:
                 raise D3OperationConflict("completion has no admitted operation")
+            companion = self._d4_companion_for_d3(record)
             if completion.finished_at < record.start.started_at:
                 raise D3OperationConflict("completion precedes operation start")
             if record.completion is not None and record.completion != completion:
@@ -1723,6 +2277,8 @@ class SqliteControlStore:
                     "UPDATE d3_operations SET completion_json = ? WHERE operation_id = ?",
                     (canonical_json(d3_payload(completion)), completion.operation_id),
                 )
+            if companion is not None:
+                self._complete_d4_operation(D4OperationCompletion(**asdict(completion)))
             self._connection.commit()
             return D3OperationRecord(record.start, completion, record.application_ref)
         except BaseException:
@@ -1737,6 +2293,7 @@ class SqliteControlStore:
             record = self.load_d3_operation(operation_id)
             if record is None or record.completion is None:
                 raise D3RecoveryRequired("unknown operation cannot be applied")
+            companion = self._d4_companion_for_d3(record)
             if record.completion.result_kind != "completed":
                 raise D3OperationConflict("unsuccessful operation cannot be applied")
             if record.application_ref is not None and record.application_ref != application_ref:
@@ -1745,6 +2302,8 @@ class SqliteControlStore:
                 "UPDATE d3_operations SET application_ref = ? WHERE operation_id = ?",
                 (application_ref, operation_id),
             )
+            if companion is not None:
+                self._mark_d4_operation_applied(operation_id, application_ref)
             self._connection.commit()
             return D3OperationRecord(record.start, record.completion, application_ref)
         except BaseException:
@@ -2518,9 +3077,14 @@ class SqliteControlStore:
             }
             if set(status_changes) != expected or len(status_changes) != len(expected):
                 raise StorageError("D3 Turn completion changed an unrelated candidate")
+        plan_binding = (
+            self.load_d3_plan_binding(mutation.d3.plan_result.plan_id)
+            if mutation.d3 is not None and mutation.d3.plan_result is not None
+            else None
+        )
         if mutation.operation == "complete_d3_plan" and mutation.d3 is not None and (
             mutation.d3.plan_binding is None and mutation.d3.plan_result is not None
-        ) and self.load_d3_plan_binding(mutation.d3.plan_result.plan_id).observation_mode == "new_observation":
+        ) and plan_binding is not None and plan_binding.observation_mode == "new_observation":
             changed = [
                 item for item in after.plans
                 if item.plan_id in old_plans
@@ -2637,6 +3201,7 @@ class SqliteControlStore:
             raise IdempotencyConflictError(
                 "ControlMutation request_fingerprint does not match its content"
             )
+        commit_started_audit = self._prepare_control_commit_audit(mutation)
 
         try:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -2664,6 +3229,23 @@ class SqliteControlStore:
                     mutation.state_changes,
                     result.event,
                 )
+                if commit_started_audit is not None:
+                    self._insert_d4_audit_event(commit_started_audit)
+                    committed_id = self._d4_audit_event_id(
+                        mutation.task_run_id,
+                        mutation.mutation_id,
+                        "control_commit_committed",
+                        "known",
+                    )
+                    if self.load_d4_audit_event(committed_id) is None:
+                        self._insert_d4_audit_event(
+                            self._control_commit_audit_event(
+                                mutation,
+                                "control_commit_committed",
+                                "known",
+                                result.checkpoint.created_at,
+                            )
+                        )
                 self._connection.commit()
                 return result
 
@@ -2739,23 +3321,33 @@ class SqliteControlStore:
             assert after is not None
             validate_control_ownership(after)
             validate_running_transition(before, after, mutation)
+            if commit_started_audit is not None:
+                self._insert_d4_audit_event(commit_started_audit)
+                self._insert_d4_audit_event(
+                    self._control_commit_audit_event(
+                        mutation,
+                        "control_commit_committed",
+                        "known",
+                        committed_at,
+                    )
+                )
             self._connection.commit()
             return ControlCommitResult(
                 event=_numbered_event(mutation.event, event_sequence),
                 checkpoint=checkpoint,
                 replayed=False,
             )
-        except (IdempotencyConflictError, StaleControlStateError):
-            self._rollback_quietly()
+        except (IdempotencyConflictError, StaleControlStateError) as exc:
+            self._abort_control_commit(mutation, exc)
             raise
-        except StorageError:
-            self._rollback_quietly()
+        except StorageError as exc:
+            self._abort_control_commit(mutation, exc)
             raise
         except sqlite3.Error as exc:
-            self._rollback_quietly()
+            self._abort_control_commit(mutation, exc)
             raise StorageError(f"SQLite control transaction failed: {exc}") from exc
         except Exception as exc:
-            self._rollback_quietly()
+            self._abort_control_commit(mutation, exc)
             raise StorageError(f"control transaction failed: {exc}") from exc
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None:

@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Callable, cast
+from typing import cast
 from uuid import uuid4
 
 from agent_adapters.attachment_import_recorder import FileAttachmentImportRecorder
 from agent_adapters.command_recorder import T6CommandRecorder
+from agent_adapters.d4_review_ledger import D4ReviewLedger
 from agent_adapters.model_evidence import FileD3ModelEvidence
 from agent_adapters.observation_proof_store import FileD3ProofStore
 from agent_adapters.review_ledger import FileD2ReviewLedger
@@ -36,7 +38,16 @@ from agent_core.command_contracts import (
 from agent_core.contracts import ModelBackend, TaskRequest
 from agent_core.control_evidence_validator import D3EvidenceValidator
 from agent_core.control_state_repository import ControlStateRepository
-from agent_core.controller import TaskRunController, TaskRunControllerRegistry
+from agent_core.controller import (
+    SandboxCleanupError,
+    TaskRunController,
+    TaskRunControllerRegistry,
+)
+from agent_core.d4_contracts import (
+    D4AuditEvent,
+    D4BudgetExhausted,
+    D4RecoveryRequired,
+)
 from agent_core.domain import FactStatus, IntentStatus, PlanStatus, TurnStatus
 from agent_core.dual_llm_contracts import (
     D3BudgetExhausted,
@@ -90,6 +101,13 @@ class D3Result:
     recovery_required: bool
 
 
+class _D4TerminalStop(RuntimeError):
+    def __init__(self, reason: str, *, cleanup_unknown: bool = False) -> None:
+        self.reason = reason
+        self.cleanup_unknown = cleanup_unknown
+        super().__init__(reason)
+
+
 class _D3ReviewCall:
     def __init__(self, application: D3Application) -> None:
         self.application = application
@@ -97,7 +115,18 @@ class _D3ReviewCall:
     def invoke(self, request: D2ReviewRequest):
         application = self.application
         application._check_role()
-        application._check_dispatch()
+        if application.config.d4_budget is None:
+            application._check_dispatch()
+        else:
+            state = application.state
+            if (
+                application._token is not None
+                and application._token.is_cancelled
+                or state.task_run.status is not TaskRunStatus.RUNNING
+                or application.clock() >= state.task_run.deadline_at
+            ):
+                return D2ModelFailure("provider_failure", "d4_review_dispatch_stopped")
+            application._check_dispatch(allow_admitted_operation_id=request.review_id)
         finished = threading.Event()
         values = []
 
@@ -147,12 +176,22 @@ class D3Application:
         self.sandbox = sandbox
         self.review_model = review_model
         self._token: CancellationToken | None = None
+        self._bound_task_run_id: str | None = None
         self.store = SqliteControlStore.open(directory / "control.sqlite", clock=clock)
         self.imports = FileAttachmentImportRecorder(directory / "imports")
         self.commands = T6CommandRecorder(directory / "commands")
         self.workspace_evidence = FileD3WorkspaceEvidence(directory / "d3-workspace")
         self.model_evidence = FileD3ModelEvidence(directory / "d3-models")
-        self.review_ledger = FileD2ReviewLedger(directory / "d3-reviews")
+        self.review_ledger = (
+            D4ReviewLedger(
+                directory / "d3-reviews",
+                store=self.store,
+                config=config,
+                clock=clock,
+            )
+            if config.d4_budget is not None
+            else FileD2ReviewLedger(directory / "d3-reviews")
+        )
         self.proof_store = FileD3ProofStore(directory / "d3-proofs")
         self.proofs = D3ObservationProofVerifier(
             self.store,
@@ -259,7 +298,409 @@ class D3Application:
             and self._token.is_cancelled
         )
 
-    def _check_dispatch(self) -> None:
+    def _d4_unknown_operations(
+        self, *, exclude_operation_id: str | None = None
+    ) -> tuple[str, ...]:
+        if self.config.d4_budget is None:
+            return ()
+        return tuple(
+            item.start.operation_id
+            for item in self.store.list_d4_operations(self.state.task_run.task_run_id)
+            if item.completion is None
+            and item.start.operation_id != exclude_operation_id
+        )
+
+    def _persist_cancel_intent(self) -> None:
+        if self.config.d4_budget is None or self._bound_task_run_id is None:
+            return
+        task_run_id = self._bound_task_run_id
+        related_ref = task_run_id
+        event_id = stable_id(task_run_id, "d4/lifecycle/cancel")
+        evidence_sha256 = digest({"task_run_id": task_run_id, "request": "cancel"})
+        existing = self.store.load_d4_audit_event(event_id)
+        event = D4AuditEvent(
+            event_id,
+            task_run_id,
+            "cancellation_requested",
+            "known",
+            existing.occurred_at if existing is not None else self.clock(),
+            task_run_id,
+            evidence_sha256,
+            related_ref,
+        )
+        if existing is not None and existing != event:
+            raise D4RecoveryRequired("d4_cancellation_intent_binding_changed")
+        self.store.record_d4_audit_event(event)
+
+    def _has_cancel_intent(self, task_run_id: str) -> bool:
+        expected_sha256 = digest({"task_run_id": task_run_id, "request": "cancel"})
+        return any(
+            event.category == "cancellation_requested"
+            and event.outcome == "known"
+            and event.evidence_ref == task_run_id
+            and event.related_ref == task_run_id
+            and event.evidence_sha256 == expected_sha256
+            for event in self.store.list_d4_audit_events(task_run_id)
+        )
+
+    def _settle_stoppage(
+        self, *, exclude_operation_id: str | None = None
+    ) -> str | None:
+        """Persist cancellation or Deadline only after all admitted results are known."""
+        if self.config.d4_budget is None or self._bound_task_run_id is None:
+            return None
+        if self.state.task_run.status is not TaskRunStatus.RUNNING:
+            return None
+        if self._token is not None and self._token.is_cancelled:
+            self._persist_cancel_intent()
+        if self._d4_unknown_operations(exclude_operation_id=exclude_operation_id):
+            return "d4_operation_outcome_unknown"
+        if self.clock() >= self.state.task_run.deadline_at:
+            try:
+                self.controller.advance_time(self._id("lifecycle/deadline"))
+            except SandboxCleanupError:
+                return "task_run_deadline_cleanup_unknown"
+            return "task_run_deadline_exceeded"
+        if self._has_cancel_intent(self._bound_task_run_id):
+            try:
+                self.controller.cancel(self._id("lifecycle/cancel"))
+            except SandboxCleanupError:
+                return "task_run_cancel_cleanup_unknown"
+            return "task_run_cancelled"
+        return None
+
+    def _reconcile_known_d4_operations(self) -> None:
+        """Repair SQLite operation completions from already-persisted evidence only."""
+        if self.config.d4_budget is None:
+            return
+        task_run_id = self.state.task_run.task_run_id
+        self.store.reconcile_d4_control_commit_audit(task_run_id)
+        for d4_record in self.store.list_d4_operations(task_run_id):
+            operation_id = d4_record.start.operation_id
+            d3_record = self.store.load_d3_operation(operation_id)
+            if d3_record is None:
+                continue
+            if d4_record.completion is not None:
+                if (
+                    d4_record.application_ref is None
+                    and d4_record.completion.result_kind == "completed"
+                ):
+                    self._reconcile_committed_plan_application(
+                        task_run_id, operation_id, d3_record
+                    )
+                continue
+            category = d3_record.start.category
+            if category in {"outer_model", "inner_model"}:
+                evidence = self.model_evidence.read(operation_id)
+                if evidence is None:
+                    continue
+                if (
+                    evidence.task_run_id != task_run_id
+                    or evidence.base_checkpoint_sequence
+                    != d3_record.start.base_checkpoint_sequence
+                    or evidence.context_sha256 != d3_record.start.context_sha256
+                    or evidence.resource_ref != d3_record.start.resource_ref
+                    or evidence.role_config_ref != d3_record.start.role_config_ref
+                ):
+                    raise D4RecoveryRequired("d4_model_evidence_binding_changed")
+                self.store.complete_d3_operation(
+                    D3OperationCompletion(
+                        operation_id,
+                        evidence.finished_at,
+                        "completed" if evidence.outcome == "accepted" else "rejected",
+                        operation_id,
+                        digest(asdict(evidence)),
+                    )
+                )
+                continue
+            if category == "attachment_import":
+                receipt = self.imports.read_receipt(operation_id)
+                if receipt is None:
+                    continue
+                import_request = AttachmentImportRequest(
+                    receipt.import_id,
+                    receipt.task_run_id,
+                    receipt.sandbox_id,
+                    receipt.attachment_index,
+                    receipt.source_root,
+                    receipt.sandbox_path,
+                )
+                if (
+                    d3_record.start.context_sha256 != digest(asdict(import_request))
+                    or d3_record.start.resource_ref != import_request.sandbox_path
+                    or receipt.task_run_id != task_run_id
+                ):
+                    raise D4RecoveryRequired("d4_import_evidence_binding_changed")
+                self.store.complete_d3_operation(
+                    D3OperationCompletion(
+                        operation_id,
+                        receipt.completed_at,
+                        "completed",
+                        operation_id,
+                        digest(asdict(receipt)),
+                    )
+                )
+                self.store.mark_d3_operation_applied(operation_id, operation_id)
+                continue
+            if category == "copy_preparation":
+                artifact_receipt = self.workspace_evidence.read_artifact(operation_id)
+                if artifact_receipt is not None:
+                    self.workspace._repair_known(
+                        operation_id, category, artifact_receipt
+                    )
+                continue
+            if category == "sha_observation":
+                digest_receipt = self.workspace_evidence.read_digest(operation_id)
+                if digest_receipt is not None:
+                    self.workspace._repair_known(operation_id, category, digest_receipt)
+                continue
+            if category == "artifact_share":
+                share_receipt = self.workspace_evidence.read_share(operation_id)
+                if share_receipt is not None:
+                    self.workspace._repair_known(operation_id, category, share_receipt)
+                continue
+            if category == "intent_stop":
+                stop_receipt = self.workspace_evidence.read_stop(operation_id)
+                if stop_receipt is not None:
+                    self.workspace._repair_known(operation_id, category, stop_receipt)
+                continue
+            if category == "tool_dispatch":
+                completed = self.commands.read_completed(operation_id)
+                if completed is None or completed.record.status == "outcome_unknown":
+                    continue
+                record = completed.record
+                plan = next(
+                    (
+                        item
+                        for item in self.state.plans
+                        if item.plan_id == record.plan_id
+                    ),
+                    None,
+                )
+                binding = self.store.load_d3_plan_binding(record.plan_id)
+                turn = (
+                    next(
+                        (
+                            item
+                            for item in self.state.turns
+                            if item.turn_id == binding.turn_id
+                        ),
+                        None,
+                    )
+                    if binding is not None
+                    else None
+                )
+                turn_binding = (
+                    self.store.load_d3_turn_binding(binding.turn_id)
+                    if binding is not None
+                    else None
+                )
+                if (
+                    plan is None
+                    or binding is None
+                    or turn is None
+                    or turn_binding is None
+                ):
+                    raise D4RecoveryRequired("d4_tool_evidence_scope_missing")
+                is_size = (
+                    binding.template == "size_then_sha256" and record.step_index == 0
+                )
+                stage: D3ModelStage = "inner_size" if is_size else "inner_sha256"
+                try:
+                    _model_request_id, proposal = self.validator._known_action(
+                        task_run_id, plan.plan_id, stage
+                    )
+                except D3RecoveryRequired as exc:
+                    raise D4RecoveryRequired("d4_tool_action_proposal_missing") from exc
+                if not isinstance(proposal.action, ProbeAction):
+                    raise D4RecoveryRequired("d4_tool_action_proposal_invalid")
+                artifact = self.workspace.read_artifact(binding.artifact_version_id)
+                claim = artifact.claim
+                expected_script = (
+                    fixed_size_script(claim.path)
+                    if is_size
+                    else fixed_digest_script(claim.path)
+                )
+                expected_conditions = (
+                    ()
+                    if is_size
+                    else (
+                        FileSha256(
+                            record.step_index, claim.path, turn_binding.expected_sha256
+                        ),
+                    )
+                )
+                action = proposal.action
+                if (
+                    action.script != expected_script
+                    or action.stdin != b""
+                    or action.working_directory != claim.path.rsplit("/", 1)[0]
+                    or action.conditions != expected_conditions
+                ):
+                    raise D4RecoveryRequired("d4_tool_action_command_binding_changed")
+                command_request = SandboxCommandRequest(
+                    operation_id,
+                    task_run_id,
+                    plan.plan_id,
+                    record.step_index,
+                    action.script,
+                    action.stdin,
+                    action.working_directory,
+                    action.timeout_seconds,
+                )
+                authorization = SandboxCommandAuthorization(
+                    self.config.authorization.authorization_id,
+                    task_run_id,
+                    ("sandbox.command",),
+                )
+                if (
+                    self.commands.replay(
+                        command_request,
+                        authorization,
+                        self.state.task_run.sandbox_id,
+                    )
+                    is None
+                ):
+                    raise D4RecoveryRequired("d4_tool_evidence_not_replayable")
+                self._gateway(turn_binding, binding)._complete_known(
+                    command_request, completed
+                )
+
+    def _reconcile_committed_plan_application(
+        self, task_run_id: str, operation_id: str, d3_record
+    ) -> None:
+        if d3_record.start.category != "inner_model":
+            return
+        evidence = self.model_evidence.read(operation_id)
+        completion = d3_record.completion
+        if evidence is None or completion is None:
+            raise D4RecoveryRequired("d4_plan_application_evidence_missing")
+        if (
+            evidence.task_run_id != task_run_id
+            or evidence.base_checkpoint_sequence
+            != d3_record.start.base_checkpoint_sequence
+            or evidence.context_sha256 != d3_record.start.context_sha256
+            or evidence.resource_ref != d3_record.start.resource_ref
+            or evidence.role_config_ref != d3_record.start.role_config_ref
+            or completion.operation_id != operation_id
+            or completion.evidence_ref != operation_id
+            or completion.evidence_sha256 != digest(asdict(evidence))
+            or completion.result_kind
+            != ("completed" if evidence.outcome == "accepted" else "rejected")
+        ):
+            raise D4RecoveryRequired("d4_plan_application_evidence_binding_changed")
+
+        matches = []
+        for plan in self.state.plans:
+            binding = self.store.load_d3_plan_binding(plan.plan_id)
+            if binding is not None and binding.proposal_request_id == operation_id:
+                matches.append((plan, binding))
+        if not matches:
+            return
+        if len(matches) != 1:
+            raise D4RecoveryRequired("d4_plan_application_binding_ambiguous")
+        plan, binding = matches[0]
+        plans_for_intent = [
+            item for item in self.state.plans if item.intent_id == plan.intent_id
+        ]
+        ordinal = next(
+            (
+                index
+                for index, item in enumerate(plans_for_intent, start=1)
+                if item.plan_id == plan.plan_id
+            ),
+            None,
+        )
+        if (
+            ordinal is None
+            or binding.task_run_id != task_run_id
+            or binding.intent_id != plan.intent_id
+            or binding.plan_id != plan.plan_id
+            or binding.proposal_request_id != operation_id
+        ):
+            raise D4RecoveryRequired("d4_plan_application_binding_changed")
+
+        mutation_id = stable_id(
+            task_run_id, f"d3/plan/{plan.intent_id}/{ordinal}/register"
+        )
+        committed = self.store.load_committed_mutation(task_run_id, mutation_id)
+        if committed is None:
+            raise D4RecoveryRequired("d4_plan_application_commit_missing")
+        operation = committed.event.details.get("operation")
+        entity_ids = committed.event.details.get("entity_ids")
+        valid_register = operation == "register_d3_plan" and entity_ids == [
+            plan.plan_id
+        ]
+        previous_plan_id = (
+            plans_for_intent[ordinal - 2].plan_id if ordinal > 1 else None
+        )
+        valid_replan = (
+            operation == "replan_d3_plan"
+            and previous_plan_id is not None
+            and plans_for_intent[ordinal - 2].status is PlanStatus.SUPERSEDED
+            and entity_ids == [previous_plan_id, plan.plan_id]
+        )
+        if (
+            not (valid_register or valid_replan)
+            or committed.event.details.get("result") != plan.plan_id
+        ):
+            raise D4RecoveryRequired("d4_plan_application_commit_binding_changed")
+
+        audits = self.store.list_d4_audit_events(task_run_id)
+        commit_confirmed = any(
+            event.category == "control_commit_committed"
+            and event.outcome == "known"
+            and event.related_ref == mutation_id
+            for event in audits
+        )
+        checkpoint_ref = f"checkpoint:{committed.checkpoint.sequence}"
+        reload_confirmed = any(
+            event.category == "control_reload_confirmed"
+            and event.outcome == "known"
+            and event.evidence_ref == checkpoint_ref
+            and event.related_ref == checkpoint_ref
+            for event in audits
+        )
+        if not commit_confirmed:
+            raise D4RecoveryRequired("d4_plan_application_commit_audit_missing")
+        if not reload_confirmed:
+            try:
+                reloaded = self.controller.reload_state()
+            except Exception as exc:
+                raise D4RecoveryRequired(
+                    "d4_plan_application_reload_unconfirmed"
+                ) from exc
+            if reloaded.latest_checkpoint.sequence < committed.checkpoint.sequence:
+                raise D4RecoveryRequired("d4_plan_application_reload_stale")
+            if not any(
+                event.category == "control_reload_confirmed"
+                and event.outcome == "known"
+                and event.evidence_ref == checkpoint_ref
+                and event.related_ref == checkpoint_ref
+                for event in self.store.list_d4_audit_events(task_run_id)
+            ):
+                raise D4RecoveryRequired("d4_plan_application_reload_unconfirmed")
+        self.store.mark_d3_operation_applied(operation_id, plan.plan_id)
+
+    def _check_dispatch(
+        self, *, allow_admitted_operation_id: str | None = None
+    ) -> None:
+        if self.config.d4_budget is not None:
+            stopped = self._settle_stoppage(
+                exclude_operation_id=allow_admitted_operation_id
+            )
+            if stopped is not None:
+                if stopped == "d4_operation_outcome_unknown":
+                    raise D4RecoveryRequired(stopped)
+                if stopped.endswith("cleanup_unknown"):
+                    raise _D4TerminalStop(stopped, cleanup_unknown=True)
+                if self.state.task_run.status is not TaskRunStatus.RUNNING:
+                    raise _D4TerminalStop(stopped)
+                raise D3RecoveryRequired(stopped)
+            if self._bound_task_run_id is not None and self._has_cancel_intent(
+                self._bound_task_run_id
+            ):
+                raise D4RecoveryRequired("d4_cancellation_requested")
         if self._dispatch_stopped():
             raise D3RecoveryRequired("d3_dispatch_stopped")
         for application in self.store.list_d3_review_applications(
@@ -270,6 +711,15 @@ class D3Application:
 
     def result(self, reason: str, *, recovery_required: bool = False) -> D3Result:
         state = self.state
+        sandbox_status = "retained"
+        if self.config.d4_budget is not None and state.task_run.sandbox_id is not None:
+            for event in self.store.list_d4_audit_events(state.task_run.task_run_id):
+                if event.evidence_ref != state.task_run.sandbox_id:
+                    continue
+                if event.category in {"cleanup_started", "cleanup_failed"}:
+                    sandbox_status = "unknown"
+                elif event.category == "cleanup_completed":
+                    sandbox_status = "cleaned"
         return D3Result(
             state.task_run.task_run_id,
             tuple((item.turn_id, item.status.value) for item in state.turns),
@@ -282,7 +732,7 @@ class D3Application:
             ),
             state.task_run.status.value,
             "not_evaluated",
-            "retained",
+            sandbox_status,
             "stopped",
             reason,
             recovery_required,
@@ -302,7 +752,150 @@ class D3Application:
             source_root=str(source_root.resolve(strict=True)),
             d3_config=self.config,
         )
+        self._bound_task_run_id = committed.value
         return committed.value
+
+    async def resume(self, task_run_id: str, token: CancellationToken) -> D3Result:
+        """Attach to a committed D4 run and resume only from durable evidence."""
+        if self.config.d4_budget is None:
+            raise D3RecoveryRequired("d4_resume_requires_explicit_budget")
+        with run_lock(self.directory):
+            if self._bound_task_run_id is None:
+                self.controller.attach(task_run_id)
+                self._bound_task_run_id = task_run_id
+            elif self._bound_task_run_id != task_run_id:
+                raise D3RecoveryRequired("d3_application_already_bound_to_another_task")
+            else:
+                self.controller.reload_state()
+            frozen = self.store.load_d3_run_config(task_run_id)
+            if frozen != self.config:
+                raise D3RecoveryRequired("d3_frozen_run_configuration_changed")
+            self.store.reconcile_d4_control_commit_audit(task_run_id)
+            if self.state.task_run.status is not TaskRunStatus.RUNNING:
+                terminal_result = self.result("task_run_already_terminal")
+                return replace(
+                    terminal_result,
+                    recovery_required=terminal_result.sandbox_status == "unknown",
+                )
+            if token.is_cancelled:
+                try:
+                    self._persist_cancel_intent()
+                except D4RecoveryRequired as exc:
+                    return self.result(str(exc), recovery_required=True)
+            try:
+                self._reconcile_known_d4_operations()
+            except D4RecoveryRequired as exc:
+                return self.result(str(exc), recovery_required=True)
+            if isinstance(self.review_ledger, D4ReviewLedger):
+                try:
+                    self.review_ledger.reconcile_known_completions(task_run_id)
+                except D4RecoveryRequired as exc:
+                    return self.result(str(exc), recovery_required=True)
+            try:
+                stopped = self._settle_stoppage()
+            except D4RecoveryRequired as exc:
+                return self.result(str(exc), recovery_required=True)
+            if stopped is not None:
+                return self.result(
+                    stopped,
+                    recovery_required=(
+                        stopped == "d4_operation_outcome_unknown"
+                        or stopped.endswith("cleanup_unknown")
+                    ),
+                )
+        return await self.run(token)
+
+    def cancel(self, task_run_id: str | None = None) -> D3Result:
+        """Cancel a D4 TaskRun unless an admitted external result is still unknown."""
+        with run_lock(self.directory):
+            if self.config.d4_budget is None:
+                raise D3RecoveryRequired("d4_cancel_requires_explicit_budget")
+            if self._bound_task_run_id is None:
+                raise D3RecoveryRequired("d3_cancel_requires_started_or_resumed_task")
+            if task_run_id is not None and task_run_id != self._bound_task_run_id:
+                raise D3RecoveryRequired("d3_cancel_task_run_mismatch")
+            if self.state.task_run.status is not TaskRunStatus.RUNNING:
+                terminal_status = self.state.task_run.status
+                reason = (
+                    "task_run_cancelled"
+                    if terminal_status is TaskRunStatus.CANCELLED
+                    else "task_run_deadline_exceeded"
+                    if terminal_status is TaskRunStatus.DEADLINE_EXCEEDED
+                    else f"task_run_already_terminal:{terminal_status.value}"
+                )
+                terminal_result = self.result(reason)
+                return replace(
+                    terminal_result,
+                    recovery_required=terminal_result.sandbox_status == "unknown",
+                )
+            try:
+                self._persist_cancel_intent()
+                self._reconcile_known_d4_operations()
+                if isinstance(self.review_ledger, D4ReviewLedger):
+                    self.review_ledger.reconcile_known_completions(
+                        self._bound_task_run_id
+                    )
+                stopped = self._settle_stoppage()
+                if stopped is not None:
+                    return self.result(
+                        stopped,
+                        recovery_required=(
+                            stopped == "d4_operation_outcome_unknown"
+                            or stopped.endswith("cleanup_unknown")
+                        ),
+                    )
+            except (D3RecoveryRequired, D4RecoveryRequired, SandboxCleanupError) as exc:
+                return self.result(
+                    f"cancel_recovery_required:{type(exc).__name__}",
+                    recovery_required=True,
+                )
+            return self.result("task_run_cancelled", recovery_required=False)
+
+    def resume_cleanup(self, task_run_id: str | None = None) -> D3Result:
+        """Explicitly reconcile and retry cleanup for a terminal D4 run."""
+        with run_lock(self.directory):
+            if self.config.d4_budget is None:
+                raise D3RecoveryRequired("d4_cleanup_requires_explicit_budget")
+            target_id = task_run_id or self._bound_task_run_id
+            if target_id is None:
+                raise D3RecoveryRequired("d4_cleanup_requires_task_run_id")
+            if self._bound_task_run_id is None:
+                try:
+                    self.controller.attach(target_id)
+                except Exception as exc:
+                    raise D3RecoveryRequired(
+                        f"d4_cleanup_attach_failed:{type(exc).__name__}"
+                    ) from exc
+                self._bound_task_run_id = target_id
+            elif self._bound_task_run_id != target_id:
+                raise D3RecoveryRequired("d3_application_already_bound_to_another_task")
+            else:
+                try:
+                    self.controller.reload_state()
+                except Exception as exc:
+                    raise D3RecoveryRequired(
+                        f"d4_cleanup_reload_failed:{type(exc).__name__}"
+                    ) from exc
+            if self.store.load_d3_run_config(target_id) != self.config:
+                raise D3RecoveryRequired("d3_frozen_run_configuration_changed")
+            try:
+                self.store.reconcile_d4_control_commit_audit(target_id)
+            except Exception as exc:
+                raise D3RecoveryRequired(
+                    f"d4_cleanup_commit_audit_failed:{type(exc).__name__}"
+                ) from exc
+            if self.state.task_run.status is TaskRunStatus.RUNNING:
+                return self.result(
+                    "d4_cleanup_requires_terminal_task_run", recovery_required=True
+                )
+            try:
+                self.controller.cleanup_sandbox()
+            except (SandboxCleanupError, D4RecoveryRequired) as exc:
+                return self.result(
+                    f"d4_cleanup_unknown:{type(exc).__name__}",
+                    recovery_required=True,
+                )
+            return self.result("d4_cleanup_confirmed", recovery_required=False)
 
     def _model_request(
         self, stage: D3ModelStage, resource_ref: str, context, name: str
@@ -416,13 +1009,44 @@ class D3Application:
             context,
             f"outer/turn/{ordinal}",
         )
-        request_id, proposal = await self.outer.propose(request, token)
-        if (
-            proposal.attachment_index
-            not in self.config.authorization.attachment_indices
-        ):
-            self.outer.reject(request_id, "d3_attachment_not_authorized")
-            raise D3ProposalRejected("d3_attachment_not_authorized")
+
+        def refresh(_current: D3ModelRequest) -> D3ModelRequest:
+            if prior_turn_id is not None and not any(
+                item.turn_id == prior_turn_id and item.status is TurnStatus.RUNNING
+                for item in self.state.turns
+            ):
+                raise D3RecoveryRequired("d3_turn_proposal_scope_expired")
+            fresh = D3OuterContext(
+                self.state.task_run.request.goal,
+                receipts,
+                prior_turn_id,
+                prior_reason,
+            )
+            return replace(
+                request,
+                base_checkpoint_sequence=self.state.latest_checkpoint.sequence,
+                context=fresh,
+            )
+
+        def validate(_current: D3ModelRequest, proposal) -> None:
+            if (
+                proposal.attachment_index
+                not in self.config.authorization.attachment_indices
+            ):
+                raise D3ProposalRejected("d3_attachment_not_authorized")
+
+        if self.config.d4_budget is None:
+            request_id, proposal = await self.outer.propose(request, token)
+            if (
+                proposal.attachment_index
+                not in self.config.authorization.attachment_indices
+            ):
+                self.outer.reject(request_id, "d3_attachment_not_authorized")
+                raise D3ProposalRejected("d3_attachment_not_authorized")
+        else:
+            request_id, proposal = await self.outer.propose(
+                request, token, refresh=refresh, validate=validate
+            )
         return request_id, proposal
 
     def _source(self, reference: str) -> object:
@@ -818,18 +1442,77 @@ class D3Application:
             context,
             f"inner/plan/{intent_id}/{ordinal}",
         )
-        request_id, proposal = await self.inner.propose(request, token)
-        if (
-            ordinal == 1
-            and proposal.template != "size_then_sha256"
-            or ordinal == 2
-            and proposal.template != "sha256_only"
-            or ordinal not in {1, 2}
-            or proposal.observation_mode == "reuse_saved_proof"
-            and proposal.source_proof_id not in context.reusable_proof_ids
-        ):
-            self.inner.reject(request_id, "d3_plan_template_or_source_unavailable")
-            raise D3ProposalRejected("d3_plan_template_or_source_unavailable")
+
+        def refresh(_current: D3ModelRequest) -> D3ModelRequest:
+            live_intent = next(
+                (item for item in self.state.intents if item.intent_id == intent_id),
+                None,
+            )
+            if live_intent is None or live_intent.status is not IntentStatus.RUNNING:
+                raise D3RecoveryRequired("d3_plan_proposal_scope_expired")
+            live_turn = next(
+                item for item in self.state.turns if item.turn_id == live_intent.turn_id
+            )
+            live_binding = self.store.load_d3_turn_binding(live_turn.turn_id)
+            if live_binding is None:
+                raise D3RecoveryRequired("d3_turn_binding_missing")
+            live_plans = [
+                item for item in self.state.plans if item.intent_id == intent_id
+            ]
+            live_proofs = []
+            for plan in live_plans:
+                result = self.store.load_d3_plan_result(plan.plan_id)
+                if result is not None and result.outcome == "satisfied":
+                    if result.proof_id is None:
+                        raise D3RecoveryRequired("d3_reusable_proof_missing")
+                    live_proofs.append(result.proof_id)
+            fresh = D3PlanContext(
+                live_turn.turn_target,
+                live_binding,
+                intent_id,
+                tuple(item.plan_id for item in live_plans),
+                tuple(live_proofs),
+                context.shared_artifacts,
+            )
+            return replace(
+                request,
+                base_checkpoint_sequence=self.state.latest_checkpoint.sequence,
+                context=fresh,
+            )
+
+        def validate(_current: D3ModelRequest, proposal) -> None:
+            live_context = _current.context
+            if (
+                ordinal == 1
+                and proposal.template != "size_then_sha256"
+                or ordinal == 2
+                and proposal.template != "sha256_only"
+                or ordinal not in {1, 2}
+                or proposal.observation_mode == "reuse_saved_proof"
+                and (
+                    not isinstance(live_context, D3PlanContext)
+                    or proposal.source_proof_id not in live_context.reusable_proof_ids
+                )
+            ):
+                raise D3ProposalRejected("d3_plan_template_or_source_unavailable")
+
+        if self.config.d4_budget is None:
+            request_id, proposal = await self.inner.propose(request, token)
+            if (
+                ordinal == 1
+                and proposal.template != "size_then_sha256"
+                or ordinal == 2
+                and proposal.template != "sha256_only"
+                or ordinal not in {1, 2}
+                or proposal.observation_mode == "reuse_saved_proof"
+                and proposal.source_proof_id not in context.reusable_proof_ids
+            ):
+                self.inner.reject(request_id, "d3_plan_template_or_source_unavailable")
+                raise D3ProposalRejected("d3_plan_template_or_source_unavailable")
+        else:
+            request_id, proposal = await self.inner.propose(
+                request, token, refresh=refresh, validate=validate
+            )
         plan_id = self._id(f"plan/{intent_id}/{ordinal}")
         source_fact_id = None
         if proposal.observation_mode == "reuse_saved_proof":
@@ -951,6 +1634,27 @@ class D3Application:
             self.clock,
         )
 
+    def _reviewable_action_rejection(
+        self, error: D3ProposalRejected, fallback_request_id: str
+    ) -> str:
+        request_id = error.model_request_id or fallback_request_id
+        evidence = self.model_evidence.read(request_id)
+        rejection = self.model_evidence.read_rejection(request_id)
+        if evidence is None:
+            raise D4RecoveryRequired(
+                f"d4_action_proposal_evidence_missing:{error.code}"
+            ) from error
+        if evidence.outcome != "accepted" or rejection is None:
+            reason = evidence.reason or evidence.outcome
+            raise D4RecoveryRequired(
+                f"d4_action_proposal_outcome_requires_recovery:{reason}"
+            ) from error
+        if evidence.correction_of_model_request_id is not None:
+            raise D4RecoveryRequired(
+                f"d4_action_refinement_rejected:{rejection.code}"
+            ) from error
+        return request_id
+
     async def _step(
         self,
         turn,
@@ -967,27 +1671,124 @@ class D3Application:
         conditions = (
             () if is_size else (FileSha256(step_index, path, turn.expected_sha256),)
         )
-        action_context = D3ActionContext(
-            next(
-                item.turn_target
-                for item in self.state.turns
-                if item.turn_id == turn.turn_id
-            ),
-            turn,
-            plan_binding,
-            step_index,
-            script,
-            path.rsplit("/", 1)[0],
-            (),
-            await self._shared_context(plan_binding.intent_id, token),
-        )
+        shared_artifacts = await self._shared_context(plan_binding.intent_id, token)
         request = self._model_request(
             stage,
             f"{plan_binding.plan_id}:{stage}",
-            action_context,
+            D3ActionContext(
+                next(
+                    item.turn_target
+                    for item in self.state.turns
+                    if item.turn_id == turn.turn_id
+                ),
+                turn,
+                plan_binding,
+                step_index,
+                script,
+                path.rsplit("/", 1)[0],
+                (),
+                shared_artifacts,
+            ),
             f"action/{plan_binding.plan_id}/{stage}",
         )
-        request_id, proposal = await self.inner.propose(request, token)
+
+        def refresh(_current: D3ModelRequest) -> D3ModelRequest:
+            live_turn = next(
+                (item for item in self.state.turns if item.turn_id == turn.turn_id),
+                None,
+            )
+            live_intent = next(
+                (
+                    item
+                    for item in self.state.intents
+                    if item.intent_id == plan_binding.intent_id
+                ),
+                None,
+            )
+            current_plan = next(
+                (
+                    item
+                    for item in self.state.plans
+                    if item.plan_id == plan_binding.plan_id
+                ),
+                None,
+            )
+            if (
+                live_turn is None
+                or live_intent is None
+                or current_plan is None
+                or live_turn.status is not TurnStatus.RUNNING
+                or live_intent.status is not IntentStatus.RUNNING
+                or current_plan.status is not PlanStatus.RUNNING
+            ):
+                raise D3RecoveryRequired("d3_action_proposal_scope_expired")
+            turn_binding = self.store.load_d3_turn_binding(live_turn.turn_id)
+            if turn_binding is None or turn_binding != turn:
+                raise D3RecoveryRequired("d3_action_turn_binding_changed")
+            fresh = D3ActionContext(
+                live_turn.turn_target,
+                turn_binding,
+                plan_binding,
+                step_index,
+                script,
+                path.rsplit("/", 1)[0],
+                (),
+                shared_artifacts,
+            )
+            return replace(
+                request,
+                base_checkpoint_sequence=self.state.latest_checkpoint.sequence,
+                context=fresh,
+            )
+
+        def validate(_current: D3ModelRequest, candidate) -> None:
+            action = candidate.action
+            if (
+                not isinstance(action, ProbeAction)
+                or action.script != script
+                or action.stdin != b""
+                or action.working_directory != path.rsplit("/", 1)[0]
+                or action.conditions != conditions
+            ):
+                raise D3ProposalRejected("d3_fixed_probe_rejected")
+            try:
+                self.validator._allowed(
+                    plan_binding.task_run_id,
+                    turn.turn_id,
+                    plan_binding.intent_id,
+                    "probe",
+                    action.timeout_seconds,
+                )
+            except D3RecoveryRequired as exc:
+                if "rejected_by_review_constraint" in str(exc):
+                    raise D3ProposalRejected(str(exc)) from exc
+                raise
+
+        try:
+            if self.config.d4_budget is None:
+                request_id, proposal = await self.inner.propose(request, token)
+            else:
+                request_id, proposal = await self.inner.propose(
+                    request, token, refresh=refresh, validate=validate
+                )
+        except D3ProposalRejected as exc:
+            if self.config.d4_budget is None:
+                raise
+            request_id = self._reviewable_action_rejection(
+                exc, request.model_request_id
+            )
+            review_id, output = self._review(
+                turn.turn_id,
+                plan_binding.intent_id,
+                "action",
+                request_id,
+                (request_id,),
+            )
+            if await self._route(
+                review_id, output, plan_binding.intent_id, receipts, token
+            ):
+                return True
+            raise D3RecoveryRequired(str(exc)) from exc
         action = proposal.action
         if (
             not isinstance(action, ProbeAction)
@@ -1181,7 +1982,93 @@ class D3Application:
             context,
             f"action/{plan.plan_id}/inner_complete",
         )
-        request_id, proposal = await self.inner.propose(request, token)
+
+        def refresh(_current: D3ModelRequest) -> D3ModelRequest:
+            live_intent = next(
+                (item for item in self.state.intents if item.intent_id == intent_id),
+                None,
+            )
+            live_plan = next(
+                (item for item in self.state.plans if item.plan_id == plan.plan_id),
+                None,
+            )
+            live_result = self.store.load_d3_plan_result(plan.plan_id)
+            if (
+                live_intent is None
+                or live_intent.status is not IntentStatus.RUNNING
+                or live_plan is None
+                or live_plan.status is not PlanStatus.COMPLETED
+                or live_result is None
+                or live_result.outcome != "satisfied"
+                or live_result.supporting_fact_id != fact_id
+            ):
+                raise D3RecoveryRequired("d3_completion_proposal_scope_expired")
+            live_turn = next(
+                (item for item in self.state.turns if item.turn_id == intent.turn_id),
+                None,
+            )
+            if live_turn is None:
+                raise D3RecoveryRequired("d3_completion_turn_missing")
+            turn_binding = self.store.load_d3_turn_binding(live_turn.turn_id)
+            if turn_binding is None or turn_binding != turn:
+                raise D3RecoveryRequired("d3_completion_turn_binding_changed")
+            fresh = D3ActionContext(
+                live_turn.turn_target,
+                turn_binding,
+                binding,
+                None,
+                None,
+                None,
+                (fact_id,),
+                context.shared_artifacts,
+            )
+            return replace(
+                request,
+                base_checkpoint_sequence=self.state.latest_checkpoint.sequence,
+                context=fresh,
+            )
+
+        def validate(_current: D3ModelRequest, candidate) -> None:
+            if not isinstance(
+                candidate.action, CompleteIntentAction
+            ) or candidate.action.fact_ids != (fact_id,):
+                raise D3ProposalRejected("d3_completion_fact_rejected")
+            try:
+                self.validator._allowed(
+                    self.state.task_run.task_run_id,
+                    intent.turn_id,
+                    intent_id,
+                    "complete_intent",
+                    None,
+                )
+            except D3RecoveryRequired as exc:
+                if "rejected_by_review_constraint" in str(exc):
+                    raise D3ProposalRejected(str(exc)) from exc
+                raise
+
+        try:
+            if self.config.d4_budget is None:
+                request_id, proposal = await self.inner.propose(request, token)
+            else:
+                request_id, proposal = await self.inner.propose(
+                    request, token, refresh=refresh, validate=validate
+                )
+        except D3ProposalRejected as exc:
+            if self.config.d4_budget is None:
+                raise
+            request_id = self._reviewable_action_rejection(
+                exc, request.model_request_id
+            )
+            review_id, output = self._review(
+                intent.turn_id,
+                intent_id,
+                "action",
+                request_id,
+                (request_id, fact_id),
+            )
+            if await self._route(review_id, output, intent_id, receipts, token):
+                return True
+            raise D3RecoveryRequired(str(exc)) from exc
         if not isinstance(
             proposal.action, CompleteIntentAction
         ) or proposal.action.fact_ids != (fact_id,):
@@ -1253,6 +2140,11 @@ class D3Application:
             raise D3RecoveryRequired("d3_tail_review_not_read_only")
 
     async def _run(self, token: CancellationToken) -> D3Result:
+        self._reconcile_known_d4_operations()
+        if isinstance(self.review_ledger, D4ReviewLedger):
+            self.review_ledger.reconcile_known_completions(
+                self.state.task_run.task_run_id
+            )
         self._check_role()
         self._check_dispatch()
         receipts = await self._import_all(token)
@@ -1355,14 +2247,55 @@ class D3Application:
         with run_lock(self.directory):
             self._token = token
             try:
+                if self.config.d4_budget is not None:
+                    attached_task_run_id = self.controller.task_run.task_run_id
+                    if self._bound_task_run_id is None:
+                        self._bound_task_run_id = attached_task_run_id
+                    elif self._bound_task_run_id != attached_task_run_id:
+                        raise D4RecoveryRequired(
+                            "d4_controller_task_run_binding_changed"
+                        )
+                    if (
+                        self.store.load_d3_run_config(attached_task_run_id)
+                        != self.config
+                    ):
+                        raise D4RecoveryRequired("d3_frozen_run_configuration_changed")
                 return await self._run(token)
             except (
                 D3RecoveryRequired,
                 D3BudgetExhausted,
+                D4BudgetExhausted,
+                D4RecoveryRequired,
                 D3ProposalRejected,
                 D2ReviewPaused,
             ) as exc:
+                if self.config.d4_budget is not None and token.is_cancelled:
+                    try:
+                        task_run_id = self._bound_task_run_id
+                        if task_run_id is None:
+                            raise D4RecoveryRequired("d4_cancellation_task_run_unbound")
+                        self._persist_cancel_intent()
+                        self._reconcile_known_d4_operations()
+                        if isinstance(self.review_ledger, D4ReviewLedger):
+                            self.review_ledger.reconcile_known_completions(task_run_id)
+                        stopped = self._settle_stoppage()
+                    except (D3RecoveryRequired, D4RecoveryRequired) as recovery_exc:
+                        return self.result(str(recovery_exc), recovery_required=True)
+                    if stopped is not None:
+                        return self.result(
+                            stopped,
+                            recovery_required=(
+                                stopped == "d4_operation_outcome_unknown"
+                                or stopped.endswith("cleanup_unknown")
+                            ),
+                        )
+                if isinstance(exc, (D3BudgetExhausted, D4BudgetExhausted)):
+                    return self.result(
+                        f"budget_exhausted:{exc}", recovery_required=False
+                    )
                 return self.result(str(exc), recovery_required=True)
+            except _D4TerminalStop as exc:
+                return self.result(exc.reason, recovery_required=exc.cleanup_unknown)
             finally:
                 self._token = None
 

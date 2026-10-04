@@ -1,0 +1,372 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="3440" viewBox="0 0 2400 3440" role="img" aria-labelledby="title desc">
+  <title id="title">Qinyuan_Agent · 双 LLM 协同架构</title>
+  <desc id="desc">已确认职责与数据流的设计图，并非完整实现验收声明。复盘是外层 LLM 对照已注册 Turn 目标、执行预期、已提交结果和证据形成的判断与策略建议，不是可信验证或状态提交。外层生成有序 Intent 并提炼当前 TaskRun 的 Process_Fact 候选；内层针对已选 Intent 生成 Plan 与 Action。Turn 首尾复盘；轮内仅在可信代码触发或内层请求、且 Action 结果与证据已保存后复盘。可信代码掌握权限、预算、调度、证据验证与状态提交。重规划结束旧 Plan 未执行部分并创建新 Plan；跨 TaskRun 导入不继承授权或验证结论。Process_Fact 与 verified ResultFact 分开保存。未配置独立答案校验器时整体目标为 not_evaluated。图中的同名圆点为连续连接点；箭头表达控制或数据流，不表示代码 import 依赖。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#475569"/></marker>
+    <marker id="arrow-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#0f766e"/></marker>
+    <marker id="arrow-pending" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#a16207"/></marker>
+    <style>
+      text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #172b43; }
+      .title { font-size: 43px; font-weight: 700; }
+      .subtitle { font-size: 24px; fill: #52647b; }
+      .section { font-size: 28px; font-weight: 700; }
+      .heading { font-size: 25px; font-weight: 700; }
+      .body { font-size: 22px; }
+      .small { font-size: 20px; fill: #52647b; }
+      .label { font-size: 20px; font-weight: 600; fill: #52647b; }
+      .panel { fill: #fff; stroke: #d4deea; stroke-width: 2; }
+      .node { stroke-width: 2; }
+      .code { fill: #eef4fc; stroke: #7694bb; }
+      .model { fill: #f3eeff; stroke: #9674c4; }
+      .solver { fill: #eef2ff; stroke: #6d86c4; }
+      .data { fill: #ecf8f3; stroke: #68a38c; }
+      .runtime { fill: #e8f5f8; stroke: #56a1b4; }
+      .stop { fill: #fff3ef; stroke: #c58b70; }
+      .pending { fill: #fffbef; stroke: #c0a45e; stroke-dasharray: 8 6; }
+      .edge { fill: none; stroke: #475569; stroke-width: 2.6; marker-end: url(#arrow); stroke-linejoin: round; }
+      .edge-data { fill: none; stroke: #0f766e; stroke-width: 2.5; stroke-dasharray: 9 6; marker-end: url(#arrow-data); }
+      .edge-pending { fill: none; stroke: #a16207; stroke-width: 2.5; stroke-dasharray: 7 6; marker-end: url(#arrow-pending); }
+      .port { fill: #fff; stroke: #64748b; stroke-width: 2; }
+      .port-pending { fill: #fffbef; stroke: #a16207; stroke-width: 2; }
+      .port-text { font-size: 22px; font-weight: 700; text-anchor: middle; }
+    </style>
+  </defs>
+  <rect width="2400" height="3440" fill="#f3f6fa"/>
+
+  <text x="60" y="77" class="title">Qinyuan_Agent · 双 LLM 协同架构</text>
+  <text x="60" y="122" class="subtitle">外层规划与复盘 · 内层 Plan / Action · 可信代码掌握控制权 · 证据决定可确认的结论</text>
+  <text x="60" y="166" class="small">已确认职责与数据流；待定契约显式保留。设计确认不等于完整实现或验收通过。</text>
+  <rect x="1660" y="42" width="690" height="135" rx="16" class="panel"/>
+  <rect x="1685" y="64" width="22" height="22" rx="5" class="node model"/>
+  <text x="1718" y="83" class="small">模型候选</text>
+  <rect x="1865" y="64" width="22" height="22" rx="5" class="node code"/>
+  <text x="1898" y="83" class="small">可信代码</text>
+  <rect x="2060" y="64" width="22" height="22" rx="5" class="node data"/>
+  <text x="2093" y="83" class="small">证据 / 数据</text>
+  <path d="M1685 112 H1735" class="edge-data"/>
+  <text x="1750" y="119" class="small">数据引用</text>
+  <path d="M1900 112 H1950" class="edge-pending"/>
+  <text x="1965" y="119" class="small">待确认细则</text>
+  <text x="1685" y="152" class="small">同名圆点连续连接；箭头为运行流，不是代码依赖。</text>
+  <rect x="50" y="215" width="1420" height="2075" rx="24" class="panel"/>
+  <text x="80" y="261" class="section">A  单 TaskRun 控制闭环</text>
+  <text x="80" y="296" class="small">一个 TaskRun 对应一次解题；所有 Turn / Intent 共用其独占 Sandbox。</text>
+  <g id="entry" data-node="true" data-x="440" data-y="320" data-w="740" data-h="105">
+  <rect x="440" y="320" width="740" height="105" rx="18" class="node code"/>
+  <text x="464" y="359" class="heading">应用入口 → TaskRun / Sandbox</text>
+  <text x="464" y="395" class="body">校验题目、输入与授权；由应用装配 Controller 和运行资源</text>
+  </g>
+  <g id="context" data-node="true" data-x="440" data-y="480" data-w="740" data-h="125">
+  <rect x="440" y="480" width="740" height="125" rx="18" class="node code"/>
+  <text x="464" y="519" class="heading">ContextBuilder · 有界上下文</text>
+  <text x="464" y="555" class="body">题目、已提交 Fact、执行记录与分类失败；按来源引用</text>
+  <text x="464" y="588" class="body">过程总结经 C 回流并保留“模型总结”身份</text>
+  </g>
+  <g id="outer-llm" data-node="true" data-x="440" data-y="660" data-w="740" data-h="160">
+  <rect x="440" y="660" width="740" height="160" rx="18" class="node model"/>
+  <text x="464" y="699" class="heading">外层 LLM · 规划 / 复盘 / 过程提炼</text>
+  <text x="464" y="735" class="body">规划：提出 Turn 目标/标准与有序 Intent 候选</text>
+  <text x="464" y="768" class="body">复盘：Turn 首尾；轮内仅被触发且 Action 已保存</text>
+  <text x="464" y="801" class="body">总结：提炼带来源引用的 Process_Fact 候选</text>
+  </g>
+  <g id="proposal-gate" data-node="true" data-x="440" data-y="875" data-w="740" data-h="155">
+  <rect x="440" y="875" width="740" height="155" rx="18" class="node code"/>
+  <text x="464" y="914" class="heading">候选审计与可信校验 → Controller</text>
+  <text x="464" y="950" class="body">校验结构、来源、状态、授权、预算与规则匹配</text>
+  <text x="464" y="979" class="body">建议绑定当前 Intent 或 Turn，范围结束即失效</text>
+  <text x="464" y="1008" class="body">不扩授权 / 预算 / Deadline；目标调整开新 Turn</text>
+  </g>
+  <g id="supervisor" data-node="true" data-x="440" data-y="1075" data-w="740" data-h="155">
+  <rect x="440" y="1075" width="740" height="155" rx="18" class="node code"/>
+  <text x="464" y="1114" class="heading">RunSupervisor · 唯一可信调度</text>
+  <text x="464" y="1150" class="body">串行选择实现同一 Turn 目标的 Intent 候选路径</text>
+  <text x="464" y="1178" class="body">当前 Intent 的状态推进须经 Controller</text>
+  <text x="464" y="1206" class="body">模型建议不直接选择执行、写状态或宣告成功</text>
+  </g>
+  <g id="inner-llm" data-node="true" data-x="440" data-y="1270" data-w="740" data-h="130">
+  <rect x="440" y="1270" width="740" height="130" rx="18" class="node solver"/>
+  <text x="464" y="1309" class="heading">内层 LLM · 当前 Intent 的 Plan / Action</text>
+  <text x="464" y="1345" class="body">根据已选 Intent、可见证据与已接受约束提出动作</text>
+  <text x="464" y="1378" class="body">不生成 Intent 列表；可请求复盘，不授予权限</text>
+  </g>
+  <g id="step-gate" data-node="true" data-x="440" data-y="1455" data-w="740" data-h="180">
+  <rect x="440" y="1455" width="740" height="180" rx="18" class="node code"/>
+  <text x="464" y="1494" class="heading">可信动作边界 · 审计 / 校验 / 准入</text>
+  <text x="464" y="1530" class="body">检查动作、状态、授权、预算、取消与 Deadline</text>
+  <text x="464" y="1559" class="body">仅受触发时复盘，且 Action 结果与证据已保存</text>
+  <text x="464" y="1588" class="body">切换前停止 Intent 进程；未确认则进入恢复边界</text>
+  <text x="464" y="1617" class="body">无安全授权路径时保存证据、报告未完成并停止</text>
+  </g>
+  <g id="execution-call" data-node="true" data-x="440" data-y="1645" data-w="740" data-h="115">
+  <rect x="440" y="1645" width="740" height="115" rx="18" class="node runtime"/>
+  <text x="464" y="1684" class="heading">受控执行 → 子图 E</text>
+  <text x="464" y="1720" class="body">专用 MCP 或直接 Bash；均经 Policy 进入同一 Sandbox</text>
+  </g>
+  <g id="fact-verification" data-node="true" data-x="440" data-y="1815" data-w="740" data-h="165">
+  <rect x="440" y="1815" width="740" height="165" rx="18" class="node data"/>
+  <text x="464" y="1854" class="heading">可信分类 / 证据验证 → Controller 提交</text>
+  <text x="464" y="1890" class="body">分类 V 的执行记录；非执行动作复核已有证据</text>
+  <text x="464" y="1923" class="body">按已声明后置条件验证，成立才提交 verified ResultFact</text>
+  <text x="464" y="1956" class="body">Intent 完成另行复核：当前目标、支持 Fact 与归属</text>
+  </g>
+  <g id="routing" data-node="true" data-x="440" data-y="2035" data-w="740" data-h="205">
+  <rect x="440" y="2035" width="740" height="205" rx="18" class="node code"/>
+  <text x="464" y="2074" class="heading">可信路由 · 先复盘，再按已提交状态决策</text>
+  <text x="464" y="2110" class="body">触发时在 Action 结束、结果与证据保存后复盘</text>
+  <text x="464" y="2141" class="body">可继续、切换兄弟 Intent，或结束旧 Plan 重规划</text>
+  <text x="464" y="2172" class="body">未执行部分进入新 Plan；策略放弃与目标不匹配分开</text>
+  <text x="464" y="2203" class="body">Turn 首尾复盘；调整目标须创建下一 Turn</text>
+  </g>
+  <path data-from="entry" data-to="context" d="M810 425 V480" class="edge"/>
+  <path data-from="context" data-to="outer-llm" d="M810 605 V660" class="edge"/>
+  <path data-from="outer-llm" data-to="proposal-gate" d="M810 820 V875" class="edge"/>
+  <path data-from="proposal-gate" data-to="supervisor" d="M810 1030 V1075" class="edge"/>
+  <path data-from="supervisor" data-to="inner-llm" d="M810 1230 V1270" class="edge"/>
+  <path data-from="inner-llm" data-to="step-gate" d="M810 1400 V1455" class="edge"/>
+  <path data-from="step-gate" data-to="execution-call" d="M810 1605 V1645" class="edge"/>
+  <path data-from="fact-verification" data-to="routing" d="M810 1980 V2035" class="edge"/>
+  <text x="810" y="1793" class="small" text-anchor="middle">经 E 子图保存记录后，从 V 返回</text>
+  <path data-from="step-gate" data-to="fact-verification" d="M440 1530 H395 V1920 H440" class="edge"/>
+  <text x="379" y="1730" class="label" text-anchor="middle" transform="rotate(-90 379 1730)">非执行动作：记录 / 复核</text>
+  <path data-from="routing" data-to="inner-llm" d="M440 2085 H340 V1335 H440" class="edge"/>
+  <text x="317" y="1730" class="label" text-anchor="middle" transform="rotate(-90 317 1730)">当前 Intent 继续</text>
+  <path data-from="routing" data-to="supervisor" d="M440 2145 H240 V1145 H440" class="edge"/>
+  <text x="217" y="1690" class="label" text-anchor="middle" transform="rotate(-90 217 1690)">Intent 级否定证明 → 下一候选</text>
+  <path data-from="routing" data-to="context" d="M440 2205 H140 V542 H440" class="edge"/>
+  <text x="117" y="1510" class="label" text-anchor="middle" transform="rotate(-90 117 1510)">被触发时 / Turn 首尾：外层复盘与下一步规划</text>
+  <g id="context-summary-in" data-port="C">
+    <circle cx="1250" cy="512" r="21" class="port"/>
+  <text x="1250" y="520" class="port-text">C</text>
+  <text x="1285" y="519" class="small">总结引用</text>
+  </g>
+  <path data-from="context-summary-in" data-to="context" d="M1229 512 H1180" class="edge-data"/>
+  <g id="review-in" data-port="R">
+    <circle cx="1250" cy="570" r="21" class="port"/>
+  <text x="1250" y="578" class="port-text">R</text>
+  <text x="1285" y="577" class="small">Turn 首尾 / 触发</text>
+  </g>
+  <path data-from="review-in" data-to="context" d="M1229 570 H1180" class="edge"/>
+  <g id="proposal-stop" data-port="S">
+    <circle cx="1250" cy="945" r="21" class="port"/>
+  <text x="1250" y="953" class="port-text">S</text>
+  <text x="1285" y="952" class="small">拒绝 / 异常</text>
+  </g>
+  <path data-from="proposal-gate" data-to="proposal-stop" d="M1180 945 H1229" class="edge"/>
+  <g id="review-out" data-port="R">
+    <circle cx="1250" cy="1500" r="21" class="port"/>
+  <text x="1250" y="1508" class="port-text">R</text>
+  <text x="1285" y="1507" class="small">内层复盘请求</text>
+  </g>
+  <path data-from="step-gate" data-to="review-out" d="M1180 1500 H1229" class="edge"/>
+  <g id="step-stop" data-port="S">
+    <circle cx="1250" cy="1560" r="21" class="port"/>
+  <text x="1250" y="1568" class="port-text">S</text>
+  <text x="1285" y="1567" class="small">阻断 / 停止</text>
+  </g>
+  <path data-from="step-gate" data-to="step-stop" d="M1180 1560 H1229" class="edge"/>
+  <g id="execution-out" data-port="E">
+    <circle cx="1250" cy="1705" r="21" class="port"/>
+  <text x="1250" y="1713" class="port-text">E</text>
+  <text x="1285" y="1712" class="small">执行展开</text>
+  </g>
+  <path data-from="execution-call" data-to="execution-out" d="M1180 1705 H1229" class="edge"/>
+  <g id="observation-in" data-port="V">
+    <circle cx="1250" cy="1885" r="21" class="port"/>
+  <text x="1250" y="1893" class="port-text">V</text>
+  <text x="1285" y="1892" class="small">记录返回</text>
+  </g>
+  <path data-from="observation-in" data-to="fact-verification" d="M1229 1885 H1180" class="edge"/>
+  <g id="verification-stop" data-port="S">
+    <circle cx="1250" cy="1950" r="21" class="port"/>
+  <text x="1250" y="1958" class="port-text">S</text>
+  <text x="1285" y="1957" class="small">异常 / 未知</text>
+  </g>
+  <path data-from="fact-verification" data-to="verification-stop" d="M1180 1950 H1229" class="edge"/>
+  <g id="goal-out" data-port="G">
+    <circle cx="1250" cy="2090" r="21" class="port"/>
+  <text x="1250" y="2098" class="port-text">G</text>
+  <text x="1285" y="2097" class="small">目标评估</text>
+  </g>
+  <path data-from="routing" data-to="goal-out" d="M1180 2090 H1229" class="edge"/>
+  <g id="routing-stop" data-port="S">
+    <circle cx="1250" cy="2145" r="21" class="port"/>
+  <text x="1250" y="2153" class="port-text">S</text>
+  <text x="1285" y="2152" class="small">暂停 / 终止</text>
+  </g>
+  <path data-from="routing" data-to="routing-stop" d="M1180 2145 H1229" class="edge"/>
+  <g id="goal-return" data-port="D">
+    <circle cx="1250" cy="2205" r="21" class="port"/>
+  <text x="1250" y="2213" class="port-text">D</text>
+  <text x="1285" y="2212" class="small">评估返回</text>
+  </g>
+  <path data-from="goal-return" data-to="routing" d="M1229 2205 H1180" class="edge"/>
+  <rect x="1510" y="215" width="840" height="890" rx="24" class="panel"/>
+  <text x="1540" y="261" class="section">Process_Fact · 当前 TaskRun 的过程总结</text>
+  <text x="1540" y="316" class="body">外层 LLM 负责规划、复盘和过程提炼。</text>
+  <text x="1540" y="357" class="body">命令、输出、Execution 和证据由代码记录。</text>
+  <text x="1540" y="398" class="body">Process_Fact 引用来源，不能替代原始证据。</text>
+  <rect x="1540" y="449" width="780" height="130" rx="14" class="node pending"/>
+  <text x="1564" y="486" class="heading">原则已确认 · 字段待冻结</text>
+  <text x="1564" y="523" class="body">有新增执行信息的成功复盘后提炼；失败不阻断。</text>
+  <text x="1564" y="556" class="small">历史保留并追加版本；适用性按对象版本判断。</text>
+  <g id="summary-validation" data-node="true" data-x="1540" data-y="670" data-w="780" data-h="155">
+  <rect x="1540" y="670" width="780" height="155" rx="18" class="node data"/>
+  <text x="1564" y="709" class="heading">Process_Fact 候选 → 来源 / 归属校验</text>
+  <text x="1564" y="745" class="body">接收外层 LLM 提炼的带来源总结候选</text>
+  <text x="1564" y="778" class="body">检查所引用记录及当前 TaskRun 的归属</text>
+  <text x="1564" y="811" class="body">引用有效不等于总结中的每项判断已经得到证明</text>
+  </g>
+  <path data-from="outer-llm" data-to="summary-validation" d="M1180 740 H1540" class="edge-data"/>
+  <text x="1330" y="716" class="label" text-anchor="middle">总结候选</text>
+  <g id="process-summary" data-node="true" data-x="1540" data-y="880" data-w="780" data-h="155">
+  <rect x="1540" y="880" width="780" height="155" rx="18" class="node data"/>
+  <text x="1564" y="919" class="heading">Process_Fact 独立保存</text>
+  <text x="1564" y="955" class="body">与 verified ResultFact 分开；仅总结当前 TaskRun</text>
+  <text x="1564" y="988" class="body">引用来源；冲突显式呈现；经 C 进入后续上下文</text>
+  <text x="1564" y="1021" class="body">凭据脱敏；不据此宣告成功或执行脚本</text>
+  </g>
+  <path data-from="summary-validation" data-to="process-summary" d="M1930 825 V880" class="edge-data"/>
+  <g id="summary-context-out" data-port="C">
+    <circle cx="1930" cy="1070" r="21" class="port"/>
+  <text x="1930" y="1078" class="port-text">C</text>
+  </g>
+  <path data-from="process-summary" data-to="summary-context-out" d="M1930 1035 V1049" class="edge-data"/>
+  <rect x="1510" y="1145" width="840" height="450" rx="24" class="panel"/>
+  <text x="1540" y="1191" class="section">GoalEvaluator · 整体目标验证边界</text>
+  <g id="goal-evaluator" data-node="true" data-x="1570" data-y="1230" data-w="650" data-h="165">
+  <rect x="1570" y="1230" width="650" height="165" rx="18" class="node data"/>
+  <text x="1594" y="1269" class="heading">注册规则 · 可信目标验证</text>
+  <text x="1594" y="1305" class="body">外层选择规则并参数化；代码按证据执行</text>
+  <text x="1594" y="1338" class="body">验证结果返回；控制状态仍由 Controller 提交</text>
+  <text x="1594" y="1371" class="body">无匹配规则或证据不足 → 未完成 / 未评估</text>
+  </g>
+  <g id="goal-in" data-port="G">
+    <circle cx="1510" cy="1310" r="21" class="port"/>
+  <text x="1510" y="1318" class="port-text">G</text>
+  </g>
+  <path data-from="goal-in" data-to="goal-evaluator" d="M1531 1310 H1570" class="edge"/>
+  <g id="decision-out" data-port="D">
+    <circle cx="2280" cy="1310" r="21" class="port"/>
+  <text x="2280" y="1318" class="port-text">D</text>
+  </g>
+  <path data-from="goal-evaluator" data-to="decision-out" d="M2220 1310 H2259" class="edge"/>
+  <text x="1540" y="1452" class="body">Fact 验证、Intent 成功、Turn 完成与 TaskRun 达成分开。</text>
+  <text x="1540" y="1495" class="body">候选答案未验证时保持 pending。</text>
+  <text x="1540" y="1538" class="body">模型自述和 Process_Fact 不能替代独立验证。</text>
+  <rect x="1510" y="1635" width="840" height="655" rx="24" class="panel"/>
+  <text x="1540" y="1681" class="section">S  生命周期、异常与结果</text>
+  <text x="1540" y="1716" class="small">此边界适用于全部阶段；图中 S 圆点表示共享停止入口。</text>
+  <g id="safe-stop" data-node="true" data-x="1570" data-y="1750" data-w="740" data-h="240">
+  <rect x="1570" y="1750" width="740" height="240" rx="18" class="node stop"/>
+  <text x="1594" y="1789" class="heading">可信结束 / 停止 / 显式恢复</text>
+  <text x="1594" y="1825" class="body">默认低影响；状态变更需明确授权；禁止破坏性操作</text>
+  <text x="1594" y="1856" class="body">无授权内安全路径时保存证据、报告未完成并停止</text>
+  <text x="1594" y="1887" class="body">未知优先待核实；取消 / Deadline 禁止新派发</text>
+  <text x="1594" y="1918" class="body">环境故障、目标不匹配与策略放弃分别报告</text>
+  <text x="1594" y="1949" class="body">刷新后受限再生成；规划 / 动作每请求最多一次</text>
+  </g>
+  <g id="stop-in" data-port="S">
+    <circle cx="1510" cy="1830" r="21" class="port"/>
+  <text x="1510" y="1838" class="port-text">S</text>
+  </g>
+  <path data-from="stop-in" data-to="safe-stop" d="M1531 1830 H1570" class="edge"/>
+  <g id="task-result" data-node="true" data-x="1570" data-y="2010" data-w="740" data-h="220">
+  <rect x="1570" y="2010" width="740" height="220" rx="18" class="node code"/>
+  <text x="1594" y="2049" class="heading">Controller → TaskResult / 停止报告</text>
+  <text x="1594" y="2085" class="body">终态提交并成功重载 → 关闭执行准入 → 清理资源</text>
+  <text x="1594" y="2119" class="body">暂停 / 未知保留恢复所需状态与证据，不冒充成功</text>
+  <text x="1594" y="2153" class="body">分别报告观察 Fact、Intent 状态与整体目标</text>
+  <text x="1594" y="2187" class="body">清理未知先核实原资源；清理状态独立报告</text>
+  </g>
+  <path data-from="safe-stop" data-to="task-result" d="M1940 1990 V2010" class="edge"/>
+  <rect x="50" y="2340" width="2300" height="645" rx="24" class="panel"/>
+  <text x="80" y="2386" class="section">B  受控执行展开 · 对应主图 E → V</text>
+  <text x="80" y="2421" class="small">按动作类型择一路径：专用工具经 MCP 获取命令；通用 Bash 直达 Sandbox。两路都受 Policy 与授权约束。</text>
+  <g id="tool-gateway" data-node="true" data-x="160" data-y="2480" data-w="350" data-h="110">
+  <rect x="160" y="2480" width="350" height="110" rx="18" class="node code"/>
+  <text x="184" y="2519" class="heading">ToolGateway</text>
+  <text x="184" y="2555" class="body">显式专用工具请求</text>
+  </g>
+  <g id="tool-policy" data-node="true" data-x="565" data-y="2480" data-w="350" data-h="110">
+  <rect x="565" y="2480" width="350" height="110" rx="18" class="node code"/>
+  <text x="589" y="2519" class="heading">Policy · 请求校验</text>
+  <text x="589" y="2555" class="body">工具 / 输入 / 目标范围</text>
+  </g>
+  <g id="mcp-planner" data-node="true" data-x="970" data-y="2480" data-w="400" data-h="110">
+  <rect x="970" y="2480" width="400" height="110" rx="18" class="node code"/>
+  <text x="994" y="2519" class="heading">MCP Planner / Adapter</text>
+  <text x="994" y="2555" class="body">取得实际命令；不拥有控制面</text>
+  </g>
+  <g id="command-policy" data-node="true" data-x="1425" data-y="2480" data-w="365" data-h="110">
+  <rect x="1425" y="2480" width="365" height="110" rx="18" class="node code"/>
+  <text x="1449" y="2519" class="heading">Policy · 实际命令校验</text>
+  <text x="1449" y="2555" class="body">执行前重新检查权限</text>
+  </g>
+  <g id="bash-gateway" data-node="true" data-x="160" data-y="2650" data-w="350" data-h="110">
+  <rect x="160" y="2650" width="350" height="110" rx="18" class="node code"/>
+  <text x="184" y="2689" class="heading">T6CommandGateway</text>
+  <text x="184" y="2725" class="body">显式结构化 Bash 请求</text>
+  </g>
+  <g id="bash-policy" data-node="true" data-x="565" data-y="2650" data-w="350" data-h="110">
+  <rect x="565" y="2650" width="350" height="110" rx="18" class="node code"/>
+  <text x="589" y="2689" class="heading">Policy · 命令校验</text>
+  <text x="589" y="2725" class="body">授权 / 目录 / 预算</text>
+  </g>
+  <g id="bash-direct" data-node="true" data-x="970" data-y="2650" data-w="820" data-h="110">
+  <rect x="970" y="2650" width="820" height="110" rx="18" class="node code"/>
+  <text x="994" y="2689" class="heading">直接 Bash 路径</text>
+  <text x="994" y="2725" class="body">通过受控运行接口派发；不经过 MCP</text>
+  </g>
+  <g id="sandbox" data-node="true" data-x="1850" data-y="2480" data-w="450" data-h="280">
+  <rect x="1850" y="2480" width="450" height="280" rx="18" class="node runtime"/>
+  <text x="1874" y="2519" class="heading">TaskRun 专属 Sandbox</text>
+  <text x="1874" y="2555" class="body">当前 TaskRun 的实际命令执行出口</text>
+  <text x="1874" y="2594" class="body">所有 Turn / Intent 共用</text>
+  <text x="1874" y="2633" class="body">只访问授权规则覆盖的目标；发现不扩权</text>
+  <text x="1874" y="2672" class="body">Controller 持有生命周期控制权</text>
+  <text x="1874" y="2711" class="body">执行结果与停止状态必须可追溯</text>
+  </g>
+  <g id="execution-in" data-port="E">
+    <circle cx="100" cy="2535" r="21" class="port"/>
+  <text x="100" y="2543" class="port-text">E</text>
+  </g>
+  <path data-from="execution-in" data-to="tool-gateway" d="M121 2535 H160" class="edge"/>
+  <path data-from="execution-in" data-to="bash-gateway" d="M100 2556 V2705 H160" class="edge"/>
+  <path data-from="tool-gateway" data-to="tool-policy" d="M510 2535 H565" class="edge"/>
+  <path data-from="tool-policy" data-to="mcp-planner" d="M915 2535 H970" class="edge"/>
+  <path data-from="mcp-planner" data-to="command-policy" d="M1370 2535 H1425" class="edge"/>
+  <path data-from="command-policy" data-to="sandbox" d="M1790 2535 H1850" class="edge"/>
+  <path data-from="bash-gateway" data-to="bash-policy" d="M510 2705 H565" class="edge"/>
+  <path data-from="bash-policy" data-to="bash-direct" d="M915 2705 H970" class="edge"/>
+  <path data-from="bash-direct" data-to="sandbox" d="M1790 2705 H1850" class="edge"/>
+  <text x="160" y="2820" class="body">共同约束：副作用前固定动作 / 请求 ID、保存请求证据并提交 running Execution。</text>
+  <text x="160" y="2862" class="body">V 返回主图：执行观察 → 独立验证 / 提交。</text>
+  <text x="160" y="2904" class="body">原始输出不直接成为 Fact；无后置条件的观察不自动升级为 verified。</text>
+  <g id="execution-recorder" data-node="true" data-x="1850" data-y="2830" data-w="450" data-h="110">
+  <rect x="1850" y="2830" width="450" height="110" rx="18" class="node data"/>
+  <text x="1874" y="2869" class="heading">ExecutionRecorder</text>
+  <text x="1874" y="2905" class="body">输出 / Artifact / 收据与分类</text>
+  </g>
+  <path data-from="sandbox" data-to="execution-recorder" d="M2075 2760 V2830" class="edge"/>
+  <g id="observation-out" data-port="V">
+    <circle cx="1780" cy="2885" r="21" class="port"/>
+  <text x="1780" y="2893" class="port-text">V</text>
+  </g>
+  <path data-from="execution-recorder" data-to="observation-out" d="M1850 2885 H1801" class="edge"/>
+  <rect x="50" y="3035" width="1110" height="340" rx="24" class="panel"/>
+  <text x="80" y="3081" class="section">C  提交、证据可见与数据所有权</text>
+  <text x="80" y="3130" class="body">Controller 复核整组候选状态、证据及归属，再提交控制面。</text>
+  <text x="80" y="3173" class="body">SQLite 管结构、归属、状态、幂等、Checkpoint 与事务。</text>
+  <text x="80" y="3216" class="body">用户通过证据视图按引用查看来源、操作和验证状态；日志仅作诊断。</text>
+  <text x="80" y="3259" class="body">Fact / Process_Fact 链接证据；敏感明文仅经受保护视图按需查看。</text>
+  <text x="80" y="3302" class="body">重放不重复查询证据或执行副作用；跨 TaskRun 产物仅显式导入。</text>
+  <rect x="1200" y="3035" width="1150" height="340" rx="24" class="panel"/>
+  <text x="1230" y="3081" class="section">D4 已冻结 / 后续延期</text>
+  <text x="1230" y="3124" class="body">48 次开始：规划 4 / 动作 16 / 复盘 8 / 提炼 4。</text>
+  <text x="1230" y="3162" class="body">工具 6 / SHA 观察 4 / 共享 4 / 导入 2；不限制 Token / 费用。</text>
+  <text x="1230" y="3200" class="body">原 ID 恢复不重复消费；终态提交并重载后清理。</text>
+  <text x="1230" y="3238" class="body">D5 / D6：过程总结、证据查看、敏感保护与跨任务导入。</text>
+  <text x="1230" y="3276" class="body">Stage / Procedure / RAG 延期；转换器负责取题和提交。</text>
+  <text x="1230" y="3314" class="body">D4 仅内部 Fake 验收；公共入口与真实验收仍留 D7。</text>
+  <text x="60" y="3410" class="small">阅读顺序：A 控制闭环 → E / B 受控执行 → V 证据返回 → G / D 目标评估 → S 停止与结果；Process_Fact 为旁路数据。</text>
+</svg>

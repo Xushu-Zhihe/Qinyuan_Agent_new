@@ -4,10 +4,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Literal, Mapping, Protocol, runtime_checkable
 
 from agent_core.contracts import TaskRequest
-
 
 CONFIRMATION_WINDOW_SECONDS = 180
 
@@ -63,6 +62,15 @@ class TaskRunSandboxPort(SandboxPort, Protocol):
 
     def quiesce(self, sandbox_id: str) -> None:
         """Close execution admission before starting terminal cleanup."""
+
+
+@runtime_checkable
+class TaskRunSandboxInspectionPort(Protocol):
+    """Optional read-only presence query used before retrying uncertain cleanup."""
+
+    def inspect_presence(
+        self, task_run_id: str, sandbox_id: str
+    ) -> Literal["present", "absent", "unknown"]: ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -7,13 +7,13 @@ network semantics do not implement the TaskRun contract.
 
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
-import json
 from threading import Lock, RLock
+from typing import Iterator, Literal
 from uuid import UUID
-from typing import Iterator
 
 from docker.errors import APIError, NotFound
 from docker.utils import parse_bytes
@@ -209,6 +209,16 @@ class TaskRunSandbox:
                 (sandbox_id,),
                 original_error=exc,
             ) from exc
+
+    def inspect_presence(
+        self, task_run_id: str, sandbox_id: str
+    ) -> Literal["present", "absent", "unknown"]:
+        """Read resource presence without stopping, deleting, or retrying it."""
+        self._validate_task_id(task_run_id)
+        try:
+            return "absent" if self._inspect(task_run_id, sandbox_id) is None else "present"
+        except TaskRunSandboxError:
+            return "unknown"
 
     def _verify_active(self, task_run_id: str, sandbox_id: str) -> None:
         try:
