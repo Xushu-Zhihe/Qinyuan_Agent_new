@@ -36,6 +36,7 @@ from agent_core.observation_proof import (
     T6ObservationProofEvidencePort,
     observation_fact_content,
 )
+from agent_core.artifact_proofs import D3ObservationProofVerifier, d3_fact_content
 
 
 MAX_CONTEXT_FACTS = 64
@@ -64,11 +65,13 @@ class ControlStateRepository:
         execution_evidence: ExecutionEvidencePort,
         file_type_proofs: FileTypeProofEvidencePort | None = None,
         t6_observation_proofs: T6ObservationProofEvidencePort | None = None,
+        d3_observation_proofs: D3ObservationProofVerifier | None = None,
     ) -> None:
         self._store = store
         self._execution_evidence = execution_evidence
         self._file_type_proofs = file_type_proofs
         self._t6_observation_proofs = t6_observation_proofs
+        self._d3_observation_proofs = d3_observation_proofs
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None:
         return self._store.load_task_run(task_run_id)
@@ -113,6 +116,10 @@ class ControlStateRepository:
                         change.source_ref, change.verification_ref.removeprefix("t6:")
                     ) if change.verification_ref is not None
                     and change.verification_ref.startswith("t6:")
+                    else self._verified_d3_evidence(
+                        change.source_ref, change.verification_ref.removeprefix("d3:")
+                    ) if change.verification_ref is not None
+                    and change.verification_ref.startswith("d3:")
                     else self._verified_file_type_evidence(
                         change.source_ref, change.verification_ref
                     )
@@ -124,7 +131,7 @@ class ControlStateRepository:
                 if change.status is FactStatus.VERIFIED and (
                     evidence.task_run_id != rows.task_run.task_run_id
                     or (evidence.target_ref not in targets
-                        and not (change.verification_ref or "").startswith("t6:"))
+                        and not (change.verification_ref or "").startswith(("t6:", "d3:")))
                     or not rows.task_run.started_at <= evidence.observed_at <= rows.task_run.deadline_at
                 ):
                     raise StorageError("verified Fact evidence is outside its TaskRun scope or time range")
@@ -142,6 +149,16 @@ class ControlStateRepository:
             return self._t6_observation_proofs.lookup(execution_id, proof_id)
         except Exception as exc:
             raise StorageError("T6 observation proof evidence is unavailable") from exc
+
+    def _verified_d3_evidence(
+        self, execution_id: str, proof_id: str
+    ) -> ExecutionEvidence:
+        if self._d3_observation_proofs is None:
+            raise StorageError("D3 observation proof evidence is not configured")
+        try:
+            return self._d3_observation_proofs.read_verified(execution_id, proof_id)[1]
+        except Exception as exc:
+            raise StorageError("D3 observation proof evidence is unavailable") from exc
 
     def load_control_state(
         self,
@@ -258,7 +275,10 @@ class ControlStateRepository:
             if registered_plan.intent_id not in intents:
                 raise StorageError("Plan references an unknown Intent")
             previous_status = plan_by_intent.get(registered_plan.intent_id)
-            if previous_status is not None and previous_status is not PlanStatus.COMPLETED:
+            if previous_status is not None and previous_status not in {
+                PlanStatus.COMPLETED,
+                PlanStatus.SUPERSEDED,
+            }:
                 raise StorageError("a later Plan follows an unfinished Plan")
             plan_by_intent[registered_plan.intent_id] = registered_plan.status
             registered_plan.to_domain()
@@ -361,6 +381,22 @@ class ControlStateRepository:
                 raise StorageError("Fact source Execution belongs to another Turn")
             fact.to_domain()
             if fact.verification_ref is not None:
+                if fact.verification_ref.startswith("d3:"):
+                    if self._d3_observation_proofs is None:
+                        raise StorageError("D3 observation proof evidence is not configured")
+                    proof, evidence = self._d3_observation_proofs.read_verified(
+                        fact.source_ref, fact.verification_ref.removeprefix("d3:")
+                    )
+                    if (
+                        fact.status is not FactStatus.VERIFIED
+                        or proof.intent_id != source_intent.intent_id
+                        or proof.turn_id != fact.turn_id
+                        or proof.task_run_id != task_run_id
+                        or fact.content != d3_fact_content(proof.proof_id)
+                        or evidence.task_run_id != task_run_id
+                    ):
+                        raise StorageError("D3 observation Fact proof does not match control state")
+                    continue
                 if fact.verification_ref.startswith("t6:"):
                     if self._t6_observation_proofs is None:
                         raise StorageError("T6 observation proof evidence is not configured")

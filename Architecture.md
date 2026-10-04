@@ -2,13 +2,45 @@
 
 ## 依据与状态
 
-本文整理 `Qinyuan_Agent_confirmed_flow.svg`、仓库中已经验证的实现及明确标注的后续已确认边界。
+本文以 `Qinyuan_Agent_dual_llm_flow.svg` 作为当前目标架构，区分已经确认的设计、当前代码实现和仍待冻结的接口。`Qinyuan_Agent_confirmed_flow.svg` 是较早且不完整的架构图，不再代表双 LLM 的目标分工。
 
 2026-09-24 用户确认本项目定位为独立的自动化渗透测试 Agent。T5 分为 CLI/事件模拟检查点和真实单 Intent 文件识别两个阶段，真实模型、真实 Docker 与实际附件链路是最终验收目标；完整 TaskRun 调度及真实单题解题闭环留在 T6。后续独立转换器负责多题目获取、调用 Agent 和平台 flag 提交。该决定已同步至流程图，替代原图中可选 qinyuan-bat 转接入口的旧约定。
 
-首期控制链描述设计目标，尚未完成端到端链路。2026-09-11 用户依据已有实现及 `323 passed` 记录确认 T3 的 `ToolGateway -> Policy -> MCP -> Sandbox` 切片验收通过；真实 Docker、完整 Agent 链路、其他 MCP、Fact 验证、GoalEvaluator、CLI 均不计入 T3 完成。完整流程图中的 Stage、Procedure 和 RAG 相关能力仍是后续设计边界，不能从图形位置推导出未确认的业务规则。
+2026-10-01 已确认双 LLM 框架的高层职责、Turn/Intent 关系、复盘时机、可信验证、授权影响边界和证据可见原则；高层设计已足以按切片开展实现，但字段、错误、存储和对外协议仍须逐项冻结。该架构描述目标，不代表相应完整链路已经实现或验收。T3 的 `ToolGateway -> Policy -> MCP -> Sandbox` 已依据当时的实现和 `323 passed` 记录验收；Stage、Procedure、RAG 仍延期，不能从图形位置推导其业务规则。
 
-## 首期控制链
+## 双 LLM 目标架构（2026-10-01）
+
+`TaskRun` 接收可信入口提供的任务目标和不可变授权。外层 LLM 在创建 Turn 时提出该 Turn 的目标、完成标准候选以及有序 Intent 候选；这些 Intent 是实现同一 Turn 目标的备选路径，不是必须依次完成的子任务。可信代码校验目标的完成标准是否引用已注册且能力匹配的验证规则，并校验候选是否符合当前 TaskRun 的授权、预算和状态。Turn 注册后，其目标保持不变；需要调整目标时创建下一 Turn 表达。
+
+内层 LLM 只针对可信调度器选中的 Intent 生成 Plan / Action，不创建或重排 Turn 的 Intent 列表，也不能扩大目标、授权、总预算或 Deadline。Intent 之间按可信调度顺序串行执行，不并行争用同一 Sandbox。任一候选路径经证据和独立规则验证达到 Turn 目标，即可完成该 Turn；Fact 已验证、Intent 成功、Turn 完成和 TaskRun 总目标达成是不同层次的结论。
+
+复盘是外层 LLM 基于已注册的 Turn 目标、执行预期、已提交结果和可追溯证据，对“预期与实际发生了什么、证据支持什么、下一步如何处理”作出的有来源判断与策略建议；它不是对话式自我评价、可信验证或状态提交。Turn 开始和结束时复盘；Turn 内仅在可信代码按信号触发或内层 LLM 请求时复盘，且必须等当前 Action 结束并保存结果与证据。外层可建议继续当前 Intent、切换兄弟候选或重规划；可信代码校验其作用域与状态后应用。切换前须停止当前 Intent 的进程；无法确认停止时进入恢复边界。策略性放弃与证据确认目标不匹配分别记录。重规划结束旧 Plan 尚未执行的部分并创建新 Plan，不改写已发生的执行记录。当前 Turn 目标不因复盘建议而改变，目标调整通过新 Turn 表达。
+
+复盘或提案处理失败时，可信侧先刷新已提交状态与证据上下文，再按受限规则重试；确定性拒绝可受限重新生成，并保留原提案及拒绝记录，仍无效则暂停。过期提案丢弃，不得应用。模型调用结果未知时不自动重发，转入恢复边界。复盘输出的受限约束须显式绑定当前 Intent 或当前 Turn；绑定范围结束时失效，不能改变授权、TaskRun 总预算、Deadline 或已注册 Turn 目标。D2 已冻结首个可运行复盘切片；D3 已冻结内部多候选、重规划及下一 Turn 的窄契约，完整预算与真实环境仍按后续轮次验收。
+
+外层 LLM 可选择并参数化已注册的目标验证规则，但不能自行充当可信验证器。验证由受控代码或注册规则适配器依据证据执行；没有能力匹配的规则时，目标保持未完成/未评估，不能根据模型自述置为成功。可信侧拥有状态提交、授权、预算、Deadline 和副作用准入的最终控制权。
+
+`Process_Fact` 是外层 LLM 对当前 TaskRun 执行过程的带来源总结，与经过验证的 `ResultFact` 分开保存。只有成功复盘发现新增执行信息时才提炼；提炼失败不单独阻断执行。历史版本保留，适用性依据对象版本与验证规则判断，冲突显式呈现。总结引用证据但不替代证据，也不能据此宣告目标成功或执行脚本。
+
+证据是可追溯、可查看的正式产物，不只存在于日志。Fact 和 `Process_Fact` 均应能引用证据，用户能够从面向用户的证据视图查看来源、关联操作、验证状态及可展示的证据内容。普通日志、事件和 `Process_Fact` 对凭据等敏感值脱敏；明文只在受保护的敏感证据视图中按需查看，具体存储、访问控制和导出协议待后续冻结。
+
+工作区按 Intent 隔离；同一 TaskRun 内跨 Intent 或 Turn 共享产物必须显式引用来源，并保留原验证状态，不因复制而升级为 verified Fact。跨 TaskRun 复用须显式导入并保留来源；旧 TaskRun 的授权和验证结论不继承，须在新 TaskRun 的授权及验证规则下重新判断。TaskRun 总预算统一累计，操作另有局部限额，调用账目跨 Turn、Intent 切换和恢复持续累计。Agent 正常执行时不强制用户介入；授权范围内无安全可行路径时，保存证据、报告未完成并停止。
+
+## 当前实现与分阶段验收边界
+
+2026-10-02 D0 已完成基线核对及 D1 最小契约确认，见 [D0_baseline_and_D1_contract.md](D0_baseline_and_D1_contract.md)。D1 内部实现现由 `D1Application` 装配 `D1SingleTurnRunner`、两个独立配置的模型角色、导入/副本准备、固定摘要观察、受限命令 Gateway、证据复核器及 Controller；验收状态以本轮 TODO 记录为准，源码接线不等同测试通过。链路只证明一个本地附件在独立 Intent 目录内的副本于首次可信摘要观察时与绑定导入收据一致：外层提出规则/单候选，可信侧固定摘要，内层仅提出固定检查。Fact、Intent、Turn 只读复核同一份保存证据，不重复读文件，不证明后来版本；TaskRun 整题仍为 `not_evaluated`。成功后 Turn 为 `completed`，TaskRun 保持 `running`，派发停止，Sandbox 与证据保留，不自动创建下一 Turn。旧运行保留原链路；D1 为本地 Fake 模型/Fake Sandbox 验收，真实模型、真实 Docker、目标网络与 D7 公共 CLI/工作台接入仍未验收。
+
+D2 已在 D1 内部链上接入可恢复复盘；`D2Application` 只装配显式标记的新 D2 TaskRun，不改变 D1 或公共入口。Turn 首复盘在 Intent 选定后、首个内层动作前；Action 复盘由内层请求、可信 `not_satisfied` 或可信动作拒绝触发；尾复盘在可信验证并提交 `Turn.completed` 后只读执行。每个复盘归属最多两次外层调用，TaskRun 内最多八次；调用开始先持久记账，失败/未知不重发，已知响应应用中断时复用原响应和 Controller mutation。SQLite schema 12 原子保存 D2 身份、复盘应用、generation、约束版本及暂停门；原始响应和已保存来源版本摘要留在证据台账。`allowed_action_kinds` 取许可交集，`max_action_timeout_seconds` 仅收紧工具动作上限；确定性拒绝仍然拒绝，不制造 Execution。内部 Fake 模型/Fake Sandbox 与恢复验收见 [D2_acceptance.md](D2_acceptance.md)；真实模型、Docker、目标网络和公共 CLI/工作台仍未验收。
+
+D3 只装配显式新建的内部 `D3Application` TaskRun：启动时冻结并导入一至两个授权本地附件，每 Turn 最多两个同目标候选、全运行最多两个 Turn。可信调度器串行选择 Intent；内层只能提固定的两步大小/SHA-256 或单步 SHA-256 Plan，可信侧准备不可覆盖的版本化副本、固定程序与证据。新观察按独立证明、verified Fact、内层 `complete_intent` 分层完成；跨 Plan 复用只保存对原证明和 Fact 的支持引用。成功候选与未尝试兄弟的 `skipped` 在一个 Controller 事务提交，Turn 完成后只读尾复盘、停止本切片派发，TaskRun 仍为 `running/not_evaluated`。
+
+D3 的 `switch_sibling_intent` 须先保存有来源的外层建议及可信接受，再确认 Action 证据、无未决结果和按 Intent 停进程收据；停止未知不启动兄弟。策略放弃与独立的 Intent 级 `target_mismatch` 分开，固定 `attachment_copy_sha256` v1 不能否定整个 Intent，已读回副本的大小或摘要后来变化均是完整性异常而非普通 `not_satisfied`。主动调整目标先校验下一 Turn 提案并确认停止，再原子提交旧 Turn `superseded`、剩余候选 `skipped` 和新 Turn 注册。显式共享按精确来源版本复制、读回并保存清单；接收副本不自动成为 Fact。副本、共享或停止的原调用结果丢失时，只读核查不补签原操作收据、不重派。D3 的 Fake 验收与保留边界见 [D3_acceptance.md](D3_acceptance.md)。
+
+以下首期控制链与后续 T1-T6 小节描述的是既有应用链路和阶段验收记录；其中的 direct `ModelReasoner` 不代表 D1 双角色实现，也不应与 D1 内部链路混同。历史验收数字不构成 D1 或新目标架构的验收。
+
+D1 的确认范围已完成内部模拟验收：D1/旧模型专项 98 项、共享控制面/旧链回归 246 项通过，证据见 [D1_acceptance.md](D1_acceptance.md)。模型共享供应商无关传输端口但固定独立角色配置；请求原 envelope、拒绝来源、应用记录和历史证明分别保存并在恢复时核对。证据复核在 Controller attach 前也能通过保存快照只读执行；结果复核失败保留历史状态并明确恢复要求。流程仍对应 SVG 的 D1 主路径，无新增职责或控制流，未改图。
+
+## 首期控制链（当前代码路径）
 
 ```text
 CLI
@@ -121,7 +153,7 @@ StagePlanner、ProcedureSelector、ProcedureRunner 和 RAG 只保留边界。它
 
 自动重载失败后，当前 Registry 所有者可调用 `reload_state()`，经 Repository 重新读取并复核完整状态和外部证据，成功后恢复缓存。该入口不写库、不调用 Sandbox；终态清理和释放注册仍分别调用 `cleanup_sandbox()`、`close()`。失败保留缓存失效及现有所有权，业务重放不承担恢复职责。
 
-SQLite 保存 `TaskRun / Turn / Intent / Plan / PlanStep / Execution / Fact / FailureSummary / PlanValidationRecord / RuntimeEvent / Checkpoint`；schema 2 增加一对一 `intent_goals` 表，schema 3 为 TaskRun 增加可空且不可变的 `source_root`，schema 4 为 Fact 增加不可变、可空的 `verification_ref`，schema 5 增加独立的 `model_invocations` 调用台账，schema 6 增加 `intent_plan_applications` 和 `intent_action_applications`，在副作用前固定 Plan、ToolRequest、证明、Fact 与 mutation ID；schema 7 增加目标网络绑定，schema 8 增加轮级 `turn_model_invocations` 台账，schema 9 允许同一 Intent 串行保存多个有序短 Plan，schema 10 增加 T6 模型动作元数据台账，固定上下文摘要与资源 ID，结果只存证据摘要。旧库逐版原子迁移并保留原记录；旧 Intent 不自动补目标，旧 TaskRun 不补猜来源目录，旧 Fact 不补造证明，旧模型调用不回填。控制状态、一个事件和一个 Checkpoint 在同一事务提交；模型调用开始/完成在独立事务记录，不推进控制面 Checkpoint。数据库不保存实际 command、stdout/stderr、附件内容、Token、T6 脚本、stdin、候选原文或模型原始响应。
+SQLite 保存 `TaskRun / Turn / Intent / Plan / PlanStep / Execution / Fact / FailureSummary / PlanValidationRecord / RuntimeEvent / Checkpoint`；schema 2 增加一对一 `intent_goals` 表，schema 3 为 TaskRun 增加可空且不可变的 `source_root`，schema 4 为 Fact 增加不可变、可空的 `verification_ref`，schema 5 增加独立的 `model_invocations` 调用台账，schema 6 增加 `intent_plan_applications` 和 `intent_action_applications`，在副作用前固定 Plan、ToolRequest、证明、Fact 与 mutation ID；schema 7 增加目标网络绑定，schema 8 增加轮级 `turn_model_invocations` 台账，schema 9 允许同一 Intent 串行保存多个有序短 Plan，schema 10 增加 T6 模型动作元数据台账，固定上下文摘要与资源 ID，结果只存证据摘要；schema 11 增加 D1 的 `d1_runs`、`d1_turn_bindings`、`d1_turn_proofs` 与 `d1_operations`；schema 12 增加 D2 TaskRun 身份和追加式复盘应用记录；schema 13 增加 D3 运行配置、Turn/Intent/Plan 绑定、Plan 结果、分类结果、操作账目及复盘应用。旧运行不补造 D1/D2/D3 身份或台账；schema 10/11/12/13 可只读查看且不写库。控制状态、一个事件、Checkpoint 与对应复盘应用或 D3 绑定/结果在同一事务提交；原始响应及来源证据留在证据台账。数据库不保存实际 command、stdout/stderr、附件内容、Token、T6 脚本、stdin、候选原文或模型原始响应。
 
 T6-5 外层入口为 `run-task` v2：`TaskApplication` 将受审计的有序 Intent 生成、`RunSupervisor`、`IncrementalIntentRunner`、通用脚本 Gateway、短 Plan 条件验证与候选证据组装在同一 TaskRun 内。模拟和真实模式共用控制状态及证据规则；T6-6 接入单一公网目标的 TaskRun 专属隔离转发，零附件目标题也可启动。`TaskResult` 从只读控制快照与证据重建，区分 verified 观察 Fact、pending 候选、暂停、恢复要求和清理结果；无独立答案校验器时整体目标固定为 `not_evaluated`。工作台已接入该 `run-task --mode real`，只负责启动、取消和只读投影，不拥有或改写控制面状态。真实目标网络待用户验收。
 

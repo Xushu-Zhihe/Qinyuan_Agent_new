@@ -10,7 +10,7 @@ from agent_core.command_contracts import T6CommandRecorderPort
 from agent_core.control_store import ControlStateSnapshot, canonical_json
 from agent_core.domain import EXECUTION_TERMINAL_STATUSES
 
-MAX_RECENT_EXECUTIONS = 8
+MAX_RECENT_EXECUTIONS = 20
 MAX_OBSERVATION_CONTEXT_BYTES = 16 * 1024
 
 

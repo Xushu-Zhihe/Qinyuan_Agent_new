@@ -321,29 +321,36 @@ class Workbench:
             return self._get(db, challenge_id)
 
     def purge(self, challenge_id, confirmation):
-        with self.lock, self._db() as db:
-            current = self._get(db, challenge_id)
-            if current["status"] in ACTIVE_RUN_STATUSES or not current["archived"]:
-                raise WorkbenchError("archive_terminal_challenge_first", HTTPStatus.CONFLICT)
-            if confirmation != current["title"]:
-                raise WorkbenchError("confirmation_title_mismatch")
-            for item in current["attachments"]:
-                path = self.uploads / challenge_id / item["id"]
-                if path.is_symlink():
-                    raise WorkbenchError("attachment_path_rejected", HTTPStatus.CONFLICT)
+        with self.lock:
+            with self._db() as db:
+                current = self._get(db, challenge_id)
+                if current["status"] in ACTIVE_RUN_STATUSES or not current["archived"]:
+                    raise WorkbenchError("archive_terminal_challenge_first", HTTPStatus.CONFLICT)
+                if confirmation != current["title"]:
+                    raise WorkbenchError("confirmation_title_mismatch")
+                attachment_paths = []
+                for item in current["attachments"]:
+                    path = self.uploads / challenge_id / item["id"]
+                    if path.is_symlink():
+                        raise WorkbenchError("attachment_path_rejected", HTTPStatus.CONFLICT)
+                    attachment_paths.append(path)
+                folder = self.uploads / challenge_id
+                run_directories = []
+                for row in db.execute("SELECT run_id FROM runs WHERE challenge_id=?", (challenge_id,)):
+                    run_directory = self.root / "runs" / canonical_id(row["run_id"])
+                    if run_directory.is_symlink():
+                        raise WorkbenchError("run_path_rejected", HTTPStatus.CONFLICT)
+                    run_directories.append(run_directory)
+                db.execute("DELETE FROM runs WHERE challenge_id=?", (challenge_id,))
+                db.execute("DELETE FROM attachments WHERE challenge_id=?", (challenge_id,))
+                db.execute("DELETE FROM challenges WHERE id=?", (challenge_id,))
+            for path in attachment_paths:
                 path.unlink(missing_ok=True)
-            folder = self.uploads / challenge_id
             if folder.exists():
                 folder.rmdir()
-            for row in db.execute("SELECT run_id FROM runs WHERE challenge_id=?", (challenge_id,)):
-                run_directory = self.root / "runs" / canonical_id(row["run_id"])
-                if run_directory.is_symlink():
-                    raise WorkbenchError("run_path_rejected", HTTPStatus.CONFLICT)
+            for run_directory in run_directories:
                 if run_directory.exists():
                     shutil.rmtree(run_directory)
-            db.execute("DELETE FROM runs WHERE challenge_id=?", (challenge_id,))
-            db.execute("DELETE FROM attachments WHERE challenge_id=?", (challenge_id,))
-            db.execute("DELETE FROM challenges WHERE id=?", (challenge_id,))
 
     def add_attachment(self, challenge_id, name, source, size):
         if not isinstance(name, str) or not name or len(name) > 255 or name in {".", ".."} or any(

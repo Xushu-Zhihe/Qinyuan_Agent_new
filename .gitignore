@@ -62,6 +62,15 @@ tests
 !/tests/test_run_supervisor.py
 !/tests/test_task_application.py
 !/tests/test_task_cli.py
+!/tests/test_d1_chain.py
+!/tests/test_d1_workspace.py
+!/tests/test_d1_persistence.py
+!/tests/test_d1_modeling.py
+!/tests/test_d2_action_envelope.py
+!/tests/test_d2_review.py
+!/tests/test_d2_chain.py
+!/tests/test_d2_control_store.py
+!/tests/test_d3_chain.py
 Architecture.md
 interface.md
 protocol.md
@@ -69,3 +78,10 @@ restrict.md
 T4_proposal.md
 
 runner-smoke-data
+.claude
+D0_baseline_and_D1_contract.md
+D1_acceptance.md
+Qinyuan_Agent_dual_llm_flow.svg
+D2_acceptance.md
+D3_acceptance.md
+D3_proposal.md

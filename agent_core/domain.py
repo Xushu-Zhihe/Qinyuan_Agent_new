@@ -19,6 +19,7 @@ class TurnStatus(StrEnum):
     COMPLETED = "completed"
     INCONCLUSIVE = "inconclusive"
     FAILED = "failed"
+    SUPERSEDED = "superseded"
 
 
 class IntentStatus(StrEnum):
@@ -27,6 +28,8 @@ class IntentStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     INCONCLUSIVE = "inconclusive"
+    ABANDONED = "abandoned"
+    SKIPPED = "skipped"
 
 
 class PlanStatus(StrEnum):
@@ -35,6 +38,7 @@ class PlanStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     INCONCLUSIVE = "inconclusive"
+    SUPERSEDED = "superseded"
 
 
 class ExecutionStatus(StrEnum):

@@ -27,6 +27,7 @@ class API:
         self.cleanup_error = False
         self.cleanup_calls = 0
         self.creates = []
+        self.writer_thread = None
 
     def exec_create(self, sandbox_id, argv, **kwargs):
         self.creates.append((sandbox_id, argv, kwargs))
@@ -56,6 +57,19 @@ class API:
         self.writer.sendall(frame)
         self.writer.shutdown(socket.SHUT_WR)
 
+    def finished_with_delayed_output(self, code, output, delay):
+        self.running = False
+        self.exit_code = code
+        frame = bytes([1, 0, 0, 0]) + len(output).to_bytes(4, "big") + output
+
+        def deliver():
+            time.sleep(delay)
+            self.writer.sendall(frame)
+            self.writer.shutdown(socket.SHUT_WR)
+
+        self.writer_thread = threading.Thread(target=deliver, daemon=True)
+        self.writer_thread.start()
+
 
 @pytest.fixture
 def runtime():
@@ -80,6 +94,8 @@ def runtime():
     )
     approved = AuthorizedCommand(request, str(uuid4()), "sandbox", 2)
     yield T6CommandSandbox(sandbox), api, approved, binding
+    if api.writer_thread is not None:
+        api.writer_thread.join(timeout=2)
     api.reader.close()
     api.writer.close()
 
@@ -94,6 +110,36 @@ def test_exit_codes_are_observations_and_bytes_are_preserved(runtime, code):
     assert result.exit_code == code and not result.timed_out
     assert result.stdout == b"raw\x00\xff" and result.stream_complete
     assert api.cleanup_calls == 0
+
+
+def test_output_is_drained_after_exec_stops(runtime):
+    executor, api, approved, _ = runtime
+    api.finished_with_delayed_output(0, b"late output", 0.35)
+
+    result = asyncio.run(
+        executor.execute(approved, SimpleNamespace(is_cancelled=False))
+    )
+
+    assert result.termination_confirmed
+    assert result.stream_complete
+    assert result.stdout == b"late output"
+    assert not result.stdout_truncated and not result.stderr_truncated
+
+
+def test_stopped_exec_without_stream_eof_remains_incomplete_after_grace(runtime):
+    executor, api, approved, _ = runtime
+    api.running = False
+    started = time.monotonic()
+
+    result = asyncio.run(
+        executor.execute(approved, SimpleNamespace(is_cancelled=False))
+    )
+
+    assert result.termination_confirmed
+    assert not result.timed_out
+    assert not result.stream_complete
+    assert result.stdout_truncated and result.stderr_truncated
+    assert time.monotonic() - started < 2
 
 
 @pytest.mark.parametrize("cleanup_error", [False, True])

@@ -188,6 +188,8 @@ def database_path() -> Path:
 def test_open_creates_parent_and_applies_confirmed_pragmas(
     database_path: Path,
 ) -> None:
+    import agent_core.sqlite_control_store as sqlite_store_module
+
     with open_store(database_path, FakeUtcClock()):
         assert database_path.is_file()
         connection = sqlite3.connect(database_path)
@@ -195,7 +197,7 @@ def test_open_creates_parent_and_applies_confirmed_pragmas(
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_versions"
-            ).fetchone()[0] == 10
+            ).fetchone()[0] == sqlite_store_module.CURRENT_SCHEMA_VERSION
             assert connection.execute(
                 "SELECT COUNT(*) FROM intent_goals"
             ).fetchone()[0] == 0
@@ -244,7 +246,7 @@ def test_schema_1_upgrade_preserves_committed_control_state(
             ) == old_checkpoint_row
             assert verification.execute(
                 "SELECT version FROM schema_versions ORDER BY version"
-            ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)]
+            ).fetchall() == [(item,) for item in range(1, sqlite_store_module.CURRENT_SCHEMA_VERSION + 1)]
             assert verification.execute(
                 "SELECT COUNT(*) FROM intent_goals"
             ).fetchone()[0] == 0
@@ -291,7 +293,7 @@ def test_schema_2_upgrade_adds_nullable_source_root_without_losing_state(
             ] == old_task_row
             assert verification.execute(
                 "SELECT version FROM schema_versions ORDER BY version"
-            ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)]
+            ).fetchall() == [(item,) for item in range(1, sqlite_store_module.CURRENT_SCHEMA_VERSION + 1)]
             assert verification.execute(
                 "SELECT source_root FROM task_runs WHERE task_run_id = ?",
                 ("task-run-1",),
@@ -461,7 +463,7 @@ def test_schema_3_upgrade_preserves_legacy_fact_without_verification_ref(
         ).fetchone() == ("legacy fact", "verified", None)
         assert verification.execute(
             "SELECT version FROM schema_versions ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)]
+        ).fetchall() == [(item,) for item in range(1, sqlite_store_module.CURRENT_SCHEMA_VERSION + 1)]
     finally:
         verification.close()
 

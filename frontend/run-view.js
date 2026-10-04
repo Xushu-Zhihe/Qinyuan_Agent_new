@@ -201,7 +201,7 @@ const RunView = (() => {
           if (value.output) {
             const output = value.output;
             body.append(node("p", `未验证的原始观察 · ${output.dispatched ? "已派发" : "未派发"} · ${output.termination_confirmed ? "停止已确认" : "停止未确认"}${output.stream_complete ? "" : " · 输出不完整"}`, "run-meta"));
-            body.append(code(`stdout${output.stdout_truncated ? " · 已截断" : ""}`, output.stdout), code(`stderr${output.stderr_truncated ? " · 已截断" : ""}`, output.stderr));
+            body.append(code(`stdout${output.stream_complete && output.stdout_truncated ? " · 已截断" : ""}`, output.stdout), code(`stderr${output.stream_complete && output.stderr_truncated ? " · 已截断" : ""}`, output.stderr));
           } else empty(body, "尚无已提交输出。");
         } catch (error) { body.replaceChildren(node("p", `证据读取失败：${error.message}`, "run-read-error")); delete body.dataset.loaded; }
       };

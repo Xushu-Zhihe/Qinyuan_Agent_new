@@ -44,6 +44,7 @@ _TURN_TERMINAL_STATUSES = frozenset(
         TurnStatus.COMPLETED,
         TurnStatus.INCONCLUSIVE,
         TurnStatus.FAILED,
+        TurnStatus.SUPERSEDED,
     }
 )
 _TURN_REGISTRATION_NAMESPACE = uuid.uuid5(

@@ -85,7 +85,7 @@ class T6ActionModelRequest:
             for item in self.failure_summaries
         ):
             raise TypeError("invalid_failure_summaries")
-        if len(self.observations) > 8 or any(
+        if len(self.observations) > 20 or any(
             not isinstance(item, T6Observation) for item in self.observations
         ):
             raise ValueError("invalid_observations")

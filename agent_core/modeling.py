@@ -8,7 +8,7 @@ import asyncio
 import threading
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol, TypeAlias, TypeVar
 
 if TYPE_CHECKING:
     from agent_core.model_invocation_audit import ModelInvocationAuditPort
@@ -355,14 +355,22 @@ class ModelErrorEvidencePort(Protocol):
         """Return whether an error evidence reference belongs to a TaskRun."""
 
 
-class ModelAdapter(Protocol):
+ModelTransportRequest = TypeVar("ModelTransportRequest", contravariant=True)
+ModelTransportResponse = TypeVar("ModelTransportResponse", covariant=True)
+
+
+class ModelTransport(Protocol[ModelTransportRequest, ModelTransportResponse]):
     def invoke(
         self,
-        request: ModelRequest,
+        request: ModelTransportRequest,
         timeout_seconds: float,
         cancellation_token: CancellationToken,
-    ) -> NormalizedModelResponse | ModelError:
+    ) -> ModelTransportResponse:
         """Call one selected provider and normalize only its protocol."""
+
+
+class ModelAdapter(ModelTransport[ModelRequest, NormalizedModelResponse | ModelError], Protocol):
+    pass
 
 
 class StructuredResponseValidationError(ValueError):

@@ -83,6 +83,19 @@ T6Action: TypeAlias = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class D2ActionEnvelope:
+    """The D2-only wrapper around the two actions allowed in the D2 slice.
+
+    D1 keeps accepting the unwrapped action object through :func:`parse_t6_action`.
+    This type exists at the D2 model boundary so the review request can be recorded
+    together with the action candidate without changing that legacy contract.
+    """
+
+    action: ProbeAction | CompleteIntentAction
+    review_requested: bool
+
+
 def action_payload(action: T6Action) -> dict[str, object]:
     if isinstance(action, ProbeAction):
         conditions: list[dict[str, object]] = []
@@ -261,3 +274,47 @@ def parse_t6_action(raw: object) -> T6Action:
         "unsupported_action_kind",
         validation_code=T6ActionValidationCode.ACTION_KIND_INVALID,
     )
+
+
+def parse_d2_action_envelope(raw: object) -> D2ActionEnvelope:
+    """Parse the strict D2 action envelope without executing the action.
+
+    The nested action uses the established D1/T6 parser so its field and value
+    limits remain identical.  D2 currently carries only ``probe`` and
+    ``complete_intent``; candidate flags and abandonment remain D1-only actions.
+    """
+
+    if not isinstance(raw, Mapping):
+        raise T6ActionError(
+            "d2_action_envelope_must_be_object",
+            validation_code=T6ActionValidationCode.ACTION_ENVELOPE_INVALID,
+        )
+    keys = set(raw)
+    if any(not isinstance(key, str) for key in keys):
+        raise T6ActionError(
+            "invalid_d2_action_envelope_fields",
+            validation_code=T6ActionValidationCode.ACTION_FIELDS_INVALID,
+        )
+    if "action" not in keys or "review_requested" not in keys:
+        raise T6ActionError(
+            "invalid_d2_action_envelope_fields",
+            validation_code=T6ActionValidationCode.ACTION_FIELD_MISSING,
+        )
+    if keys - {"action", "review_requested"}:
+        raise T6ActionError(
+            "invalid_d2_action_envelope_fields",
+            validation_code=T6ActionValidationCode.ACTION_FIELD_UNEXPECTED,
+        )
+    review_requested = raw["review_requested"]
+    if type(review_requested) is not bool:
+        raise T6ActionError(
+            "invalid_review_requested",
+            validation_code=T6ActionValidationCode.ACTION_VALUE_INVALID,
+        )
+    action = parse_t6_action(raw["action"])
+    if not isinstance(action, (ProbeAction, CompleteIntentAction)):
+        raise T6ActionError(
+            "d2_action_kind_not_supported",
+            validation_code=T6ActionValidationCode.ACTION_KIND_INVALID,
+        )
+    return D2ActionEnvelope(action, review_requested)

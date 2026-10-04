@@ -5,17 +5,33 @@ import math
 import os
 import sqlite3
 import time
-from dataclasses import asdict
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 
+from agent_core.action_audit import (
+    ActionAuditConflict,
+    ActionInvocationCompletion,
+    ActionInvocationRecord,
+    ActionInvocationStart,
+    ActionRecoveryRequired,
+    ActionResourceIds,
+)
+from agent_core.contracts import ModelBackend, TaskRequest
+from agent_core.control_candidate import (
+    project_candidate,
+    validate_control_ownership,
+    validate_running_transition,
+)
 from agent_core.control_store import (
+    AppendD2ReviewApplication,
     AppendFailureSummary,
     AppendPlanValidationRecord,
     Checkpoint,
     ControlCommitResult,
     ControlMutation,
     ControlStateRows,
+    D2RunConfig,
     ExecutionSnapshot,
     FactRecordSnapshot,
     FailureSummaryRecordSnapshot,
@@ -26,8 +42,8 @@ from agent_core.control_store import (
     StaleControlStateError,
     StateChange,
     StorageError,
-    TaskRunSnapshot,
     TargetNetworkBinding,
+    TaskRunSnapshot,
     TurnSnapshot,
     UpsertExecution,
     UpsertFact,
@@ -36,13 +52,32 @@ from agent_core.control_store import (
     UpsertPlan,
     UpsertTaskRun,
     UpsertTurn,
+    active_d2_pause_gates,
     canonical_json,
     control_mutation_fingerprint,
     task_request_payload,
     validate_control_event,
 )
-from agent_core.contracts import ModelBackend, TaskRequest
-from agent_core.control_candidate import validate_control_ownership, validate_running_transition
+from agent_core.dual_llm_contracts import (
+    D3_CATEGORY_LIMITS,
+    D3_SHA_STEP,
+    D3_SIZE_STEP,
+    D3BudgetExhausted,
+    D3CommitMetadata,
+    D3IntentBinding,
+    D3OperationCompletion,
+    D3OperationConflict,
+    D3OperationRecord,
+    D3OperationStart,
+    D3Outcome,
+    D3PlanBinding,
+    D3PlanResult,
+    D3RecoveryRequired,
+    D3ReviewApplication,
+    D3RunConfig,
+    D3TurnBinding,
+    d3_payload,
+)
 from agent_core.domain import (
     ExecutionStatus,
     FactStatus,
@@ -54,19 +89,15 @@ from agent_core.domain import (
     PlanValidationStatus,
     TurnStatus,
 )
-from agent_core.runtime import RuntimeEvent, TaskRunStatus
-from agent_core.intent_goals import FileTypeIntentGoal
-from agent_core.modeling import (
-    IntentActionResponse, ModelRequestType, PlanGenerationResponse, parse_intent_action,
-)
 from agent_core.intent_action_application import (
     IntentActionApplication,
     IntentActionApplicationConflict,
     IntentPlanApplication,
 )
+from agent_core.intent_goals import FileTypeIntentGoal
 from agent_core.model_invocation_audit import (
-    ModelInvocationCompletion,
     ModelInvocationBudgetExhausted,
+    ModelInvocationCompletion,
     ModelInvocationConflict,
     ModelInvocationRecord,
     ModelInvocationRecoveryRequired,
@@ -74,17 +105,162 @@ from agent_core.model_invocation_audit import (
     result_from_payload,
     result_payload,
 )
-from agent_core.action_audit import (
-    ActionAuditConflict,
-    ActionInvocationCompletion,
-    ActionInvocationRecord,
-    ActionInvocationStart,
-    ActionRecoveryRequired,
-    ActionResourceIds,
+from agent_core.modeling import (
+    IntentActionResponse,
+    ModelRequestType,
+    PlanGenerationResponse,
+    parse_intent_action,
+)
+from agent_core.review_contracts import (
+    D2AllowedActionKinds,
+    D2Constraint,
+    D2MaxActionTimeout,
+    d2_payload,
+)
+from agent_core.runtime import RuntimeEvent, TaskRunStatus
+from agent_core.turn_contracts import (
+    D1_CATEGORY_LIMITS,
+    D1BudgetExhausted,
+    D1OperationCompletion,
+    D1OperationConflict,
+    D1OperationRecord,
+    D1OperationStart,
+    D1RecoveryRequired,
+    D1RunConfig,
+    D1TurnBinding,
+    D1TurnProof,
+    d1_payload,
 )
 
+CURRENT_SCHEMA_VERSION = 13
 
-CURRENT_SCHEMA_VERSION = 10
+MIGRATION_11 = """
+CREATE TABLE d1_runs (
+    task_run_id TEXT PRIMARY KEY REFERENCES task_runs(task_run_id),
+    config_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d1_turn_bindings (
+    turn_id TEXT PRIMARY KEY REFERENCES turns(turn_id),
+    task_run_id TEXT NOT NULL REFERENCES d1_runs(task_run_id),
+    intent_id TEXT NOT NULL UNIQUE REFERENCES intents(intent_id),
+    binding_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d1_turn_proofs (
+    turn_id TEXT PRIMARY KEY REFERENCES d1_turn_bindings(turn_id),
+    proof_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d1_operations (
+    operation_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d1_runs(task_run_id),
+    category TEXT NOT NULL,
+    resource_ref TEXT,
+    start_json TEXT NOT NULL,
+    completion_json TEXT,
+    application_ref TEXT
+);
+"""
+
+MIGRATION_12 = """
+CREATE TABLE d2_runs (
+    task_run_id TEXT PRIMARY KEY REFERENCES d1_runs(task_run_id),
+    config_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d2_review_applications (
+    task_run_id TEXT NOT NULL REFERENCES d2_runs(task_run_id),
+    review_root_id TEXT NOT NULL,
+    review_generation INTEGER NOT NULL,
+    review_id TEXT NOT NULL,
+    application_ref TEXT NOT NULL,
+    context_version TEXT NOT NULL,
+    constraint_version INTEGER NOT NULL,
+    output_constraints_json TEXT NOT NULL,
+    paused_gate INTEGER NOT NULL CHECK (paused_gate IN (0, 1)),
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    review_scope TEXT NOT NULL,
+    action_candidate_id TEXT,
+    pause_reason TEXT,
+    created_event_sequence INTEGER NOT NULL,
+    PRIMARY KEY (task_run_id, review_id),
+    UNIQUE (task_run_id, application_ref)
+);
+CREATE INDEX idx_d2_review_applications_root
+ON d2_review_applications(task_run_id, review_root_id, review_generation);
+CREATE UNIQUE INDEX idx_d2_review_accepted_generation
+ON d2_review_applications(task_run_id, review_root_id, review_generation)
+WHERE paused_gate = 0;
+"""
+
+MIGRATION_13 = """
+CREATE TABLE d3_runs (
+    task_run_id TEXT PRIMARY KEY REFERENCES task_runs(task_run_id),
+    config_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d3_turn_bindings (
+    turn_id TEXT PRIMARY KEY REFERENCES turns(turn_id),
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    binding_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d3_intent_bindings (
+    intent_id TEXT PRIMARY KEY REFERENCES intents(intent_id),
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    turn_id TEXT NOT NULL REFERENCES d3_turn_bindings(turn_id),
+    binding_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d3_plan_bindings (
+    plan_id TEXT PRIMARY KEY REFERENCES plans(plan_id),
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    intent_id TEXT NOT NULL REFERENCES d3_intent_bindings(intent_id),
+    binding_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d3_plan_results (
+    plan_id TEXT PRIMARY KEY REFERENCES d3_plan_bindings(plan_id),
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    result_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d3_outcomes (
+    entity_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    entity_kind TEXT NOT NULL,
+    outcome_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE TABLE d3_operations (
+    operation_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    category TEXT NOT NULL,
+    resource_ref TEXT NOT NULL,
+    start_json TEXT NOT NULL,
+    completion_json TEXT,
+    application_ref TEXT
+);
+CREATE INDEX idx_d3_operations_task_category ON d3_operations(task_run_id, category);
+CREATE TABLE d3_review_applications (
+    review_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    review_root_id TEXT NOT NULL,
+    review_generation INTEGER NOT NULL,
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    decision TEXT NOT NULL,
+    paused_gate INTEGER NOT NULL CHECK (paused_gate IN (0, 1)),
+    constraint_version INTEGER NOT NULL,
+    application_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX idx_d3_review_accepted_generation
+ON d3_review_applications(task_run_id, review_root_id, review_generation)
+WHERE paused_gate = 0;
+"""
 
 
 MIGRATION_1 = """
@@ -385,6 +561,7 @@ class SqliteControlStore:
         self._connection = connection
         self.path = path
         self._clock = clock
+        self._schema_version = 0
 
     @classmethod
     def open(
@@ -410,6 +587,7 @@ class SqliteControlStore:
             connection.execute("PRAGMA journal_mode = WAL")
             store = cls(connection, database_path, clock=clock)
             store._migrate()
+            store._schema_version = CURRENT_SCHEMA_VERSION
             return store
         except StorageError:
             if connection is not None:
@@ -422,7 +600,7 @@ class SqliteControlStore:
 
     @classmethod
     def open_readonly(cls, path: str | os.PathLike[str]) -> SqliteControlStore:
-        """Read current-schema history without migrations or journal changes."""
+        """Read supported history without migrations or journal changes."""
         database_path = Path(path).resolve(strict=True)
         connection = sqlite3.connect(
             database_path.as_uri() + "?mode=ro", uri=True, timeout=0.1,
@@ -431,10 +609,12 @@ class SqliteControlStore:
         connection.row_factory = sqlite3.Row
         try:
             version = connection.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0]
-            if version != CURRENT_SCHEMA_VERSION:
-                raise StorageError("read-only history requires the current schema")
+            if version not in {10, 11, 12, CURRENT_SCHEMA_VERSION}:
+                raise StorageError("read-only history requires supported schema 10, 11, 12 or 13")
             connection.execute("BEGIN")
-            return cls(connection, database_path, clock=time.time)
+            store = cls(connection, database_path, clock=time.time)
+            store._schema_version = int(version)
+            return store
         except BaseException:
             connection.close()
             raise
@@ -541,6 +721,27 @@ class SqliteControlStore:
                 self._connection.execute(
                     "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                     (10, self._now()),
+                )
+            if version < 11:
+                for statement in _sql_statements(MIGRATION_11):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (11, self._now()),
+                )
+            if version < 12:
+                for statement in _sql_statements(MIGRATION_12):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (12, self._now()),
+                )
+            if version < 13:
+                for statement in _sql_statements(MIGRATION_13):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (13, self._now()),
                 )
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
@@ -1242,6 +1443,1194 @@ class SqliteControlStore:
         except (sqlite3.Error, ValueError, TypeError, KeyError) as exc:
             raise StorageError("could not read Intent application") from exc
 
+    def load_d1_run_config(self, task_run_id: str) -> D1RunConfig | None:
+        if self._schema_version < 11:
+            return None
+        row = self._connection.execute("SELECT config_json FROM d1_runs WHERE task_run_id = ?", (task_run_id,)).fetchone()
+        return None if row is None else D1RunConfig.from_dict(json.loads(row[0]))
+
+    def load_d1_turn_binding(self, turn_id: str) -> D1TurnBinding | None:
+        if self._schema_version < 11:
+            return None
+        row = self._connection.execute("SELECT binding_json FROM d1_turn_bindings WHERE turn_id = ?", (turn_id,)).fetchone()
+        return None if row is None else D1TurnBinding.from_dict(json.loads(row[0]))
+
+    def load_d1_turn_proof(self, turn_id: str) -> D1TurnProof | None:
+        if self._schema_version < 11:
+            return None
+        row = self._connection.execute("SELECT proof_json FROM d1_turn_proofs WHERE turn_id = ?", (turn_id,)).fetchone()
+        return None if row is None else D1TurnProof.from_dict(json.loads(row[0]))
+
+    @staticmethod
+    def _decode_d1_operation(row: sqlite3.Row) -> D1OperationRecord:
+        return D1OperationRecord(
+            D1OperationStart(**json.loads(row["start_json"])),
+            D1OperationCompletion(**json.loads(row["completion_json"])) if row["completion_json"] is not None else None,
+            row["application_ref"],
+        )
+
+    def load_d1_operation(self, operation_id: str) -> D1OperationRecord | None:
+        if self._schema_version < 11:
+            return None
+        row = self._connection.execute("SELECT * FROM d1_operations WHERE operation_id = ?", (operation_id,)).fetchone()
+        return None if row is None else self._decode_d1_operation(row)
+
+    def list_d1_operations(self, task_run_id: str) -> tuple[D1OperationRecord, ...]:
+        if self._schema_version < 11:
+            return ()
+        rows = self._connection.execute("SELECT * FROM d1_operations WHERE task_run_id = ? ORDER BY rowid", (task_run_id,)).fetchall()
+        return tuple(self._decode_d1_operation(row) for row in rows)
+
+    @staticmethod
+    def _decode_d2_constraints(value: object) -> tuple[D2Constraint, ...]:
+        if not isinstance(value, list):
+            raise StorageError("D2 review constraints are not a JSON array")
+        constraints: list[D2Constraint] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise StorageError("D2 review constraint is not a JSON object")
+            kind = item.get("kind")
+            if kind == "allowed_action_kinds":
+                if set(item) != {"kind", "scope_kind", "scope_id", "allowed_action_kinds"}:
+                    raise StorageError("D2 stored action constraint has unexpected fields")
+                if not isinstance(item["allowed_action_kinds"], list):
+                    raise StorageError("D2 stored action kinds are not an array")
+                constraints.append(
+                    D2AllowedActionKinds(
+                        item["scope_kind"], item["scope_id"],
+                        tuple(item["allowed_action_kinds"]),
+                    )
+                )
+            elif kind == "max_action_timeout_seconds":
+                if set(item) != {"kind", "scope_kind", "scope_id", "max_action_timeout_seconds"}:
+                    raise StorageError("D2 stored timeout constraint has unexpected fields")
+                constraints.append(
+                    D2MaxActionTimeout(
+                        item["scope_kind"], item["scope_id"],
+                        item["max_action_timeout_seconds"],
+                    )
+                )
+            else:
+                raise StorageError("unsupported D2 review constraint kind")
+        return tuple(constraints)
+
+    @classmethod
+    def _decode_d2_review_application(cls, row: sqlite3.Row) -> AppendD2ReviewApplication:
+        if row["paused_gate"] not in {0, 1}:
+            raise StorageError("D2 paused gate is not a stored boolean")
+        return AppendD2ReviewApplication(
+            row["review_root_id"], row["review_generation"], row["review_id"],
+            row["application_ref"], row["context_version"], row["constraint_version"],
+            cls._decode_d2_constraints(json.loads(row["output_constraints_json"])),
+            bool(row["paused_gate"]),
+            row["turn_id"], row["intent_id"], row["review_scope"],
+            row["action_candidate_id"], row["pause_reason"],
+        )
+
+    def load_d2_run_config(self, task_run_id: str) -> D2RunConfig | None:
+        if self._schema_version < 12:
+            return None
+        row = self._connection.execute(
+            "SELECT config_json FROM d2_runs WHERE task_run_id = ?", (task_run_id,)
+        ).fetchone()
+        return None if row is None else D2RunConfig(**json.loads(row["config_json"]))
+
+    def load_d2_review_application(
+        self, task_run_id: str, review_id: str
+    ) -> AppendD2ReviewApplication | None:
+        if self._schema_version < 12:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM d2_review_applications WHERE task_run_id = ? AND review_id = ?",
+            (task_run_id, review_id),
+        ).fetchone()
+        return None if row is None else self._decode_d2_review_application(row)
+
+    def list_d2_review_applications(
+        self, task_run_id: str
+    ) -> tuple[AppendD2ReviewApplication, ...]:
+        if self._schema_version < 12:
+            return ()
+        rows = self._connection.execute(
+            "SELECT * FROM d2_review_applications WHERE task_run_id = ? ORDER BY created_event_sequence",
+            (task_run_id,),
+        ).fetchall()
+        return tuple(self._decode_d2_review_application(row) for row in rows)
+
+    def load_d3_run_config(self, task_run_id: str) -> D3RunConfig | None:
+        if self._schema_version < 13:
+            return None
+        row = self._connection.execute(
+            "SELECT config_json FROM d3_runs WHERE task_run_id = ?", (task_run_id,)
+        ).fetchone()
+        return None if row is None else D3RunConfig.from_dict(json.loads(row["config_json"]))
+
+    def load_d3_turn_binding(self, turn_id: str) -> D3TurnBinding | None:
+        if self._schema_version < 13:
+            return None
+        row = self._connection.execute(
+            "SELECT binding_json FROM d3_turn_bindings WHERE turn_id = ?", (turn_id,)
+        ).fetchone()
+        return None if row is None else D3TurnBinding(**json.loads(row["binding_json"]))
+
+    def load_d3_intent_binding(self, intent_id: str) -> D3IntentBinding | None:
+        if self._schema_version < 13:
+            return None
+        row = self._connection.execute(
+            "SELECT binding_json FROM d3_intent_bindings WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        return None if row is None else D3IntentBinding(**json.loads(row["binding_json"]))
+
+    def load_d3_plan_binding(self, plan_id: str) -> D3PlanBinding | None:
+        if self._schema_version < 13:
+            return None
+        row = self._connection.execute(
+            "SELECT binding_json FROM d3_plan_bindings WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        return None if row is None else D3PlanBinding(**json.loads(row["binding_json"]))
+
+    def load_d3_plan_result(self, plan_id: str) -> D3PlanResult | None:
+        if self._schema_version < 13:
+            return None
+        row = self._connection.execute(
+            "SELECT result_json FROM d3_plan_results WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        return None if row is None else D3PlanResult(**json.loads(row["result_json"]))
+
+    def load_d3_outcome(self, entity_id: str) -> D3Outcome | None:
+        if self._schema_version < 13:
+            return None
+        row = self._connection.execute(
+            "SELECT outcome_json FROM d3_outcomes WHERE entity_id = ?", (entity_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row["outcome_json"])
+        value["evidence_refs"] = tuple(value["evidence_refs"])
+        return D3Outcome(**value)
+
+    def load_d3_operation(self, operation_id: str) -> D3OperationRecord | None:
+        if self._schema_version < 13:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM d3_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        start = D3OperationStart(**json.loads(row["start_json"]))
+        completion = (
+            D3OperationCompletion(**json.loads(row["completion_json"]))
+            if row["completion_json"] is not None else None
+        )
+        if (
+            start.task_run_id != row["task_run_id"]
+            or start.category != row["category"]
+            or start.resource_ref != row["resource_ref"]
+            or completion is not None and completion.operation_id != start.operation_id
+        ):
+            raise StorageError("D3 operation row differs from its typed record")
+        return D3OperationRecord(start, completion, row["application_ref"])
+
+    def list_d3_operations(self, task_run_id: str) -> tuple[D3OperationRecord, ...]:
+        if self._schema_version < 13:
+            return ()
+        rows = self._connection.execute(
+            "SELECT operation_id FROM d3_operations WHERE task_run_id = ? ORDER BY rowid",
+            (task_run_id,),
+        ).fetchall()
+        records = []
+        for row in rows:
+            record = self.load_d3_operation(row["operation_id"])
+            if record is None:
+                raise StorageError("D3 operation disappeared while listing")
+            records.append(record)
+        return tuple(records)
+
+    def begin_d3_operation(self, start: D3OperationStart) -> D3OperationRecord | None:
+        if not isinstance(start, D3OperationStart):
+            raise TypeError("start must be D3OperationStart")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self.load_d3_operation(start.operation_id)
+            if existing is not None:
+                if existing.start != start:
+                    raise D3OperationConflict("operation ID belongs to another fixed request")
+                if existing.completion is None:
+                    raise D3RecoveryRequired("operation result is unknown; do not dispatch again")
+                self._connection.commit()
+                return existing
+            task = self.load_task_run(start.task_run_id)
+            config = self.load_d3_run_config(start.task_run_id)
+            if task is None or config is None:
+                raise D3OperationConflict("operation requires an explicitly registered D3 TaskRun")
+            checkpoint = self._connection.execute(
+                "SELECT MAX(sequence) FROM checkpoints WHERE task_run_id = ?",
+                (start.task_run_id,),
+            ).fetchone()[0]
+            if checkpoint != start.base_checkpoint_sequence:
+                raise StaleControlStateError("D3 operation was prepared from a stale checkpoint")
+            if (
+                task.status is not TaskRunStatus.RUNNING
+                or not task.started_at <= start.started_at < task.deadline_at
+                or self._now() >= task.deadline_at
+            ):
+                raise D3OperationConflict("operation requires a running TaskRun before Deadline")
+            if start.role is not None:
+                role = config.outer_role if start.role == "outer_planning" else config.inner_role
+                if start.role_config_ref != role.role_config_ref:
+                    raise D3OperationConflict("model role differs from frozen configuration")
+            records = self.list_d3_operations(start.task_run_id)
+            if any(record.completion is None for record in records):
+                raise D3RecoveryRequired("an earlier operation result remains unknown")
+            if any(
+                record.start.category == start.category
+                and record.start.resource_ref == start.resource_ref
+                and start.category not in {"outer_model", "inner_model"}
+                for record in records
+            ):
+                raise D3OperationConflict("resource already has a fixed operation ID")
+            limit = D3_CATEGORY_LIMITS[start.category]
+            if limit is not None and sum(
+                record.start.category == start.category for record in records
+            ) >= limit:
+                raise D3BudgetExhausted(f"D3 {start.category} budget exhausted")
+            self._connection.execute(
+                "INSERT INTO d3_operations(operation_id, task_run_id, category, resource_ref, start_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (start.operation_id, start.task_run_id, start.category,
+                 start.resource_ref, canonical_json(d3_payload(start))),
+            )
+            self._connection.commit()
+            return None
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def complete_d3_operation(self, completion: D3OperationCompletion) -> D3OperationRecord:
+        if not isinstance(completion, D3OperationCompletion):
+            raise TypeError("completion must be D3OperationCompletion")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self.load_d3_operation(completion.operation_id)
+            if record is None:
+                raise D3OperationConflict("completion has no admitted operation")
+            if completion.finished_at < record.start.started_at:
+                raise D3OperationConflict("completion precedes operation start")
+            if record.completion is not None and record.completion != completion:
+                raise D3OperationConflict("known operation completion is immutable")
+            if record.completion is None:
+                self._connection.execute(
+                    "UPDATE d3_operations SET completion_json = ? WHERE operation_id = ?",
+                    (canonical_json(d3_payload(completion)), completion.operation_id),
+                )
+            self._connection.commit()
+            return D3OperationRecord(record.start, completion, record.application_ref)
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def mark_d3_operation_applied(self, operation_id: str, application_ref: str) -> D3OperationRecord:
+        if not isinstance(application_ref, str) or not application_ref.strip():
+            raise ValueError("application_ref must be non-empty")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self.load_d3_operation(operation_id)
+            if record is None or record.completion is None:
+                raise D3RecoveryRequired("unknown operation cannot be applied")
+            if record.completion.result_kind != "completed":
+                raise D3OperationConflict("unsuccessful operation cannot be applied")
+            if record.application_ref is not None and record.application_ref != application_ref:
+                raise D3OperationConflict("operation application is immutable")
+            self._connection.execute(
+                "UPDATE d3_operations SET application_ref = ? WHERE operation_id = ?",
+                (application_ref, operation_id),
+            )
+            self._connection.commit()
+            return D3OperationRecord(record.start, record.completion, application_ref)
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    @classmethod
+    def _decode_d3_review_application(cls, row: sqlite3.Row) -> D3ReviewApplication:
+        value = json.loads(row["application_json"])
+        value["output_constraints"] = cls._decode_d2_constraints(value["output_constraints"])
+        value["source_ids"] = tuple(value["source_ids"])
+        application = D3ReviewApplication(**value)
+        if (
+            application.task_run_id != row["task_run_id"]
+            or application.review_id != row["review_id"]
+            or application.review_root_id != row["review_root_id"]
+            or application.review_generation != row["review_generation"]
+            or application.turn_id != row["turn_id"]
+            or application.intent_id != row["intent_id"]
+            or application.decision != row["decision"]
+            or int(application.paused_gate) != row["paused_gate"]
+            or application.constraint_version != row["constraint_version"]
+        ):
+            raise StorageError("D3 review row differs from its typed application")
+        return application
+
+    def load_d3_review_application(self, task_run_id: str, review_id: str) -> D3ReviewApplication | None:
+        if self._schema_version < 13:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM d3_review_applications WHERE task_run_id = ? AND review_id = ?",
+            (task_run_id, review_id),
+        ).fetchone()
+        return None if row is None else self._decode_d3_review_application(row)
+
+    def list_d3_review_applications(self, task_run_id: str) -> tuple[D3ReviewApplication, ...]:
+        if self._schema_version < 13:
+            return ()
+        rows = self._connection.execute(
+            "SELECT * FROM d3_review_applications WHERE task_run_id = ? ORDER BY created_event_sequence",
+            (task_run_id,),
+        ).fetchall()
+        return tuple(self._decode_d3_review_application(row) for row in rows)
+
+    def begin_d1_operation(self, start: D1OperationStart) -> D1OperationRecord | None:
+        if not isinstance(start, D1OperationStart):
+            raise TypeError("start must be D1OperationStart")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self.load_d1_operation(start.operation_id)
+            if existing is not None:
+                current_payload = d1_payload(start)
+                existing_payload = d1_payload(existing.start)
+                current_payload.pop("started_at")
+                existing_payload.pop("started_at")
+                if current_payload != existing_payload:
+                    raise D1OperationConflict("operation ID belongs to another fixed request")
+                if existing.completion is None:
+                    raise D1RecoveryRequired("operation result is unknown; do not dispatch again")
+                self._connection.commit()
+                return existing
+            task = self.load_task_run(start.task_run_id)
+            config = self.load_d1_run_config(start.task_run_id)
+            if task is None or config is None:
+                raise D1OperationConflict("operation requires an explicitly registered D1 TaskRun")
+            checkpoint = self._connection.execute("SELECT MAX(sequence) FROM checkpoints WHERE task_run_id = ?", (start.task_run_id,)).fetchone()[0]
+            if checkpoint != start.base_checkpoint_sequence:
+                raise StaleControlStateError("D1 operation was prepared from a stale checkpoint")
+            if task.status is not TaskRunStatus.RUNNING or not task.started_at <= start.started_at < task.deadline_at or self._now() >= task.deadline_at:
+                raise D1OperationConflict("operation requires a running TaskRun before Deadline")
+            if self._connection.execute("SELECT 1 FROM turns WHERE task_run_id = ? AND status = ?", (start.task_run_id, TurnStatus.COMPLETED.value)).fetchone() is not None:
+                raise D1OperationConflict("D1 Turn has completed; dispatch is stopped")
+            if start.role is not None:
+                role_config = config.outer_role if start.role == "outer_planning" else config.inner_role
+                if start.role_config_ref != role_config.role_config_ref:
+                    raise D1OperationConflict("model role configuration differs from frozen TaskRun content")
+            records = self.list_d1_operations(start.task_run_id)
+            if self.load_d2_run_config(start.task_run_id) is not None:
+                review_apps = self.list_d2_review_applications(start.task_run_id)
+                if active_d2_pause_gates(review_apps):
+                    raise D1RecoveryRequired("d2_review_pause_gate")
+                if start.category in {
+                    "inner_probe_model", "inner_complete_model", "inner_tool",
+                    "first_digest", "copy_preparation",
+                } and not any(
+                    item.review_scope == "turn_start" and not item.paused_gate
+                    for item in review_apps
+                ):
+                    raise D1RecoveryRequired("d2_turn_start_review_required")
+            for record in records:
+                same_resource = record.start.category == start.category and record.start.resource_ref == start.resource_ref
+                if record.completion is None:
+                    raise D1RecoveryRequired("an earlier operation result remains unknown")
+                if same_resource and start.resource_ref is not None and start.role is None:
+                    raise D1OperationConflict("resource already has a fixed operation ID")
+            category_count = sum(record.start.category == start.category for record in records)
+            limit = D1_CATEGORY_LIMITS[start.category]
+            if limit is not None and category_count >= limit:
+                raise D1BudgetExhausted(f"D1 {start.category} budget exhausted")
+            if start.category in {"inner_probe_model", "inner_complete_model"} and sum(record.start.category in {"inner_probe_model", "inner_complete_model"} for record in records) >= 4:
+                raise D1BudgetExhausted("D1 inner model total budget exhausted")
+            self._connection.execute(
+                "INSERT INTO d1_operations(operation_id,task_run_id,category,resource_ref,start_json) VALUES (?,?,?,?,?)",
+                (start.operation_id, start.task_run_id, start.category, start.resource_ref, canonical_json(d1_payload(start))),
+            )
+            self._connection.commit()
+            return None
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def complete_d1_operation(self, completion: D1OperationCompletion) -> D1OperationRecord:
+        if not isinstance(completion, D1OperationCompletion):
+            raise TypeError("completion must be D1OperationCompletion")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self.load_d1_operation(completion.operation_id)
+            if record is None:
+                raise D1OperationConflict("completion has no admitted operation")
+            if completion.finished_at < record.start.started_at:
+                raise D1OperationConflict("completion precedes operation start")
+            if record.completion is not None and record.completion != completion:
+                raise D1OperationConflict("known operation completion is immutable")
+            if record.completion is None:
+                self._connection.execute("UPDATE d1_operations SET completion_json = ? WHERE operation_id = ?", (canonical_json(d1_payload(completion)), completion.operation_id))
+            self._connection.commit()
+            return D1OperationRecord(record.start, completion, record.application_ref)
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def mark_d1_operation_applied(self, operation_id: str, application_ref: str) -> D1OperationRecord:
+        if not isinstance(application_ref, str) or not application_ref.strip():
+            raise ValueError("application_ref must be a non-empty committed reference")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self.load_d1_operation(operation_id)
+            if record is None or record.completion is None:
+                raise D1RecoveryRequired("unknown operation cannot be applied")
+            if record.completion.result_kind != "completed":
+                raise D1OperationConflict("rejected, stale or unsuccessful result cannot be applied")
+            if record.application_ref is not None and record.application_ref != application_ref:
+                raise D1OperationConflict("operation application is immutable")
+            self._connection.execute("UPDATE d1_operations SET application_ref = ? WHERE operation_id = ?", (application_ref, operation_id))
+            self._connection.commit()
+            return D1OperationRecord(record.start, record.completion, application_ref)
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def _validate_d2_mutation(self, mutation: ControlMutation) -> None:
+        if mutation.d2_config is not None:
+            if self.load_d2_run_config(mutation.task_run_id) is not None:
+                raise StorageError("D2 run configuration is immutable")
+        applications = [
+            change for change in mutation.state_changes
+            if isinstance(change, AppendD2ReviewApplication)
+        ]
+        if mutation.operation == "apply_d2_review":
+            if self.load_d2_run_config(mutation.task_run_id) is None:
+                raise StorageError("D2 review application requires an explicit D2 run")
+            if len(applications) != 1 or len(mutation.state_changes) != 1:
+                raise StorageError("D2 review application requires one typed change")
+            application = applications[0]
+            if (
+                self._task_run_for_turn(application.turn_id) != mutation.task_run_id
+                or self._task_run_for_intent(application.intent_id) != mutation.task_run_id
+                or self._connection.execute(
+                    "SELECT turn_id FROM intents WHERE intent_id = ?", (application.intent_id,)
+                ).fetchone()["turn_id"] != application.turn_id
+            ):
+                raise StorageError("D2 review application scope is outside its TaskRun")
+            if not application.paused_gate and any(
+                not (
+                    item.pause_reason == "review_application_uncommitted"
+                    and item.review_root_id == application.review_root_id
+                    and application.review_generation >= item.review_generation
+                )
+                for item in active_d2_pause_gates(self.list_d2_review_applications(mutation.task_run_id))
+            ):
+                raise StorageError("an earlier D2 review pause still closes dispatch")
+            existing = self.load_d2_review_application(
+                mutation.task_run_id, application.review_id
+            )
+            if existing is not None:
+                raise StorageError("D2 review application is append-only; replay its mutation")
+            if not application.paused_gate and self._connection.execute(
+                "SELECT 1 FROM d2_review_applications WHERE task_run_id = ? "
+                "AND review_root_id = ? AND review_generation = ? AND paused_gate = 0",
+                (mutation.task_run_id, application.review_root_id, application.review_generation),
+            ).fetchone() is not None:
+                raise StorageError("D2 review generation already has an immutable application")
+            prior_applications = self.list_d2_review_applications(mutation.task_run_id)
+            expected_version = max(
+                (item.constraint_version for item in prior_applications), default=0
+            ) + bool(application.output_constraints)
+            if application.constraint_version != expected_version:
+                raise StaleControlStateError("D2 constraint version is not current")
+            for constraint in application.output_constraints:
+                owner = (
+                    self._task_run_for_intent(constraint.scope_id)
+                    if constraint.scope_kind == "intent"
+                    else self._task_run_for_turn(constraint.scope_id)
+                )
+                if owner != mutation.task_run_id:
+                    raise StorageError("D2 constraint scope is outside its TaskRun")
+                expected_scope_id = (
+                    application.intent_id if constraint.scope_kind == "intent"
+                    else application.turn_id
+                )
+                if constraint.scope_id != expected_scope_id:
+                    raise StorageError("D2 constraint scope differs from its review")
+            conflict = self._connection.execute(
+                "SELECT review_id FROM d2_review_applications "
+                "WHERE task_run_id = ? AND application_ref = ?",
+                (mutation.task_run_id, application.application_ref),
+            ).fetchone()
+            if conflict is not None and conflict["review_id"] != application.review_id:
+                raise StorageError("D2 application_ref already belongs to another review")
+        elif applications:
+            raise StorageError("D2 review application requires its dedicated operation")
+
+    def _save_d2_mutation(self, mutation: ControlMutation, event_sequence: int) -> None:
+        if mutation.d2_config is not None:
+            self._connection.execute(
+                "INSERT INTO d2_runs VALUES (?, ?, ?)",
+                (mutation.task_run_id, canonical_json(d2_payload(mutation.d2_config)), event_sequence),
+            )
+        for application in mutation.state_changes:
+            if not isinstance(application, AppendD2ReviewApplication):
+                continue
+            self._connection.execute(
+                """
+                INSERT INTO d2_review_applications(
+                    task_run_id, review_root_id, review_generation, review_id,
+                    application_ref, context_version, constraint_version,
+                    output_constraints_json, paused_gate, created_event_sequence
+                    , turn_id, intent_id, review_scope, action_candidate_id, pause_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    mutation.task_run_id,
+                    application.review_root_id,
+                    application.review_generation,
+                    application.review_id,
+                    application.application_ref,
+                    application.context_version,
+                    application.constraint_version,
+                    canonical_json([d2_payload(item) for item in application.output_constraints]),
+                    int(application.paused_gate),
+                    event_sequence,
+                    application.turn_id,
+                    application.intent_id,
+                    application.review_scope,
+                    application.action_candidate_id,
+                    application.pause_reason,
+                ),
+            )
+
+    def _validate_d1_mutation(self, mutation: ControlMutation) -> None:
+        config = self.load_d1_run_config(mutation.task_run_id)
+        if mutation.d1_config is not None:
+            if config is not None:
+                raise StorageError("D1 TaskRun configuration is immutable")
+            attachments = mutation.request.target.attachments
+            if mutation.request.target.endpoints or len(attachments) != 1 or attachments[0].kind != "local_path":
+                raise StorageError("D1 requires the sole authorized local attachment without network")
+            if len(mutation.state_changes) != 1 or not isinstance(mutation.state_changes[0], UpsertTaskRun):
+                raise StorageError("D1 start saves only its TaskRun and frozen chain configuration")
+        if config is None:
+            if mutation.d1_binding is not None or mutation.d1_turn_proof is not None:
+                raise StorageError("D1 binding/proof requires explicit D1 TaskRun identity")
+            return
+        new_turns = [change for change in mutation.state_changes if isinstance(change, UpsertTurn) and self._task_run_for_turn(change.turn_id) is None]
+        if new_turns:
+            if mutation.operation != "register_turn" or mutation.d1_binding is None or len(new_turns) != 1 or self._connection.execute("SELECT 1 FROM turns WHERE task_run_id = ?", (mutation.task_run_id,)).fetchone() is not None:
+                raise StorageError("D1 supports exactly one explicitly bound Turn")
+            binding = mutation.d1_binding
+            turn = new_turns[0]
+            if binding.turn_id != turn.turn_id or turn.intent_ids != (binding.intent_id,) or binding.attachment_index != config.authorization.attachment_index:
+                raise StorageError("D1 binding differs from fixed Turn/Intent registration")
+            proposal = self.load_d1_operation(binding.proposal_request_id)
+            if proposal is None or proposal.start.task_run_id != mutation.task_run_id or proposal.start.category != "outer_model" or proposal.completion is None or proposal.completion.result_kind != "completed":
+                raise StorageError("D1 binding requires known accepted outer proposal evidence")
+        for change in mutation.state_changes:
+            if isinstance(change, UpsertTaskRun) and change.status in {TaskRunStatus.ACHIEVED, TaskRunStatus.ASSUMED_ACHIEVED}:
+                raise StorageError("D1 has no registered whole-task success rule")
+            if isinstance(change, UpsertTurn):
+                row = self._connection.execute("SELECT sequence, turn_target, intent_ids_json FROM turns WHERE turn_id = ?", (change.turn_id,)).fetchone()
+                if row is not None and (row["sequence"], row["turn_target"], tuple(json.loads(row["intent_ids_json"]))) != (change.sequence, change.turn_target, change.intent_ids):
+                    raise StorageError("registered D1 Turn declaration is immutable")
+            if isinstance(change, UpsertIntent):
+                row = self._connection.execute("SELECT description, priority, intent_type FROM intents WHERE intent_id = ?", (change.intent_id,)).fetchone()
+                if row is not None and tuple(row) != (change.description, change.priority, change.intent_type):
+                    raise StorageError("registered D1 Intent declaration is immutable")
+            if isinstance(change, UpsertIntent) and change.status is IntentStatus.SUCCEEDED and mutation.operation != "complete_verified_t6_intent":
+                raise StorageError("D1 Intent success requires the separate fixed-rule completion gate")
+            if isinstance(change, UpsertTurn) and change.status is TurnStatus.COMPLETED:
+                if mutation.operation != "complete_verified_d1_turn" or mutation.d1_turn_proof is None:
+                    raise StorageError("D1 Turn success requires the independent completion gate")
+                binding = self.load_d1_turn_binding(change.turn_id)
+                proof = mutation.d1_turn_proof
+                if binding is None or proof.turn_id != change.turn_id or proof.binding_id != binding.binding_id or mutation.event.details.get("verified_fact_ids") != list(proof.supporting_fact_ids) or mutation.event.details.get("proof_ref") != proof.proof_ref:
+                    raise StorageError("D1 Turn proof does not match its immutable binding")
+
+    def _save_d1_mutation(self, mutation: ControlMutation, event_sequence: int) -> None:
+        if mutation.d1_config is not None:
+            self._connection.execute("INSERT INTO d1_runs VALUES (?,?,?)", (mutation.task_run_id, canonical_json(d1_payload(mutation.d1_config)), event_sequence))
+        if mutation.d1_binding is not None:
+            binding = mutation.d1_binding
+            self._connection.execute("INSERT INTO d1_turn_bindings VALUES (?,?,?,?,?)", (binding.turn_id, binding.task_run_id, binding.intent_id, canonical_json(d1_payload(binding)), event_sequence))
+        if mutation.d1_turn_proof is not None:
+            proof = mutation.d1_turn_proof
+            self._connection.execute("INSERT INTO d1_turn_proofs VALUES (?,?,?)", (proof.turn_id, canonical_json(d1_payload(proof)), event_sequence))
+
+    def _validate_d3_mutation(self, mutation: ControlMutation) -> None:
+        metadata = mutation.d3
+        config = self.load_d3_run_config(mutation.task_run_id)
+        if metadata is not None and metadata.config is not None:
+            if config is not None or mutation.operation != "start_task_run":
+                raise StorageError("D3 TaskRun configuration is immutable")
+            if metadata != D3CommitMetadata(config=metadata.config):
+                raise StorageError("D3 start may only save its frozen configuration")
+            attachments = mutation.request.target.attachments
+            if (
+                mutation.request.target.endpoints
+                or len(attachments) != len(metadata.config.authorization.attachment_indices)
+                or any(item.kind != "local_path" for item in attachments)
+                or len(mutation.state_changes) != 1
+                or not isinstance(mutation.state_changes[0], UpsertTaskRun)
+            ):
+                raise StorageError("D3 requires one or two frozen local attachments without network")
+            return
+        if config is None:
+            if metadata is not None or any(
+                isinstance(change, D3ReviewApplication) for change in mutation.state_changes
+            ):
+                raise StorageError("D3 metadata requires explicit D3 TaskRun identity")
+            return
+        if mutation.d1_config is not None or mutation.d2_config is not None:
+            raise StorageError("D3 cannot be combined with a D1 or D2 run")
+        allowed = {
+            "finish_task_run", "register_d3_turn", "select_d3_intent",
+            "apply_d3_review", "register_d3_plan", "replan_d3_plan",
+            "complete_d3_plan", "complete_d3_intent", "switch_d3_intent",
+            "complete_d3_turn", "advance_d3_turn", "exhaust_d3_turn",
+            "append_plan_validation_record", "create_execution", "start_execution",
+            "complete_execution", "finish_d3_execution",
+        }
+        if mutation.operation not in allowed:
+            raise StorageError("legacy control operation is not admitted for D3")
+        if any(
+            isinstance(change, UpsertTaskRun)
+            and change.status in {TaskRunStatus.ACHIEVED, TaskRunStatus.ASSUMED_ACHIEVED}
+            for change in mutation.state_changes
+        ):
+            raise StorageError("D3 has no whole-task success evaluator")
+        turn_changes = [change for change in mutation.state_changes if isinstance(change, UpsertTurn)]
+        intent_changes = [change for change in mutation.state_changes if isinstance(change, UpsertIntent)]
+        plan_changes = [change for change in mutation.state_changes if isinstance(change, UpsertPlan)]
+        new_turns = [change for change in turn_changes if self._task_run_for_turn(change.turn_id) is None]
+        new_plans = [change for change in plan_changes if self._task_run_for_plan(change.plan_id) is None]
+        if new_turns:
+            if (
+                mutation.operation not in {"register_d3_turn", "advance_d3_turn"}
+                or metadata is None or metadata.turn_binding is None
+                or len(new_turns) != 1
+                or self._connection.execute(
+                    "SELECT COUNT(*) FROM turns WHERE task_run_id = ?",
+                    (mutation.task_run_id,),
+                ).fetchone()[0] >= 2
+            ):
+                raise StorageError("D3 Turn requires one bound registration within the two-Turn limit")
+            turn = new_turns[0]
+            binding = metadata.turn_binding
+            children = sorted(
+                (item for item in intent_changes if item.turn_id == turn.turn_id),
+                key=lambda item: item.priority,
+            )
+            if (
+                binding.task_run_id != mutation.task_run_id
+                or binding.turn_id != turn.turn_id
+                or binding.attachment_index not in config.authorization.attachment_indices
+                or not 1 <= len(children) <= 2
+                or tuple(item.intent_id for item in children) != turn.intent_ids
+                or tuple(item.priority for item in children) != tuple(range(1, len(children) + 1))
+                or turn.status is not TurnStatus.PENDING
+                or any(item.status is not IntentStatus.PENDING for item in children)
+                or {item.intent_id for item in metadata.intent_bindings}
+                != set(turn.intent_ids)
+                or any(
+                    item.task_run_id != mutation.task_run_id
+                    or item.turn_id != turn.turn_id
+                    for item in metadata.intent_bindings
+                )
+            ):
+                raise StorageError("D3 Turn, Intent and rule bindings differ")
+            proposal = self.load_d3_operation(binding.proposal_request_id)
+            if (
+                proposal is None or proposal.start.task_run_id != mutation.task_run_id
+                or proposal.start.category != "outer_model"
+                or proposal.completion is None
+                or proposal.completion.result_kind != "completed"
+            ):
+                raise StorageError("D3 Turn requires a known outer proposal")
+        elif metadata is not None and (metadata.turn_binding is not None or metadata.intent_bindings):
+            raise StorageError("D3 Turn binding requires a new Turn")
+        if new_plans:
+            if (
+                mutation.operation not in {"register_d3_plan", "replan_d3_plan"}
+                or metadata is None or metadata.plan_binding is None
+                or len(new_plans) != 1
+            ):
+                raise StorageError("D3 Plan requires one bound registration")
+            plan = new_plans[0]
+            binding = metadata.plan_binding
+            expected_steps = (
+                (D3_SIZE_STEP, D3_SHA_STEP)
+                if binding.template == "size_then_sha256" else (D3_SHA_STEP,)
+            )
+            count = self._connection.execute(
+                "SELECT COUNT(*) FROM plans WHERE intent_id = ?", (plan.intent_id,)
+            ).fetchone()[0]
+            if (
+                binding.task_run_id != mutation.task_run_id
+                or binding.plan_id != plan.plan_id
+                or binding.intent_id != plan.intent_id
+                or self._task_run_for_intent(plan.intent_id) != mutation.task_run_id
+                or self.load_d3_intent_binding(plan.intent_id) is None
+                or plan.status is not PlanStatus.RUNNING
+                or tuple(step.description for step in plan.steps) != expected_steps
+                or count >= 2
+            ):
+                raise StorageError("D3 Plan declaration or per-Intent limit differs")
+            proposal = self.load_d3_operation(binding.proposal_request_id)
+            if (
+                proposal is None or proposal.start.category != "inner_model"
+                or proposal.start.task_run_id != mutation.task_run_id
+                or proposal.completion is None
+                or proposal.completion.result_kind != "completed"
+            ):
+                raise StorageError("D3 Plan requires a known inner proposal")
+        elif metadata is not None and metadata.plan_binding is not None:
+            raise StorageError("D3 Plan binding requires a new Plan")
+        if mutation.operation == "complete_d3_plan" and (
+            metadata is None or metadata.plan_result is None
+        ):
+            raise StorageError("D3 Plan completion requires its saved result")
+        if metadata is not None and metadata.plan_result is not None:
+            result = metadata.plan_result
+            binding = self.load_d3_plan_binding(result.plan_id)
+            facts = [item for item in mutation.state_changes if isinstance(item, UpsertFact)]
+            if (
+                binding is None or result.task_run_id != mutation.task_run_id
+                or result.artifact_version_id != binding.artifact_version_id
+                or self.load_d3_plan_result(result.plan_id) is not None
+                or not any(
+                    item.plan_id == result.plan_id and item.status is PlanStatus.COMPLETED
+                    for item in plan_changes
+                )
+                or binding.observation_mode == "reuse_saved_proof" and (
+                    result.proof_id != binding.source_proof_id
+                    or result.supporting_fact_id != binding.source_fact_id
+                )
+                or result.outcome == "satisfied" and binding.observation_mode == "new_observation" and (
+                    len(facts) != 1
+                    or facts[0].fact_id != result.supporting_fact_id
+                    or facts[0].verification_ref != f"d3:{result.proof_id}"
+                )
+                or binding.observation_mode == "reuse_saved_proof" and facts
+                or result.outcome == "not_satisfied" and facts
+            ):
+                raise StorageError("D3 Plan result is not bound to its completed Plan")
+        elif any(isinstance(item, UpsertFact) for item in mutation.state_changes):
+            raise StorageError("D3 Fact requires the independent Plan result transaction")
+        if mutation.operation == "apply_d3_review":
+            self._validate_d3_review(mutation)
+        elif any(isinstance(change, D3ReviewApplication) for change in mutation.state_changes):
+            raise StorageError("D3 review requires its dedicated operation")
+        if metadata is not None:
+            for outcome in metadata.outcomes:
+                change = next((
+                    item for item in mutation.state_changes
+                    if outcome.entity_kind == "turn" and isinstance(item, UpsertTurn) and item.turn_id == outcome.entity_id
+                    or outcome.entity_kind == "intent" and isinstance(item, UpsertIntent) and item.intent_id == outcome.entity_id
+                    or outcome.entity_kind == "plan" and isinstance(item, UpsertPlan) and item.plan_id == outcome.entity_id
+                ), None)
+                if (
+                    change is None or change.status.value != outcome.status
+                    or self.load_d3_outcome(outcome.entity_id) is not None
+                ):
+                    raise StorageError("D3 outcome requires its own terminal state change")
+                if outcome.reason == "target_mismatch" or outcome.reason == "all_candidates_target_mismatch":
+                    raise StorageError("fixed v1 rule cannot negate an entire Intent")
+        required_outcomes = set()
+        for change in mutation.state_changes:
+            if isinstance(change, UpsertTurn) and change.status in {
+                TurnStatus.COMPLETED, TurnStatus.FAILED,
+                TurnStatus.INCONCLUSIVE, TurnStatus.SUPERSEDED,
+            }:
+                kind, table, key, entity_id = "turn", "turns", "turn_id", change.turn_id
+            elif isinstance(change, UpsertIntent) and change.status in {
+                IntentStatus.SUCCEEDED, IntentStatus.FAILED,
+                IntentStatus.INCONCLUSIVE, IntentStatus.ABANDONED,
+                IntentStatus.SKIPPED,
+            }:
+                kind, table, key, entity_id = "intent", "intents", "intent_id", change.intent_id
+            elif isinstance(change, UpsertPlan) and change.status is PlanStatus.SUPERSEDED:
+                kind, table, key, entity_id = "plan", "plans", "plan_id", change.plan_id
+            else:
+                continue
+            row = self._connection.execute(
+                f"SELECT status FROM {table} WHERE {key} = ?", (entity_id,)
+            ).fetchone()
+            if row is not None and row["status"] != change.status.value:
+                required_outcomes.add((kind, entity_id))
+        supplied_outcomes = {
+            (item.entity_kind, item.entity_id): item
+            for item in metadata.outcomes
+        } if metadata is not None else {}
+        if not required_outcomes.issubset(supplied_outcomes):
+            raise StorageError("D3 terminal transition requires an independent outcome")
+        expected_reasons = {
+            ("replan_d3_plan", "plan", "superseded"): "replanned",
+            ("complete_d3_intent", "intent", "succeeded"): "rule_satisfied",
+            ("complete_d3_turn", "turn", "completed"): "turn_goal_satisfied",
+            ("complete_d3_turn", "intent", "skipped"): "turn_goal_satisfied",
+            ("switch_d3_intent", "intent", "abandoned"): "strategy_abandoned",
+            ("switch_d3_intent", "plan", "superseded"): "sibling_switch",
+            ("advance_d3_turn", "turn", "superseded"): "turn_target_adjusted",
+            ("advance_d3_turn", "intent", "abandoned"): "turn_target_adjusted",
+            ("advance_d3_turn", "intent", "skipped"): "turn_target_adjusted",
+            ("advance_d3_turn", "plan", "superseded"): "turn_target_adjusted",
+        }
+        for kind, entity_id in required_outcomes:
+            outcome = supplied_outcomes[(kind, entity_id)]
+            expected_reason = expected_reasons.get(
+                (mutation.operation, kind, outcome.status)
+            )
+            if expected_reason is not None and outcome.reason != expected_reason:
+                raise StorageError("D3 terminal outcome reason differs from its transition")
+        for change in turn_changes:
+            row = self._connection.execute(
+                "SELECT sequence, turn_target, intent_ids_json FROM turns WHERE turn_id = ?",
+                (change.turn_id,),
+            ).fetchone()
+            if row is not None and (
+                row["sequence"], row["turn_target"], tuple(json.loads(row["intent_ids_json"]))
+            ) != (change.sequence, change.turn_target, change.intent_ids):
+                raise StorageError("registered D3 Turn declaration is immutable")
+            if change.status is TurnStatus.COMPLETED and mutation.operation != "complete_d3_turn":
+                raise StorageError("D3 Turn completion requires its independent gate")
+        for change in intent_changes:
+            row = self._connection.execute(
+                "SELECT description, priority, intent_type FROM intents WHERE intent_id = ?",
+                (change.intent_id,),
+            ).fetchone()
+            if row is not None and tuple(row) != (
+                change.description, change.priority, change.intent_type,
+            ):
+                raise StorageError("registered D3 Intent declaration is immutable")
+            if change.status is IntentStatus.SUCCEEDED and mutation.operation != "complete_d3_intent":
+                raise StorageError("D3 Intent success requires its independent gate")
+        self._validate_d3_transitions(mutation)
+
+    def _validate_d3_transitions(self, mutation: ControlMutation) -> None:
+        before = self.load_control_state_rows(mutation.task_run_id)
+        if before is None:
+            raise StorageError("D3 transition requires an existing TaskRun")
+        after = project_candidate(before, mutation)
+        old_turns = {item.turn_id: item for item in before.turns}
+        old_intents = {item.intent_id: item for item in before.intents}
+        old_plans = {item.plan_id: item for item in before.plans}
+        new_turns = {item.turn_id: item for item in after.turns}
+        new_intents = {item.intent_id: item for item in after.intents}
+        new_plans = {item.plan_id: item for item in after.plans}
+        status_changes = tuple(
+            ("turn", change.turn_id, change.status) if isinstance(change, UpsertTurn)
+            else ("intent", change.intent_id, change.status) if isinstance(change, UpsertIntent)
+            else ("plan", change.plan_id, change.status) if isinstance(change, UpsertPlan)
+            else None
+            for change in mutation.state_changes
+        )
+        transitions = {
+            "turn": {
+                (TurnStatus.PENDING, TurnStatus.RUNNING): {"select_d3_intent"},
+                (TurnStatus.RUNNING, TurnStatus.COMPLETED): {"complete_d3_turn"},
+                (TurnStatus.RUNNING, TurnStatus.SUPERSEDED): {"advance_d3_turn"},
+                (TurnStatus.RUNNING, TurnStatus.INCONCLUSIVE): {"exhaust_d3_turn"},
+            },
+            "intent": {
+                (IntentStatus.PENDING, IntentStatus.RUNNING): {"select_d3_intent", "switch_d3_intent"},
+                (IntentStatus.PENDING, IntentStatus.SKIPPED): {"complete_d3_turn", "advance_d3_turn"},
+                (IntentStatus.RUNNING, IntentStatus.SUCCEEDED): {"complete_d3_intent"},
+                (IntentStatus.RUNNING, IntentStatus.ABANDONED): {"switch_d3_intent", "advance_d3_turn"},
+            },
+            "plan": {
+                (PlanStatus.RUNNING, PlanStatus.COMPLETED): {"complete_d3_plan"},
+                (PlanStatus.RUNNING, PlanStatus.SUPERSEDED): {
+                    "replan_d3_plan", "switch_d3_intent", "advance_d3_turn",
+                },
+            },
+        }
+        for kind, old_items, new_items in (
+            ("turn", old_turns, new_turns),
+            ("intent", old_intents, new_intents),
+            ("plan", old_plans, new_plans),
+        ):
+            for entity_id, previous in old_items.items():
+                current = new_items[entity_id]
+                if previous.status == current.status:
+                    continue
+                if mutation.operation not in transitions[kind].get(
+                    (previous.status, current.status), set()
+                ):
+                    raise StorageError(f"D3 {kind} state transition is not admitted")
+        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1:
+            raise StorageError("D3 may run only one Turn")
+        if sum(item.status is IntentStatus.RUNNING for item in after.intents) > 1:
+            raise StorageError("D3 may run only one Intent")
+        if mutation.operation == "register_d3_turn":
+            created = [item for item in after.turns if item.turn_id not in old_turns]
+            if len(created) != 1 or any(
+                item.status not in {
+                    TurnStatus.COMPLETED, TurnStatus.FAILED,
+                    TurnStatus.INCONCLUSIVE, TurnStatus.SUPERSEDED,
+                } for item in before.turns
+            ):
+                raise StorageError("D3 next Turn requires the previous Turn to be terminal")
+            if before.turns:
+                old_turn = before.turns[-1]
+                outcome = self.load_d3_outcome(old_turn.turn_id)
+                if (
+                    outcome is None
+                    or outcome.reason != "candidates_exhausted_after_strategy_abandonment"
+                    or not any(
+                        item.turn_id == old_turn.turn_id
+                        and item.review_scope == "turn_end"
+                        and item.decision == "acknowledge_turn_end"
+                        and not item.paused_gate
+                        for item in self.list_d3_review_applications(mutation.task_run_id)
+                    )
+                ):
+                    raise StorageError("D3 exhausted Turn needs its accepted tail review")
+        if mutation.operation == "select_d3_intent":
+            activated = [
+                item for item in after.intents
+                if item.intent_id in old_intents
+                and old_intents[item.intent_id].status is IntentStatus.PENDING
+                and item.status is IntentStatus.RUNNING
+            ]
+            if (
+                len(activated) != 1 or activated[0].priority != 1
+                or old_turns[activated[0].turn_id].status is not TurnStatus.PENDING
+                or new_turns[activated[0].turn_id].status is not TurnStatus.RUNNING
+            ):
+                raise StorageError("D3 first selection must use the highest-priority candidate")
+            expected = {
+                ("turn", activated[0].turn_id, TurnStatus.RUNNING),
+                ("intent", activated[0].intent_id, IntentStatus.RUNNING),
+            }
+            if set(status_changes) != expected or len(status_changes) != len(expected):
+                raise StorageError("D3 first selection must change only its Turn and Intent")
+        if mutation.operation == "switch_d3_intent":
+            old_active = [
+                item for item in before.intents if item.status is IntentStatus.RUNNING
+            ]
+            new_active = [
+                item for item in after.intents if item.status is IntentStatus.RUNNING
+            ]
+            pending = [
+                item for item in before.intents
+                if old_active and item.turn_id == old_active[0].turn_id
+                and item.status is IntentStatus.PENDING
+            ]
+            if (
+                len(old_active) != 1 or len(new_active) != 1
+                or not pending
+                or new_active[0].turn_id != old_active[0].turn_id
+                or new_intents[old_active[0].intent_id].status is not IntentStatus.ABANDONED
+                or new_active[0].priority != min(item.priority for item in pending)
+            ):
+                raise StorageError("D3 sibling switch must choose the highest-priority untried Intent")
+            expected = {
+                ("intent", old_active[0].intent_id, IntentStatus.ABANDONED),
+                ("intent", new_active[0].intent_id, IntentStatus.RUNNING),
+                *(
+                    ("plan", item.plan_id, PlanStatus.SUPERSEDED)
+                    for item in before.plans
+                    if item.intent_id == old_active[0].intent_id
+                    and item.status is PlanStatus.RUNNING
+                ),
+            }
+            if set(status_changes) != expected or len(status_changes) != len(expected):
+                raise StorageError("D3 sibling switch must close old running Plans")
+        if mutation.operation == "advance_d3_turn":
+            created = [item for item in after.turns if item.turn_id not in old_turns]
+            old_turn = before.turns[-1] if before.turns else None
+            active = [item for item in before.intents if old_turn is not None
+                      and item.turn_id == old_turn.turn_id
+                      and item.status is IntentStatus.RUNNING]
+            if (
+                old_turn is None or old_turn.status is not TurnStatus.RUNNING
+                or len(created) != 1 or len(active) != 1
+            ):
+                raise StorageError("D3 adjusted Turn requires one active predecessor")
+            expected = {
+                ("turn", old_turn.turn_id, TurnStatus.SUPERSEDED),
+                ("turn", created[0].turn_id, TurnStatus.PENDING),
+                ("intent", active[0].intent_id, IntentStatus.ABANDONED),
+                *(
+                    ("intent", item.intent_id, IntentStatus.SKIPPED)
+                    for item in before.intents
+                    if item.turn_id == old_turn.turn_id
+                    and item.status is IntentStatus.PENDING
+                ),
+                *(
+                    ("intent", item.intent_id, IntentStatus.PENDING)
+                    for item in after.intents
+                    if item.turn_id == created[0].turn_id
+                ),
+                *(
+                    ("plan", item.plan_id, PlanStatus.SUPERSEDED)
+                    for item in before.plans
+                    if item.intent_id == active[0].intent_id
+                    and item.status is PlanStatus.RUNNING
+                ),
+            }
+            if set(status_changes) != expected or len(status_changes) != len(expected):
+                raise StorageError("D3 adjusted Turn must close remaining candidates")
+        if mutation.operation == "complete_d3_intent":
+            completed = [
+                item for item in after.intents
+                if item.intent_id in old_intents
+                and old_intents[item.intent_id].status is IntentStatus.RUNNING
+                and item.status is IntentStatus.SUCCEEDED
+            ]
+            if len(completed) != 1:
+                raise StorageError("D3 Intent completion needs one active Intent")
+            plans = [item for item in after.plans if item.intent_id == completed[0].intent_id]
+            if not plans or plans[-1].status is not PlanStatus.COMPLETED:
+                raise StorageError("D3 Intent completion needs its latest completed Plan")
+            result = self.load_d3_plan_result(plans[-1].plan_id)
+            if result is None or result.outcome != "satisfied":
+                raise StorageError("D3 latest Plan has no trusted satisfied support")
+        if mutation.operation == "complete_d3_turn":
+            completed = [
+                item for item in after.turns
+                if item.turn_id in old_turns
+                and old_turns[item.turn_id].status is TurnStatus.RUNNING
+                and item.status is TurnStatus.COMPLETED
+            ]
+            if len(completed) != 1 or sum(
+                new_intents[intent_id].status is IntentStatus.SUCCEEDED
+                for intent_id in completed[0].intent_ids
+            ) != 1 or any(
+                new_intents[intent_id].status not in {
+                    IntentStatus.SUCCEEDED, IntentStatus.ABANDONED,
+                    IntentStatus.FAILED, IntentStatus.SKIPPED,
+                } for intent_id in completed[0].intent_ids
+            ):
+                raise StorageError("D3 completed Turn must close all sibling candidates")
+            expected = {
+                ("turn", completed[0].turn_id, TurnStatus.COMPLETED),
+                *(
+                    ("intent", item.intent_id, IntentStatus.SKIPPED)
+                    for item in before.intents
+                    if item.turn_id == completed[0].turn_id
+                    and item.status is IntentStatus.PENDING
+                ),
+            }
+            if set(status_changes) != expected or len(status_changes) != len(expected):
+                raise StorageError("D3 Turn completion changed an unrelated candidate")
+        if mutation.operation == "complete_d3_plan" and mutation.d3 is not None and (
+            mutation.d3.plan_binding is None and mutation.d3.plan_result is not None
+        ) and self.load_d3_plan_binding(mutation.d3.plan_result.plan_id).observation_mode == "new_observation":
+            changed = [
+                item for item in after.plans
+                if item.plan_id in old_plans
+                and old_plans[item.plan_id].status is PlanStatus.RUNNING
+                and item.status is PlanStatus.COMPLETED
+            ]
+            if len(changed) != 1 or any(
+                sum(
+                    execution.plan_id == changed[0].plan_id
+                    and execution.step_index == step_index
+                    and execution.status is ExecutionStatus.SUCCEEDED
+                    for execution in before.executions
+                ) != 1 for step_index in range(len(changed[0].steps))
+            ):
+                raise StorageError("D3 observed Plan cannot finish with an unexecuted fixed step")
+
+    def _validate_d3_review(self, mutation: ControlMutation) -> None:
+        if len(mutation.state_changes) != 1 or not isinstance(mutation.state_changes[0], D3ReviewApplication):
+            raise StorageError("D3 review requires one typed application")
+        application = mutation.state_changes[0]
+        if (
+            application.task_run_id != mutation.task_run_id
+            or self._task_run_for_turn(application.turn_id) != mutation.task_run_id
+            or self._task_run_for_intent(application.intent_id) != mutation.task_run_id
+            or self._connection.execute(
+                "SELECT turn_id FROM intents WHERE intent_id = ?", (application.intent_id,)
+            ).fetchone()["turn_id"] != application.turn_id
+            or self.load_d3_review_application(mutation.task_run_id, application.review_id) is not None
+        ):
+            raise StorageError("D3 review scope or immutable identity differs")
+        prior = self.list_d3_review_applications(mutation.task_run_id)
+        expected_version = max((item.constraint_version for item in prior), default=0) + bool(application.output_constraints)
+        if application.constraint_version != expected_version:
+            raise StaleControlStateError("D3 constraint version is not current")
+        if not application.paused_gate and any(
+            item.review_root_id == application.review_root_id
+            and item.review_generation == application.review_generation
+            and not item.paused_gate for item in prior
+        ):
+            raise StorageError("D3 review generation already has an accepted application")
+        for constraint in application.output_constraints:
+            expected_scope = application.intent_id if constraint.scope_kind == "intent" else application.turn_id
+            if constraint.scope_id != expected_scope:
+                raise StorageError("D3 constraint scope differs from its review")
+            previous = [
+                item for item in prior for item in item.output_constraints
+                if item.scope_kind == constraint.scope_kind and item.scope_id == constraint.scope_id
+                and type(item) is type(constraint)
+            ]
+            if isinstance(constraint, D2AllowedActionKinds):
+                admitted = {"probe", "complete_intent"}
+                for item in previous:
+                    admitted &= set(item.allowed_action_kinds)
+                if not set(constraint.allowed_action_kinds).issubset(admitted):
+                    raise StorageError("D3 action kinds can only tighten")
+            else:
+                limit = min((item.max_action_timeout_seconds for item in previous), default=300)
+                if constraint.max_action_timeout_seconds > limit:
+                    raise StorageError("D3 action timeout can only tighten")
+
+    def _save_d3_mutation(self, mutation: ControlMutation, event_sequence: int) -> None:
+        metadata = mutation.d3
+        if metadata is not None:
+            if metadata.config is not None:
+                self._connection.execute(
+                    "INSERT INTO d3_runs VALUES (?, ?, ?)",
+                    (mutation.task_run_id, canonical_json(d3_payload(metadata.config)), event_sequence),
+                )
+            if metadata.turn_binding is not None:
+                binding = metadata.turn_binding
+                self._connection.execute(
+                    "INSERT INTO d3_turn_bindings VALUES (?, ?, ?, ?)",
+                    (binding.turn_id, binding.task_run_id, canonical_json(d3_payload(binding)), event_sequence),
+                )
+            for binding in metadata.intent_bindings:
+                self._connection.execute(
+                    "INSERT INTO d3_intent_bindings VALUES (?, ?, ?, ?, ?)",
+                    (binding.intent_id, binding.task_run_id, binding.turn_id,
+                     canonical_json(d3_payload(binding)), event_sequence),
+                )
+            if metadata.plan_binding is not None:
+                binding = metadata.plan_binding
+                self._connection.execute(
+                    "INSERT INTO d3_plan_bindings VALUES (?, ?, ?, ?, ?)",
+                    (binding.plan_id, binding.task_run_id, binding.intent_id,
+                     canonical_json(d3_payload(binding)), event_sequence),
+                )
+            if metadata.plan_result is not None:
+                result = metadata.plan_result
+                self._connection.execute(
+                    "INSERT INTO d3_plan_results VALUES (?, ?, ?, ?)",
+                    (result.plan_id, result.task_run_id, canonical_json(d3_payload(result)), event_sequence),
+                )
+            for outcome in metadata.outcomes:
+                self._connection.execute(
+                    "INSERT INTO d3_outcomes VALUES (?, ?, ?, ?, ?)",
+                    (outcome.entity_id, mutation.task_run_id, outcome.entity_kind,
+                     canonical_json(d3_payload(outcome)), event_sequence),
+                )
+        for change in mutation.state_changes:
+            if not isinstance(change, D3ReviewApplication):
+                continue
+            self._connection.execute(
+                "INSERT INTO d3_review_applications VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (change.review_id, change.task_run_id, change.review_root_id,
+                 change.review_generation, change.turn_id, change.intent_id,
+                 change.decision, int(change.paused_gate), change.constraint_version,
+                 canonical_json(d3_payload(change)), event_sequence),
+            )
+
     def commit(self, mutation: ControlMutation) -> ControlCommitResult:
         expected_fingerprint = control_mutation_fingerprint(mutation)
         if mutation.request_fingerprint != expected_fingerprint:
@@ -1296,12 +2685,18 @@ class SqliteControlStore:
             event_sequence = self._next_event_sequence(mutation.task_run_id)
             committed_at = self._now()
             before = self.load_control_state_rows(mutation.task_run_id)
+            self._validate_d1_mutation(mutation)
+            self._validate_d2_mutation(mutation)
+            self._validate_d3_mutation(mutation)
             self._validate_existing_owners(mutation)
             self._apply_state_changes(
                 mutation,
                 event_sequence=event_sequence,
                 committed_at=committed_at,
             )
+            self._save_d1_mutation(mutation, event_sequence)
+            self._save_d2_mutation(mutation, event_sequence)
+            self._save_d3_mutation(mutation, event_sequence)
             self._insert_event(mutation.event, event_sequence)
             checkpoint = Checkpoint(
                 task_run_id=mutation.task_run_id,
@@ -1779,6 +3174,7 @@ class SqliteControlStore:
         order = {kind: index for index, kind in enumerate((
             UpsertTaskRun, UpsertTurn, UpsertIntent, UpsertIntentGoal, UpsertPlan, UpsertExecution,
             UpsertFact, AppendPlanValidationRecord, AppendFailureSummary,
+            AppendD2ReviewApplication, D3ReviewApplication,
         ))}
         for ordinal, change in sorted(enumerate(mutation.state_changes), key=lambda entry: order[type(entry[1])]):
             self._validate_change_owner(change, mutation.task_run_id)
@@ -1795,7 +3191,7 @@ class SqliteControlStore:
             elif isinstance(change, UpsertExecution):
                 self._upsert_execution(change)
             elif isinstance(change, UpsertFact):
-                if mutation.operation in {"commit_verified_file_type_fact", "commit_verified_t6_observation", "commit_verified_t6_fact"} and self._connection.execute(
+                if mutation.operation in {"commit_verified_file_type_fact", "commit_verified_t6_observation", "commit_verified_t6_fact", "complete_d3_plan"} and self._connection.execute(
                     "SELECT 1 FROM facts WHERE fact_id = ?", (change.fact_id,)
                 ).fetchone() is not None:
                     raise StorageError("file-type Fact commit must insert a new Fact")
@@ -1809,6 +3205,9 @@ class SqliteControlStore:
                 )
             elif isinstance(change, AppendPlanValidationRecord):
                 self._append_plan_validation(change, committed_at)
+            elif isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication)):
+                # Append-only review rows are saved with the same event and checkpoint.
+                pass
             else:
                 raise StorageError("unsupported state change")
 
@@ -1891,6 +3290,18 @@ class SqliteControlStore:
             return
         elif isinstance(change, AppendPlanValidationRecord):
             owner = self._task_run_for_plan(change.record.plan_id)
+        elif isinstance(change, AppendD2ReviewApplication):
+            if self._connection.execute(
+                "SELECT 1 FROM task_runs WHERE task_run_id = ?", (task_run_id,)
+            ).fetchone() is None:
+                raise StorageError("D2 review application TaskRun does not exist")
+            return
+        elif isinstance(change, D3ReviewApplication):
+            if change.task_run_id != task_run_id or self._connection.execute(
+                "SELECT 1 FROM task_runs WHERE task_run_id = ?", (task_run_id,)
+            ).fetchone() is None:
+                raise StorageError("D3 review application TaskRun does not exist")
+            return
         else:
             raise StorageError("unsupported control object")
         if owner != task_run_id:

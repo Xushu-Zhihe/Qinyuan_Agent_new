@@ -12,7 +12,7 @@ from agent_adapters.deepseek_model import (
     DeepSeekSettings,
     build_payload,
 )
-from agent_core.contracts import ModelBackend, TaskRequest
+from agent_core.contracts import ModelBackend, Target, TaskRequest
 from agent_core.control_state_repository import ControlStateRepository
 from agent_core.control_store import StorageError
 from agent_core.controller import TaskRunController, TaskRunControllerRegistry
@@ -25,7 +25,7 @@ from agent_core.modeling import (
     ModelRequest,
     ModelRequestType,
 )
-from agent_core.sqlite_control_store import SqliteControlStore
+from agent_core.sqlite_control_store import CURRENT_SCHEMA_VERSION, SqliteControlStore
 
 NOW = 1_800_000_000.0
 
@@ -133,6 +133,29 @@ def test_deepseek_adapter_normalizes_ordered_intents_without_tools(tmp_path):
     assert [(item.description, item.intent_type) for item in result.candidates] == [
         ("inspect the binary", "analysis"), ("test the target", None)
     ]
+
+
+def test_intent_generation_prompt_uses_workspace_attachment_paths(tmp_path):
+    fixture = Fixture(tmp_path, [])
+    request = ModelRequest(
+        str(uuid4()), fixture.task_id, str(uuid4()),
+        ModelRequestType.INTENT_GENERATION,
+        "analyze the files",
+        Target.from_dict({"attachments": [
+            {"kind": "local_path", "path": "input/pwn"},
+            {"kind": "local_path", "path": "input/libc.so.6"},
+        ]}),
+        "inspect local files", (), (),
+    )
+
+    system_prompt = build_payload(request, DeepSeekSettings("deepseek-test", "test-key"))[
+        "messages"
+    ][0]["content"]
+
+    assert "/workspace/work/pwn" in system_prompt
+    assert "/workspace/work/libc.so.6" in system_prompt
+    assert "do not prepend input/" in system_prompt
+    assert "/workspace/work/input/pwn" not in system_prompt
 
 
 def test_ordered_intents_are_durable_and_exact_replay_has_no_model_call(tmp_path):
@@ -336,6 +359,10 @@ def test_schema_7_upgrade_keeps_registered_turn_and_adds_generation_audit(tmp_pa
     fixture.store.close()
     path = tmp_path / "control.sqlite"
     with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE d1_operations")
+        connection.execute("DROP TABLE d1_turn_proofs")
+        connection.execute("DROP TABLE d1_turn_bindings")
+        connection.execute("DROP TABLE d1_runs")
         connection.execute("DROP TABLE t6_action_resource_ids")
         connection.execute("DROP TABLE t6_action_invocations")
         connection.execute("DROP TABLE turn_model_invocations")
@@ -350,4 +377,4 @@ def test_schema_7_upgrade_keeps_registered_turn_and_adds_generation_audit(tmp_pa
         assert upgraded.list_unapplied_turn_generations(task_id) == ()
         assert upgraded._connection.execute(
             "SELECT MAX(version) FROM schema_versions"
-        ).fetchone()[0] == 10
+        ).fetchone()[0] == CURRENT_SCHEMA_VERSION

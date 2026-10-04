@@ -15,6 +15,9 @@ from agent_core.command_contracts import (
 )
 from Sandbox.task_run_sandbox import TaskRunSandboxError
 
+OUTPUT_READ_POLL_SECONDS = 0.25
+OUTPUT_STREAM_DRAIN_GRACE_SECONDS = 1.0
+
 BASH_WRAPPER = r"""import os,subprocess,sys
 path,size,script=sys.argv[1],int(sys.argv[2]),sys.argv[3]
 root='/workspace/work'
@@ -243,15 +246,28 @@ class T6CommandSandbox:
                 if not isinstance(sent, int) or sent <= 0:
                     raise OSError("short_command_input")
                 offset += sent
-            raw.settimeout(0.25)
             stream_complete = False
-            while time.monotonic() < end and not token.is_cancelled:
+            drain_deadline = None
+            while not token.is_cancelled:
+                now = time.monotonic()
+                if drain_deadline is None and now >= end:
+                    info = api.exec_inspect(execution["Id"])
+                    if info.get("Running") is not False:
+                        break
+                    drain_deadline = now + OUTPUT_STREAM_DRAIN_GRACE_SECONDS
+                active_deadline = end if drain_deadline is None else drain_deadline
+                remaining = active_deadline - now
+                if remaining <= 0:
+                    break
+                raw.settimeout(min(OUTPUT_READ_POLL_SECONDS, remaining))
                 try:
                     block = self._read_output(raw)
                 except TimeoutError:
                     info = api.exec_inspect(execution["Id"])
-                    if info.get("Running") is False:
-                        break
+                    if info.get("Running") is False and drain_deadline is None:
+                        drain_deadline = (
+                            time.monotonic() + OUTPUT_STREAM_DRAIN_GRACE_SECONDS
+                        )
                     continue
                 if not block:
                     stream_complete = True

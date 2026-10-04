@@ -2,29 +2,39 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Any
 
 from agent_core.attachment_import import AttachmentImportEvidencePort
-from agent_core.contracts import ModelBackend, TaskRequest, TaskRequestError, resolve_model_backend
+from agent_core.contracts import (
+    ModelBackend,
+    TaskRequest,
+    TaskRequestError,
+    resolve_model_backend,
+)
 from agent_core.control_state_repository import ControlStateRepository, RecoveryResult
 from agent_core.control_store import (
+    AppendD2ReviewApplication,
     CommittedOperation,
     ControlCommitResult,
     ControlMutation,
     ControlStateSnapshot,
     ControlStore,
+    D2RunConfig,
+    FactRecordSnapshot,
     IdempotencyConflictError,
     IntentGoalBindingResult,
     StaleControlStateError,
     StorageError,
+    StateChange,
+    TargetNetworkBinding,
     TaskRunNotFoundError,
     TaskRunSnapshot,
-    TargetNetworkBinding,
-    TurnRegistration,
     TurnOperation,
+    TurnRegistration,
     UpsertExecution,
     UpsertFact,
     UpsertIntent,
@@ -33,33 +43,48 @@ from agent_core.control_store import (
     UpsertTaskRun,
     UpsertTurn,
 )
-from agent_core.domain import ExecutionStatus, FactStatus, IntentStatus, PlanStatus, TurnStatus
+from agent_core.dual_llm_contracts import D3CommitMetadata, D3RunConfig
+from agent_core.turn_contracts import (
+    D1RunConfig,
+    D1TurnBinding,
+    D1TurnEvaluatorPort,
+    D1TurnProof,
+)
+from agent_core.domain import (
+    ExecutionStatus,
+    FactStatus,
+    IntentStatus,
+    PlanStatus,
+    TurnStatus,
+)
 from agent_core.file_inspection import FILE_TOOL
 from agent_core.file_type_fact import FileTypeFactCandidate, fact_content
 from agent_core.file_type_verifier import (
     FileTypeProofEvidencePort,
     FileTypeVerificationError,
 )
-from agent_core.observation_proof import (
-    ObservationProofError,
-    T6ObservationProofEvidencePort,
-    observation_fact_content,
-)
-from agent_core.intent_goals import FileTypeIntentGoal, IntentGoalBindingError
 from agent_core.intent_goal_evaluator import (
     IntentGoalEvaluation,
     IntentGoalEvaluationError,
     IntentGoalEvaluatorPort,
 )
-from agent_core.tool_contracts import ToolAuthorization
+from agent_core.intent_goals import FileTypeIntentGoal, IntentGoalBindingError
+from agent_core.observation_proof import (
+    ObservationProofError,
+    T6ObservationProofEvidencePort,
+    observation_fact_content,
+)
 from agent_core.runtime import (
+    TERMINAL_STATUSES,
     InvalidTransition,
     RuntimeEvent,
-    TERMINAL_STATUSES,
-    TaskRunController as LegacyTaskRunController,
-    TaskRunStatus,
     TaskRunSandboxPort,
+    TaskRunStatus,
 )
+from agent_core.runtime import (
+    TaskRunController as LegacyTaskRunController,
+)
+from agent_core.tool_contracts import ToolAuthorization
 
 
 class ControllerRegistryError(RuntimeError):
@@ -202,6 +227,8 @@ class TaskRunController(LegacyTaskRunController):
         t6_observation_proofs: T6ObservationProofEvidencePort | None = None,
         intent_goal_evaluator: IntentGoalEvaluatorPort | None = None,
         target_network_adapter: Any | None = None,
+        d1_turn_evaluator: D1TurnEvaluatorPort | None = None,
+        d3_evidence_validator: Callable[[ControlMutation, ControlStateSnapshot], None] | None = None,
     ) -> None:
         super().__init__(sandbox, clock=clock if callable(clock) else _clock_now_wrapper(clock))
         supplied = (store, repository, registry)
@@ -226,6 +253,8 @@ class TaskRunController(LegacyTaskRunController):
         self._intent_goal_evaluator = intent_goal_evaluator
         self._target_network = target_network_adapter
         self._target_network_destroyed = False
+        self._d1_turn_evaluator = d1_turn_evaluator
+        self._d3_evidence_validator = d3_evidence_validator
 
     def _now_utc(self) -> float:
         return _clock_now(self._clock)
@@ -269,6 +298,9 @@ class TaskRunController(LegacyTaskRunController):
         *,
         source_root: str | None = None,
         task_run_id: str | None = None,
+        d1_config: D1RunConfig | None = None,
+        d2_config: D2RunConfig | None = None,
+        d3_config: D3RunConfig | None = None,
     ) -> Any:
         if self._persistent is None:
             if (
@@ -276,11 +308,14 @@ class TaskRunController(LegacyTaskRunController):
                 or mutation_id is not None
                 or source_root is not None
                 or task_run_id is not None
+                or d1_config is not None
+                or d2_config is not None
+                or d3_config is not None
             ):
                 raise InvalidTransition("persistent dependencies are required for this start signature")
             return super().start(request)
         return self._start_persistent(
-            request, effective_model_backend, mutation_id, source_root, task_run_id,
+            request, effective_model_backend, mutation_id, source_root, task_run_id, d1_config, d2_config, d3_config,
         )
 
     def _start_persistent(
@@ -290,6 +325,9 @@ class TaskRunController(LegacyTaskRunController):
         mutation_id: str | None,
         source_root: str | None,
         task_run_id: str | None = None,
+        d1_config: D1RunConfig | None = None,
+        d2_config: D2RunConfig | None = None,
+        d3_config: D3RunConfig | None = None,
     ) -> CommittedOperation:
         deps = self._require_persistent()
         if self._persistent_task_run_id is not None or self._closed:
@@ -309,6 +347,26 @@ class TaskRunController(LegacyTaskRunController):
         if request.model_backend is not None and request.model_backend is not backend:
             raise TaskRequestError("TaskRequest model_backend conflicts with effective_model_backend")
         source_root = _validate_source_root(source_root)
+        if d2_config is not None and (
+            not isinstance(d2_config, D2RunConfig) or d1_config is None
+        ):
+            raise TaskRequestError("D2 requires its frozen configuration and fixed execution configuration")
+        if d1_config is not None:
+            if not isinstance(d1_config, D1RunConfig):
+                raise TaskRequestError("d1_config must be a frozen D1RunConfig")
+            attachments = request.target.attachments
+            if request.target.endpoints or len(attachments) != 1 or attachments[0].kind != "local_path" or self._target_network is not None:
+                raise TaskRequestError("D1 requires exactly one local attachment without network")
+        if d3_config is not None:
+            attachments = request.target.attachments
+            if (
+                not isinstance(d3_config, D3RunConfig)
+                or d1_config is not None or d2_config is not None
+                or request.target.endpoints or self._target_network is not None
+                or len(attachments) != len(d3_config.authorization.attachment_indices)
+                or any(item.kind != "local_path" for item in attachments)
+            ):
+                raise TaskRequestError("D3 requires one or two frozen local attachments without network")
 
         supplied_task_id = task_run_id is not None
         task_run_id = str(uuid.uuid4()) if task_run_id is None else _validate_mutation_id(task_run_id)
@@ -363,6 +421,9 @@ class TaskRunController(LegacyTaskRunController):
                 base_checkpoint_sequence=0,
                 state_changes=(change,),
                 event=event,
+                d1_config=d1_config,
+                d2_config=d2_config,
+                d3=D3CommitMetadata(config=d3_config) if d3_config is not None else None,
             )
             commit = deps.store.commit(mutation)
             committed = True
@@ -484,6 +545,8 @@ class TaskRunController(LegacyTaskRunController):
         self,
         registration: TurnRegistration,
         mutation_id: str,
+        *,
+        d1_binding: D1TurnBinding | None = None,
     ) -> CommittedOperation:
         """Atomically persist a prepared pending Turn and its fixed Intent list."""
 
@@ -495,11 +558,23 @@ class TaskRunController(LegacyTaskRunController):
         task_run, _state = self._require_bound_state()
         if registration.task_run_id != task_run.task_run_id:
             raise InvalidTransition("TurnRegistration belongs to another TaskRun")
+        deps = self._require_persistent()
+        config = deps.store.load_d1_run_config(task_run.task_run_id)
+        if (config is None) != (d1_binding is None):
+            raise InvalidTransition("D1 registration requires the explicit immutable binding")
+        if d1_binding is not None and (
+            d1_binding.task_run_id != task_run.task_run_id
+            or d1_binding.turn_id != registration.turn_id
+            or registration.entity_ids != (d1_binding.turn_id, d1_binding.intent_id)
+        ):
+            raise InvalidTransition("D1 binding differs from its Turn/Intent registration")
 
         replay = self._load_existing_commit(mutation_id)
         if replay is not None:
             operation = replay.event.details.get("operation")
             if operation == "register_turn":
+                if d1_binding is not None and deps.store.load_d1_turn_binding(registration.turn_id) != d1_binding:
+                    raise IdempotencyConflictError("D1 binding differs from committed registration")
                 return CommittedOperation.from_commit(replay)
             self._assert_deadline_preempted_replay(replay)
             return CommittedOperation.from_commit(replay)
@@ -515,6 +590,22 @@ class TaskRunController(LegacyTaskRunController):
                 now=now,
                 failure_reason=task_run.failure_reason,
             )
+        if d1_binding is not None:
+            imports = self._attachment_imports
+            claim = None if imports is None else imports.read_claim(d1_binding.import_id)
+            receipt = None if imports is None else imports.read_receipt(d1_binding.import_id)
+            if (
+                claim is None or receipt is None or claim.identity() != receipt.identity()
+                or claim.claimed_at != receipt.claimed_at
+                or receipt.task_run_id != task_run.task_run_id
+                or receipt.sandbox_id != task_run.sandbox_id
+                or receipt.source_root != task_run.source_root
+                or receipt.attachment_index != d1_binding.attachment_index
+                or receipt.local_path != task_run.request.target.attachments[d1_binding.attachment_index].value
+                or receipt.sha256 != d1_binding.expected_sha256
+                or not task_run.started_at <= receipt.claimed_at <= receipt.completed_at <= now
+            ):
+                raise InvalidTransition("D1 binding requires the matching successful trusted import receipt")
 
         event = RuntimeEvent(
             type="control_state_committed",
@@ -536,6 +627,7 @@ class TaskRunController(LegacyTaskRunController):
             base_checkpoint_sequence=registration.base_checkpoint_sequence,
             state_changes=registration.state_changes,
             event=event,
+            d1_binding=d1_binding,
         )
         commit = deps.store.commit(mutation)
         self._reload_after_commit()
@@ -559,6 +651,17 @@ class TaskRunController(LegacyTaskRunController):
             raise InvalidTransition("TurnOperation belongs to another TaskRun")
         if self._closed or self._registry_released:
             raise InvalidTransition("TurnOperation requires an owned, open Controller")
+        if deps.store.load_d1_run_config(task_run.task_run_id) is not None and any(
+            isinstance(change, UpsertTurn) and change.status is TurnStatus.COMPLETED
+            or isinstance(change, UpsertIntent) and change.status is IntentStatus.SUCCEEDED
+            for change in operation.state_changes
+        ):
+            raise InvalidTransition("D1 success requires its dedicated Fact/Intent/Turn evidence gates")
+        if deps.store.load_d3_run_config(task_run.task_run_id) is not None and operation.operation not in {
+            "append_plan_validation_record", "create_execution", "start_execution",
+            "complete_execution",
+        }:
+            raise InvalidTransition("D3 domain changes require their dedicated Controller gate")
         replay = self._load_existing_commit(mutation_id)
         now = replay.event.timestamp if replay is not None else self._now_utc()
         if replay is None:
@@ -590,11 +693,78 @@ class TaskRunController(LegacyTaskRunController):
             # The Store checks the original fingerprint. No evidence lookup,
             # snapshot reload, clock-driven transition or Sandbox call on replay.
             return CommittedOperation.from_commit(deps.store.commit(mutation))
+        if deps.store.load_d3_run_config(task_run.task_run_id) is not None:
+            if self._d3_evidence_validator is None:
+                raise InvalidTransition("D3 evidence validator is not configured")
+            self._d3_evidence_validator(mutation, self.control_state)
         deps.repository.validate_candidate(self.control_state, mutation)
         commit = deps.store.commit(mutation)
         self._reload_after_commit(commit)
         if self.status() in TERMINAL_STATUSES:
             self._cleanup_after_terminal()
+        return CommittedOperation.from_commit(commit)
+
+    def commit_d3_transition(
+        self,
+        operation: str,
+        state_changes: tuple[StateChange, ...],
+        entity_ids: tuple[str, ...],
+        result: str,
+        mutation_id: str,
+        *,
+        metadata: D3CommitMetadata | None = None,
+    ) -> CommittedOperation:
+        """Commit one D3-only transition after independent evidence validation."""
+        mutation_id = _validate_mutation_id(mutation_id)
+        task, state = self._require_bound_state()
+        deps = self._require_persistent()
+        if deps.store.load_d3_run_config(task.task_run_id) is None:
+            raise InvalidTransition("D3 transition requires an explicit D3 TaskRun")
+        if self._d3_evidence_validator is None:
+            raise InvalidTransition("D3 evidence validator is not configured")
+        replay = self._load_existing_commit(mutation_id)
+        now = replay.event.timestamp if replay is not None else self._now_utc()
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.RUNNING,
+            details={
+                "operation": operation,
+                "entity_ids": list(entity_ids),
+                "result": result,
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task.task_run_id,
+            mutation_id=mutation_id,
+            operation=operation,
+            request=task.request,
+            effective_model_backend=task.effective_model_backend,
+            base_checkpoint_sequence=(
+                replay.checkpoint.sequence - 1
+                if replay is not None else state.latest_checkpoint.sequence
+            ),
+            state_changes=state_changes,
+            event=event,
+            d3=metadata,
+        )
+        if replay is not None:
+            return CommittedOperation.from_commit(deps.store.commit(mutation))
+        if (
+            self._closed or self._registry_released
+            or task.status is not TaskRunStatus.RUNNING
+            or now >= task.deadline_at
+        ):
+            raise InvalidTransition("D3 transition requires a running TaskRun before Deadline")
+        self._d3_evidence_validator(mutation, state)
+        if state.latest_checkpoint.sequence != self.control_state.latest_checkpoint.sequence:
+            raise StaleControlStateError("D3 state changed during evidence validation")
+        if self._now_utc() >= task.deadline_at:
+            raise InvalidTransition("D3 Deadline elapsed during evidence validation")
+        deps.repository.validate_candidate(state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
         return CommittedOperation.from_commit(commit)
 
     def bind_intent_goal(
@@ -851,6 +1021,8 @@ class TaskRunController(LegacyTaskRunController):
             "commit_verified_t6_observation" if complete_intent
             else "commit_verified_t6_fact"
         )
+        if complete_intent and deps.store.load_d1_run_config(task_run.task_run_id) is not None:
+            raise InvalidTransition("D1 commits Fact and Intent completion separately")
         entity_ids = [fact_id, intent_id] if complete_intent else [fact_id]
         replay = self._load_existing_commit(mutation_id)
         if replay is not None:
@@ -922,6 +1094,14 @@ class TaskRunController(LegacyTaskRunController):
         verified = self._t6_observation_proofs.lookup(proof.source_execution_id, proof_id)
         if verified.task_run_id != task_run.task_run_id:
             raise ObservationProofError("proof_task_mismatch")
+        binding = deps.store.load_d1_turn_binding(intent.turn_id)
+        if binding is not None:
+            candidate_fact = FactRecordSnapshot(
+                fact_change.fact_id, fact_change.turn_id, fact_change.content,
+                fact_change.source_ref, fact_change.status,
+                state.latest_checkpoint.sequence + 1, 0, fact_change.verification_ref,
+            )
+            self._evaluate_d1_evidence(binding, replace(state, facts=state.facts + (candidate_fact,)), (fact_id,))
         deps.repository.validate_candidate(state, mutation)
         commit = deps.store.commit(mutation)
         self._reload_after_commit(commit)
@@ -1083,6 +1263,9 @@ class TaskRunController(LegacyTaskRunController):
             latest_supported |= proof.plan_id == latest_verifiable_id
         if not latest_supported:
             raise ObservationProofError("latest_plan_has_no_verified_fact")
+        binding = deps.store.load_d1_turn_binding(intent.turn_id)
+        if binding is not None:
+            self._evaluate_d1_evidence(binding, state, fact_ids)
 
         event = RuntimeEvent(
             type="control_state_committed",
@@ -1107,6 +1290,176 @@ class TaskRunController(LegacyTaskRunController):
                 intent.intent_id, intent.turn_id, intent.description,
                 intent.priority, intent.intent_type, IntentStatus.SUCCEEDED,
             ),),
+            event=event,
+        )
+        deps.repository.validate_candidate(state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        return CommittedOperation.from_commit(commit)
+
+    def _evaluate_d1_evidence(
+        self, binding: D1TurnBinding, state: ControlStateSnapshot,
+        fact_ids: tuple[str, ...],
+    ):
+        if binding.task_run_id != state.task_run.task_run_id or self._t6_observation_proofs is None:
+            raise ObservationProofError("d1_evidence_scope_mismatch")
+        for fact_id in fact_ids:
+            fact = next((item for item in state.facts if item.fact_id == fact_id), None)
+            execution = next((item for item in state.executions if fact is not None and item.execution_id == fact.source_ref), None)
+            plan = next((item for item in state.plans if execution is not None and item.plan_id == execution.plan_id), None)
+            if fact is None or fact.status is not FactStatus.VERIFIED or fact.turn_id != binding.turn_id or fact.verification_ref is None or not fact.verification_ref.startswith("t6:") or plan is None or plan.intent_id != binding.intent_id:
+                raise ObservationProofError("d1_supporting_fact_scope_mismatch")
+            self._t6_observation_proofs.lookup(fact.source_ref, fact.verification_ref.removeprefix("t6:"))
+        evaluator = self._d1_turn_evaluator
+        if evaluator is None:
+            raise ObservationProofError("d1_evaluator_not_configured")
+        evaluation = evaluator.evaluate(binding, state, fact_ids)
+        if not evaluation.satisfied or evaluation.supporting_fact_ids != fact_ids or evaluation.proof_ref is None:
+            raise ObservationProofError("d1_fixed_rule_not_satisfied")
+        if self.control_state.latest_checkpoint.sequence != state.latest_checkpoint.sequence or self.status() is not TaskRunStatus.RUNNING or self._now_utc() >= state.task_run.deadline_at:
+            raise ObservationProofError("state_conflict")
+        return evaluation
+
+    def complete_verified_d1_turn(
+        self, turn_id: str, fact_ids: tuple[str, ...], mutation_id: str,
+    ) -> CommittedOperation:
+        """Independently recheck saved D1 evidence and atomically save Turn proof."""
+        mutation_id = _validate_mutation_id(mutation_id)
+        if not isinstance(fact_ids, tuple) or not fact_ids or len(set(fact_ids)) != len(fact_ids):
+            raise ObservationProofError("invalid_supporting_facts")
+        task, state = self._require_bound_state()
+        deps = self._require_persistent()
+        binding = deps.store.load_d1_turn_binding(turn_id)
+        if binding is None or binding.task_run_id != task.task_run_id:
+            raise ObservationProofError("d1_binding_missing_or_mismatched")
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            proof = deps.store.load_d1_turn_proof(turn_id)
+            if replay.event.details.get("operation") != "complete_verified_d1_turn" or proof is None or proof.supporting_fact_ids != fact_ids or replay.event.details.get("entity_ids") != [turn_id]:
+                raise IdempotencyConflictError("mutation_id belongs to another D1 Turn completion")
+            return CommittedOperation.from_commit(replay)
+        turn = next((item for item in state.turns if item.turn_id == turn_id), None)
+        intent = next((item for item in state.intents if item.intent_id == binding.intent_id), None)
+        now = self._now_utc()
+        if self._closed or self._registry_released or task.status is not TaskRunStatus.RUNNING or now >= task.deadline_at or turn is None or turn.status is not TurnStatus.RUNNING or intent is None or intent.status is not IntentStatus.SUCCEEDED or turn.intent_ids != (intent.intent_id,):
+            raise ObservationProofError("state_conflict")
+        evaluation = self._evaluate_d1_evidence(binding, state, fact_ids)
+        now = self._now_utc()
+        if now >= task.deadline_at:
+            raise ObservationProofError("state_conflict")
+        proof = D1TurnProof(turn_id, binding.binding_id, evaluation.proof_ref, fact_ids)
+        event = RuntimeEvent(
+            type="control_state_committed", task_run_id=task.task_run_id,
+            timestamp=now, status=TaskRunStatus.RUNNING,
+            details={"operation": "complete_verified_d1_turn", "entity_ids": [turn_id],
+                     "result": "completed", "verified_fact_ids": list(fact_ids), "proof_ref": proof.proof_ref},
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task.task_run_id, mutation_id=mutation_id,
+            operation="complete_verified_d1_turn", request=task.request,
+            effective_model_backend=task.effective_model_backend,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            state_changes=(UpsertTurn(turn.turn_id, turn.task_run_id, turn.sequence, turn.turn_target, turn.intent_ids, TurnStatus.COMPLETED),),
+            event=event, d1_turn_proof=proof,
+        )
+        deps.repository.validate_candidate(state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        return CommittedOperation.from_commit(commit)
+
+    def apply_d2_review(
+        self,
+        application: AppendD2ReviewApplication,
+        mutation_id: str,
+        *,
+        evidence_validator: Callable[[AppendD2ReviewApplication], None] | None = None,
+    ) -> CommittedOperation:
+        """Atomically apply one trusted, already-validated D2 review result."""
+        if not isinstance(application, AppendD2ReviewApplication):
+            raise TypeError("application must be AppendD2ReviewApplication")
+        mutation_id = _validate_mutation_id(mutation_id)
+        task, state = self._require_bound_state()
+        deps = self._require_persistent()
+        replay = self._load_existing_commit(mutation_id)
+        if replay is not None:
+            details = replay.event.details
+            if (
+                details.get("operation") != "apply_d2_review"
+                or details.get("entity_ids") != [application.review_id]
+                or any(
+                    details.get(name) != value
+                    for name, value in {
+                        "review_root_id": application.review_root_id,
+                        "review_generation": application.review_generation,
+                        "review_id": application.review_id,
+                        "application_ref": application.application_ref,
+                        "context_version": application.context_version,
+                        "constraint_version": application.constraint_version,
+                        "paused_gate": application.paused_gate,
+                        "turn_id": application.turn_id,
+                        "intent_id": application.intent_id,
+                        "review_scope": application.review_scope,
+                        "action_candidate_id": application.action_candidate_id,
+                        "pause_reason": application.pause_reason,
+                    }.items()
+                )
+            ):
+                raise IdempotencyConflictError("mutation_id belongs to another D2 review")
+            if deps.store.load_d2_review_application(task.task_run_id, application.review_id) != application:
+                raise IdempotencyConflictError("D2 replay application content differs")
+            return CommittedOperation.from_commit(replay)
+        now = self._now_utc()
+        if (
+            self._closed or self._registry_released
+            or task.status is not TaskRunStatus.RUNNING
+            or now >= task.deadline_at
+        ):
+            raise InvalidTransition("D2 review application requires a running TaskRun")
+        if deps.store.load_d2_run_config(task.task_run_id) is None:
+            raise InvalidTransition("review application requires an explicit D2 run")
+        turn = next((item for item in state.turns if item.turn_id == application.turn_id), None)
+        intent = next((item for item in state.intents if item.intent_id == application.intent_id), None)
+        if turn is None or intent is None or intent.turn_id != turn.turn_id:
+            raise InvalidTransition("D2 review scope differs from registered objects")
+        if not application.paused_gate:
+            if evidence_validator is None:
+                raise InvalidTransition("D2 review requires a saved known-evidence validator")
+            evidence_validator(application)
+        if state.latest_checkpoint.sequence != self.control_state.latest_checkpoint.sequence:
+            raise StaleControlStateError("D2 review state changed during evidence validation")
+        if self._now_utc() >= task.deadline_at:
+            raise InvalidTransition("D2 review Deadline elapsed during evidence validation")
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task.task_run_id,
+            timestamp=now,
+            status=TaskRunStatus.RUNNING,
+            details={
+                "operation": "apply_d2_review",
+                "entity_ids": [application.review_id],
+                "result": "paused" if application.paused_gate else "applied",
+                "review_root_id": application.review_root_id,
+                "review_generation": application.review_generation,
+                "review_id": application.review_id,
+                "application_ref": application.application_ref,
+                "context_version": application.context_version,
+                "constraint_version": application.constraint_version,
+                "paused_gate": application.paused_gate,
+                "turn_id": application.turn_id,
+                "intent_id": application.intent_id,
+                "review_scope": application.review_scope,
+                "action_candidate_id": application.action_candidate_id,
+                "pause_reason": application.pause_reason,
+            },
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task.task_run_id,
+            mutation_id=mutation_id,
+            operation="apply_d2_review",
+            request=task.request,
+            effective_model_backend=task.effective_model_backend,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            state_changes=(application,),
             event=event,
         )
         deps.repository.validate_candidate(state, mutation)

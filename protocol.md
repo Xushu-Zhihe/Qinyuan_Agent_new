@@ -4,6 +4,23 @@
 
 本文件记录已确认的跨模块协议和未冻结部分。它不把当前 Python 类名自动当成稳定的外部 wire protocol；独立 Agent 的 CLI 与事件、后续转换器调用和其他外部 MCP 集成仍需按实际入口确认与验收。2026-09-24 用户取消 T5 的 qinyuan-bat 专用转接，后续转换器单独确认协议。
 
+## 双 LLM 框架逻辑协议（2026-10-01，高层已确认）
+
+本节冻结职责和顺序，不定义新的 CLI 字段、HTTP 端点、JSON schema 或事件 wire shape。新协议字段须在实现切片前另行确认。
+
+1. 外层 LLM 在 Turn 创建阶段提出 Turn 目标、完成标准候选和有序 Intent 候选；同一 Turn 的 Intent 是实现同一目标的候选路径。可信代码只注册符合当前 TaskRun 授权、状态和预算的提案。已注册 Turn 目标不可改写，目标调整通过下一 Turn 表达。
+2. 可信调度器串行选择一个 Intent；内层 LLM 只为该 Intent 产生 Plan / Action 候选，可提出复盘请求，不能新增 Intent 或修改授权、总预算和 Deadline。
+3. 复盘是外层 LLM 对照已注册 Turn 目标、执行预期、已提交结果与证据，形成有来源的判断和下一步策略建议；它不是可信验证或状态提交。Turn 首尾复盘；轮内只在可信代码按信号触发或内层请求时复盘，并须等当前 Action 结束且结果、证据已保存。可信代码校验建议及其适用范围后再应用；可继续当前 Intent、切换兄弟候选，或结束旧 Plan 尚未执行的部分并创建新 Plan。切换前停止旧 Intent 的进程，无法确认则进入恢复边界。
+4. 选定的目标验证规则必须来自已注册且能力匹配的规则集合，由可信代码/受控适配器执行。无可用规则或证据不足时不得宣告目标完成，结果保持未完成/未评估。模型判断、Fact 验证、Intent 成功、Turn 完成和 TaskRun 达成分别记录。
+5. Process_Fact 是当前 TaskRun 的带来源过程总结，与 verified ResultFact 分开保存；成功复盘发现新增执行信息时提炼，失败总结不阻断。总结可引用证据，但不能替代原证据或证明目标成功。
+6. 执行证据须作为可读产物通过证据引用访问；日志是诊断信息，不是唯一证据入口。普通日志、事件、模型上下文和 Process_Fact 中的凭据默认脱敏；明文只通过受保护证据查看路径提供给使用者。具体存储、访问控制、导出与 UI/API 操作字段仍待确认。
+7. TaskRun 授权不可变，发现新资产不会自行扩大范围；只允许测试当前授权规则覆盖的目标。默认低影响；状态变更须由当前 TaskRun 明确授权，破坏性操作禁止。没有授权内安全可行路径时，记录证据、报告未完成并停止，不等待强制人工审批。
+8. TaskRun 总预算统一累计；操作有局部限额；计量跨 Turn、Intent 切换和恢复持续累计。预算数值、轮内触发阈值和受限重试次数留待实施阶段确认。
+
+复盘建议中的受限约束须显式绑定当前 Intent 或当前 Turn，并在该范围结束时失效；不得改变授权、TaskRun 总预算、Deadline 或已注册 Turn 目标。过期提案丢弃。确定性拒绝允许受限重新生成，原提案及拒绝记录均保留；复盘失败或提案处理失败时，先刷新已提交状态与证据上下文再作受限重试，仍失败则暂停。模型调用结果未知时不自动重发，转入恢复边界；D2 的次数、触发与恢复已在本协议冻结，后续切片的其他规则逐轮确认。
+
+工作目录按 Intent 隔离。同一 TaskRun 内共享产物必须显式传递来源和原验证状态，不因共享而变成 verified。跨 TaskRun 复用必须显式导入并保留来源，不继承旧授权或验证结论；在新 TaskRun 的授权和验证规则下重新核验。精确目录布局、引用失效规则和恢复时的产物处理须在对应接口设计时确认。
+
 ## 已冻结协议
 
 ### CLI / Python API
@@ -77,20 +94,64 @@ Agent 请求/结果协议与题目平台的获取/提交协议分属不同边界
 
 ## 版本、错误与取消
 
-当前控制面 schema 版本为 6；`protocol.md` 本身不是外部版本协商协议。T5 CLI 和导出事件使用 protocol_version=1；Python API、其他 MCP 及后续兼容窗口另行确认；后续转换器与题目平台的版本协议另行确认。T5 不要求兼容 qinyuan-bat wire protocol。
+当前控制面 schema 版本为 13；schema 10/11/12 是保留的历史版本。正常打开从旧 schema 逐版事务迁移；只读打开兼容 schema 10、11、12、13，且不迁移、不写入。`protocol.md` 本身不是外部版本协商协议。T5 CLI 和导出事件使用 protocol_version=1，T6 run-task 使用 protocol_version=2；D1～D3 内部切片均未增加公共协议版本。Python API、其他 MCP 及后续兼容窗口另行确认；后续转换器与题目平台的版本协议另行确认。T5 不要求兼容 qinyuan-bat wire protocol。
+
+D0（2026-10-02）已确认旧 TaskRun/Checkpoint/证据保留原行为，新双 LLM 仅用于明确创建的新链运行；不回填旧 Turn 标准、角色、授权或完成台账。D1 当时的只读 Store 接受 schema 10/11；当前只读 Store 扩至 schema 10～13，仍不迁移，status/replay 不能隐式写库。D1 最小内部链及审计/失败契约见 [D0_baseline_and_D1_contract.md](D0_baseline_and_D1_contract.md)，未冻结新版外部 CLI/事件版本。
+
+D1 的一致性证明限于首次可信摘要观察时；Fact、Intent、Turn 和恢复只读复核保存证据的完整性、归属和固定规则绑定，不再次读取文件。可信观察确认不存在/摘要不同为 not_satisfied；观察证据缺失/损坏/未知才进入恢复边界。调用完成与提案应用分开记录：已收到但被拒绝、过期或未应用的响应不是未知；仅无法确认结果的开始记录禁止补造完成或自动重发。角色配置引用固定不可变内容并在恢复时校验，凭据不进入审计。
+
+### D1 内部单 Turn 协议（2026-10-02）
+
+D1 当前只供内部 `D1Application` / `D1SingleTurnRunner` 使用，不改变 T5 v1、T6 v2、CLI、工作台或事件导出协议。一次新 D1 TaskRun 固定两个独立角色配置（允许同模型供应商）、单个本地附件、无目标网络、固定工具 `d1_fixed_sha256` 与单个获选 Intent。外层只能提 `attachment_copy_sha256` v1、附件索引 0 和一个 `IntentCandidate`；可信侧绑定导入收据摘要及 `/workspace/work/intents/<intent_id>/` 路径。内层动作只能通过固定只读摘要检查；任意 Bash、额外动作、候选或规则版本均拒绝。
+
+schema 11 的 `d1_runs` 保存冻结配置，`d1_turn_bindings` 保存 Turn/Intent/导入/副本/规则绑定，`d1_turn_proofs` 保存独立 Turn 完成证明，`d1_operations` 分别保存模型、工具、首次摘要观察及可信导入/副本准备操作的开始、已知完成和应用引用。操作开始前检查 TaskRun 状态、Deadline、Checkpoint、冻结角色配置及分类预算；已知完成不可变，完成结果和应用分开记录。未知开始记录不重派；完整模型证据已保存但未应用时只读重用。预算按 TaskRun 累计，模型类别和内层总计、工具派发及摘要观察上限按 `restrict.md` / D0 契约执行。
+
+首次摘要观察仅执行一次并经审计；Fact、Intent、Turn 与恢复只读复核同一观察证据，不重读文件。Turn 独立完成门复核绑定、导入收据、工作副本准备、Fact 和固定规则证明。成功结果为 Intent `succeeded`、Turn `completed`、TaskRun `running`、整体目标 `not_evaluated`、本轮 `dispatch_status=stopped`、Sandbox `retained`；不自动建立下一 Turn 或清理 Sandbox。需要用户结束运行时先通过 Controller 提交取消终态，再使用现有清理流程；Deadline 按既有 Controller 规则执行。测试夹具分别校验业务验收与资源清理。
+
+当前 D1 验收边界为本地 Fake 模型与 Fake Sandbox。真实模型、真实 Docker、目标网络及 D7 公共应用接入尚未由此协议或模拟结果验收。
+
+D1 本地模拟切片已通过验收，命令与结果见 [D1_acceptance.md](D1_acceptance.md)。模型完成证据保存完整可信 envelope；纠正响应须同时保留原结构拒绝，语义拒绝保存独立收据。控制提交后中断只能依据固定 mutation 和对应对象补记应用，不重复调用模型。首次摘要操作固定历史证明引用；证明/声明缺失进入恢复，不重新签发。结果当前证据不可复核时显示 `inconclusive` 和恢复要求，并保留历史已提交 Fact/Intent/Turn 状态。
 
 错误必须保留发生阶段、结构化类别、证据引用和短原因。模型错误、Policy 拒绝、参数错误、环境故障、目标不匹配和未知结果分别处理；不能把所有错误压成普通任务失败。
 
 取消要求停止正在进行的副作用并完成可观察清理；T2 的正常路径先提交并重载终态，再关闭准入和清理，提交失败不触发紧急强停。当前已确认的控制面终态是 `cancelled`，Deadline 到达时是 `deadline_exceeded`，只允许依据已验证 Fact 形成 `partial/inconclusive` 结果。T2 stop 和保守恢复清理语义见上节；T5 保留运行目录和证据、不自动删除；跨进程取消与事件顺序见下节。紧急强制清理仍不提供。
 
+### D2 内部复盘协议（2026-10-02，已确认）
+
+复盘请求由可信代码生成 `review_id`、`review_root_id`、`review_generation`、`review_attempt`、`review_scope`、TaskRun/Turn/Intent ID、`action_candidate_id`、Checkpoint、上下文/来源/约束版本和有界摘要；模型只返回 `decision`、`rationale`、`source_ids`、`constraints`。`source_ids` 必须属于当前已保存来源快照；模型不能提供或覆盖任何 ID、版本或来源。Action 候选根 ID 等于首次内层动作请求的可信内部台账 ID；结构纠正请求有独立内部 request ID 但沿用该候选根。供应商 request ID 可空且只作审计。Turn 首尾 scope 的 `action_candidate_id=null`，Action scope 必填。
+
+首复盘在 Intent 选定后、首个内层动作前；轮内由内层显式 `review_requested`、可信检查确定 `not_satisfied` 或确定性动作拒绝触发。执行中的请求待 Action 结束且结果/证据保存后再消费；执行结果未知进入恢复，不调用复盘。已保存提案/拒绝和审计后可在 Action 派发前触发复盘，不创建虚假 Execution。相同动作与上下文的触发合并原因；新可信来源/结论使上下文实质变化时保留旧版本、使未应用建议失效，并在同一额度内增加 generation。已应用建议不可改写。Turn 尾复盘在独立可信验证和原子 `Turn.completed` 后只读执行，不加约束、不改结论；取消/Deadline 阻止调用时保存 `not_called` 原因。
+
+每个 `review_root_id` 最多两次实际外层调用，单 TaskRun 所有 D2 review 共用八次硬上限；首次调用和一次再生成共用额度，拒绝、无效/空响应和上下文刷新共用一次再生成机会。generation 不重置额度；provider failure、认证失败、明确拒答和未知结果均消耗额度，恢复永不重发，也不创建新 review root。已知 accepted 输出若尚未写入应用台账，恢复只以同一 `review_id` 幂等提交，不重问模型。空响应、结构无效和语义拒绝可在额度内刷新后再生成；认证失败、拒答、provider failure、超时或无可靠完成收据保持暂停。暂停不新增 TaskRun 状态；查询、取消和清理可继续。
+
+D2 只允许 `allowed_action_kinds` 与 `max_action_timeout_seconds`。约束显式绑定当前 Intent/Turn；许可取交集、超时采用更小上界，只能收紧，违规直接拒绝。超时约束只检查工具动作，不改变模型超时、验证规则或 TaskRun Deadline；约束在绑定对象结束时失效但历史保留。已派发 probe 按原边界完成，未派发候选及尚未提交的 `complete_intent` 均按当前约束复核。空交集或额度耗尽时暂停并记录原因；取消、Deadline 和未知结果走各自已有路径。SQLite schema 12 在同一 mutation 原子提交 D2 应用、事件、Checkpoint、generation、约束版本和 pause gate；原始模型响应与来源内容留在证据台账。
+
+已知响应在应用前须刷新并比较来源/上下文版本；实质变化时保留原响应，使用原 root 剩余额度生成下一代。Controller 应用前失败或提交后证据收据失败，只能用原结果及原 mutation 恢复；应用成功后该可恢复暂停门解除，其他失败/未知暂停不解除。复盘自身新增约束不产生新的复盘调用。D2 应用使用现有 OS 运行锁保证同一运行的单一派发者；验收见 [D2_acceptance.md](D2_acceptance.md)。
+
+### D3 内部多候选与重规划协议（2026-10-04，已确认）
+
+D3 只用于显式创建的新内部 TaskRun，不改变 D1/D2 旧运行、T5/T6 CLI、工作台或事件 wire shape。启动时冻结外层/内层角色、无网络授权和一至两个本地附件，两个附件均先导入；每 TaskRun 至多两个 Turn、每 Turn 至多两个同目标候选、每 Intent 至多两个 Plan。外层只提出 `attachment_copy_sha256` v1、已授权的 `attachment_index`、Turn 目标文本和有序候选；下一 Turn 可以选不同索引，旧 Turn 目标不改写。可信侧绑定对应导入收据的期望大小和摘要、独立 Intent 目录及固定规则。
+
+内层初始 Plan 只能提 `size_then_sha256/new_observation`，重规划 Plan 只能提 `sha256_only/new_observation` 或 `sha256_only/reuse_saved_proof`。可信侧填路径、大小、摘要和对象 ID 并生成固定只读程序；逐步动作须逐字匹配且经 `probe` 许可、Policy/Gateway 与证据门。新 SHA-256 观察前必须从冻结导入物创建不可覆盖的版本化副本；新观察满足规则才依次建立独立证明、verified Fact，随后内层单独提 `complete_intent`。`reuse_saved_proof` 只可选择当前可信上下文列出的 `source_proof_id`；核对原 Plan、Fact、Intent、附件索引、副本版本、规则及绑定摘要后，新 Plan 保存不可变支持引用，不产生工具派发、Execution、观察或 Fact。完成门再次复核原证明和引用。
+
+D3 复盘只接受 `continue_current_intent`、`switch_sibling_intent`、`replan_current_intent`、`adjust_turn_target` 和终态只读 `acknowledge_turn_end`，并保留 D2 的来源快照、作用域与只能收紧约束。无兄弟的切换在停进程前拒绝。合法切换须先保存有来源的建议及可信接受、落盘已结束 Action 的结果与证据、确认无未决操作，再按 Intent 停止全部归属进程；停止收据确认后，同一 Controller 事务提交旧 Intent `abandoned/strategy_abandoned`、未完成旧 Plan `superseded/sibling_switch` 和最高优先级兄弟 `running`。目标调整先校验下一 Turn 提案并确认停进程，再原子提交旧 Turn `superseded`、当前 Intent `abandoned`、未尝试 Intent `skipped` 和新 Turn 注册。一个候选经独立规则证明完成 Turn 时，同事务将其余未尝试兄弟标为 `skipped/turn_goal_satisfied`，只读尾复盘后停止内部派发；TaskRun 仍 `running`、整题 `not_evaluated`。
+
+同 TaskRun 共享仅由可信入口指定精确 `artifact_version_id` 与接收 Intent，按源版本复制到接收目录，读回两端并保存不可变 `share_id`、清单、原验证状态和收据；接收副本不自动成为 Fact，也不替代目标副本。副本、share、Intent 停止已开始但原调用结果丢失时，原 ID 保持 `outcome_unknown`，只读核查即使匹配也不能补签该次操作完成收据、重派或启动兄弟；已有可靠完成记录而数据库收据写入中断才可按原 ID 修复。已确认版本副本后来出现大小不符、SHA 的 `missing`/`unsafe`/摘要变化均为完整性异常并暂停。固定 v1 不能由一次副本不一致否定整个 Intent，因此 D3 不产生 Intent 级 `target_mismatch`；保留独立证明门和候选耗尽原因类型，但这些真实路径待相应规则后验收。
+
+D3 外层规划最多 4 次、全部内层模型调用合计最多 16 次、固定工具派发最多 6 次、目标 SHA 观察最多 4 次、share 单独最多 4 次；D2 复盘仍每 root 最多 2 次、全运行最多 8 次。操作开始前记账，失败/未知跨恢复占用额度，未知不重发；额度耗尽暂停，不记目标失败。内部 Fake 验收及不可达边界见 [D3_acceptance.md](D3_acceptance.md)。
+
 ## 待确认协议问题
 
-- T6 完整 TaskRun 结果和多 Intent 调度；T5 v1 不覆盖这些能力。
+- 双 LLM 交互的具体结构化请求/响应、审核记录、状态事件和兼容版本；本节只冻结逻辑顺序。
+- 注册目标验证规则的标识、参数 schema、适配器能力声明和不可评估结果字段。
+- 面向用户的证据查看入口、敏感证据保护/授权显示、保留与导出语义；已确认不能只依赖运行日志。
+- 发现凭据后是否允许在授权资产内进行认证测试，以及明文证据的存储和传递机制。
+- D4 的跨能力全局预算和 D3 内部切片以外的局部限额；D2 review 与 D3 内部上限已在本协议冻结。
 - Python API 的异步模型和长期兼容承诺。
 - 后续独立转换器的 Agent 调用协议、题目/附件映射、flag 交付，以及题目平台获取/提交的错误、幂等与版本边界（不属于 T5）。
-- ToolRequest、PolicyDecision、MCPCommand、SandboxExecutionRequest、ExecutionRecord、TaskResult 的字段和序列化格式。
+- ToolRequest、PolicyDecision、MCPCommand、SandboxExecutionRequest、ExecutionRecord、TaskResult 的新增/通用字段和序列化格式；既有 T3/T5/T6 切片字段仍按各自版本记录。
 - Stage/Procedure/RAG 的协议、失败分支、候选提交粒度和策略记忆。
-- 目标范围、网络、写文件、工具权限、MCP Server 运行位置和真实目标授权。
+- 新资产与凭据认证的授权表达、允许影响分类和适用的工具权限；TaskRun 授权不可变且发现资产不自动扩权。
 
 ## T3 已确认文件工具协议（2026-09-10）
 
@@ -150,9 +211,9 @@ SQLite 当前 schema 6。Plan/动作结果在控制面或工具副作用前先�
 
 通用脚本不经过 MCP。可信侧在 `T6CommandGateway` 中校验当前 TaskRun、Plan 步、`sandbox.command` 授权、工作目录和预算，然后由同一 TaskRun 的 Sandbox 直接执行唯一 argv `bash -c <script>`。专用工具仍可使用各自的 MCP Manager；MCP 不能为通用脚本增加权限或改写 argv。
 
-请求限制为脚本文本 64 KiB、stdin 1 MiB、stdout/stderr 各 64 KiB，工作目录为 `/workspace/work` 或其真实子目录，单步有效时限为请求值、60 秒步骤预算和 TaskRun 剩余时限的最小值，且最多 300 秒。附件原件保持只读；只有首次摘要校验通过的 `/workspace/work` 副本可执行，后续被修改或新生成的文件在证据中区别记录。
+请求限制为脚本文本 64 KiB、stdin 1 MiB、stdout/stderr 各 64 KiB，工作目录为 `/workspace/work` 或其真实子目录，单步有效时限为请求值、60 秒步骤预算和 TaskRun 剩余时限的最小值，且最多 300 秒。附件原件保持只读于 `/workspace/input/<文件名>`；首次摘要校验通过的工作副本位于 `/workspace/work/<文件名>`，模型命令应使用工作副本的路径，不得把原始宿主机相对路径中的 `input/` 前缀追加到工作区。后续修改或新生成的文件在证据中区别记录。
 
-Sandbox 的正常结束以可信侧观察到进程停止和完整输出流为准，退出码为零或非零都记录为 `completed`，退出码和有界输出交给后置条件验证器。不能用脚本自行返回的退出码模拟超时。可信侧确认的超时在清理所有模型进程后记录为 `step_timeout`，同一 Plan 步最多允许一次改命令重试；清理无法确认、派发后结果未知或证据提交中断时记录 `outcome_unknown`，停止新的派发并等待显式恢复。预算在派发前耗尽也消耗这一次超时重试，但不创建 Docker exec。
+Sandbox 的正常结束以可信侧观察到进程停止和完整输出流为准，退出码为零或非零都记录为 `completed`，退出码和有界输出交给后置条件验证器。进程停止后，可信侧最多再等待 1 秒读取同一输出流的尾部；读到 EOF 才确认流完整，到期仍未读到 EOF 则保留 `outcome_unknown`，不重派命令。不能用脚本自行返回的退出码模拟超时。可信侧确认的超时在清理所有模型进程后记录为 `step_timeout`，同一 Plan 步最多允许一次改命令重试；清理无法确认、派发后结果未知或证据提交中断时记录 `outcome_unknown`，停止新的派发并等待显式恢复。预算在派发前耗尽也消耗这一次超时重试，但不创建 Docker exec。
 
 每次请求先保存不可覆盖收据和命令摘要，再保存字节证据与 `ExecutionRecord`。精确完成标记只读重放且不调用 Sandbox；残留收据、未知结果或完成标记缺失不得自动重派。
 

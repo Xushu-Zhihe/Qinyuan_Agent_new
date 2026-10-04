@@ -10,8 +10,18 @@ from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias, cast
 
 from agent_core.contracts import ModelBackend, TaskRequest
-from agent_core.intent_goals import FileTypeIntentGoal
-from agent_core.file_type_fact import FACT_PREFIX
+from agent_core.dual_llm_contracts import (
+    D3CommitMetadata,
+    D3ReviewApplication,
+    d3_payload,
+)
+from agent_core.turn_contracts import D1RunConfig, D1TurnBinding, D1TurnProof, d1_payload
+from agent_core.review_contracts import (
+    D2AllowedActionKinds,
+    D2Constraint,
+    D2MaxActionTimeout,
+    d2_payload,
+)
 from agent_core.domain import (
     Execution,
     ExecutionStatus,
@@ -22,13 +32,15 @@ from agent_core.domain import (
     Intent,
     IntentStatus,
     Plan,
-    PlanStep,
     PlanStatus,
+    PlanStep,
     PlanValidationRecord,
     PlanValidationStatus,
     Turn,
     TurnStatus,
 )
+from agent_core.file_type_fact import FACT_PREFIX
+from agent_core.intent_goals import FileTypeIntentGoal
 from agent_core.runtime import RuntimeEvent, TaskRunStatus
 
 
@@ -430,6 +442,92 @@ class AppendPlanValidationRecord:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class D2RunConfig:
+    review_role_ref: str
+    chain_id: str = "dual_llm_d2"
+    contract_version: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.review_role_ref, str)
+            or not self.review_role_ref.startswith("sha256:")
+            or len(self.review_role_ref) != 71
+            or any(char not in "0123456789abcdef" for char in self.review_role_ref[7:])
+        ):
+            raise ValueError("D2 review role must have an immutable SHA-256 reference")
+        if self.chain_id != "dual_llm_d2" or self.contract_version != 1:
+            raise ValueError("unsupported D2 chain configuration")
+
+
+@dataclass(frozen=True, slots=True)
+class AppendD2ReviewApplication:
+    """Immutable control-plane application of one accepted D2 review."""
+
+    review_root_id: str
+    review_generation: int
+    review_id: str
+    application_ref: str
+    context_version: str
+    constraint_version: int
+    output_constraints: tuple[D2Constraint, ...]
+    paused_gate: bool
+    turn_id: str
+    intent_id: str
+    review_scope: Literal["turn_start", "action", "turn_end"]
+    action_candidate_id: str | None = None
+    pause_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        _non_empty(self.review_root_id, "AppendD2ReviewApplication.review_root_id")
+        _positive_integer(self.review_generation, "AppendD2ReviewApplication.review_generation")
+        _non_empty(self.review_id, "AppendD2ReviewApplication.review_id")
+        _non_empty(self.application_ref, "AppendD2ReviewApplication.application_ref")
+        _non_empty(self.context_version, "AppendD2ReviewApplication.context_version")
+        _non_negative_integer(self.constraint_version, "AppendD2ReviewApplication.constraint_version")
+        _non_empty(self.turn_id, "AppendD2ReviewApplication.turn_id")
+        _non_empty(self.intent_id, "AppendD2ReviewApplication.intent_id")
+        if self.review_scope not in {"turn_start", "action", "turn_end"}:
+            raise ValueError("unsupported D2 review application scope")
+        if (self.review_scope == "action") != (self.action_candidate_id is not None):
+            raise ValueError("D2 action review must bind exactly one action candidate")
+        if self.action_candidate_id is not None:
+            _non_empty(self.action_candidate_id, "AppendD2ReviewApplication.action_candidate_id")
+        if not isinstance(self.output_constraints, tuple) or any(
+            not isinstance(item, (D2AllowedActionKinds, D2MaxActionTimeout))
+            for item in self.output_constraints
+        ):
+            raise ValueError("AppendD2ReviewApplication.output_constraints must be D2 constraints")
+        if type(self.paused_gate) is not bool:
+            raise ValueError("AppendD2ReviewApplication.paused_gate must be bool")
+        if self.paused_gate:
+            _non_empty(self.pause_reason, "AppendD2ReviewApplication.pause_reason")
+            if self.output_constraints:
+                raise ValueError("a paused D2 gate cannot apply new constraints")
+        elif self.pause_reason is not None:
+            raise ValueError("a continuing D2 application has no pause reason")
+        if self.review_scope == "turn_end" and self.output_constraints:
+            raise ValueError("D2 turn_end application cannot add constraints")
+
+
+def active_d2_pause_gates(
+    applications: tuple[AppendD2ReviewApplication, ...],
+) -> tuple[AppendD2ReviewApplication, ...]:
+    """Known application failures resolve only through their own trusted application."""
+    return tuple(
+        item for item in applications
+        if item.paused_gate and not (
+            item.pause_reason == "review_application_uncommitted"
+            and any(
+                not applied.paused_gate
+                and applied.review_root_id == item.review_root_id
+                and applied.review_generation >= item.review_generation
+                for applied in applications
+            )
+        )
+    )
+
+
 StateChange: TypeAlias = (
     UpsertTaskRun
     | UpsertTurn
@@ -440,6 +538,8 @@ StateChange: TypeAlias = (
     | UpsertFact
     | AppendFailureSummary
     | AppendPlanValidationRecord
+    | AppendD2ReviewApplication
+    | D3ReviewApplication
 )
 
 STATE_CHANGE_TYPES = (
@@ -452,6 +552,8 @@ STATE_CHANGE_TYPES = (
     UpsertFact,
     AppendFailureSummary,
     AppendPlanValidationRecord,
+    AppendD2ReviewApplication,
+    D3ReviewApplication,
 )
 
 
@@ -709,6 +811,62 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"completed"}),
         ),
+        "complete_verified_d1_turn": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"completed"}),
+        ),
+        "apply_d2_review": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"applied", "paused"}),
+        ),
+        "register_d3_turn": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="turn",
+        ),
+        "select_d3_intent": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="running_intent",
+        ),
+        "apply_d3_review": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"applied", "paused"}),
+        ),
+        "register_d3_plan": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="plan",
+        ),
+        "replan_d3_plan": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="plan",
+        ),
+        "complete_d3_plan": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"satisfied", "not_satisfied"}),
+        ),
+        "finish_d3_execution": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="execution",
+        ),
+        "complete_d3_intent": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"succeeded"}),
+        ),
+        "switch_d3_intent": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="running_intent",
+        ),
+        "complete_d3_turn": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"completed"}),
+        ),
+        "advance_d3_turn": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            dynamic_result_entity="turn",
+        ),
+        "exhaust_d3_turn": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"failed", "inconclusive"}),
+        ),
         "record_command_generation_failure": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset(
@@ -843,6 +1001,33 @@ def validate_control_event(
         or not isinstance(state_changes[0], UpsertIntentGoal)
     ):
         raise ValueError("bind_intent_goal requires one Intent goal change")
+    if operation == "complete_verified_d1_turn" and (
+        len(state_changes) != 1 or not isinstance(state_changes[0], UpsertTurn)
+        or state_changes[0].status is not TurnStatus.COMPLETED
+    ):
+        raise ValueError("D1 Turn completion requires one completed Turn")
+    if operation == "apply_d2_review" and (
+        len(state_changes) != 1
+        or not isinstance(state_changes[0], AppendD2ReviewApplication)
+    ):
+        raise ValueError("D2 review application requires one typed application change")
+    if operation == "apply_d3_review" and (
+        len(state_changes) != 1
+        or not isinstance(state_changes[0], D3ReviewApplication)
+    ):
+        raise ValueError("D3 review application requires one typed application change")
+    if operation == "complete_d3_plan" and (
+        len(state_changes) not in {1, 2}
+        or not isinstance(state_changes[0], UpsertPlan)
+        or state_changes[0].status is not PlanStatus.COMPLETED
+        or len(state_changes) == 2 and (
+            not isinstance(state_changes[1], UpsertFact)
+            or state_changes[1].status is not FactStatus.VERIFIED
+            or state_changes[1].verification_ref is None
+            or not state_changes[1].verification_ref.startswith("d3:")
+        )
+    ):
+        raise ValueError("D3 Plan completion requires its checked Plan and optional verified Fact")
     if operation == "commit_verified_file_type_fact" and (
         len(state_changes) != 1
         or not isinstance(state_changes[0], UpsertFact)
@@ -874,7 +1059,7 @@ def validate_control_event(
         or state_changes[0].status is not IntentStatus.SUCCEEDED
     ):
         raise ValueError("Intent completion requires one succeeded Intent change")
-    if operation not in {"commit_verified_file_type_fact", "commit_verified_t6_observation", "commit_verified_t6_fact"} and any(
+    if operation not in {"commit_verified_file_type_fact", "commit_verified_t6_observation", "commit_verified_t6_fact", "complete_d3_plan"} and any(
         isinstance(change, UpsertFact) and change.verification_ref is not None
         for change in state_changes
     ):
@@ -904,12 +1089,48 @@ def validate_control_event(
         allowed_fields.add("intent_id")
     if operation in {"complete_satisfied_intent", "complete_verified_t6_intent"}:
         allowed_fields.add("verified_fact_ids")
+    if operation == "complete_verified_d1_turn":
+        allowed_fields.update({"verified_fact_ids", "proof_ref"})
+    if operation == "apply_d2_review":
+        allowed_fields.update({
+            "review_root_id", "review_generation", "review_id", "application_ref",
+            "context_version", "constraint_version", "paused_gate",
+            "turn_id", "intent_id", "review_scope", "action_candidate_id", "pause_reason",
+        })
     unknown_fields = set(details) - allowed_fields
     if unknown_fields:
         raise ValueError(
             "RuntimeEvent.details contains unsupported fields: "
             + ", ".join(sorted(unknown_fields))
         )
+    if operation == "apply_d2_review":
+        application = state_changes[0]
+        assert isinstance(application, AppendD2ReviewApplication)
+        expected = {
+            "review_root_id": application.review_root_id,
+            "review_generation": application.review_generation,
+            "review_id": application.review_id,
+            "application_ref": application.application_ref,
+            "context_version": application.context_version,
+            "constraint_version": application.constraint_version,
+            "paused_gate": application.paused_gate,
+            "turn_id": application.turn_id,
+            "intent_id": application.intent_id,
+            "review_scope": application.review_scope,
+            "action_candidate_id": application.action_candidate_id,
+            "pause_reason": application.pause_reason,
+        }
+        if any(details.get(name) != value for name, value in expected.items()):
+            raise ValueError("D2 review event does not match its typed application")
+        if details.get("result") != ("paused" if application.paused_gate else "applied"):
+            raise ValueError("D2 review result does not match its paused gate")
+    if operation == "apply_d3_review":
+        application = state_changes[0]
+        assert isinstance(application, D3ReviewApplication)
+        if details.get("entity_ids") != [application.review_id] or details.get("result") != (
+            "paused" if application.paused_gate else "applied"
+        ):
+            raise ValueError("D3 review event does not match its typed application")
     if operation == "bind_intent_goal":
         _uuid4(details.get("import_id"), "RuntimeEvent.details.import_id")
     if operation == "commit_verified_file_type_fact":
@@ -1042,6 +1263,11 @@ class ControlMutation:
     event: RuntimeEvent
     checkpoint: CheckpointDraft
     request_fingerprint: str
+    d1_config: D1RunConfig | None = None
+    d1_binding: D1TurnBinding | None = None
+    d1_turn_proof: D1TurnProof | None = None
+    d2_config: D2RunConfig | None = None
+    d3: D3CommitMetadata | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.task_run_id, "ControlMutation.task_run_id")
@@ -1064,6 +1290,42 @@ class ControlMutation:
         if self.event.task_run_id != self.task_run_id:
             raise ValueError("ControlMutation.event belongs to another TaskRun")
         validate_control_event(self.operation, self.state_changes, self.event)
+        if self.d1_config is not None and (
+            not isinstance(self.d1_config, D1RunConfig) or self.operation != "start_task_run"
+        ):
+            raise ValueError("D1 run configuration may only be saved at explicit start")
+        if self.d2_config is not None and (
+            not isinstance(self.d2_config, D2RunConfig)
+            or self.operation != "start_task_run" or self.d1_config is None
+        ):
+            raise ValueError("D2 configuration requires explicit start and fixed execution configuration")
+        if self.d3 is not None:
+            if not isinstance(self.d3, D3CommitMetadata) or self.d1_config is not None or self.d2_config is not None:
+                raise ValueError("D3 metadata must be typed and separate from D1/D2")
+            if self.d3.config is not None and self.operation != "start_task_run":
+                raise ValueError("D3 run configuration requires explicit start")
+            if self.d3.turn_binding is not None and self.operation not in {
+                "register_d3_turn", "advance_d3_turn",
+            }:
+                raise ValueError("D3 Turn binding requires its registration transaction")
+            if self.d3.plan_binding is not None and self.operation not in {
+                "register_d3_plan", "replan_d3_plan",
+            }:
+                raise ValueError("D3 Plan binding requires its registration transaction")
+            if self.d3.plan_result is not None and self.operation != "complete_d3_plan":
+                raise ValueError("D3 Plan result requires its completion transaction")
+        if self.d1_binding is not None and (
+            not isinstance(self.d1_binding, D1TurnBinding)
+            or self.operation != "register_turn" or self.d1_binding.task_run_id != self.task_run_id
+        ):
+            raise ValueError("D1 binding requires the same Turn registration transaction")
+        if self.operation == "complete_verified_d1_turn" and self.d1_turn_proof is None:
+            raise ValueError("D1 Turn completion requires its independent proof")
+        if self.d1_turn_proof is not None and (
+            not isinstance(self.d1_turn_proof, D1TurnProof)
+            or self.operation != "complete_verified_d1_turn"
+        ):
+            raise ValueError("D1 Turn proof requires the independent completion operation")
         if self.checkpoint.task_run_id != self.task_run_id:
             raise ValueError("ControlMutation.checkpoint belongs to another TaskRun")
         if self.checkpoint.sequence != self.base_checkpoint_sequence + 1:
@@ -1092,6 +1354,11 @@ class ControlMutation:
         base_checkpoint_sequence: int,
         state_changes: tuple[StateChange, ...],
         event: RuntimeEvent,
+        d1_config: D1RunConfig | None = None,
+        d1_binding: D1TurnBinding | None = None,
+        d1_turn_proof: D1TurnProof | None = None,
+        d2_config: D2RunConfig | None = None,
+        d3: D3CommitMetadata | None = None,
     ) -> "ControlMutation":
         checkpoint = CheckpointDraft(
             task_run_id=task_run_id,
@@ -1108,6 +1375,11 @@ class ControlMutation:
             event=event,
             checkpoint=checkpoint,
             request_fingerprint="0" * 64,
+            d1_config=d1_config,
+            d1_binding=d1_binding,
+            d1_turn_proof=d1_turn_proof,
+            d2_config=d2_config,
+            d3=d3,
         )
         return cls(
             task_run_id=provisional.task_run_id,
@@ -1120,6 +1392,11 @@ class ControlMutation:
             event=provisional.event,
             checkpoint=provisional.checkpoint,
             request_fingerprint=control_mutation_fingerprint(provisional),
+            d1_config=provisional.d1_config,
+            d1_binding=provisional.d1_binding,
+            d1_turn_proof=provisional.d1_turn_proof,
+            d2_config=provisional.d2_config,
+            d3=provisional.d3,
         )
 
 
@@ -1352,6 +1629,42 @@ class ControlStore(Protocol):
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None: ...
 
+    def load_d1_run_config(self, task_run_id: str) -> D1RunConfig | None: ...
+
+    def load_d1_turn_binding(self, turn_id: str) -> D1TurnBinding | None: ...
+
+    def load_d1_turn_proof(self, turn_id: str) -> D1TurnProof | None: ...
+
+    def load_d2_review_application(
+        self, task_run_id: str, review_id: str
+    ) -> AppendD2ReviewApplication | None: ...
+
+    def list_d2_review_applications(
+        self, task_run_id: str
+    ) -> tuple[AppendD2ReviewApplication, ...]: ...
+
+    def load_d2_run_config(self, task_run_id: str) -> D2RunConfig | None: ...
+
+    def load_d3_run_config(self, task_run_id: str): ...
+
+    def load_d3_turn_binding(self, turn_id: str): ...
+
+    def load_d3_intent_binding(self, intent_id: str): ...
+
+    def load_d3_plan_binding(self, plan_id: str): ...
+
+    def load_d3_plan_result(self, plan_id: str): ...
+
+    def load_d3_outcome(self, entity_id: str): ...
+
+    def load_d3_operation(self, operation_id: str): ...
+
+    def list_d3_operations(self, task_run_id: str): ...
+
+    def load_d3_review_application(self, task_run_id: str, review_id: str): ...
+
+    def list_d3_review_applications(self, task_run_id: str): ...
+
     def load_terminal_commit(self, task_run_id: str) -> ControlCommitResult | None:
         """First persisted terminal result for repeated cancellation; no new mutation."""
         ...
@@ -1467,6 +1780,25 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
             "short_reason": record.short_reason,
             "command_ref": record.command_ref,
         }
+    if isinstance(change, AppendD2ReviewApplication):
+        return {
+            "type": "append_d2_review_application",
+            "review_root_id": change.review_root_id,
+            "review_generation": change.review_generation,
+            "review_id": change.review_id,
+            "application_ref": change.application_ref,
+            "context_version": change.context_version,
+            "constraint_version": change.constraint_version,
+            "output_constraints": [d2_payload(item) for item in change.output_constraints],
+            "paused_gate": change.paused_gate,
+            "turn_id": change.turn_id,
+            "intent_id": change.intent_id,
+            "review_scope": change.review_scope,
+            "action_candidate_id": change.action_candidate_id,
+            "pause_reason": change.pause_reason,
+        }
+    if isinstance(change, D3ReviewApplication):
+        return {"type": "append_d3_review_application", **d3_payload(change)}
     raise TypeError("unsupported state change")
 
 
@@ -1548,5 +1880,11 @@ def control_mutation_fingerprint(mutation: ControlMutation) -> str:
             "details": details,
         },
     }
+    for name in ("d1_config", "d1_binding", "d1_turn_proof", "d2_config"):
+        value = getattr(mutation, name)
+        if value is not None:
+            payload[name] = d1_payload(value)
+    if mutation.d3 is not None:
+        payload["d3"] = d3_payload(mutation.d3)
     encoded = canonical_json(payload).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

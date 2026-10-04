@@ -4,7 +4,42 @@
 
 本文件描述 Python 层的端口边界。接口文件只声明签名，不实现业务函数；T2 Sandbox 与 T3 文件工具适配器的已确认实现另见后续章节，T5 已增加 CLI 装配，历史真实 Docker 文件识别效果复核通过；本次完整独立复验受权限阻塞，详情见 TODO。已有类型优先复用 `agent_core` 中的定义。
 
+## 双 LLM 目标架构的逻辑接口（职责已确认，Python 签名待冻结）
+
+以下是目标层的职责契约，不是新增的 Python Protocol、CLI 字段或 wire protocol。具体输入/输出类型、错误、取消和持久化字段未冻结前不添加猜测签名；现有供应商无关 `ModelAdapter` 可作为模型传输边界复用。
+
+| 逻辑角色 | 输入职责 | 输出职责 | 可信侧边界 |
+| --- | --- | --- | --- |
+| 外层 LLM | TaskRun 目标、已注册 Turn、已提交证据与执行记录 | Turn 目标/完成标准候选、有序 Intent 候选；Action/Turn 复盘建议；带来源的 Process_Fact 候选 | 不能写控制状态、授予权限或直接宣告目标完成；建议须经可信规则与状态校验 |
+| 内层 LLM | 当前已选 Intent、有界上下文、已接受约束 | 当前 Intent 的 Plan / Action 候选；可提出复盘请求 | 不能创建/重排 Intent 列表、改变 Turn 目标、扩大授权/预算或直接执行副作用 |
+| 注册目标验证器 | 可信侧确认的已注册规则及经校验参数、对应证据引用 | 独立的目标验证结果 | 由受控代码执行；不支持或不匹配时保持未完成/未评估 |
+| 证据读取/展示边界 | Fact、Process_Fact 或执行记录中的证据引用 | 只读来源、操作、验证状态和可展示的证据内容 | 不以日志替代证据；敏感值默认脱敏，明文查看走受保护证据路径 |
+
+外层与内层是两个模型职责，不预设必须使用不同供应商或不同模型名称。Turn 目标注册后不可变，调度器串行选择同一 Turn 中的候选 Intent；候选路径成功、策略放弃、证据确认目标不匹配和运行结果未知必须区分。复盘对照已注册目标、执行预期、已提交结果和证据，输出有来源的判断及策略建议；它不是可信验证器或状态提交。Turn 首尾复盘；轮内只在可信代码触发或内层请求时复盘，并且当前 Action 已结束、结果和证据已保存。状态提交与建议应用由可信控制器完成。
+
+复盘建议可继续当前 Intent、切换兄弟候选，或结束旧 Plan 未执行部分并创建新 Plan。受限约束须绑定当前 Intent 或 Turn，并在该范围结束时失效；不能改变授权、TaskRun 总预算、Deadline 或已注册 Turn 目标。提案过期时丢弃；确定性拒绝允许受限重生成并保留拒绝记录；失败前先刷新已提交上下文，仍失败则暂停。未知模型调用结果不自动重发，进入恢复边界。D2/D3 内部切片的次数、信号与恢复参数已分别冻结；通用入口仍待后续轮次确认。
+
+`Process_Fact` 是带来源的模型总结，不是 verified ResultFact。总结在成功复盘发现新执行信息时产生，失败总结不阻断执行；历史版本保留，冲突和适用性显式处理。普通模型上下文、事件、日志和 Process_Fact 不含明文凭据；用户可通过受保护的证据查看路径访问对应敏感证据。
+
+同一 TaskRun 内显式共享的产物保留来源与原验证状态。跨 TaskRun 复用须由调用方显式导入并保留来源；不得继承原 TaskRun 的授权或验证结论。导入后的权限与事实有效性由新 TaskRun 重新核验，相关端口字段待确认。
+
 ## 已冻结的声明
+
+D0（2026-10-02）已确认最小提案、字段来源、分层结果、持久计数和兼容方案，见 [D0_baseline_and_D1_contract.md](D0_baseline_and_D1_contract.md)。D1 已增加内部窄类型和实现，但未新增或冻结 CLI、工作台或外部 wire protocol；其本地验收状态见 TODO。`agent_core/turn_modeling.py` 定义 `TurnProposal`、`AttachmentCopySha256Rule`、双角色 `D1ModelRequest` 及 `D1ModelAdapterPort`；`agent_core/turn_contracts.py` 定义不可变角色/授权/运行配置、Turn 绑定与证明、调用分类与持久操作记录、`D1TurnEvaluatorPort`。`agent_core/single_turn_runner.py` 负责外层提案验证、单候选注册、内层 `ProbeAction`/`CompleteIntentAction` 处理及独立 Turn 完成门；`agent_adapters/dual_llm_application.py` 组合适配器。
+
+D1 的 `attachment_copy_sha256` v1 只允许可信侧选择附件索引，期望摘要、Intent 工作路径与授权由可信侧绑定。规则只证明首次可信摘要观察时的一致性，各层只读复核同一份证据。`role_config_ref` 绑定不可变角色配置内容摘要，恢复时校验模型、提示模板和参数；凭据不进审计。调用完成与提案应用分开记录，各类别在调用前持久计数。既有 CLI/T5/T6 路径继续使用原 `ModelReasoner`、`IncrementalIntentRunner` 与 `RunSupervisor` 契约；不把 D1 配置或 schema 11 元数据回填到旧运行。
+
+D2 的内部契约位于 `agent_core/review_contracts.py`：`D2ReviewRequest` 是可信侧生成的冻结快照，`D2ReviewOutput` 只含 decision、rationale、source_ids 和 typed constraints，`D2ReviewModel` 与 `D2ReviewLedger` 是窄端口。`D2ReviewCoordinator` 在模型调用前持久化 attempt，负责来源/作用域/收紧规则校验、调用额度、generation 与恢复；`D2ReviewSession` 固定首复盘、Action 触发及尾复盘时序。动作候选 ID 使用首次内层模型请求的可信内部台账 ID；结构纠正响应另有请求台账 ID但沿用候选根，供应商 request ID 只作审计。SQLite Controller 原子提交复盘应用、约束版本和 pause gate；原始响应与来源证据版本在独立证据台账中。上述接口仅供内部 D2 组装，不是 CLI、工作台或外部 wire protocol；D2 schema 12 不回填旧 TaskRun。
+
+`D2Application` 使用已有 OS 运行锁串行派发。已知复盘应用中断仅重用原响应与 mutation；未应用结果须先刷新来源，过期结果在原额度内换代。已提交的应用不可改写；自身新增约束不构成重复首复盘触发。普通暂停不新增 TaskRun 枚举；未知/供应商失败禁止恢复重发。内部验收与限制见 [D2_acceptance.md](D2_acceptance.md)。
+
+D3 的内部窄契约位于 `agent_core/d3_contracts.py`、`d3_modeling.py` 与 `d3_workspace.py`：`D3RunConfig` 冻结双角色和一至两个本地附件授权；`D3TurnBinding`、`D3IntentBinding`、`D3PlanBinding` 绑定同目标候选、Intent 目录、规则及版本副本。外层 `D3TurnProposal` 只选择授权附件索引并提出最多两个有序候选；内层 `D3PlanProposal` 只提出 `size_then_sha256`/`sha256_only` 模板及 `new_observation`/`reuse_saved_proof`，后者仅可选择可信上下文列出的 `source_proof_id`。路径、摘要、Fact ID、Plan ID 和固定程序均由可信侧填入；逐步 `D3ActionProposal` 只可逐字匹配固定只读动作或提出 `complete_intent`，不得提供任意脚本。
+
+`D3ReviewOutput` 仅增加 `continue_current_intent`、`switch_sibling_intent`、`replan_current_intent`、`adjust_turn_target` 和尾复盘 `acknowledge_turn_end`，保留 D2 的来源、Intent/Turn 作用域及只能收紧的约束。`D3Application` 只装配显式 D3 TaskRun，通过 `start`、`run`、可信入口 `share_artifact` 和只读 `audit_unknown_operation` 工作，不更改 CLI、工作台或外部 wire protocol。Controller 独占控制状态事务；工作区端口负责按 Intent 停进程、不可覆盖版本副本与显式共享收据；证明端口复核 Execution、观察、规则绑定和旧证明支持引用。新 Plan 对原证明/Fact 的引用可支持该 Plan 的 `complete_intent`，但不改写原证明或新建 Fact/Execution。原调用结果丢失的副本、share、stop 仅保存只读核查，不补签原操作收据；可靠完成记录已保存而控制账目写入中断可按原 ID 修复。Fake 验收边界见 [D3_acceptance.md](D3_acceptance.md)。
+
+`ModelTransport[Request, Response]` 是原 `ModelAdapter` 与 `D1ModelAdapterPort` 共用的供应商无关传输签名；D1 adapter 暴露实际不可变 `role_config`，可信侧逐次核对冻结内容。`D1AuditedModel.propose_async` 仅把供应商 I/O 放到工作线程，所有台账/证据写入留在调用线程；取消、Deadline 或局部时限后未知结果不重调，迟到结果不能提交状态。`read_saved` 核对完整原 envelope 和结构纠正来源；`reconcile_application` 依据固定 mutation 的提交记录补记应用，拒绝缺失/不匹配记录。`reject_application` 保存独立不可覆盖语义拒绝收据，不改写调用完成。
+
+`D1Result` 分开报告 `historical_verified_fact_ids`、当前可复核的 `verified_fact_ids`、`fact_evidence_status` 与 `control_state_status`。结果最终复核失败时规则结论为 `inconclusive`、`recovery_required=True`，历史 Intent/Turn 状态仍保留。证明签发声明固定首次摘要操作和 proof_id，并在 SQLite 保存应用引用；丢失已声明证明时不能生成替代证明。内部验收已通过，详见 [D1_acceptance.md](D1_acceptance.md)，这些字段尚不是公共 wire protocol。
 
 代码位置：[`agent_core/interfaces.py`](agent_core/interfaces.py)。
 
@@ -61,7 +96,7 @@ CLI 外形已确认为同步 `qinyuan-agent-new run-intent --request <JSON 文�
 5. `ToolGatewayPort` / `PolicyPort`：T3 File Tool 已确认；T6 通用脚本新增 `T6CommandGateway`，其权限粒度与 Scope/ROE 仅限本轮已确认的 Sandbox 边界。
 6. `MCPManagerPort` / `SandboxRuntimePort`：专用 MCP 仍使用 T3 方法；通用脚本直接进入 T6 Sandbox，其他 Tool、远程 MCP 和真实 Docker 验收仍需确认。
 7. `ExecutionRecorderPort`：T3 执行记录、保留、截断、Hash 与脱敏已确认；一般 Artifact 的扩展字段和清理 API 仍待后续确认。
-8. 通用 `FactVerifierPort` / TaskRun `GoalEvaluatorPort`：任意事实与整体任务判断仍待确认；T4 文件类型验证器和只读 IntentGoalEvaluatorPort 已实现，不以此扩大到通用目标判断。
+8. `FactVerifierPort` / TaskRun `GoalEvaluatorPort`：高层规则已确认由模型选择并参数化已注册验证规则、由可信代码独立执行；注册表能力、参数类型、适配器和结果字段仍待冻结。T4 文件类型验证器和只读 IntentGoalEvaluatorPort 只覆盖各自切片。
 9. `EventPort`：事件类型、顺序、持久化、重放、订阅和背压。
 
 ## T2 外围适配入口

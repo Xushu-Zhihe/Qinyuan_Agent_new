@@ -58,6 +58,8 @@ def action_worker(pipe, settings, payload, timeout):
     assert '"kind":"complete_intent"' not in prompt
     assert "do not propose complete_intent" in prompt
     assert '"working_directory":"/workspace/work"' in prompt
+    assert "/workspace/work/challenge.bin" in prompt
+    assert "do not prepend input/" in prompt
     assert '"step_index":0' in prompt
     context = json.loads(payload["messages"][1]["content"])
     assert context["pending_candidates"] == {"entries": [], "history_clipped": False}
@@ -128,6 +130,8 @@ def test_t6_action_prompt_matches_parser_and_correction(monkeypatch):
         for action in ("probe", "abandon_intent", "candidate_flag"):
             assert f'"kind":"{action}"' in prompt
         assert '"working_directory":"/workspace/work"' in prompt
+        assert "/workspace/work/challenge.bin" in prompt
+        assert "do not prepend input/" in prompt
         assert '"step_index":0' in prompt
     assert all('"kind":"complete_intent"' not in prompt for prompt in prompts[:2])
     assert all("do not propose complete_intent" in prompt for prompt in prompts[:2])
