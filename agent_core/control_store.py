@@ -10,18 +10,6 @@ from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias, cast
 
 from agent_core.contracts import ModelBackend, TaskRequest
-from agent_core.dual_llm_contracts import (
-    D3CommitMetadata,
-    D3ReviewApplication,
-    d3_payload,
-)
-from agent_core.turn_contracts import D1RunConfig, D1TurnBinding, D1TurnProof, d1_payload
-from agent_core.review_contracts import (
-    D2AllowedActionKinds,
-    D2Constraint,
-    D2MaxActionTimeout,
-    d2_payload,
-)
 from agent_core.domain import (
     Execution,
     ExecutionStatus,
@@ -39,9 +27,27 @@ from agent_core.domain import (
     Turn,
     TurnStatus,
 )
+from agent_core.dual_llm_contracts import (
+    D3CommitMetadata,
+    D3ReviewApplication,
+    d3_payload,
+)
 from agent_core.file_type_fact import FACT_PREFIX
 from agent_core.intent_goals import FileTypeIntentGoal
+from agent_core.process_facts import D5ProcessFact
+from agent_core.review_contracts import (
+    D2AllowedActionKinds,
+    D2Constraint,
+    D2MaxActionTimeout,
+    d2_payload,
+)
 from agent_core.runtime import RuntimeEvent, TaskRunStatus
+from agent_core.turn_contracts import (
+    D1RunConfig,
+    D1TurnBinding,
+    D1TurnProof,
+    d1_payload,
+)
 
 
 class StorageError(RuntimeError):
@@ -540,6 +546,7 @@ StateChange: TypeAlias = (
     | AppendPlanValidationRecord
     | AppendD2ReviewApplication
     | D3ReviewApplication
+    | D5ProcessFact
 )
 
 STATE_CHANGE_TYPES = (
@@ -554,6 +561,7 @@ STATE_CHANGE_TYPES = (
     AppendPlanValidationRecord,
     AppendD2ReviewApplication,
     D3ReviewApplication,
+    D5ProcessFact,
 )
 
 
@@ -831,6 +839,10 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"applied", "paused"}),
         ),
+        "append_process_fact": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"applied"}),
+        ),
         "register_d3_plan": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             dynamic_result_entity="plan",
@@ -1016,6 +1028,12 @@ def validate_control_event(
         or not isinstance(state_changes[0], D3ReviewApplication)
     ):
         raise ValueError("D3 review application requires one typed application change")
+    if operation == "append_process_fact" and (
+        len(state_changes) != 1 or not isinstance(state_changes[0], D5ProcessFact)
+    ):
+        raise ValueError("Process_Fact requires one typed append change")
+    if operation != "append_process_fact" and any(isinstance(change, D5ProcessFact) for change in state_changes):
+        raise ValueError("Process_Fact may only be appended by its dedicated operation")
     if operation == "complete_d3_plan" and (
         len(state_changes) not in {1, 2}
         or not isinstance(state_changes[0], UpsertPlan)
@@ -1131,6 +1149,11 @@ def validate_control_event(
             "paused" if application.paused_gate else "applied"
         ):
             raise ValueError("D3 review event does not match its typed application")
+    if operation == "append_process_fact":
+        fact = state_changes[0]
+        assert isinstance(fact, D5ProcessFact)
+        if details.get("entity_ids") != [fact.process_fact_id]:
+            raise ValueError("Process_Fact event does not match its typed append")
     if operation == "bind_intent_goal":
         _uuid4(details.get("import_id"), "RuntimeEvent.details.import_id")
     if operation == "commit_verified_file_type_fact":
@@ -1629,6 +1652,10 @@ class ControlStore(Protocol):
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None: ...
 
+    def list_task_run_refs(self) -> tuple[str, ...]:
+        """Read TaskRun identities without exposing their request contents."""
+        ...
+
     def load_d1_run_config(self, task_run_id: str) -> D1RunConfig | None: ...
 
     def load_d1_turn_binding(self, turn_id: str) -> D1TurnBinding | None: ...
@@ -1664,6 +1691,8 @@ class ControlStore(Protocol):
     def load_d3_review_application(self, task_run_id: str, review_id: str): ...
 
     def list_d3_review_applications(self, task_run_id: str): ...
+
+    def list_process_facts(self, task_run_id: str) -> tuple[D5ProcessFact, ...]: ...
 
     def load_terminal_commit(self, task_run_id: str) -> ControlCommitResult | None:
         """First persisted terminal result for repeated cancellation; no new mutation."""
@@ -1799,6 +1828,8 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
         }
     if isinstance(change, D3ReviewApplication):
         return {"type": "append_d3_review_application", **d3_payload(change)}
+    if isinstance(change, D5ProcessFact):
+        return {"type": "append_process_fact", **d3_payload(change)}
     raise TypeError("unsupported state change")
 
 

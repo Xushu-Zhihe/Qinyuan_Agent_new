@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -16,6 +16,9 @@ from agent_adapters.command_recorder import T6CommandRecorder
 from agent_adapters.d4_review_ledger import D4ReviewLedger
 from agent_adapters.model_evidence import FileD3ModelEvidence
 from agent_adapters.observation_proof_store import FileD3ProofStore
+from agent_adapters.process_fact_evidence import D5EvidenceError, FileD5Evidence
+from agent_adapters.process_fact_model import D5RedactingModel
+from agent_adapters.process_sources import D5SourceReader
 from agent_adapters.review_ledger import FileD2ReviewLedger
 from agent_adapters.run_files import run_lock
 from agent_adapters.workspace_evidence import FileD3WorkspaceEvidence
@@ -35,10 +38,12 @@ from agent_core.command_contracts import (
     SandboxCommandAuthorization,
     SandboxCommandRequest,
 )
-from agent_core.contracts import ModelBackend, TaskRequest
+from agent_core.contracts import ModelBackend, TaskRequest, TaskRequestError
 from agent_core.control_evidence_validator import D3EvidenceValidator
 from agent_core.control_state_repository import ControlStateRepository
+from agent_core.control_store import StorageError
 from agent_core.controller import (
+    CommittedStateReloadError,
     SandboxCleanupError,
     TaskRunController,
     TaskRunControllerRegistry,
@@ -74,6 +79,12 @@ from agent_core.fixed_command_gateway import D3FixedCommandGateway, D3FixedComma
 from agent_core.intent_postconditions import FileSha256
 from agent_core.modeling import CancellationToken
 from agent_core.multi_turn_control import D3Control
+from agent_core.process_refinement import ProcessRefinement
+from agent_core.redaction import (
+    D5Redactor,
+    D5SensitiveValue,
+    d5_sensitive_configuration_matches,
+)
 from agent_core.review import D2ReviewCoordinator, D2ReviewPaused
 from agent_core.review_contracts import (
     D2ModelFailure,
@@ -169,12 +180,25 @@ class D3Application:
         inner_model,
         review_model,
         clock: Callable[[], float],
+        refinement_model=None,
+        sensitive_config: Mapping[str, D5SensitiveValue] | None = None,
+        refinement_timeout_seconds: float = 180.0,
     ) -> None:
         self.directory = directory
         self.config = config
         self.clock = clock
         self.sandbox = sandbox
-        self.review_model = review_model
+        self._redaction_configured = d5_sensitive_configuration_matches(
+            config.d5_sensitive_requirements, sensitive_config
+        )
+        self.redactor = D5Redactor(
+            tuple(entry.value for entry in (sensitive_config or {}).values())
+            if self._redaction_configured else None
+        )
+        self.review_model = D5RedactingModel(
+            review_model, self.redactor, enabled=config.d5_enabled,
+            configured=self._redaction_configured,
+        )
         self._token: CancellationToken | None = None
         self._bound_task_run_id: str | None = None
         self.store = SqliteControlStore.open(directory / "control.sqlite", clock=clock)
@@ -223,6 +247,18 @@ class D3Application:
             registry=TaskRunControllerRegistry(),
             attachment_imports=self.imports,
             d3_evidence_validator=self.validator,
+            process_fact_validator=self._validate_process_fact,
+        )
+        self.refinement = (
+            ProcessRefinement(
+                self.controller, self.store, FileD5Evidence(directory / "d5-process"),
+                D5SourceReader(directory, self.store), D5RedactingModel(
+                    refinement_model or outer_model, self.redactor,
+                    configured=self._redaction_configured, redact_response=False,
+                ),
+                config, clock, self._dispatch_stopped, self.redactor,
+                timeout_seconds=refinement_timeout_seconds,
+            ) if config.d5_enabled else None
         )
         self.importer = AttachmentImporter(
             controller=self.controller,
@@ -244,7 +280,10 @@ class D3Application:
             self.controller,
             self.store,
             self.model_evidence,
-            outer_model,
+            D5RedactingModel(
+                outer_model, self.redactor, enabled=config.d5_enabled,
+                configured=self._redaction_configured,
+            ),
             config,
             clock,
         )
@@ -252,7 +291,10 @@ class D3Application:
             self.controller,
             self.store,
             self.model_evidence,
-            inner_model,
+            D5RedactingModel(
+                inner_model, self.redactor, enabled=config.d5_enabled,
+                configured=self._redaction_configured,
+            ),
             config,
             clock,
         )
@@ -275,6 +317,18 @@ class D3Application:
     @property
     def state(self):
         return self.controller.control_state
+
+    def _validate_process_fact(self, mutation, state) -> None:
+        if self.refinement is None:
+            raise D3RecoveryRequired("d5_not_enabled")
+        self.refinement.validate(mutation, state)
+
+    def _after_review(self, review_id: str) -> None:
+        if self.refinement is not None:
+            try:
+                self.refinement.after_review(review_id)
+            except (D5EvidenceError, OSError, StorageError, CommittedStateReloadError) as exc:
+                raise D3RecoveryRequired("d5_refinement_persistence_recovery_required") from exc
 
     def _id(self, name: str) -> str:
         return stable_id(self.state.task_run.task_run_id, f"d3/{name}")
@@ -303,11 +357,19 @@ class D3Application:
     ) -> tuple[str, ...]:
         if self.config.d4_budget is None:
             return ()
+        task_run_id = self.state.task_run.task_run_id
+        list_unresolved = getattr(
+            self.store, "list_d4_unresolved_operations", None
+        )
+        if not callable(list_unresolved):
+            raise D4RecoveryRequired("d4_operation_ledger_unavailable")
+        operations = list_unresolved(task_run_id)
+        if any(item.start.task_run_id != task_run_id for item in operations):
+            raise D4RecoveryRequired("d4_operation_owner_changed")
         return tuple(
             item.start.operation_id
-            for item in self.store.list_d4_operations(self.state.task_run.task_run_id)
-            if item.completion is None
-            and item.start.operation_id != exclude_operation_id
+            for item in operations
+            if item.start.operation_id != exclude_operation_id
         )
 
     def _persist_cancel_intent(self) -> None:
@@ -375,6 +437,11 @@ class D3Application:
             return
         task_run_id = self.state.task_run.task_run_id
         self.store.reconcile_d4_control_commit_audit(task_run_id)
+        if self.refinement is not None:
+            try:
+                self.refinement.reconcile()
+            except (D5EvidenceError, OSError, StorageError, CommittedStateReloadError) as exc:
+                raise D3RecoveryRequired("d5_refinement_persistence_recovery_required") from exc
         for d4_record in self.store.list_d4_operations(task_run_id):
             operation_id = d4_record.start.operation_id
             d3_record = self.store.load_d3_operation(operation_id)
@@ -739,6 +806,33 @@ class D3Application:
         )
 
     def start(self, request: TaskRequest, source_root: Path) -> str:
+        if self.config.d5_enabled and not self._redaction_configured:
+            raise D3RecoveryRequired("d5_redaction_configuration_unavailable")
+        committed_source_root = None
+        if self.config.d5_enabled:
+            if not isinstance(request, TaskRequest):
+                raise TaskRequestError("request must be a TaskRequest")
+            source_root_text = str(source_root)
+            if self.redactor.contains_sensitive(source_root_text):
+                raise TaskRequestError("d5_sensitive_task_request_rejected")
+
+            def string_values(value):
+                if isinstance(value, str):
+                    yield value
+                elif isinstance(value, Mapping):
+                    for key, item in value.items():
+                        yield from string_values(key)
+                        yield from string_values(item)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        yield from string_values(item)
+
+            readable_text = tuple(string_values(request.to_dict()))
+            if any(self.redactor.contains_sensitive(value) for value in readable_text):
+                raise TaskRequestError("d5_sensitive_task_request_rejected")
+            committed_source_root = str(source_root.resolve(strict=True))
+            if self.redactor.contains_sensitive(committed_source_root):
+                raise TaskRequestError("d5_sensitive_task_request_rejected")
         if (
             self.outer.adapter.role_config != self.config.outer_role
             or self.inner.adapter.role_config != self.config.inner_role
@@ -749,7 +843,7 @@ class D3Application:
             request,
             ModelBackend.CODEX_CLI,
             str(uuid4()),
-            source_root=str(source_root.resolve(strict=True)),
+            source_root=committed_source_root or str(source_root.resolve(strict=True)),
             d3_config=self.config,
         )
         self._bound_task_run_id = committed.value
@@ -770,6 +864,8 @@ class D3Application:
             frozen = self.store.load_d3_run_config(task_run_id)
             if frozen != self.config:
                 raise D3RecoveryRequired("d3_frozen_run_configuration_changed")
+            if self.config.d5_enabled and not self._redaction_configured:
+                return self.result("d5_redaction_configuration_unavailable", recovery_required=True)
             self.store.reconcile_d4_control_commit_audit(task_run_id)
             if self.state.task_run.status is not TaskRunStatus.RUNNING:
                 terminal_result = self.result("task_run_already_terminal")
@@ -917,6 +1013,7 @@ class D3Application:
             resource_ref,
             stage,
             context,
+            process_facts=self.refinement.context_for(resource_ref) if self.refinement is not None else (),
         )
 
     async def _import_all(self, token: CancellationToken):
@@ -1176,6 +1273,9 @@ class D3Application:
             },
             "constraint_version": version,
         }
+        if self.config.d5_enabled:
+            context["source_summaries"] = self.redactor.redact_value(context["source_summaries"])
+            context["turn_target"] = self.redactor.redact(context["turn_target"])
         summary = {**context, "checkpoint": state.latest_checkpoint.sequence}
         from agent_core.control_store import canonical_json
 
@@ -1345,10 +1445,12 @@ class D3Application:
                 )
                 if not isinstance(result.output, D3ReviewOutput):
                     raise D3RecoveryRequired("d3_review_application_receipt_missing")
+                self._after_review(result.review_id)
                 return result.review_id, result.output
             application, _, output = self.validator._review_call(
                 request.task_run_id, prior[-1].review_id
             )
+            self._after_review(application.review_id)
             return application.review_id, output
         if self._dispatch_stopped():
             self.review_ledger.record_not_called(request, "d3_review_dispatch_stopped")
@@ -1360,6 +1462,7 @@ class D3Application:
         )
         if not isinstance(result.output, D3ReviewOutput):
             raise D3RecoveryRequired("d3_review_output_missing")
+        self._after_review(result.review_id)
         return result.review_id, result.output
 
     async def _shared_context(
@@ -2260,6 +2363,8 @@ class D3Application:
                         != self.config
                     ):
                         raise D4RecoveryRequired("d3_frozen_run_configuration_changed")
+                if self.config.d5_enabled and not self._redaction_configured:
+                    return self.result("d5_redaction_configuration_unavailable", recovery_required=True)
                 return await self._run(token)
             except (
                 D3RecoveryRequired,

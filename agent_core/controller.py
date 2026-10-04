@@ -76,6 +76,7 @@ from agent_core.observation_proof import (
     T6ObservationProofEvidencePort,
     observation_fact_content,
 )
+from agent_core.process_facts import D5ProcessFact
 from agent_core.runtime import (
     TERMINAL_STATUSES,
     InvalidTransition,
@@ -238,6 +239,7 @@ class TaskRunController(LegacyTaskRunController):
         target_network_adapter: Any | None = None,
         d1_turn_evaluator: D1TurnEvaluatorPort | None = None,
         d3_evidence_validator: Callable[[ControlMutation, ControlStateSnapshot], None] | None = None,
+        process_fact_validator: Callable[[ControlMutation, ControlStateSnapshot], None] | None = None,
     ) -> None:
         super().__init__(sandbox, clock=clock if callable(clock) else _clock_now_wrapper(clock))
         supplied = (store, repository, registry)
@@ -264,6 +266,7 @@ class TaskRunController(LegacyTaskRunController):
         self._target_network_destroyed = False
         self._d1_turn_evaluator = d1_turn_evaluator
         self._d3_evidence_validator = d3_evidence_validator
+        self._process_fact_validator = process_fact_validator
 
     def _now_utc(self) -> float:
         return _clock_now(self._clock)
@@ -834,8 +837,9 @@ class TaskRunController(LegacyTaskRunController):
         deps = self._require_persistent()
         if deps.store.load_d3_run_config(task.task_run_id) is None:
             raise InvalidTransition("D3 transition requires an explicit D3 TaskRun")
-        if self._d3_evidence_validator is None:
-            raise InvalidTransition("D3 evidence validator is not configured")
+        validator = self._process_fact_validator if operation == "append_process_fact" else self._d3_evidence_validator
+        if validator is None:
+            raise InvalidTransition("transition evidence validator is not configured")
         replay = self._load_existing_commit(mutation_id)
         now = replay.event.timestamp if replay is not None else self._now_utc()
         event = RuntimeEvent(
@@ -871,7 +875,7 @@ class TaskRunController(LegacyTaskRunController):
             or now >= task.deadline_at
         ):
             raise InvalidTransition("D3 transition requires a running TaskRun before Deadline")
-        self._d3_evidence_validator(mutation, state)
+        validator(mutation, state)
         if state.latest_checkpoint.sequence != self.control_state.latest_checkpoint.sequence:
             raise StaleControlStateError("D3 state changed during evidence validation")
         if self._now_utc() >= task.deadline_at:
@@ -880,6 +884,14 @@ class TaskRunController(LegacyTaskRunController):
         commit = deps.store.commit(mutation)
         self._reload_after_commit(commit)
         return CommittedOperation.from_commit(commit)
+
+    def commit_process_fact(self, fact: D5ProcessFact, mutation_id: str) -> CommittedOperation:
+        """Append model-summary metadata independently of verified Facts."""
+        if not isinstance(fact, D5ProcessFact):
+            raise TypeError("Process_Fact requires typed metadata")
+        return self.commit_d3_transition(
+            "append_process_fact", (fact,), (fact.process_fact_id,), "applied", mutation_id
+        )
 
     def bind_intent_goal(
         self,
@@ -1918,13 +1930,18 @@ class TaskRunController(LegacyTaskRunController):
             else None
         )
         if config is not None and getattr(config, "d4_budget", None) is not None:
-            list_operations = getattr(deps.store, "list_d4_operations", None)
-            if not callable(list_operations):
+            list_unresolved = getattr(
+                deps.store, "list_d4_unresolved_operations", None
+            )
+            if not callable(list_unresolved):
                 raise D4RecoveryRequired("d4_operation_ledger_unavailable")
+            unresolved = list_unresolved(task_run.task_run_id)
             if any(
-                item.completion is None
-                for item in list_operations(task_run.task_run_id)
+                item.start.task_run_id != task_run.task_run_id
+                for item in unresolved
             ):
+                raise D4RecoveryRequired("d4_operation_owner_changed")
+            if unresolved:
                 raise D4RecoveryRequired("d4_operation_outcome_unknown")
         change = UpsertTaskRun(
             task_run_id=task_run.task_run_id,

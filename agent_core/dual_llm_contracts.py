@@ -96,6 +96,16 @@ def d3_payload(value: object) -> dict[str, object]:
         and value.config.d4_budget is None
     ):
         payload["config"].pop("d4_budget")
+    if isinstance(value, D3RunConfig) and not value.d5_enabled:
+        payload.pop("d5_enabled")
+        payload.pop("d5_sensitive_requirements")
+    elif (
+        isinstance(value, D3CommitMetadata)
+        and value.config is not None
+        and not value.config.d5_enabled
+    ):
+        payload["config"].pop("d5_enabled")
+        payload["config"].pop("d5_sensitive_requirements")
     return payload
 
 
@@ -126,6 +136,8 @@ class D3RunConfig:
     chain_id: str = "dual_llm_d3"
     contract_version: int = 1
     d4_budget: D4BudgetPolicy | None = None
+    d5_enabled: bool = False
+    d5_sensitive_requirements: tuple[tuple[str, str], ...] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -147,6 +159,33 @@ class D3RunConfig:
         ):
             raise TypeError("D4 requires a frozen budget policy")
         if (
+            type(self.d5_enabled) is not bool
+            or self.d5_enabled
+            and self.d4_budget is None
+        ):
+            raise ValueError("D5 requires explicit enablement and a frozen D4 budget")
+        requirements = self.d5_sensitive_requirements
+        if requirements is None and self.d5_enabled:
+            raise ValueError("D5 sensitive requirements must be explicitly declared")
+        if requirements is not None and (
+            not isinstance(requirements, tuple)
+            or any(
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or any(
+                    not isinstance(part, str) or not part.strip() or "\x00" in part
+                    for part in item
+                )
+                for item in requirements
+            )
+            or len({item[0] for item in requirements}) != len(requirements)
+        ):
+            raise ValueError(
+                "D5 sensitive requirements require unique non-secret keys and versions"
+            )
+        if requirements and not self.d5_enabled:
+            raise ValueError("sensitive requirements require D5 enablement")
+        if (
             self.chain_id != "dual_llm_d3"
             or type(self.contract_version) is not int
             or self.contract_version != 1
@@ -163,7 +202,13 @@ class D3RunConfig:
             "chain_id",
             "contract_version",
         }
-        if set(value) not in (fields, fields | {"d4_budget"}):
+        allowed = (
+            fields,
+            fields | {"d4_budget"},
+            fields | {"d4_budget", "d5_enabled"},
+            fields | {"d4_budget", "d5_enabled", "d5_sensitive_requirements"},
+        )
+        if set(value) not in allowed:
             raise ValueError("invalid D3RunConfig fields")
         budget = value.get("d4_budget")
         if budget is not None and not isinstance(budget, dict):
@@ -174,6 +219,15 @@ class D3RunConfig:
         indices = authorization.get("attachment_indices")
         if not isinstance(indices, list):
             raise TypeError("invalid D3 attachment indices")
+        requirements = value.get("d5_sensitive_requirements")
+        if requirements is not None and (
+            not isinstance(requirements, (list, tuple))
+            or any(
+                not isinstance(item, (list, tuple)) or len(item) != 2
+                for item in requirements
+            )
+        ):
+            raise TypeError("invalid D5 sensitive requirements")
         return cls(
             D1RoleConfig.from_dict(value["outer_role"]),  # type: ignore[arg-type]
             D1RoleConfig.from_dict(value["inner_role"]),  # type: ignore[arg-type]
@@ -187,6 +241,10 @@ class D3RunConfig:
             value["chain_id"],  # type: ignore[arg-type]
             value["contract_version"],  # type: ignore[arg-type]
             D4BudgetPolicy.from_dict(budget) if budget is not None else None,
+            value.get("d5_enabled", False),  # type: ignore[arg-type]
+            tuple(tuple(item) for item in requirements)
+            if requirements is not None
+            else None,  # type: ignore[arg-type]
         )
 
 

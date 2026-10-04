@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -127,6 +128,7 @@ from agent_core.modeling import (
     PlanGenerationResponse,
     parse_intent_action,
 )
+from agent_core.process_facts import D5Attempt, D5ProcessFact
 from agent_core.review_contracts import (
     D2AllowedActionKinds,
     D2Constraint,
@@ -148,7 +150,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 14
+CURRENT_SCHEMA_VERSION = 15
 
 MIGRATION_14 = """
 CREATE TABLE d4_operations (
@@ -178,6 +180,27 @@ CREATE INDEX idx_d4_audit_events_task_category
 ON d4_audit_events(task_run_id, category);
 CREATE INDEX idx_d4_audit_events_related
 ON d4_audit_events(task_run_id, related_ref);
+"""
+
+MIGRATION_15 = """
+ALTER TABLE d4_operations
+ADD COLUMN unknown_disposition_json TEXT;
+CREATE TABLE d5_attempts (
+    model_request_id TEXT PRIMARY KEY REFERENCES d4_operations(operation_id),
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    review_id TEXT NOT NULL REFERENCES d3_review_applications(review_id),
+    attempt_json TEXT NOT NULL,
+    UNIQUE(task_run_id, review_id)
+);
+CREATE TABLE process_facts (
+    process_fact_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    version INTEGER NOT NULL CHECK (version > 0),
+    model_request_id TEXT NOT NULL UNIQUE REFERENCES d5_attempts(model_request_id),
+    metadata_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL,
+    UNIQUE(task_run_id, version)
+);
 """
 
 MIGRATION_11 = """
@@ -655,8 +678,8 @@ class SqliteControlStore:
         connection.row_factory = sqlite3.Row
         try:
             version = connection.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0]
-            if version not in {10, 11, 12, 13, CURRENT_SCHEMA_VERSION}:
-                raise StorageError("read-only history requires supported schema 10 through 14")
+            if version not in {10, 11, 12, 13, 14, CURRENT_SCHEMA_VERSION}:
+                raise StorageError("read-only history requires supported schema 10 through 15")
             connection.execute("BEGIN")
             store = cls(connection, database_path, clock=time.time)
             store._schema_version = int(version)
@@ -795,6 +818,13 @@ class SqliteControlStore:
                 self._connection.execute(
                     "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                     (14, self._now()),
+                )
+            if version < 15:
+                for statement in _sql_statements(MIGRATION_15):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (15, self._now()),
                 )
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
@@ -1721,7 +1751,162 @@ class SqliteControlStore:
             or completion is not None and completion.operation_id != start.operation_id
         ):
             raise StorageError("D4 operation row differs from its typed record")
+        self._decode_d4_unknown_disposition(row, start, completion)
         return D4OperationRecord(start, completion, row["application_ref"])
+
+    @staticmethod
+    def _d4_sha256(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value)
+        )
+
+    def _decode_d4_unknown_disposition(
+        self,
+        row: sqlite3.Row,
+        start: D4OperationStart,
+        completion: D4OperationCompletion | None,
+    ) -> dict[str, object] | None:
+        if self._schema_version < 15:
+            return None
+        raw = row["unknown_disposition_json"]
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("D4 unknown disposition is invalid JSON") from exc
+        expected = {
+            "disposition",
+            "operation_id",
+            "task_run_id",
+            "decided_at",
+            "evidence_ref",
+            "evidence_sha256",
+            "payload_sha256",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise StorageError("D4 unknown disposition has invalid fields")
+        decided_at = value["decided_at"]
+        evidence_ref = value["evidence_ref"]
+        if (
+            value["disposition"] != "sealed_not_applied"
+            or value["operation_id"] != start.operation_id
+            or value["task_run_id"] != start.task_run_id
+            or start.category != "refinement"
+            or completion is not None
+            or isinstance(decided_at, bool)
+            or not isinstance(decided_at, (int, float))
+            or not math.isfinite(decided_at)
+            or decided_at < start.started_at
+            or not isinstance(evidence_ref, str)
+            or not evidence_ref.strip()
+            or not self._d4_sha256(value["evidence_sha256"])
+            or not self._d4_sha256(value["payload_sha256"])
+        ):
+            raise StorageError("D4 unknown disposition differs from its operation")
+        payload = {key: value[key] for key in expected - {"payload_sha256"}}
+        payload_sha256 = hashlib.sha256(
+            canonical_json(payload).encode("utf-8")
+        ).hexdigest()
+        if value["payload_sha256"] != payload_sha256:
+            raise StorageError("D4 unknown disposition checksum differs")
+        return value
+
+    def is_unknown_refinement_sealed(self, operation_id: str) -> bool:
+        if self._schema_version < 14:
+            return False
+        record = self.load_d4_operation(operation_id)
+        if record is None or self._schema_version < 15:
+            return False
+        row = self._connection.execute(
+            "SELECT unknown_disposition_json FROM d4_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise StorageError("D4 operation disappeared while checking disposition")
+        return row["unknown_disposition_json"] is not None
+
+    def list_d4_unresolved_operations(
+        self, task_run_id: str
+    ) -> tuple[D4OperationRecord, ...]:
+        unresolved = []
+        for record in self.list_d4_operations(task_run_id):
+            if record.start.task_run_id != task_run_id:
+                raise StorageError("D4 operation belongs to another TaskRun")
+            if record.completion is None and not self.is_unknown_refinement_sealed(
+                record.start.operation_id
+            ):
+                unresolved.append(record)
+        return tuple(unresolved)
+
+    def seal_unknown_refinement(
+        self,
+        operation_id: str,
+        *,
+        decided_at: float,
+        evidence_ref: str,
+        evidence_sha256: str,
+    ) -> None:
+        if self._schema_version < 15:
+            raise D4RecoveryRequired("refinement unknown sealing requires schema 15")
+        if (
+            isinstance(decided_at, bool)
+            or not isinstance(decided_at, (int, float))
+            or not math.isfinite(decided_at)
+            or not isinstance(evidence_ref, str)
+            or not evidence_ref.strip()
+            or not self._d4_sha256(evidence_sha256)
+        ):
+            raise ValueError("invalid D4 refinement unknown disposition")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self.load_d4_operation(operation_id)
+            if record is None:
+                raise D4OperationConflict("refinement disposition has no operation")
+            if record.start.category != "refinement":
+                raise D4OperationConflict("only refinement unknown may be sealed")
+            if record.completion is not None:
+                raise D4RecoveryRequired("known refinement result cannot be sealed")
+            if decided_at < record.start.started_at:
+                raise D4OperationConflict("refinement disposition precedes operation")
+            payload: dict[str, object] = {
+                "disposition": "sealed_not_applied",
+                "operation_id": record.start.operation_id,
+                "task_run_id": record.start.task_run_id,
+                "decided_at": float(decided_at),
+                "evidence_ref": evidence_ref,
+                "evidence_sha256": evidence_sha256,
+            }
+            payload["payload_sha256"] = hashlib.sha256(
+                canonical_json(payload).encode("utf-8")
+            ).hexdigest()
+            row = self._connection.execute(
+                "SELECT unknown_disposition_json FROM d4_operations "
+                "WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise StorageError("D4 operation disappeared while sealing unknown")
+            existing_raw = row["unknown_disposition_json"]
+            if existing_raw is not None:
+                if json.loads(existing_raw) != payload:
+                    raise D4OperationConflict(
+                        "refinement unknown disposition is immutable"
+                    )
+            else:
+                self._connection.execute(
+                    "UPDATE d4_operations SET unknown_disposition_json = ? "
+                    "WHERE operation_id = ?",
+                    (canonical_json(payload), operation_id),
+                )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_quietly()
+            raise
+        if not self.is_unknown_refinement_sealed(operation_id):
+            raise D4RecoveryRequired("refinement unknown disposition readback failed")
 
     def list_d4_operations(self, task_run_id: str) -> tuple[D4OperationRecord, ...]:
         if self._schema_version < 14:
@@ -2064,9 +2249,9 @@ class SqliteControlStore:
             or self._now() >= task.deadline_at
         ):
             raise D4OperationConflict("operation requires a running TaskRun before Deadline")
-        records = self.list_d4_operations(start.task_run_id)
-        if any(record.completion is None for record in records):
+        if self.list_d4_unresolved_operations(start.task_run_id):
             raise D4RecoveryRequired("an earlier operation result remains unknown")
+        records = self.list_d4_operations(start.task_run_id)
         if start.charged:
             if sum(record.start.charged for record in records) >= config.d4_budget.total:
                 raise D4BudgetExhausted("D4 total operation-start budget exhausted")
@@ -2115,6 +2300,8 @@ class SqliteControlStore:
         record = self.load_d4_operation(completion.operation_id)
         if record is None:
             raise D4OperationConflict("completion has no admitted operation")
+        if self.is_unknown_refinement_sealed(completion.operation_id):
+            raise D4RecoveryRequired("sealed refinement response cannot be completed")
         if completion.finished_at < record.start.started_at:
             raise D4OperationConflict("completion precedes operation start")
         if record.completion is not None and record.completion != completion:
@@ -2619,6 +2806,195 @@ class SqliteControlStore:
             proof = mutation.d1_turn_proof
             self._connection.execute("INSERT INTO d1_turn_proofs VALUES (?,?,?)", (proof.turn_id, canonical_json(d1_payload(proof)), event_sequence))
 
+    @staticmethod
+    def _validate_d5_attempt_start(attempt: D5Attempt, start: D4OperationStart) -> None:
+        if (
+            start.operation_id != attempt.model_request_id
+            or start.task_run_id != attempt.task_run_id
+            or start.category != "refinement"
+            or start.context_sha256 != attempt.context_sha256
+            or start.base_checkpoint_sequence != attempt.base_checkpoint_sequence
+            or start.role != "outer_planning"
+            or start.role_config_ref != attempt.role_config_ref
+            or start.resource_ref != attempt.review_id
+            or start.started_at != attempt.started_at
+        ):
+            raise StorageError("D5 admission binding changed")
+
+    def load_d5_attempt(self, model_request_id: str) -> D5Attempt | None:
+        if self._schema_version < 15:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM d5_attempts WHERE model_request_id = ?", (model_request_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        attempt = D5Attempt.from_dict(json.loads(row["attempt_json"]))
+        if (attempt.model_request_id, attempt.task_run_id, attempt.review_id) != (
+            row["model_request_id"], row["task_run_id"], row["review_id"]
+        ):
+            raise StorageError("D5 attempt ownership changed")
+        operation = self.load_d4_operation(model_request_id)
+        if operation is None:
+            raise StorageError("D5 attempt has no D4 admission")
+        self._validate_d5_attempt_start(attempt, operation.start)
+        return attempt
+
+    def list_d5_attempt_refs(self, task_run_id: str) -> tuple[str, ...]:
+        """List owned keys without parsing each row, for isolated evidence reads."""
+        if self._schema_version < 15:
+            return ()
+        rows = self._connection.execute(
+            "SELECT model_request_id FROM d5_attempts WHERE task_run_id = ? ORDER BY rowid",
+            (task_run_id,),
+        ).fetchall()
+        return tuple(row[0] for row in rows)
+
+    def list_d5_attempts(self, task_run_id: str) -> tuple[D5Attempt, ...]:
+        if self._schema_version < 15:
+            return ()
+        rows = self._connection.execute(
+            "SELECT model_request_id FROM d5_attempts WHERE task_run_id = ? ORDER BY rowid",
+            (task_run_id,),
+        ).fetchall()
+        attempts = tuple(self.load_d5_attempt(row[0]) for row in rows)
+        if any(item is None or item.task_run_id != task_run_id for item in attempts):
+            raise StorageError("D5 attempt ownership changed")
+        return cast(tuple[D5Attempt, ...], attempts)
+
+    def begin_d5_attempt(self, attempt: D5Attempt, start: D4OperationStart) -> D5Attempt | None:
+        """Charge admission and source-version dedup in the same transaction."""
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._validate_d5_attempt_start(attempt, start)
+            existing = self.load_d5_attempt(attempt.model_request_id)
+            if existing is not None:
+                if existing != attempt:
+                    raise IdempotencyConflictError("D5 attempt content changed")
+                operation = self.load_d4_operation(attempt.model_request_id)
+                if operation is None or operation.start != start:
+                    raise IdempotencyConflictError("D5 attempt admission changed")
+                self._connection.commit()
+                return existing
+            config = self.load_d3_run_config(attempt.task_run_id)
+            review = self.load_d3_review_application(attempt.task_run_id, attempt.review_id)
+            if config is None or not config.d5_enabled or config.d4_budget is None:
+                raise StorageError("D5 requires explicit new-run enablement")
+            if review is None or review.paused_gate or not set(
+                source.object_id for source in attempt.sources
+            ).issubset(review.source_ids):
+                raise StorageError("D5 requires committed accepted review sources")
+            previous = self.list_d5_attempts(attempt.task_run_id)
+            tried = {source.version_key for item in previous for source in item.sources}
+            if any(item.review_id == attempt.review_id for item in previous) or not any(
+                source.version_key not in tried for source in attempt.sources
+            ):
+                raise StorageError("D5 source versions were already attempted")
+            if self._begin_d4_operation(start) is not None:
+                raise StorageError("D5 attempt cannot adopt a prior D4 admission")
+            self._connection.execute(
+                "INSERT INTO d5_attempts VALUES (?, ?, ?, ?)",
+                (attempt.model_request_id, attempt.task_run_id, attempt.review_id,
+                 canonical_json(asdict(attempt))),
+            )
+            self._connection.commit()
+            return None
+        except BaseException:
+            self._connection.rollback()
+            raise
+
+    def list_process_facts(self, task_run_id: str) -> tuple[D5ProcessFact, ...]:
+        if self._schema_version < 15:
+            return ()
+        rows = self._connection.execute(
+            "SELECT * FROM process_facts WHERE task_run_id = ? ORDER BY version",
+            (task_run_id,),
+        ).fetchall()
+        facts = []
+        for row in rows:
+            fact = D5ProcessFact.from_dict(json.loads(row["metadata_json"]))
+            if (fact.process_fact_id, fact.task_run_id, fact.version, fact.model_request_id) != (
+                row["process_fact_id"], task_run_id, row["version"], row["model_request_id"]
+            ):
+                raise StorageError("Process_Fact ownership changed")
+            facts.append(fact)
+        if tuple(item.version for item in facts) != tuple(range(1, len(facts) + 1)):
+            raise StorageError("Process_Fact versions must be contiguous")
+        return tuple(facts)
+
+    def list_process_fact_refs(self, task_run_id: str) -> tuple[str, ...]:
+        """List owned summary keys without parsing row metadata."""
+        if self._schema_version < 15:
+            return ()
+        rows = self._connection.execute(
+            "SELECT process_fact_id FROM process_facts WHERE task_run_id = ? ORDER BY version",
+            (task_run_id,),
+        ).fetchall()
+        return tuple(row[0] for row in rows)
+
+    def load_process_fact(self, process_fact_id: str) -> D5ProcessFact | None:
+        """Read and verify one immutable metadata row independently."""
+        if self._schema_version < 15:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM process_facts WHERE process_fact_id = ?", (process_fact_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        fact = D5ProcessFact.from_dict(json.loads(row["metadata_json"]))
+        if (
+            fact.process_fact_id, fact.task_run_id, fact.version, fact.model_request_id
+        ) != (
+            row["process_fact_id"], row["task_run_id"], row["version"], row["model_request_id"]
+        ):
+            raise StorageError("Process_Fact ownership changed")
+        return fact
+
+    def _validate_d5_mutation(self, mutation: ControlMutation) -> None:
+        if mutation.operation != "append_process_fact":
+            return
+        fact = mutation.state_changes[0]
+        assert isinstance(fact, D5ProcessFact)
+        config = self.load_d3_run_config(mutation.task_run_id)
+        attempt = self.load_d5_attempt(fact.model_request_id)
+        operation = self.load_d4_operation(fact.model_request_id)
+        review = self.load_d3_review_application(mutation.task_run_id, fact.review_id)
+        previous = self.list_process_facts(mutation.task_run_id)
+        if (
+            config is None or not config.d5_enabled or config.d4_budget is None
+            or fact.task_run_id != mutation.task_run_id
+            or attempt is None or attempt.task_run_id != mutation.task_run_id
+            or attempt.review_id != fact.review_id or attempt.sources != fact.sources
+            or operation is None or operation.start.category != "refinement"
+            or operation.start.task_run_id != mutation.task_run_id
+            or operation.start.resource_ref != attempt.review_id
+            or operation.start.base_checkpoint_sequence != attempt.base_checkpoint_sequence
+            or operation.start.context_sha256 != attempt.context_sha256
+            or operation.start.started_at != attempt.started_at
+            or operation.start.role != "outer_planning"
+            or operation.start.role_config_ref != attempt.role_config_ref
+            or operation.completion is None or operation.completion.result_kind != "completed"
+            or operation.completion.evidence_ref != fact.model_request_id
+            or operation.completion.evidence_sha256 != fact.evidence_sha256
+            or operation.application_ref is not None
+            or review is None or review.paused_gate or fact.version != len(previous) + 1
+        ):
+            raise StorageError("Process_Fact requires accepted, unapplied, bound D5 evidence")
+        if self.list_d4_unresolved_operations(mutation.task_run_id):
+            raise D4RecoveryRequired("D5 cannot apply while other outcomes are unknown")
+
+    def _save_d5_mutation(self, mutation: ControlMutation, event_sequence: int) -> None:
+        if mutation.operation != "append_process_fact":
+            return
+        fact = mutation.state_changes[0]
+        assert isinstance(fact, D5ProcessFact)
+        self._connection.execute(
+            "INSERT INTO process_facts VALUES (?, ?, ?, ?, ?, ?)",
+            (fact.process_fact_id, fact.task_run_id, fact.version, fact.model_request_id,
+             canonical_json(asdict(fact)), event_sequence),
+        )
+        self._mark_d4_operation_applied(fact.model_request_id, fact.process_fact_id)
+
     def _validate_d3_mutation(self, mutation: ControlMutation) -> None:
         metadata = mutation.d3
         config = self.load_d3_run_config(mutation.task_run_id)
@@ -2646,6 +3022,7 @@ class SqliteControlStore:
         if mutation.d1_config is not None or mutation.d2_config is not None:
             raise StorageError("D3 cannot be combined with a D1 or D2 run")
         allowed = {
+            "append_process_fact",
             "finish_task_run", "register_d3_turn", "select_d3_intent",
             "apply_d3_review", "register_d3_plan", "replan_d3_plan",
             "complete_d3_plan", "complete_d3_intent", "switch_d3_intent",
@@ -3270,6 +3647,7 @@ class SqliteControlStore:
             self._validate_d1_mutation(mutation)
             self._validate_d2_mutation(mutation)
             self._validate_d3_mutation(mutation)
+            self._validate_d5_mutation(mutation)
             self._validate_existing_owners(mutation)
             self._apply_state_changes(
                 mutation,
@@ -3279,6 +3657,7 @@ class SqliteControlStore:
             self._save_d1_mutation(mutation, event_sequence)
             self._save_d2_mutation(mutation, event_sequence)
             self._save_d3_mutation(mutation, event_sequence)
+            self._save_d5_mutation(mutation, event_sequence)
             self._insert_event(mutation.event, event_sequence)
             checkpoint = Checkpoint(
                 task_run_id=mutation.task_run_id,
@@ -3349,6 +3728,16 @@ class SqliteControlStore:
         except Exception as exc:
             self._abort_control_commit(mutation, exc)
             raise StorageError(f"control transaction failed: {exc}") from exc
+
+    def list_task_run_refs(self) -> tuple[str, ...]:
+        """Read the database ownership index, including from a read-only store."""
+        try:
+            rows = self._connection.execute(
+                "SELECT task_run_id FROM task_runs ORDER BY task_run_id"
+            ).fetchall()
+            return tuple(row["task_run_id"] for row in rows)
+        except sqlite3.Error as exc:
+            raise StorageError("could not read TaskRun ownership index") from exc
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None:
         try:
@@ -3766,7 +4155,7 @@ class SqliteControlStore:
         order = {kind: index for index, kind in enumerate((
             UpsertTaskRun, UpsertTurn, UpsertIntent, UpsertIntentGoal, UpsertPlan, UpsertExecution,
             UpsertFact, AppendPlanValidationRecord, AppendFailureSummary,
-            AppendD2ReviewApplication, D3ReviewApplication,
+            AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact,
         ))}
         for ordinal, change in sorted(enumerate(mutation.state_changes), key=lambda entry: order[type(entry[1])]):
             self._validate_change_owner(change, mutation.task_run_id)
@@ -3797,7 +4186,7 @@ class SqliteControlStore:
                 )
             elif isinstance(change, AppendPlanValidationRecord):
                 self._append_plan_validation(change, committed_at)
-            elif isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication)):
+            elif isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact)):
                 # Append-only review rows are saved with the same event and checkpoint.
                 pass
             else:
@@ -3888,7 +4277,7 @@ class SqliteControlStore:
             ).fetchone() is None:
                 raise StorageError("D2 review application TaskRun does not exist")
             return
-        elif isinstance(change, D3ReviewApplication):
+        elif isinstance(change, (D3ReviewApplication, D5ProcessFact)):
             if change.task_run_id != task_run_id or self._connection.execute(
                 "SELECT 1 FROM task_runs WHERE task_run_id = ?", (task_run_id,)
             ).fetchone() is None:

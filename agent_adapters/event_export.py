@@ -5,15 +5,176 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import re
 import signal
 import sqlite3
 import time
 from pathlib import Path
 
 from agent_adapters.run_files import encode
+from agent_core.control_store import CONTROL_OPERATION_RULES
+from agent_core.dual_llm_contracts import D3RunConfig
+from agent_core.redaction import (
+    D5Redactor,
+    d5_sensitive_configuration_matches,
+)
+from agent_core.runtime import TaskRunStatus
+
+_WITHHELD = "[WITHHELD]"
+_UUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_EVENT_DETAIL_KEYS = {
+    "operation",
+    "entity_ids",
+    "result",
+    "reason",
+    "import_id",
+    "intent_id",
+    "verified_fact_ids",
+    "proof_ref",
+    "path",
+    "observed_type",
+    "review_root_id",
+    "review_generation",
+    "review_id",
+    "application_ref",
+    "context_version",
+    "constraint_version",
+    "paused_gate",
+    "turn_id",
+    "review_scope",
+    "action_candidate_id",
+    "pause_reason",
+    "withheld_fields",
+}
+_SAFE_OPERATIONS = frozenset(CONTROL_OPERATION_RULES)
+_SAFE_EVENT_TYPES = frozenset(
+    rule.event_type for rule in CONTROL_OPERATION_RULES.values()
+)
+_SAFE_RESULTS = frozenset(TaskRunStatus) | frozenset(
+    result
+    for rule in CONTROL_OPERATION_RULES.values()
+    for result in rule.allowed_results
+)
+_SAFE_REASONS = {"single_intent_slice_finished"}
+_SAFE_REVIEW_SCOPES = {"intent_end", "turn_end"}
+_ID_EVENT_KEYS = {
+    "entity_ids",
+    "verified_fact_ids",
+    "import_id",
+    "intent_id",
+    "review_root_id",
+    "review_id",
+    "turn_id",
+    "action_candidate_id",
+}
+_DIGEST_EVENT_KEYS = {"context_version", "constraint_version", "sha256", "digest"}
 
 
-def read_events(database: Path, task_run_id, after_sequence=0, limit=128):
+def _read_d5_configuration(connection, task_run_id, supplied):
+    """Return (is_d5, redactor-or-None), without exposing configuration errors."""
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='d3_runs'"
+    ).fetchone()
+    if table is None:
+        return False, None
+    row = connection.execute(
+        "SELECT config_json FROM d3_runs WHERE task_run_id=?", (task_run_id,)
+    ).fetchone()
+    if row is None:
+        return False, None
+    try:
+        config = D3RunConfig.from_dict(json.loads(row["config_json"]))
+    except Exception:  # noqa: BLE001 -- corrupted declarations fail closed
+        return True, None
+    if not config.d5_enabled:
+        return False, None
+    requirements = config.d5_sensitive_requirements
+    if requirements is None:
+        return True, None
+    configuration = supplied
+    if configuration is None:
+        from agent_adapters.evidence_query import sensitive_config_from_json
+
+        configuration = sensitive_config_from_json(
+            os.environ.get("QINYUAN_AGENT_D5_SENSITIVE_CONFIG")
+        )
+    if configuration is None and not requirements:
+        configuration = {}
+    if not d5_sensitive_configuration_matches(requirements, configuration):
+        return True, None
+    values = tuple(item.value for item in (configuration or {}).values())
+    return True, D5Redactor(values)
+
+
+def _safe_event_value(key, value):
+    if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, list):
+        return [_safe_event_value(key, item) for item in value]
+    if isinstance(value, dict):
+        result = {}
+        withheld_fields = 0
+        for item_key, item in value.items():
+            if item_key in _EVENT_DETAIL_KEYS:
+                result[item_key] = _safe_event_value(item_key, item)
+            else:
+                withheld_fields += 1
+        if withheld_fields:
+            result["withheld_fields"] = withheld_fields
+        return result
+    if not isinstance(value, str):
+        return _WITHHELD
+    if key == "operation" and value in _SAFE_OPERATIONS:
+        return value
+    if key == "type" and value in _SAFE_EVENT_TYPES:
+        return value
+    if key == "status" and value in _SAFE_RESULTS:
+        return value
+    if key == "result" and value in _SAFE_RESULTS:
+        return value
+    if key == "reason" and value in _SAFE_REASONS:
+        return value
+    if key == "review_scope" and value in _SAFE_REVIEW_SCOPES:
+        return value
+    if key in _ID_EVENT_KEYS or key.endswith(("_id", "_sha256")) or key == "result":
+        if _UUID.fullmatch(value) or _SHA256.fullmatch(value) or value.isdigit():
+            return value
+    if key == "proof_ref" and value.startswith("t6:") and _UUID.fullmatch(value[3:]):
+        return value
+    if key in _DIGEST_EVENT_KEYS and (_SHA256.fullmatch(value) or value.isdigit()):
+        return value
+    return _WITHHELD
+
+
+def _project_event(event, *, is_d5, redactor):
+    if not is_d5:
+        return event
+    if redactor is not None:
+        projected = redactor.redact_value(event)
+        return {
+            **projected,
+            "protocol_version": 2,
+            "redaction_status": "available",
+            "redaction_reason": None,
+        }
+    details = _safe_event_value("details", event["details"])
+    return {
+        **event,
+        "protocol_version": 2,
+        "redaction_status": "withheld",
+        "redaction_reason": "sensitive_configuration_unavailable",
+        "type": _safe_event_value("type", event["type"]),
+        "status": _safe_event_value("status", event["status"]),
+        "details": details,
+    }
+
+
+def read_events(
+    database: Path, task_run_id, after_sequence=0, limit=128, *, sensitive_config=None
+):
     if type(after_sequence) is not int or after_sequence < 0 or not 1 <= limit <= 512:
         raise ValueError("invalid_event_cursor")
     if not database.exists():
@@ -26,6 +187,7 @@ def read_events(database: Path, task_run_id, after_sequence=0, limit=128):
             "SELECT 1 FROM sqlite_master WHERE name='checkpoints'"
         ).fetchone():
             return []
+        is_d5, redactor = _read_d5_configuration(conn, task_run_id, sensitive_config)
         rows = conn.execute(
             "SELECT e.* FROM runtime_events e WHERE e.task_run_id=? AND e.sequence>? "
             "AND e.sequence<=(SELECT MAX(watermark_event_sequence) FROM checkpoints WHERE task_run_id=?) "
@@ -33,15 +195,19 @@ def read_events(database: Path, task_run_id, after_sequence=0, limit=128):
             (task_run_id, after_sequence, task_run_id, limit),
         ).fetchall()
         return [
-            {
-                "protocol_version": 1,
-                "task_run_id": row["task_run_id"],
-                "sequence": row["sequence"],
-                "type": row["type"],
-                "timestamp": row["timestamp"],
-                "status": row["status"],
-                "details": json.loads(row["details_json"]),
-            }
+            _project_event(
+                {
+                    "protocol_version": 1,
+                    "task_run_id": row["task_run_id"],
+                    "sequence": row["sequence"],
+                    "type": row["type"],
+                    "timestamp": row["timestamp"],
+                    "status": row["status"],
+                    "details": json.loads(row["details_json"]),
+                },
+                is_d5=is_d5,
+                redactor=redactor,
+            )
             for row in rows
         ]
 

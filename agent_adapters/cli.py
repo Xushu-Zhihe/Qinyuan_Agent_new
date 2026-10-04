@@ -59,6 +59,18 @@ def parser():
     task.add_argument("--env-file", default=".env")
     task.add_argument("--state-dir", required=True)
     task.add_argument("--events")
+    evidence = commands.add_parser("evidence")
+    evidence.add_argument("--task-run-id", required=True)
+    directory = evidence.add_mutually_exclusive_group(required=True)
+    directory.add_argument(
+        "--state-dir", help="root of the legacy TaskRun directory layout"
+    )
+    directory.add_argument(
+        "--run-dir", help="exact owned run directory, no run.json required"
+    )
+    evidence.add_argument(
+        "--html", help="explicit static report path outside the selected run directory"
+    )
     for command in ("resume", "cancel", "status", "replay"):
         item = commands.add_parser(command)
         item.add_argument("--task-run-id", required=True)
@@ -117,12 +129,23 @@ def _worker(
         with run_lock(directory):
             if declaration["protocol_version"] == 2:
                 _owned_task_operation(
-                    directory, declaration, cancel, operation, settings, output_name,
+                    directory,
+                    declaration,
+                    cancel,
+                    operation,
+                    settings,
+                    output_name,
                 )
             else:
                 _owned_operation(
-                    directory, declaration, cancel, operation, auth, settings,
-                    output_name, verify_import,
+                    directory,
+                    declaration,
+                    cancel,
+                    operation,
+                    auth,
+                    settings,
+                    output_name,
+                    verify_import,
                 )
     except ValueError as exc:
         if str(exc) != "task_run_busy":
@@ -133,7 +156,9 @@ def _worker(
         immutable_write(directory / output_name, result)
 
 
-def _owned_task_operation(directory, declaration, cancel, operation, settings, output_name):
+def _owned_task_operation(
+    directory, declaration, cancel, operation, settings, output_name
+):
     from agent_adapters.task_application import TaskApplication
 
     app = None
@@ -155,9 +180,11 @@ def _owned_task_operation(directory, declaration, cancel, operation, settings, o
             asyncio.run(app.execute(start=operation == "start"))
     except Exception as exc:  # noqa: BLE001 -- sanitized process boundary
         errors.append(safe_error(exc))
-        if operation == "start" and app is not None and app.store.load_task_run(
-            declaration["task_run_id"]
-        ) is None:
+        if (
+            operation == "start"
+            and app is not None
+            and app.store.load_task_run(declaration["task_run_id"]) is None
+        ):
             immutable_write(directory / "start-failure.json", errors[-1])
     finally:
         if app is not None:
@@ -365,6 +392,26 @@ def supervise(
 
 def dispatch(args):
     settings = None
+    if args.command == "evidence":
+        from agent_adapters.evidence_query import (
+            export_static_html,
+            query_d5_evidence,
+            sensitive_config_from_json,
+        )
+
+        result = query_d5_evidence(
+            Path(args.state_dir) if args.state_dir is not None else None,
+            args.task_run_id,
+            sensitive_config=sensitive_config_from_json(
+                os.environ.get("QINYUAN_AGENT_D5_SENSITIVE_CONFIG")
+            ),
+            run_dir=Path(args.run_dir) if args.run_dir is not None else None,
+        )
+        if args.html:
+            export_static_html(
+                result, Path(args.state_dir or args.run_dir), Path(args.html)
+            )
+        return result
     if args.command == "run-task":
         from agent_adapters.task_cli import dispatch_run_task
 

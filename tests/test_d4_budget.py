@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 from test_d4_chain import make_d4_scenario, reopen_scenario
 
+from agent_core.control_store import StorageError
 from agent_core.d4_contracts import (
     D4AuditEvent,
     D4BudgetExhausted,
@@ -406,6 +407,177 @@ def test_unknown_review_blocks_d3_category_exhaustion_without_partial_admission(
     assert app.store.load_d4_operation(unknown_review.operation_id).completion is None
 
 
+def test_unknown_refinement_seal_preserves_unknown_and_budget_and_forbids_replay(
+    d4_scenario_fixture,
+):
+    case = d4_scenario_fixture
+    app = case[0]
+    start = _start(case, "refinement", 0)
+    assert app.store.begin_d4_operation(start) is None
+    seal = {
+        "decided_at": start.started_at,
+        "evidence_ref": f"d5/refinement/{start.operation_id}/unknown-seal",
+        "evidence_sha256": digest({"operation_id": start.operation_id, "sealed": True}),
+    }
+
+    app.store.seal_unknown_refinement(start.operation_id, **seal)
+    app.store.seal_unknown_refinement(start.operation_id, **seal)
+
+    record = app.store.load_d4_operation(start.operation_id)
+    assert record is not None and record.completion is None
+    assert app.store.is_unknown_refinement_sealed(start.operation_id)
+    assert app.store.list_d4_unresolved_operations(start.task_run_id) == ()
+    usage = app.store.d4_budget_usage(start.task_run_id)
+    assert usage.total_used == 1
+    assert dict(usage.category_counts)["refinement"] == 1
+
+    with pytest.raises(D4RecoveryRequired, match="do not dispatch again"):
+        app.store.begin_d4_operation(start)
+    with pytest.raises(D4RecoveryRequired, match="sealed refinement"):
+        app.store.complete_d4_operation(_completion(start))
+    with pytest.raises(D4OperationConflict, match="immutable"):
+        app.store.seal_unknown_refinement(
+            start.operation_id,
+            decided_at=seal["decided_at"],
+            evidence_ref=f"{seal['evidence_ref']}/changed",
+            evidence_sha256=seal["evidence_sha256"],
+        )
+    assert app.store.load_d4_operation(start.operation_id).completion is None
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "planning",
+        "action",
+        "review",
+        "tool_dispatch",
+        "sha_observation",
+        "artifact_share",
+        "attachment_import",
+    ],
+)
+def test_non_refinement_unknown_cannot_be_sealed(d4_scenario_fixture, category):
+    case = d4_scenario_fixture
+    app = case[0]
+    start = _start(case, category, 0)
+    assert app.store.begin_d4_operation(start) is None
+
+    with pytest.raises(D4OperationConflict, match="only refinement"):
+        app.store.seal_unknown_refinement(
+            start.operation_id,
+            decided_at=start.started_at,
+            evidence_ref=f"d5/refinement/{start.operation_id}/unknown-seal",
+            evidence_sha256=digest(
+                {"operation_id": start.operation_id, "sealed": True}
+            ),
+        )
+
+    assert not app.store.is_unknown_refinement_sealed(start.operation_id)
+    assert tuple(
+        item.start.operation_id
+        for item in app.store.list_d4_unresolved_operations(start.task_run_id)
+    ) == (start.operation_id,)
+
+
+def test_sealed_refinement_is_exempt_from_lifecycle_gate_but_tool_unknown_is_not(
+    d4_scenario_fixture,
+):
+    case = d4_scenario_fixture
+    app = case[0]
+    refinement = _start(case, "refinement", 0)
+    assert app.store.begin_d4_operation(refinement) is None
+    app.store.seal_unknown_refinement(
+        refinement.operation_id,
+        decided_at=refinement.started_at,
+        evidence_ref=f"d5/refinement/{refinement.operation_id}/unknown-seal",
+        evidence_sha256=digest(
+            {"operation_id": refinement.operation_id, "sealed": True}
+        ),
+    )
+    assert app._d4_unknown_operations() == ()
+
+    tool = _start(case, "tool_dispatch", 0)
+    assert app.store.begin_d4_operation(tool) is None
+    assert app._d4_unknown_operations() == (tool.operation_id,)
+    with pytest.raises(D4RecoveryRequired, match="outcome_unknown"):
+        app.controller.cancel(str(uuid4()))
+    assert app.state.task_run.status.value == "running"
+
+    app.store.complete_d4_operation(_completion(tool))
+    app.controller.cancel(str(uuid4()))
+    assert app.state.task_run.status.value == "cancelled"
+    assert app.store.load_d4_operation(refinement.operation_id).completion is None
+
+
+def test_schema14_readonly_keeps_unknown_refinement_unresolved(tmp_path):
+    case = make_d4_scenario(tmp_path)
+    app = case[0]
+    start = _start(case, "refinement", 0)
+    assert app.store.begin_d4_operation(start) is None
+    path = app.directory / "control.sqlite"
+    app.store.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TABLE d5_attempts")
+    connection.execute("DROP TABLE process_facts")
+    connection.execute("ALTER TABLE d4_operations DROP COLUMN unknown_disposition_json")
+    connection.execute("DELETE FROM schema_versions WHERE version = 15")
+    connection.commit()
+    connection.close()
+    before = path.read_bytes()
+
+    with SqliteControlStore.open_readonly(path) as readonly:
+        assert readonly._schema_version == 14
+        assert not readonly.is_unknown_refinement_sealed(start.operation_id)
+        assert tuple(
+            item.start.operation_id
+            for item in readonly.list_d4_unresolved_operations(start.task_run_id)
+        ) == (start.operation_id,)
+    assert path.read_bytes() == before
+
+    with SqliteControlStore.open(path, clock=case[5]) as upgraded:
+        version = upgraded._connection.execute(
+            "SELECT MAX(version) FROM schema_versions"
+        ).fetchone()[0]
+        assert version == 15
+        assert tuple(
+            item.start.operation_id
+            for item in upgraded.list_d4_unresolved_operations(start.task_run_id)
+        ) == (start.operation_id,)
+    case[1].destroyed = True
+
+
+def test_corrupt_refinement_disposition_fails_closed(d4_scenario_fixture):
+    case = d4_scenario_fixture
+    app = case[0]
+    start = _start(case, "refinement", 0)
+    assert app.store.begin_d4_operation(start) is None
+    app.store.seal_unknown_refinement(
+        start.operation_id,
+        decided_at=start.started_at,
+        evidence_ref=f"d5/refinement/{start.operation_id}/unknown-seal",
+        evidence_sha256=digest({"operation_id": start.operation_id, "sealed": True}),
+    )
+    original = app.store._connection.execute(
+        "SELECT unknown_disposition_json FROM d4_operations WHERE operation_id = ?",
+        (start.operation_id,),
+    ).fetchone()[0]
+    app.store._connection.execute(
+        "UPDATE d4_operations SET unknown_disposition_json = ? WHERE operation_id = ?",
+        ("{invalid", start.operation_id),
+    )
+
+    try:
+        with pytest.raises(StorageError, match="unknown disposition"):
+            app.store.list_d4_unresolved_operations(start.task_run_id)
+    finally:
+        app.store._connection.execute(
+            "UPDATE d4_operations SET unknown_disposition_json = ? WHERE operation_id = ?",
+            (original, start.operation_id),
+        )
+
+
 def test_legacy_d3_payload_and_metadata_do_not_gain_d4_budget_field(
     d4_scenario_fixture,
 ):
@@ -460,9 +632,11 @@ def test_schema13_readonly_is_unchanged_and_upgrade_does_not_backfill_d4(
             source.task_run_id,
         ),
     )
+    connection.execute("DROP TABLE d5_attempts")
+    connection.execute("DROP TABLE process_facts")
     connection.execute("DROP TABLE d4_audit_events")
     connection.execute("DROP TABLE d4_operations")
-    connection.execute("DELETE FROM schema_versions WHERE version = 14")
+    connection.execute("DELETE FROM schema_versions WHERE version >= 14")
     connection.commit()
     connection.close()
     before = path.read_bytes()
@@ -477,7 +651,7 @@ def test_schema13_readonly_is_unchanged_and_upgrade_does_not_backfill_d4(
         version = upgraded._connection.execute(
             "SELECT MAX(version) FROM schema_versions"
         ).fetchone()[0]
-        assert version == 14
+        assert version == 15
         assert upgraded.list_d4_operations(source.task_run_id) == ()
         assert upgraded.load_d3_operation(d3_start.operation_id) is not None
     case[1].destroyed = True

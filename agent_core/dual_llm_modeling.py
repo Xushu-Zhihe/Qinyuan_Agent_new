@@ -265,9 +265,12 @@ class D3ModelRequest:
     context: D3OuterContext | D3PlanContext | D3ActionContext
     correction_of_model_request_id: str | None = None
     rejection_code: str | None = None
+    process_facts: tuple[dict[str, object], ...] = ()
 
     @property
     def context_sha256(self) -> str:
+        if self.process_facts:
+            return digest({"context": asdict(self.context), "process_facts": self.process_facts})
         return digest(asdict(self.context))
 
 

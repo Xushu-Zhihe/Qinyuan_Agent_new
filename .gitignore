@@ -84,9 +84,15 @@ runner-smoke-data
 .claude
 D0_baseline_and_D1_contract.md
 D1_acceptance.md
-!/Qinyuan_Agent_dual_llm_flow.svg
+Qinyuan_Agent_dual_llm_flow.svg
 D2_acceptance.md
 D3_acceptance.md
 D3_proposal.md
 D4_acceptance.md
 D4_proposal.md
+D2_proposal.md
+T6_flow_audit.md
+T6_proposal.md
+TODO.md
+D5_acceptance.md
+D5_proposal.md
