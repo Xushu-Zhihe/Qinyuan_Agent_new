@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
-from typing import Callable
 
 from agent_core.artifact_operations import fixed_size_script
 from agent_core.attachment_workspace import fixed_digest_script
@@ -20,6 +20,7 @@ from agent_core.command_contracts import (
     T6ExecutionRecord,
 )
 from agent_core.control_store import PlanValidationRecordDraft, UpsertExecution
+from agent_core.d6_contracts import D6ArtifactReference
 from agent_core.domain import Execution, ExecutionStatus, PlanValidationStatus
 from agent_core.dual_llm_contracts import (
     D3OperationCompletion,
@@ -29,6 +30,7 @@ from agent_core.dual_llm_contracts import (
     D3RunConfig,
     D3TurnBinding,
 )
+from agent_core.execution_authorization import D6Policy
 from agent_core.modeling import CancellationToken
 from agent_core.runtime import TaskRunStatus
 from agent_core.turn_modeling import digest, stable_id
@@ -124,6 +126,26 @@ class D3FixedCommandPolicy(SandboxCommandPolicy):
             or active_turn.status.value != "running"
         ):
             raise ValueError("d3_fixed_command_mismatch")
+        d6_authorization = self.config.d6_authorization
+        if d6_authorization is not None:
+            if request.task_run_id != d6_authorization.task_run_id:
+                raise ValueError("d6_authorization_task_mismatch")
+            try:
+                source = d6_authorization.local_artifacts[self.turn.attachment_index]
+            except IndexError:
+                raise ValueError("d6_asset_not_authorized") from None
+            if not isinstance(source, D6ArtifactReference) or (
+                source.sha256 != claim.expected_sha256
+                or self.turn.expected_sha256 != source.sha256
+            ):
+                raise ValueError("d6_asset_not_authorized")
+            D6Policy(d6_authorization).authorize(
+                "fixed_size"
+                if request.script == fixed_size_script(claim.path)
+                else "fixed_sha256",
+                request.task_run_id,
+                source,
+            )
         return super().authorize(
             request,
             authorization,

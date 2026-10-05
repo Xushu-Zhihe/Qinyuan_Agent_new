@@ -487,6 +487,11 @@ class TaskRunController(LegacyTaskRunController):
 
         supplied_task_id = task_run_id is not None
         task_run_id = str(uuid.uuid4()) if task_run_id is None else _validate_mutation_id(task_run_id)
+        if (
+            d3_config is not None and d3_config.d6_authorization is not None
+            and d3_config.d6_authorization.task_run_id != task_run_id
+        ):
+            raise TaskRequestError("d6_frozen_authorization_owner_mismatch")
         if supplied_task_id and deps.store.load_task_run(task_run_id) is not None:
             raise InvalidTransition("TaskRun ID already exists; use attach")
         deps.registry.claim(task_run_id, self)

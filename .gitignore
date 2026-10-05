@@ -74,6 +74,11 @@ tests
 !/tests/test_d4_budget.py
 !/tests/test_d4_chain.py
 !/tests/test_d4_lifecycle.py
+!/tests/test_d6_core_slice.py
+!/tests/test_d6_execution_authorization.py
+!/tests/test_d6_windows_protection.py
+!/tests/test_d6_transfer.py
+!/tests/test_d6_sensitive_evidence.py
 Architecture.md
 interface.md
 protocol.md
@@ -96,3 +101,5 @@ T6_proposal.md
 TODO.md
 D5_acceptance.md
 D5_proposal.md
+D6_acceptance.md
+D6_proposal.md

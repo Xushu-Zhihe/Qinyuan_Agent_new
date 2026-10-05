@@ -13,6 +13,12 @@ from uuid import uuid4
 
 from agent_adapters.attachment_import_recorder import FileAttachmentImportRecorder
 from agent_adapters.command_recorder import T6CommandRecorder
+from agent_adapters.cross_run_artifacts import (
+    CrossTaskRunArtifactStore,
+    D6ArtifactImportError,
+    D6ArtifactImportRecoveryRequired,
+)
+from agent_adapters.cross_run_transfer import D6ArtifactTransfer
 from agent_adapters.d4_review_ledger import D4ReviewLedger
 from agent_adapters.model_evidence import FileD3ModelEvidence
 from agent_adapters.observation_proof_store import FileD3ProofStore
@@ -38,7 +44,7 @@ from agent_core.command_contracts import (
     SandboxCommandAuthorization,
     SandboxCommandRequest,
 )
-from agent_core.contracts import ModelBackend, TaskRequest, TaskRequestError
+from agent_core.contracts import Attachment, ModelBackend, TaskRequest, TaskRequestError
 from agent_core.control_evidence_validator import D3EvidenceValidator
 from agent_core.control_state_repository import ControlStateRepository
 from agent_core.control_store import StorageError
@@ -53,6 +59,7 @@ from agent_core.d4_contracts import (
     D4BudgetExhausted,
     D4RecoveryRequired,
 )
+from agent_core.d6_contracts import D6ArtifactReference
 from agent_core.domain import FactStatus, IntentStatus, PlanStatus, TurnStatus
 from agent_core.dual_llm_contracts import (
     D3BudgetExhausted,
@@ -183,11 +190,22 @@ class D3Application:
         refinement_model=None,
         sensitive_config: Mapping[str, D5SensitiveValue] | None = None,
         refinement_timeout_seconds: float = 180.0,
+        d6_artifact_store: CrossTaskRunArtifactStore | None = None,
+        d6_artifact_transfer: D6ArtifactTransfer | None = None,
     ) -> None:
         self.directory = directory
         self.config = config
         self.clock = clock
         self.sandbox = sandbox
+        self.d6_artifact_store = d6_artifact_store
+        self.d6_artifact_transfer = d6_artifact_transfer
+        if (d6_artifact_store is None) != (d6_artifact_transfer is None):
+            raise ValueError("d6_import_services_incomplete")
+        if (
+            d6_artifact_transfer is not None
+            and d6_artifact_transfer.snapshots is not d6_artifact_store
+        ):
+            raise ValueError("d6_import_store_mismatch")
         self._redaction_configured = d5_sensitive_configuration_matches(
             config.d5_sensitive_requirements, sensitive_config
         )
@@ -805,10 +823,61 @@ class D3Application:
             recovery_required,
         )
 
-    def start(self, request: TaskRequest, source_root: Path) -> str:
+    def start(
+        self, request: TaskRequest, source_root: Path, *, task_run_id: str | None = None,
+        d6_artifacts: tuple[D6ArtifactReference, ...] | None = None,
+    ) -> str:
+        committed_request = request
+        committed_source_root: str | None = None
+        if self.config.d6_authorization is None:
+            if d6_artifacts is not None:
+                raise D3RecoveryRequired("d6_import_not_authorized")
+        else:
+            if task_run_id is None or task_run_id != self.config.d6_authorization.task_run_id:
+                raise D3RecoveryRequired("d6_task_run_id_required")
+            if (
+                not isinstance(d6_artifacts, tuple)
+                or d6_artifacts != self.config.d6_authorization.local_artifacts
+                or not d6_artifacts
+                or len(d6_artifacts) > 2
+            ):
+                raise D3RecoveryRequired("d6_start_artifacts_mismatch")
+            if self.d6_artifact_store is None or self.d6_artifact_transfer is None:
+                raise D3RecoveryRequired("d6_import_services_unavailable")
+            if (
+                len(request.target.attachments) != len(d6_artifacts)
+                or any(item.kind != "local_path" for item in request.target.attachments)
+            ):
+                raise TaskRequestError("D6 requires one local attachment slot per imported artifact")
+            imports = []
+            for reference in d6_artifacts:
+                try:
+                    manifest = self.d6_artifact_store.find_import(task_run_id, reference)
+                    verified, _declaration = self.d6_artifact_transfer.verify_confirmed_import(
+                        manifest.request
+                    )
+                except (D6ArtifactImportError, D6ArtifactImportRecoveryRequired) as exc:
+                    raise D3RecoveryRequired(str(exc)) from exc
+                if (
+                    verified != manifest
+                    or manifest.request.target_task_run_id != task_run_id
+                    or manifest.request.source != reference
+                    or not manifest.request.non_sensitive
+                ):
+                    raise D3RecoveryRequired("d6_import_manifest_binding_changed")
+                imports.append(manifest)
+            input_root = Path(imports[0].target_path).parent.resolve(strict=True)
+            if any(Path(item.target_path).parent.resolve(strict=True) != input_root for item in imports):
+                raise D3RecoveryRequired("d6_import_input_root_changed")
+            request_payload = request.to_dict()
+            request_payload["target"]["attachments"] = [
+                Attachment("local_path", Path(item.target_path).name).to_dict()
+                for item in imports
+            ]
+            committed_request = TaskRequest.from_dict(request_payload)
+            committed_source_root = str(input_root)
         if self.config.d5_enabled and not self._redaction_configured:
             raise D3RecoveryRequired("d5_redaction_configuration_unavailable")
-        committed_source_root = None
         if self.config.d5_enabled:
             if not isinstance(request, TaskRequest):
                 raise TaskRequestError("request must be a TaskRequest")
@@ -827,10 +896,11 @@ class D3Application:
                     for item in value:
                         yield from string_values(item)
 
-            readable_text = tuple(string_values(request.to_dict()))
+            readable_text = tuple(string_values(committed_request.to_dict()))
             if any(self.redactor.contains_sensitive(value) for value in readable_text):
                 raise TaskRequestError("d5_sensitive_task_request_rejected")
-            committed_source_root = str(source_root.resolve(strict=True))
+            if committed_source_root is None:
+                committed_source_root = str(source_root.resolve(strict=True))
             if self.redactor.contains_sensitive(committed_source_root):
                 raise TaskRequestError("d5_sensitive_task_request_rejected")
         if (
@@ -840,10 +910,11 @@ class D3Application:
         ):
             raise D3RecoveryRequired("d3_adapter_role_configuration_changed")
         committed = self.controller.start(
-            request,
+            committed_request,
             ModelBackend.CODEX_CLI,
             str(uuid4()),
             source_root=committed_source_root or str(source_root.resolve(strict=True)),
+            task_run_id=task_run_id,
             d3_config=self.config,
         )
         self._bound_task_run_id = committed.value
@@ -1083,6 +1154,53 @@ class D3Application:
             )
             self.store.complete_d3_operation(expected)
             self.store.mark_d3_operation_applied(import_id, import_id)
+            if self.config.d6_authorization is not None:
+                if self.d6_artifact_store is None or self.d6_artifact_transfer is None:
+                    raise D3RecoveryRequired("d6_import_services_unavailable")
+                references = self.config.d6_authorization.local_artifacts
+                if index >= len(references):
+                    raise D3RecoveryRequired("d6_import_attachment_index_unbound")
+                try:
+                    d6_manifest = self.d6_artifact_store.find_import(
+                        task.task_run_id, references[index],
+                    )
+                    verified_manifest, _declaration = self.d6_artifact_transfer.verify_confirmed_import(
+                        d6_manifest.request,
+                    )
+                except (D6ArtifactImportError, D6ArtifactImportRecoveryRequired) as exc:
+                    raise D3RecoveryRequired(str(exc)) from exc
+                target_path = Path(d6_manifest.target_path)
+                if (
+                    verified_manifest != d6_manifest
+                    or d6_manifest.request.source != references[index]
+                    or d6_manifest.request.target_task_run_id != task.task_run_id
+                    or d6_manifest.status != "confirmed"
+                    or not d6_manifest.request.non_sensitive
+                    or task.source_root is None
+                    or target_path.parent.resolve(strict=True) != Path(task.source_root).resolve(strict=True)
+                    or task.request.target.attachments[index].value != target_path.name
+                    or receipt.local_path != target_path.name
+                    or receipt.source_root != str(target_path.parent.resolve(strict=True))
+                    or receipt.byte_size != d6_manifest.byte_size
+                    or receipt.sha256 != d6_manifest.sha256
+                    or receipt.sandbox_path != request.sandbox_path
+                    or receipt.attachment_index != index
+                ):
+                    raise D3RecoveryRequired("d6_attachment_receipt_source_binding_changed")
+                receipt_sha256 = digest(asdict(receipt))
+                try:
+                    self.d6_artifact_store.bind_attachment_receipt(
+                        request=d6_manifest.request,
+                        attachment_index=index,
+                        receipt_sha256=receipt_sha256,
+                    )
+                    self.d6_artifact_store.verify_attachment_receipt(
+                        request=d6_manifest.request,
+                        attachment_index=index,
+                        receipt_sha256=receipt_sha256,
+                    )
+                except D6ArtifactImportError as exc:
+                    raise D3RecoveryRequired(str(exc)) from exc
             receipts.append(receipt)
         return tuple(receipts)
 

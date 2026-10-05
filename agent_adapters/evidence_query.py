@@ -505,6 +505,29 @@ def query_d5_evidence(
                         "sources": [],
                     }
                 )
+            from agent_adapters.sensitive_evidence_service import (
+                query_sensitive_evidence,
+            )
+
+            protected = query_sensitive_evidence(directory, task_run_id)
+            proof_recheck = {
+                row["proof_id"]: row
+                for row in protected.get("proof_recheck", [])
+            }
+            for source in sources.values():
+                projection = proof_recheck.get(source.get("source", {}).get("object_id"))
+                if projection is not None:
+                    source["sensitive_evidence_ids"] = projection["evidence_ids"]
+                    source["recheck_status"] = projection["recheck_status"]
+            for row in fact_rows_from_control:
+                verification_ref = row["verification_ref"]
+                if isinstance(verification_ref, str) and verification_ref.startswith("d3:"):
+                    projection = proof_recheck.get(verification_ref.removeprefix("d3:"))
+                    if projection is not None:
+                        row["sensitive_evidence_ids"] = projection["evidence_ids"]
+                        row["recheck_status"] = projection["recheck_status"]
+                        if projection["recheck_status"] == "evidence_deleted_unverifiable":
+                            row["verification_source_status"] = "evidence_deleted_unverifiable"
             return {
                 "protocol_version": 1,
                 "task_run_id": task_run_id,
@@ -521,6 +544,7 @@ def query_d5_evidence(
                 "executions": execution_rows,
                 "facts": fact_rows_from_control,
                 "source_links": [sources[key] for key in sorted(sources)],
+                **protected,
                 "exit_code": 0,
             }
     except EvidenceQueryError:

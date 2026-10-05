@@ -8,6 +8,7 @@ from typing import Literal
 from uuid import UUID
 
 from agent_core.d4_contracts import D4BudgetPolicy
+from agent_core.execution_authorization import D6Authorization
 from agent_core.review_contracts import (
     D2AllowedActionKinds,
     D2Constraint,
@@ -88,6 +89,13 @@ def d3_payload(value: object) -> dict[str, object]:
     payload = (
         asdict(value) if is_dataclass(value) and not isinstance(value, type) else {}
     )
+    if isinstance(value, D3RunConfig) and value.d6_authorization is None:
+        payload.pop("d6_authorization")
+    elif (
+        isinstance(value, D3CommitMetadata) and value.config is not None
+        and value.config.d6_authorization is None
+    ):
+        payload["config"].pop("d6_authorization")
     if isinstance(value, D3RunConfig) and value.d4_budget is None:
         payload.pop("d4_budget")
     elif (
@@ -138,6 +146,7 @@ class D3RunConfig:
     d4_budget: D4BudgetPolicy | None = None
     d5_enabled: bool = False
     d5_sensitive_requirements: tuple[tuple[str, str], ...] | None = None
+    d6_authorization: D6Authorization | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -185,6 +194,17 @@ class D3RunConfig:
             )
         if requirements and not self.d5_enabled:
             raise ValueError("sensitive requirements require D5 enablement")
+        if self.d6_authorization is not None and (
+            not isinstance(self.d6_authorization, D6Authorization)
+            or not self.d5_enabled
+            or len(self.d6_authorization.local_artifacts)
+            != len(self.authorization.attachment_indices)
+            or any(
+                item.source_task_run_id == self.d6_authorization.task_run_id
+                for item in self.d6_authorization.local_artifacts
+            )
+        ):
+            raise ValueError("D6 requires D5 and exact frozen local inputs")
         if (
             self.chain_id != "dual_llm_d3"
             or type(self.contract_version) is not int
@@ -208,7 +228,7 @@ class D3RunConfig:
             fields | {"d4_budget", "d5_enabled"},
             fields | {"d4_budget", "d5_enabled", "d5_sensitive_requirements"},
         )
-        if set(value) not in allowed:
+        if set(value) - {"d6_authorization"} not in allowed:
             raise ValueError("invalid D3RunConfig fields")
         budget = value.get("d4_budget")
         if budget is not None and not isinstance(budget, dict):
@@ -245,6 +265,8 @@ class D3RunConfig:
             tuple(tuple(item) for item in requirements)
             if requirements is not None
             else None,  # type: ignore[arg-type]
+            D6Authorization.from_dict(value["d6_authorization"])
+            if value.get("d6_authorization") is not None else None,
         )
 
 

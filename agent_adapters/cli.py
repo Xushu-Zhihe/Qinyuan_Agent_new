@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import multiprocessing
 import os
 import signal
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from uuid import uuid4
 
@@ -71,6 +73,11 @@ def parser():
     evidence.add_argument(
         "--html", help="explicit static report path outside the selected run directory"
     )
+    sensitive = commands.add_parser("evidence-sensitive")
+    sensitive.add_argument("action", choices=("view", "delete"))
+    sensitive.add_argument("--run-dir", required=True)
+    sensitive.add_argument("--task-run-id", required=True)
+    sensitive.add_argument("--evidence-id", required=True)
     for command in ("resume", "cancel", "status", "replay"):
         item = commands.add_parser(command)
         item.add_argument("--task-run-id", required=True)
@@ -392,6 +399,56 @@ def supervise(
 
 def dispatch(args):
     settings = None
+    if args.command == "evidence-sensitive":
+        if args.action == "view" and not (
+            sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()
+        ):
+            raise ValueError("d6_sensitive_view_requires_terminal")
+        from agent_adapters.protected_evidence import ProtectedEvidenceError
+        from agent_adapters.sensitive_evidence_service import (
+            TrustedSensitiveEvidenceService,
+        )
+
+        if args.action == "view":
+            try:
+                terminal_encoding = codecs.lookup(sys.stderr.encoding or "").name
+            except LookupError as exc:
+                raise ProtectedEvidenceError("d6_evidence_terminal_encoding_unsupported") from exc
+            if terminal_encoding != "utf-8":
+                raise ProtectedEvidenceError("d6_evidence_terminal_encoding_unsupported")
+
+        service = TrustedSensitiveEvidenceService(
+            Path(args.run_dir), args.task_run_id, create=False
+        )
+        if args.action == "view":
+            prepared_display: list[bytes] = []
+
+            def prepare_display(body: bytes) -> None:
+                try:
+                    text = body.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise ProtectedEvidenceError("d6_evidence_body_not_text") from exc
+                # Escape terminal controls before any byte reaches the screen.
+                display = "".join(
+                    f"\\u{ord(char):04x}"
+                    if unicodedata.category(char) in {"Cc", "Cf", "Cs"}
+                    else char
+                    for char in text
+                )
+                try:
+                    prepared_display.append((display + "\n").encode("utf-8", errors="strict"))
+                except UnicodeEncodeError as exc:
+                    raise ProtectedEvidenceError("d6_evidence_display_failed") from exc
+
+            service.view(args.evidence_id, validate_body=prepare_display)
+            payload = prepared_display[0]
+            written = sys.stderr.buffer.write(payload)
+            if written != len(payload):
+                raise ProtectedEvidenceError("d6_evidence_display_failed")
+            sys.stderr.flush()
+            return {"task_run_id": args.task_run_id, "evidence_id": args.evidence_id, "status": "viewed", "exit_code": 0}
+        result = service.delete(args.evidence_id)
+        return {"task_run_id": args.task_run_id, "evidence_id": args.evidence_id, "status": result["status"], "exit_code": 0}
     if args.command == "evidence":
         from agent_adapters.evidence_query import (
             export_static_html,
@@ -561,23 +618,30 @@ def dispatch(args):
 def main(argv=None):
     try:
         result = dispatch(parser().parse_args(argv))
+        if result is None:
+            return 0
     except KeyboardInterrupt:
         result = base_result()
         result["errors"].append({"code": "interrupted_before_run_started"})
-    except (ValueError, OSError) as exc:
-        result = base_result()
-        # Do not echo argparse input, invalid values or raw OS errors.
-        code = (
-            str(exc)
-            if isinstance(exc, ValueError)
-            and str(exc).replace("_", "").isalnum()
-            and len(str(exc)) <= 80
-            else "input_or_configuration_rejected"
-        )
-        result.update(exit_code=2, errors=[{"code": code}])
     except Exception as exc:  # noqa: BLE001 -- sanitized CLI/process boundary
-        result = base_result()
-        result["errors"].append(safe_error(exc))
+        from agent_adapters.protected_evidence import ProtectedEvidenceError
+
+        if isinstance(exc, ProtectedEvidenceError):
+            result = base_result()
+            result.update(exit_code=2, errors=[{"code": exc.code}])
+        elif isinstance(exc, (ValueError, OSError)):
+            result = base_result()
+            code = (
+                str(exc)
+                if isinstance(exc, ValueError)
+                and str(exc).replace("_", "").isalnum()
+                and len(str(exc)) <= 80
+                else "input_or_configuration_rejected"
+            )
+            result.update(exit_code=2, errors=[{"code": code}])
+        else:
+            result = base_result()
+            result["errors"].append(safe_error(exc))
     sys.stdout.write(encode(result).decode("ascii") + "\n")
     sys.stdout.flush()
     return result["exit_code"]
