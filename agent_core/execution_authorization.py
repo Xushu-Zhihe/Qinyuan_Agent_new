@@ -10,7 +10,27 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 from uuid import UUID
 
-from agent_core.d6_contracts import D6ActionDeclaration, D6ArtifactReference, D6Impact
+from agent_core.cross_run_artifact_contracts import D6ArtifactReference
+
+D6Impact = Literal["low_impact", "state_change", "destructive"]
+
+
+@dataclass(frozen=True, slots=True)
+class D6ActionDeclaration:
+    """Trusted adapter declaration used by the D6 policy boundary."""
+
+    action_id: str
+    impact: D6Impact
+    uses_credentials: bool
+    authentication: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action_id, str) or not self.action_id.strip():
+            raise ValueError("action_id_invalid")
+        if self.impact not in {"low_impact", "state_change", "destructive"}:
+            raise ValueError("impact_invalid")
+        if type(self.uses_credentials) is not bool or type(self.authentication) is not bool:
+            raise ValueError("action_classification_invalid")
 
 
 def _uuid4(value: object, code: str) -> None:

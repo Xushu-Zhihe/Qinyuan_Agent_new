@@ -12,19 +12,19 @@ import pytest
 from test_d4_chain import make_d4_scenario, reopen_scenario
 
 from agent_core.control_store import StorageError
-from agent_core.d4_contracts import (
+from agent_core.dual_llm_contracts import (
+    D3CommitMetadata,
+    D3OperationCompletion,
+    D3OperationStart,
+    d3_payload,
+)
+from agent_core.operation_accounting import (
     D4AuditEvent,
     D4BudgetExhausted,
     D4OperationCompletion,
     D4OperationConflict,
     D4OperationStart,
     D4RecoveryRequired,
-)
-from agent_core.dual_llm_contracts import (
-    D3CommitMetadata,
-    D3OperationCompletion,
-    D3OperationStart,
-    d3_payload,
 )
 from agent_core.sqlite_control_store import SqliteControlStore
 from agent_core.turn_modeling import digest, stable_id

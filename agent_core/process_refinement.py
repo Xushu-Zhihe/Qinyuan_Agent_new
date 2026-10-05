@@ -6,13 +6,13 @@ import threading
 import time
 from dataclasses import asdict
 
-from agent_core.d4_contracts import (
+from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.modeling import ModelError, ModelErrorKind
+from agent_core.operation_accounting import (
     D4BudgetExhausted,
     D4OperationCompletion,
     D4OperationStart,
 )
-from agent_core.dual_llm_contracts import D3RecoveryRequired
-from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.process_facts import (
     D5Attempt,
     D5Candidate,

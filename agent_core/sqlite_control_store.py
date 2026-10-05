@@ -61,20 +61,6 @@ from agent_core.control_store import (
     task_request_payload,
     validate_control_event,
 )
-from agent_core.d4_contracts import (
-    D4_CATEGORY_LIMITS,
-    D4AuditCategory,
-    D4AuditEvent,
-    D4AuditOutcome,
-    D4BudgetExhausted,
-    D4BudgetUsage,
-    D4OperationCategory,
-    D4OperationCompletion,
-    D4OperationConflict,
-    D4OperationRecord,
-    D4OperationStart,
-    D4RecoveryRequired,
-)
 from agent_core.domain import (
     ExecutionStatus,
     FactStatus,
@@ -127,6 +113,20 @@ from agent_core.modeling import (
     ModelRequestType,
     PlanGenerationResponse,
     parse_intent_action,
+)
+from agent_core.operation_accounting import (
+    D4_CATEGORY_LIMITS,
+    D4AuditCategory,
+    D4AuditEvent,
+    D4AuditOutcome,
+    D4BudgetExhausted,
+    D4BudgetUsage,
+    D4OperationCategory,
+    D4OperationCompletion,
+    D4OperationConflict,
+    D4OperationRecord,
+    D4OperationStart,
+    D4RecoveryRequired,
 )
 from agent_core.process_facts import D5Attempt, D5ProcessFact
 from agent_core.review_contracts import (

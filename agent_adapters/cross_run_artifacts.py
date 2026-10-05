@@ -19,7 +19,7 @@ from agent_adapters.run_files import (
     run_lock,
     run_path,
 )
-from agent_core.d6_contracts import (
+from agent_core.cross_run_artifact_contracts import (
     D6_MAX_IMPORT_BYTES,
     D6_MAX_IMPORTS_PER_RUN,
     D6ArtifactImportRequest,

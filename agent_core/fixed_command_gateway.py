@@ -20,7 +20,7 @@ from agent_core.command_contracts import (
     T6ExecutionRecord,
 )
 from agent_core.control_store import PlanValidationRecordDraft, UpsertExecution
-from agent_core.d6_contracts import D6ArtifactReference
+from agent_core.cross_run_artifact_contracts import D6ArtifactReference
 from agent_core.domain import Execution, ExecutionStatus, PlanValidationStatus
 from agent_core.dual_llm_contracts import (
     D3OperationCompletion,

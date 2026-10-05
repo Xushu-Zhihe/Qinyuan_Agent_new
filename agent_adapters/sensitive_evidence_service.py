@@ -24,7 +24,7 @@ from agent_adapters.protected_evidence import (
 from agent_adapters.run_files import immutable_read, immutable_write
 from agent_adapters.windows_evidence_protection import WindowsEvidenceProtection
 from agent_core.control_candidate import validate_control_ownership
-from agent_core.d6_contracts import D6_SENSITIVE_KINDS
+from agent_core.sensitive_evidence_contracts import D6_SENSITIVE_KINDS
 from agent_core.sqlite_control_store import SqliteControlStore
 
 

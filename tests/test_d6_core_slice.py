@@ -10,9 +10,11 @@ from agent_adapters.cross_run_artifacts import (
     CrossTaskRunArtifactStore,
     D6ArtifactImportRecoveryRequired,
 )
-from agent_core.d6_contracts import (
+from agent_core.cross_run_artifact_contracts import (
     D6ArtifactImportRequest,
     D6ArtifactReference,
+)
+from agent_core.sensitive_evidence_contracts import (
     D6SensitiveEvidenceMetadata,
 )
 

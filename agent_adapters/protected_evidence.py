@@ -24,7 +24,10 @@ from agent_adapters.windows_evidence_protection import (
     WindowsEvidenceProtection,
     WindowsEvidenceProtectionError,
 )
-from agent_core.d6_contracts import D6_SENSITIVE_KINDS, D6SensitiveEvidenceMetadata
+from agent_core.sensitive_evidence_contracts import (
+    D6_SENSITIVE_KINDS,
+    D6SensitiveEvidenceMetadata,
+)
 
 
 class ProtectedEvidenceError(RuntimeError):

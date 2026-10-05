@@ -12,7 +12,6 @@ from test_d3_chain import Clock, Model, ReviewModel, Sandbox, Token
 
 from agent_adapters.multi_turn_application import D3Application
 from agent_core.contracts import TaskRequest
-from agent_core.d4_contracts import D4BudgetPolicy, D4RecoveryRequired
 from agent_core.dual_llm_contracts import (
     D3Authorization,
     D3RecoveryRequired,
@@ -25,6 +24,7 @@ from agent_core.dual_llm_modeling import (
     D3ProposalRejected,
 )
 from agent_core.modeling import ModelError, ModelErrorKind
+from agent_core.operation_accounting import D4BudgetPolicy, D4RecoveryRequired
 from agent_core.review_contracts import D2ReviewRequest
 from agent_core.turn_contracts import D1RoleConfig
 

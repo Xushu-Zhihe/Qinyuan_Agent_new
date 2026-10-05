@@ -45,12 +45,6 @@ from agent_core.control_store import (
     UpsertTaskRun,
     UpsertTurn,
 )
-from agent_core.d4_contracts import (
-    D4AuditCategory,
-    D4AuditEvent,
-    D4AuditOutcome,
-    D4RecoveryRequired,
-)
 from agent_core.domain import (
     ExecutionStatus,
     FactStatus,
@@ -75,6 +69,12 @@ from agent_core.observation_proof import (
     ObservationProofError,
     T6ObservationProofEvidencePort,
     observation_fact_content,
+)
+from agent_core.operation_accounting import (
+    D4AuditCategory,
+    D4AuditEvent,
+    D4AuditOutcome,
+    D4RecoveryRequired,
 )
 from agent_core.process_facts import D5ProcessFact
 from agent_core.runtime import (

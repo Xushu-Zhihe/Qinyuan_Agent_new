@@ -8,16 +8,17 @@ from uuid import uuid4
 
 import pytest
 
-from agent_core.d4_contracts import D4BudgetPolicy
-from agent_core.d6_contracts import D6ActionDeclaration, D6ArtifactReference
+from agent_core.cross_run_artifact_contracts import D6ArtifactReference
 from agent_core.dual_llm_contracts import D3Authorization, D3RunConfig, d3_payload
 from agent_core.execution_authorization import (
     DEFAULT_ACTION_DECLARATIONS,
+    D6ActionDeclaration,
     D6Authorization,
     D6NetworkAsset,
     D6Policy,
     D6TrustedAction,
 )
+from agent_core.operation_accounting import D4BudgetPolicy
 from agent_core.turn_contracts import D1RoleConfig
 
 

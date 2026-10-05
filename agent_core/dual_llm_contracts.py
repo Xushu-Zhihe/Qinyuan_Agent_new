@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, is_dataclass
 from typing import Literal
 from uuid import UUID
 
-from agent_core.d4_contracts import D4BudgetPolicy
 from agent_core.execution_authorization import D6Authorization
+from agent_core.operation_accounting import D4BudgetPolicy
 from agent_core.review_contracts import (
     D2AllowedActionKinds,
     D2Constraint,

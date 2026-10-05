@@ -19,7 +19,7 @@ from agent_adapters.cross_run_artifacts import (
 from agent_adapters.run_files import immutable_read, immutable_write, run_lock
 from agent_adapters.workspace_evidence import FileD3WorkspaceEvidence
 from agent_core.control_candidate import validate_control_ownership
-from agent_core.d6_contracts import (
+from agent_core.cross_run_artifact_contracts import (
     D6_MAX_IMPORT_BYTES,
     D6ArtifactImportRequest,
     D6ArtifactReference,

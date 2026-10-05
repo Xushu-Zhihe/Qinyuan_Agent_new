@@ -1,4 +1,4 @@
-"""D4 SQLite budget admission layered onto the existing D2 review evidence."""
+"""SQLite budget admission layered onto the existing review evidence."""
 
 from __future__ import annotations
 
@@ -8,14 +8,14 @@ from dataclasses import asdict
 from pathlib import Path
 
 from agent_adapters.review_ledger import FileD2ReviewLedger
-from agent_core.d4_contracts import (
+from agent_core.dual_llm_contracts import D3RunConfig
+from agent_core.operation_accounting import (
     D4BudgetExhausted,
     D4OperationCompletion,
     D4OperationResult,
     D4OperationStart,
     D4RecoveryRequired,
 )
-from agent_core.dual_llm_contracts import D3RunConfig
 from agent_core.review_contracts import D2ReviewOutput, D2ReviewRequest
 from agent_core.sqlite_control_store import SqliteControlStore
 from agent_core.turn_modeling import digest
