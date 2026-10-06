@@ -212,13 +212,50 @@ def read_events(
         ]
 
 
-def _writer(pipe, path, database, task_id, finish):
+def _existing_event_sequence(path, database, task_id):
+    """Validate an existing JSONL file as a prefix of committed run events."""
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError("event_export_path_invalid")
+    if not path.exists():
+        return 0
+    sequence = 0
+    with path.open("rb") as stream:
+        while True:
+            lines = []
+            for _ in range(512):
+                line = stream.readline()
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    raise ValueError("event_export_prefix_invalid")
+                lines.append(line[:-1])
+            if not lines:
+                return sequence
+            try:
+                existing = [json.loads(line.decode("utf-8")) for line in lines]
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("event_export_prefix_invalid") from exc
+            if any(not isinstance(item, dict) for item in existing):
+                raise ValueError("event_export_prefix_invalid")
+            page = read_events(
+                Path(database),
+                task_id,
+                sequence,
+                limit=len(existing),
+            )
+            if len(page) != len(existing) or existing != page:
+                raise ValueError("event_export_prefix_invalid")
+            sequence = page[-1]["sequence"]
+
+
+def _event_writer(pipe, path, database, task_id, finish, *, append_existing):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         # Only small acknowledgements travel over IPC, never event batches.
-        with Path(path).open("xb") as stream:
-            pipe.send({"ready": True})
-            sequence = 0
+        sequence = _existing_event_sequence(path, database, task_id) if append_existing else 0
+        with Path(path).open("ab" if append_existing else "xb") as stream:
+            pipe.send({"ready": True, "sequence": sequence})
             while True:
                 pipe.send({"writing_at": time.monotonic()})
                 batch = read_events(Path(database), task_id, sequence)
@@ -243,13 +280,32 @@ def _writer(pipe, path, database, task_id, finish):
         pipe.close()
 
 
+def _writer(pipe, path, database, task_id, finish):
+    _event_writer(pipe, path, database, task_id, finish, append_existing=False)
+
+
+def _append_writer(pipe, path, database, task_id, finish):
+    _event_writer(pipe, path, database, task_id, finish, append_existing=True)
+
+
 class EventExporter:
-    def __init__(self, path: Path, database: Path, task_id: str, *, worker=_writer):
+    def __init__(
+        self,
+        path: Path,
+        database: Path,
+        task_id: str,
+        *,
+        worker=_writer,
+        append_existing: bool = False,
+    ):
+        if append_existing and worker is not _writer:
+            raise ValueError("append_existing_requires_default_writer")
         ctx = multiprocessing.get_context("spawn")
         self.pipe, child = ctx.Pipe(duplex=False)
         self.finish = ctx.Event()
         self.process = ctx.Process(
-            target=worker, args=(child, str(path), str(database), task_id, self.finish)
+            target=_append_writer if append_existing else worker,
+            args=(child, str(path), str(database), task_id, self.finish),
         )
         self.process.start()
         child.close()

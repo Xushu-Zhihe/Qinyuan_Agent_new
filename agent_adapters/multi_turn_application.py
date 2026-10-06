@@ -70,6 +70,7 @@ from agent_core.dual_llm_contracts import (
 from agent_core.dual_llm_modeling import (
     D3ActionContext,
     D3AuditedModel,
+    D3CandidateContext,
     D3ModelRequest,
     D3ModelStage,
     D3OuterContext,
@@ -78,6 +79,12 @@ from agent_core.dual_llm_modeling import (
     D3SharedArtifactContext,
 )
 from agent_core.fixed_command_gateway import D3FixedCommandGateway, D3FixedCommandPolicy
+from agent_core.goal_candidates import D7AnswerCandidate
+from agent_core.goal_feedback import (
+    ExternalValidationFeedback,
+    FeedbackProjectionState,
+    project_candidate_feedback,
+)
 from agent_core.intent_postconditions import FileSha256
 from agent_core.modeling import CancellationToken
 from agent_core.multi_turn_control import D3Control
@@ -117,6 +124,15 @@ class D3Result:
     dispatch_status: str
     stop_reason: str
     recovery_required: bool
+
+
+@dataclass(frozen=True, slots=True)
+class D7FeedbackApplicationResult:
+    task_run_id: str
+    feedback_operation_id: str
+    feedback_state: FeedbackProjectionState
+    run_result: D3Result
+    continuation_candidate: D7AnswerCandidate | None
 
 
 class _D4TerminalStop(RuntimeError):
@@ -429,7 +445,10 @@ class D3Application:
         """Persist cancellation or Deadline only after all admitted results are known."""
         if self.config.d4_budget is None or self._bound_task_run_id is None:
             return None
-        if self.state.task_run.status is not TaskRunStatus.RUNNING:
+        if self.state.task_run.status not in {
+            TaskRunStatus.RUNNING,
+            TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+        }:
             return None
         if self._token is not None and self._token.is_cancelled:
             self._persist_cancel_intent()
@@ -788,6 +807,8 @@ class D3Application:
                 raise D4RecoveryRequired("d4_cancellation_requested")
         if self._dispatch_stopped():
             raise D3RecoveryRequired("d3_dispatch_stopped")
+        if self._d7_task_has_feedback_conflict(self.state.task_run.task_run_id):
+            raise D3RecoveryRequired("d7_feedback_conflict_reconciliation_required")
         for application in self.store.list_d3_review_applications(
             self.state.task_run.task_run_id
         ):
@@ -911,7 +932,7 @@ class D3Application:
             raise D3RecoveryRequired("d3_adapter_role_configuration_changed")
         committed = self.controller.start(
             committed_request,
-            ModelBackend.CODEX_CLI,
+            committed_request.model_backend or ModelBackend.CODEX_CLI,
             str(uuid4()),
             source_root=committed_source_root or str(source_root.resolve(strict=True)),
             task_run_id=task_run_id,
@@ -972,16 +993,267 @@ class D3Application:
                 )
         return await self.run(token)
 
+    async def register_next_d7_turn(self, token: CancellationToken):
+        """Register one next Turn after a D7 candidate was rejected.
+
+        D3 normally registers the first Turn in ``_run`` and leaves a
+        completed Turn attached to the running TaskRun.  D7 feedback is an
+        external evaluator boundary: a rejection keeps the TaskRun running,
+        and the next Turn must be registered explicitly before ``run`` can
+        continue.  This method performs only that durable registration; it
+        does not dispatch a model or tool operation and does not mutate the
+        completed Turn.
+
+        The trusted feedback application invokes this after its durable
+        rejection commit. Callers should use that application entry so replay
+        can inspect persisted progress before registering another Turn.
+        """
+        with run_lock(self.directory):
+            self.controller.reload_state()
+            self._check_role()
+            self._check_dispatch()
+            task = self.state.task_run
+            if task.status is not TaskRunStatus.RUNNING:
+                raise D3RecoveryRequired("d7_next_turn_requires_running_task")
+            if not self.state.turns or self.state.turns[-1].status is not TurnStatus.COMPLETED:
+                raise D3RecoveryRequired("d7_next_turn_requires_completed_turn")
+            ordinal = len(self.state.turns) + 1
+            receipts = await self._import_all(token)
+            # The next-turn proposal is scoped by the completed prior Turn and
+            # its persisted outcome.  Passing this context through the model
+            # evidence is required for the Controller's evidence validator to
+            # distinguish a legitimate D7 continuation from a rewritten first
+            # Turn proposal.
+            prior_turn = self.state.turns[-1]
+            prior_outcome = self.store.load_d3_outcome(prior_turn.turn_id)
+            prior_reason = prior_outcome.reason if prior_outcome is not None else None
+            self._check_dispatch()
+            request_id, proposal = await self._outer_proposal(
+                ordinal,
+                receipts,
+                token,
+                prior_turn.turn_id,
+                prior_reason,
+            )
+            self._check_dispatch()
+            binding = self.control.register_turn(
+                proposal,
+                request_id,
+                receipts[proposal.attachment_index],
+                name=f"turn/{ordinal}/register",
+            )
+            self.store.mark_d3_operation_applied(request_id, binding.turn_id)
+            return binding
+
+    async def apply_trusted_d7_feedback(
+        self,
+        feedback: ExternalValidationFeedback,
+        token: CancellationToken,
+        protected_candidate_evidence,
+    ) -> D7FeedbackApplicationResult:
+        """Commit adapter feedback and continue one rejected candidate in D3.
+
+        This typed application entry is for trusted adapter assembly only. It
+        is deliberately not exposed through the CLI or request JSON. Feedback
+        persistence is the Controller's atomic ControlStore mutation; a retry
+        derives continuation progress from committed Turns and candidates.
+        """
+        if not isinstance(feedback, ExternalValidationFeedback):
+            raise TypeError("trusted D7 adapter must provide typed feedback")
+        with run_lock(self.directory):
+            task_run_id = feedback.task_run_id
+            if self._bound_task_run_id is None:
+                try:
+                    self.controller.attach(task_run_id)
+                except Exception as exc:
+                    raise D3RecoveryRequired(
+                        f"d7_feedback_attach_failed:{type(exc).__name__}"
+                    ) from exc
+                self._bound_task_run_id = task_run_id
+            elif self._bound_task_run_id != task_run_id:
+                raise D3RecoveryRequired("d7_feedback_task_run_mismatch")
+            else:
+                try:
+                    self.controller.reload_state()
+                except Exception as exc:
+                    raise D3RecoveryRequired(
+                        f"d7_feedback_reload_failed:{type(exc).__name__}"
+                    ) from exc
+            if self.state.task_run.task_run_id != task_run_id:
+                raise D3RecoveryRequired("d7_feedback_task_run_mismatch")
+            if self.store.load_d3_run_config(task_run_id) != self.config:
+                raise D3RecoveryRequired("d3_frozen_run_configuration_changed")
+            self._check_role()
+            self.controller.apply_external_validation_feedback(feedback)
+            self.controller.reload_state()
+            candidate = self.store.load_d7_answer_candidate(feedback.candidate_id)
+            if candidate is None or candidate.task_run_id != task_run_id:
+                raise D3RecoveryRequired("d7_feedback_candidate_unavailable")
+            records = self.store.list_d7_validation_feedback(
+                task_run_id, candidate.candidate_id, candidate.evidence_version
+            )
+            projection = project_candidate_feedback(
+                task_run_id,
+                candidate.candidate_id,
+                candidate.evidence_version,
+                records,
+            )
+            feedback_state = (
+                "conflict"
+                if self._d7_task_has_feedback_conflict(task_run_id)
+                else projection.state
+            )
+            if feedback_state != "rejected":
+                return D7FeedbackApplicationResult(
+                    task_run_id,
+                    feedback.operation_id,
+                    feedback_state,
+                    self.result(f"d7_feedback_{feedback_state}"),
+                    None,
+                )
+            turns = tuple(self.state.turns)
+            turn_positions = {item.turn_id: index for index, item in enumerate(turns)}
+            rejected_turn_position = turn_positions.get(candidate.turn_id)
+            if rejected_turn_position is None:
+                raise D3RecoveryRequired("d7_feedback_candidate_turn_unavailable")
+            candidates = self.store.list_d7_answer_candidates(task_run_id)
+            later_candidates = [
+                item
+                for item in candidates
+                if turn_positions.get(item.turn_id, -1) > rejected_turn_position
+            ]
+            if later_candidates:
+                return D7FeedbackApplicationResult(
+                    task_run_id,
+                    feedback.operation_id,
+                    feedback_state,
+                    self.result("d7_rejection_already_advanced"),
+                    later_candidates[-1],
+                )
+            if self.state.task_run.status is not TaskRunStatus.RUNNING:
+                return D7FeedbackApplicationResult(
+                    task_run_id,
+                    feedback.operation_id,
+                    feedback_state,
+                    self.result("d7_rejection_does_not_reopen_task_run"),
+                    None,
+                )
+            later_turns = turns[rejected_turn_position + 1 :]
+
+        if not later_turns:
+            try:
+                await self.register_next_d7_turn(token)
+            except D3RecoveryRequired:
+                self.controller.reload_state()
+                if self._d7_task_has_feedback_conflict(task_run_id):
+                    return D7FeedbackApplicationResult(
+                        task_run_id,
+                        feedback.operation_id,
+                        "conflict",
+                        self.result("d7_feedback_conflict"),
+                        None,
+                    )
+                if len(self.state.turns) <= rejected_turn_position + 1:
+                    raise
+
+        # A conflict may have arrived after this adapter call committed but
+        # before the next Turn was dispatched. Re-check immediately before D3.
+        with run_lock(self.directory):
+            self.controller.reload_state()
+            latest_conflict = self._d7_task_has_feedback_conflict(task_run_id)
+            if (
+                latest_conflict
+                or self.state.task_run.status is not TaskRunStatus.RUNNING
+            ):
+                latest_state = "conflict" if latest_conflict else "pending"
+                return D7FeedbackApplicationResult(
+                    task_run_id,
+                    feedback.operation_id,
+                    latest_state,
+                    self.result(f"d7_feedback_{latest_state}"),
+                    None,
+                )
+
+        run_result = await self.run(token)
+        self.controller.reload_state()
+        if self._d7_task_has_feedback_conflict(task_run_id):
+            return D7FeedbackApplicationResult(
+                task_run_id,
+                feedback.operation_id,
+                "conflict",
+                run_result,
+                None,
+            )
+        continuation_candidate = None
+        if self.state.turns and self.state.turns[-1].status is TurnStatus.COMPLETED:
+            continuation_candidate = next(
+                (
+                    item
+                    for item in reversed(
+                        self.store.list_d7_answer_candidates(task_run_id)
+                    )
+                    if item.turn_id == self.state.turns[-1].turn_id
+                ),
+                None,
+            )
+            if continuation_candidate is None:
+                continuation_candidate = await self.propose_d7_candidate(
+                    token, protected_candidate_evidence
+                )
+        return D7FeedbackApplicationResult(
+            task_run_id,
+            feedback.operation_id,
+            feedback_state,
+            run_result,
+            continuation_candidate,
+        )
+
+    def _d7_task_has_feedback_conflict(self, task_run_id: str) -> bool:
+        for candidate in self.store.list_d7_answer_candidates(task_run_id):
+            records = self.store.list_d7_validation_feedback(
+                task_run_id, candidate.candidate_id, candidate.evidence_version
+            )
+            projection = project_candidate_feedback(
+                task_run_id,
+                candidate.candidate_id,
+                candidate.evidence_version,
+                records,
+            )
+            if projection.state == "conflict":
+                return True
+        return False
+
     def cancel(self, task_run_id: str | None = None) -> D3Result:
         """Cancel a D4 TaskRun unless an admitted external result is still unknown."""
         with run_lock(self.directory):
             if self.config.d4_budget is None:
                 raise D3RecoveryRequired("d4_cancel_requires_explicit_budget")
+            target_id = task_run_id or self._bound_task_run_id
+            if target_id is None:
+                raise D3RecoveryRequired("d3_cancel_requires_task_run_id")
             if self._bound_task_run_id is None:
-                raise D3RecoveryRequired("d3_cancel_requires_started_or_resumed_task")
-            if task_run_id is not None and task_run_id != self._bound_task_run_id:
+                try:
+                    self.controller.attach(target_id)
+                except Exception as exc:
+                    raise D3RecoveryRequired(
+                        f"d3_cancel_attach_failed:{type(exc).__name__}"
+                    ) from exc
+                self._bound_task_run_id = target_id
+            elif target_id != self._bound_task_run_id:
                 raise D3RecoveryRequired("d3_cancel_task_run_mismatch")
-            if self.state.task_run.status is not TaskRunStatus.RUNNING:
+            else:
+                try:
+                    self.controller.reload_state()
+                except Exception as exc:
+                    raise D3RecoveryRequired(
+                        f"d3_cancel_reload_failed:{type(exc).__name__}"
+                    ) from exc
+            if self.store.load_d3_run_config(target_id) != self.config:
+                raise D3RecoveryRequired("d3_frozen_run_configuration_changed")
+            if self.state.task_run.status not in {
+                TaskRunStatus.RUNNING,
+                TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+            }:
                 terminal_status = self.state.task_run.status
                 reason = (
                     "task_run_cancelled"
@@ -1086,6 +1358,78 @@ class D3Application:
             context,
             process_facts=self.refinement.context_for(resource_ref) if self.refinement is not None else (),
         )
+
+    async def propose_d7_candidate(self, token, protected_candidate_evidence):
+        """Generate and durably register a candidate for the completed Turn."""
+        with run_lock(self.directory):
+            self._check_role()
+            task = self.state.task_run
+            if task.status.value not in {"running", "awaiting_external_feedback"}:
+                raise D3RecoveryRequired("d7_candidate_requires_active_task_run")
+            if not self.state.turns or self.state.turns[-1].status is not TurnStatus.COMPLETED:
+                raise D3RecoveryRequired("d7_candidate_requires_completed_turn")
+
+            completed_turn = self.state.turns[-1]
+            successful_intents = {
+                item.intent_id
+                for item in self.state.intents
+                if item.turn_id == completed_turn.turn_id
+                and item.status is IntentStatus.SUCCEEDED
+            }
+            successful_plans = {
+                item.plan_id: item
+                for item in self.state.plans
+                if item.intent_id in successful_intents
+                and item.status is PlanStatus.COMPLETED
+            }
+            execution = next(
+                (
+                    item
+                    for item in reversed(self.state.executions)
+                    if item.plan_id in successful_plans
+                    and item.status.value == "succeeded"
+                    and item.output_ref is not None
+                ),
+                None,
+            )
+            if execution is None:
+                raise D3RecoveryRequired("d7_candidate_execution_unavailable")
+            plan = successful_plans[execution.plan_id]
+            turn_binding = self.store.load_d3_turn_binding(completed_turn.turn_id)
+            plan_binding = self.store.load_d3_plan_binding(plan.plan_id)
+            plan_result = self.store.load_d3_plan_result(plan.plan_id)
+            if (
+                turn_binding is None
+                or plan_binding is None
+                or plan_result is None
+                or plan_result.outcome != "satisfied"
+                or plan_binding.task_run_id != task.task_run_id
+                or plan_binding.turn_id != completed_turn.turn_id
+                or plan_binding.intent_id != plan.intent_id
+                or plan_result.evidence_sha256 is None
+            ):
+                raise D3RecoveryRequired("d7_candidate_source_evidence_unavailable")
+            context = D3CandidateContext(
+                turn_binding,
+                plan_binding,
+                execution.execution_id,
+                plan_result,
+            )
+            request = self._model_request(
+                "inner_candidate",
+                f"{execution.execution_id}:inner_candidate",
+                context,
+                f"candidate/{execution.execution_id}",
+            )
+            request_id, candidate = await self.inner.propose_candidate(
+                request, token, protected_candidate_evidence
+            )
+            mutation_id = stable_id(
+                task.task_run_id, f"d7/candidate/register/{candidate.candidate_id}"
+            )
+            self.controller.register_answer_candidate(candidate, mutation_id)
+            self.store.mark_d3_operation_applied(request_id, candidate.candidate_id)
+            return candidate
 
     async def _import_all(self, token: CancellationToken):
         task = self.state.task_run
@@ -1212,6 +1556,12 @@ class D3Application:
         prior_turn_id: str | None = None,
         prior_reason: str | None = None,
     ):
+        self._check_dispatch()
+        if prior_turn_id is None and self.state.turns:
+            prior_turn = self.state.turns[-1]
+            prior_turn_id = prior_turn.turn_id
+            outcome = self.store.load_d3_outcome(prior_turn_id)
+            prior_reason = outcome.reason if outcome is not None else None
         context = D3OuterContext(
             self.state.task_run.request.goal,
             receipts,
@@ -1226,8 +1576,15 @@ class D3Application:
         )
 
         def refresh(_current: D3ModelRequest) -> D3ModelRequest:
+            self._check_dispatch()
             if prior_turn_id is not None and not any(
-                item.turn_id == prior_turn_id and item.status is TurnStatus.RUNNING
+                item.turn_id == prior_turn_id
+                and item.status in {
+                    TurnStatus.RUNNING,
+                    TurnStatus.COMPLETED,
+                    TurnStatus.FAILED,
+                    TurnStatus.INCONCLUSIVE,
+                }
                 for item in self.state.turns
             ):
                 raise D3RecoveryRequired("d3_turn_proposal_scope_expired")
@@ -1259,6 +1616,7 @@ class D3Application:
                 self.outer.reject(request_id, "d3_attachment_not_authorized")
                 raise D3ProposalRejected("d3_attachment_not_authorized")
         else:
+            self._check_dispatch()
             request_id, proposal = await self.outer.propose(
                 request, token, refresh=refresh, validate=validate
             )
@@ -1445,7 +1803,11 @@ class D3Application:
             < 2
         ):
             raise ValueError("d3_replan_not_available")
-        if output.decision == "adjust_turn_target" and len(state.turns) >= 2:
+        if (
+            output.decision == "adjust_turn_target"
+            and self.config.max_turns is not None
+            and len(state.turns) >= self.config.max_turns
+        ):
             raise ValueError("d3_turn_limit_reached")
         return output
 
@@ -2054,6 +2416,7 @@ class D3Application:
                 return True
             raise
         tool_id = self._id(f"tool/{plan_binding.plan_id}/{step_index}")
+        self._check_dispatch()
         completed = await self._gateway(turn, plan_binding).call(
             SandboxCommandRequest(
                 tool_id,

@@ -52,3 +52,8 @@ extend-exclude = [".test"]
 [tool.mypy]
 cache_dir = ".test/mypy-cache"
 exclude = ['^\.test/']
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

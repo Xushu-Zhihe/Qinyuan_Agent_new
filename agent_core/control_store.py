@@ -10,6 +10,12 @@ from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias, cast
 
 from agent_core.contracts import ModelBackend, TaskRequest
+from agent_core.d7_web_contracts import (
+    D7WebExecutionRecord,
+    D7WebPlanRecord,
+    D7WebRunConfig,
+    canonical_web_origin,
+)
 from agent_core.domain import (
     Execution,
     ExecutionStatus,
@@ -33,6 +39,7 @@ from agent_core.dual_llm_contracts import (
     d3_payload,
 )
 from agent_core.file_type_fact import FACT_PREFIX
+from agent_core.goal_candidates import D7CommitMetadata, D7WebExecutionBinding
 from agent_core.intent_goals import FileTypeIntentGoal
 from agent_core.process_facts import D5ProcessFact
 from agent_core.review_contracts import (
@@ -728,6 +735,22 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             event_type="completion_confirmation_requested",
             allowed_results=frozenset({"awaiting_confirmation"}),
         ),
+        "register_d7_candidate": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"awaiting_external_feedback"}),
+        ),
+        "apply_external_validation_feedback": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"accepted", "rejected", "unknown"}),
+        ),
+        "start_external_validation_check": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"check_started"}),
+        ),
+        "complete_external_validation_check": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"accepted", "rejected", "unknown"}),
+        ),
         "finish_task_run": OperationResultRule(
             event_type="task_run_finished",
             allowed_results=frozenset(
@@ -1109,6 +1132,20 @@ def validate_control_event(
         allowed_fields.add("verified_fact_ids")
     if operation == "complete_verified_d1_turn":
         allowed_fields.update({"verified_fact_ids", "proof_ref"})
+    if operation == "register_d7_candidate":
+        allowed_fields.update({"candidate_id", "evidence_version"})
+    if operation == "apply_external_validation_feedback":
+        allowed_fields.update({
+            "candidate_id", "evidence_version", "feedback_operation_id", "verdict",
+        })
+    if operation in {
+        "start_external_validation_check",
+        "complete_external_validation_check",
+    }:
+        allowed_fields.update({
+            "candidate_id", "checkpoint_sequence", "evidence_version",
+            "feedback_operation_id", "query_id", "verdict",
+        })
     if operation == "apply_d2_review":
         allowed_fields.update({
             "review_root_id", "review_generation", "review_id", "application_ref",
@@ -1142,6 +1179,68 @@ def validate_control_event(
             raise ValueError("D2 review event does not match its typed application")
         if details.get("result") != ("paused" if application.paused_gate else "applied"):
             raise ValueError("D2 review result does not match its paused gate")
+    if operation in {
+        "register_d7_candidate",
+        "apply_external_validation_feedback",
+        "start_external_validation_check",
+        "complete_external_validation_check",
+    }:
+        if len(state_changes) != 1 or not isinstance(state_changes[0], UpsertTaskRun):
+            raise ValueError("D7 lifecycle commits require exactly one TaskRun change")
+        task_change = state_changes[0]
+        if operation == "register_d7_candidate":
+            if (
+                task_change.status is not TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
+                or event.status is not TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
+                or details.get("candidate_id") is None
+                or details.get("evidence_version") is None
+                or details.get("result") != "awaiting_external_feedback"
+                or details.get("entity_ids") != [task_change.task_run_id, details.get("candidate_id")]
+            ):
+                raise ValueError("D7 candidate event does not match its waiting transition")
+        elif operation == "apply_external_validation_feedback":
+            verdict = details.get("verdict")
+            expected_status = {
+                "accepted": TaskRunStatus.ACHIEVED,
+                "rejected": TaskRunStatus.RUNNING,
+                "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+            }.get(verdict)
+            if (
+                expected_status is None
+                or task_change.status is not event.status
+                or details.get("result") != verdict
+                or details.get("entity_ids") != [task_change.task_run_id, details.get("candidate_id")]
+                or not isinstance(details.get("feedback_operation_id"), str)
+            ):
+                raise ValueError("D7 feedback event does not match its verdict transition")
+        elif operation == "start_external_validation_check":
+            if (
+                task_change.status is not event.status
+                or details.get("result") != "check_started"
+                or not isinstance(details.get("query_id"), str)
+                or not isinstance(details.get("feedback_operation_id"), str)
+                or not isinstance(details.get("checkpoint_sequence"), int)
+                or details.get("entity_ids")
+                != [task_change.task_run_id, details.get("candidate_id")]
+            ):
+                raise ValueError("D7 check-start event does not match its waiting state")
+        else:
+            verdict = details.get("verdict")
+            expected_status = {
+                "accepted": TaskRunStatus.ACHIEVED,
+                "rejected": TaskRunStatus.RUNNING,
+                "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+            }.get(verdict)
+            if (
+                expected_status is None
+                or task_change.status is not event.status
+                or details.get("result") != verdict
+                or not isinstance(details.get("query_id"), str)
+                or not isinstance(details.get("feedback_operation_id"), str)
+                or details.get("entity_ids")
+                != [task_change.task_run_id, details.get("candidate_id")]
+            ):
+                raise ValueError("D7 check-result event does not match its verdict")
     if operation == "apply_d3_review":
         application = state_changes[0]
         assert isinstance(application, D3ReviewApplication)
@@ -1291,6 +1390,7 @@ class ControlMutation:
     d1_turn_proof: D1TurnProof | None = None
     d2_config: D2RunConfig | None = None
     d3: D3CommitMetadata | None = None
+    d7: D7CommitMetadata | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.task_run_id, "ControlMutation.task_run_id")
@@ -1313,6 +1413,48 @@ class ControlMutation:
         if self.event.task_run_id != self.task_run_id:
             raise ValueError("ControlMutation.event belongs to another TaskRun")
         validate_control_event(self.operation, self.state_changes, self.event)
+        if self.d7 is not None:
+            details = self.event.details
+            if self.d7.candidate is not None and (
+                details.get("candidate_id") != self.d7.candidate.candidate_id
+                or details.get("evidence_version") != self.d7.candidate.evidence_version
+            ):
+                raise ValueError("D7 candidate event differs from its typed payload")
+            if self.d7.feedback is not None and (
+                details.get("candidate_id") != self.d7.feedback.candidate_id
+                or details.get("evidence_version") != self.d7.feedback.evidence_version
+                or details.get("feedback_operation_id") != self.d7.feedback.operation_id
+                or details.get("verdict") != self.d7.feedback.verdict
+            ):
+                raise ValueError("D7 feedback event differs from its typed payload")
+            if self.d7.check_request is not None and (
+                self.operation != "start_external_validation_check"
+                or details.get("query_id") != self.d7.check_request.query_id
+                or details.get("candidate_id") != self.d7.check_request.candidate_id
+                or details.get("evidence_version") != self.d7.check_request.evidence_version
+                or details.get("feedback_operation_id")
+                != self.d7.check_request.submission_operation_id
+                or details.get("checkpoint_sequence")
+                != self.d7.check_request.checkpoint_sequence
+                or self.d7.check_request.task_run_id != self.task_run_id
+                or self.d7.check_request.query_id != self.mutation_id
+                or self.d7.check_request.checkpoint_sequence != self.checkpoint.sequence
+            ):
+                raise ValueError("D7 check-start event differs from its typed request")
+            if self.d7.check_completion is not None:
+                result = self.d7.check_completion.result
+                request = result.request
+                if (
+                    self.operation != "complete_external_validation_check"
+                    or details.get("query_id") != request.query_id
+                    or details.get("candidate_id") != request.candidate_id
+                    or details.get("evidence_version") != request.evidence_version
+                    or details.get("feedback_operation_id")
+                    != request.submission_operation_id
+                    or details.get("verdict") != result.verdict
+                    or request.task_run_id != self.task_run_id
+                ):
+                    raise ValueError("D7 check-result event differs from its typed result")
         if self.d1_config is not None and (
             not isinstance(self.d1_config, D1RunConfig) or self.operation != "start_task_run"
         ):
@@ -1337,6 +1479,69 @@ class ControlMutation:
                 raise ValueError("D3 Plan binding requires its registration transaction")
             if self.d3.plan_result is not None and self.operation != "complete_d3_plan":
                 raise ValueError("D3 Plan result requires its completion transaction")
+        if self.d7 is not None:
+            if not isinstance(self.d7, D7CommitMetadata):
+                raise ValueError("D7 metadata must be typed")
+            if self.d1_config is not None or self.d2_config is not None:
+                raise ValueError("D7 metadata cannot be combined with a D1 or D2 run")
+            if self.d7.run_config is not None:
+                config = self.d7.run_config
+                endpoints = self.request.target.endpoints
+                if (
+                    self.operation != "start_task_run"
+                    or self.d7.candidate is not None
+                    or self.d7.feedback is not None
+                    or self.d7.check_request is not None
+                    or self.d7.check_completion is not None
+                    or self.d3 is not None
+                    or config.task_run_id != self.task_run_id
+                    or len(endpoints) != 1
+                    or self.request.target.attachments
+                    or canonical_web_origin(endpoints[0].url) != config.endpoint
+                ):
+                    raise ValueError("D7 Web config must bind its explicit Web TaskRun start")
+            elif self.operation == "register_d7_candidate":
+                if self.d7.candidate is None or self.d7.feedback is not None:
+                    raise ValueError("D7 candidate registration requires a candidate")
+                if self.d7.candidate.task_run_id != self.task_run_id:
+                    raise ValueError("D7 candidate belongs to another TaskRun")
+            elif self.operation == "apply_external_validation_feedback":
+                if self.d7.feedback is None or self.d7.candidate is not None:
+                    raise ValueError("D7 feedback commit requires feedback")
+                if self.d7.feedback.task_run_id != self.task_run_id:
+                    raise ValueError("D7 feedback belongs to another TaskRun")
+                if self.d7.feedback.operation_id != self.mutation_id:
+                    raise ValueError("D7 feedback operation_id must equal mutation_id")
+            elif self.operation == "start_external_validation_check":
+                if (
+                    self.d7.check_request is None
+                    or self.d7.check_completion is not None
+                ):
+                    raise ValueError("D7 check start requires a query request")
+            elif self.operation == "complete_external_validation_check":
+                if (
+                    self.d7.check_completion is None
+                    or self.d7.check_request is not None
+                ):
+                    raise ValueError("D7 check completion requires a query result")
+                from agent_core.goal_feedback import (
+                    external_validation_check_result_mutation_id,
+                )
+
+                if (
+                    external_validation_check_result_mutation_id(
+                        self.d7.check_completion.result.request
+                    )
+                    != self.mutation_id
+                ):
+                    raise ValueError("D7 check result mutation ID is not stable")
+            else:
+                raise ValueError("D7 metadata is only valid for D7 lifecycle operations")
+        elif self.operation in {
+            "register_d7_candidate", "apply_external_validation_feedback",
+            "start_external_validation_check", "complete_external_validation_check",
+        }:
+            raise ValueError("D7 lifecycle operation requires typed D7 metadata")
         if self.d1_binding is not None and (
             not isinstance(self.d1_binding, D1TurnBinding)
             or self.operation != "register_turn" or self.d1_binding.task_run_id != self.task_run_id
@@ -1382,6 +1587,7 @@ class ControlMutation:
         d1_turn_proof: D1TurnProof | None = None,
         d2_config: D2RunConfig | None = None,
         d3: D3CommitMetadata | None = None,
+        d7: D7CommitMetadata | None = None,
     ) -> "ControlMutation":
         checkpoint = CheckpointDraft(
             task_run_id=task_run_id,
@@ -1403,6 +1609,7 @@ class ControlMutation:
             d1_turn_proof=d1_turn_proof,
             d2_config=d2_config,
             d3=d3,
+            d7=d7,
         )
         return cls(
             task_run_id=provisional.task_run_id,
@@ -1420,6 +1627,7 @@ class ControlMutation:
             d1_turn_proof=provisional.d1_turn_proof,
             d2_config=provisional.d2_config,
             d3=provisional.d3,
+            d7=provisional.d7,
         )
 
 
@@ -1692,6 +1900,49 @@ class ControlStore(Protocol):
 
     def list_d3_review_applications(self, task_run_id: str): ...
 
+    def load_d7_answer_candidate(self, candidate_id: str): ...
+
+    def list_d7_answer_candidates(self, task_run_id: str): ...
+
+    def load_d7_web_run_config(
+        self, task_run_id: str
+    ) -> D7WebRunConfig | None: ...
+
+    def register_d7_web_plan(
+        self, record: D7WebPlanRecord
+    ) -> D7WebPlanRecord: ...
+
+    def load_d7_web_plan(self, plan_id: str) -> D7WebPlanRecord | None: ...
+
+    def list_d7_web_plans(
+        self, task_run_id: str
+    ) -> tuple[D7WebPlanRecord, ...]: ...
+
+    def start_d7_web_execution(
+        self, record: D7WebExecutionRecord
+    ) -> tuple[D7WebExecutionRecord, bool]: ...
+
+    def complete_d7_web_execution(
+        self, record: D7WebExecutionRecord
+    ) -> D7WebExecutionRecord: ...
+
+    def load_d7_web_execution(
+        self, execution_id: str
+    ) -> D7WebExecutionRecord | None: ...
+
+    def load_d7_web_execution_binding(
+        self, execution_id: str
+    ) -> D7WebExecutionBinding | None: ...
+
+    def list_d7_web_executions(
+        self, task_run_id: str
+    ) -> tuple[D7WebExecutionRecord, ...]: ...
+
+    def list_d7_validation_feedback(
+        self, task_run_id: str, candidate_id: str, evidence_version: str,
+        *, through_event_sequence: int | None = None,
+    ): ...
+
     def list_process_facts(self, task_run_id: str) -> tuple[D5ProcessFact, ...]: ...
 
     def load_terminal_commit(self, task_run_id: str) -> ControlCommitResult | None:
@@ -1917,5 +2168,7 @@ def control_mutation_fingerprint(mutation: ControlMutation) -> str:
             payload[name] = d1_payload(value)
     if mutation.d3 is not None:
         payload["d3"] = d3_payload(mutation.d3)
+    if mutation.d7 is not None:
+        payload["d7"] = mutation.d7.to_dict()
     encoded = canonical_json(payload).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

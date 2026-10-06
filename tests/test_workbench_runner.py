@@ -173,7 +173,8 @@ def test_terminal_recovery_uses_explicit_cleanup_only_before_archive(tmp_path):
             workbench.runner.cleanup(challenge_id)
     assert popen.call_args.args[0][3:] == [
         "resume", "--task-run-id", task_id, "--state-dir",
-        str(agent_directory.parent), "--cleanup-only",
+        str(agent_directory.parent), "--cleanup-only", "--events",
+        str(directory / "events.jsonl"),
     ]
     with pytest.raises(WorkbenchError, match="cancel_running_challenge_first"):
         workbench.archive(challenge_id)
@@ -306,6 +307,9 @@ def test_paused_v2_can_cancel_through_cli_without_resuming_model(tmp_path):
     assert popen.call_count == 1
     assert popen.call_args.args[0][3:6] == ["cancel", "--task-run-id", task_id]
     assert "resume" not in popen.call_args.args[0]
+    assert popen.call_args.args[0][-2:] == [
+        "--events", str(directory / "events.jsonl")
+    ]
 
 
 @pytest.mark.parametrize("terminal_status", ["cancelled", "deadline_exceeded"])
@@ -426,7 +430,8 @@ def test_historical_remote_cleanup_requires_explicit_network_cleanup(tmp_path):
         assert restarted.runner.cleanup(challenge_id)["status"] == "cleaning"
     assert popen.call_args.args[0][3:] == [
         "resume", "--task-run-id", task_id, "--state-dir",
-        str(agent_directory.parent), "--cleanup-only",
+        str(agent_directory.parent), "--cleanup-only", "--events",
+        str(directory / "events.jsonl"),
     ]
     confirmed = old_result | {"cleanup": {
         "status": "succeeded", "target_network_confirmed": True,

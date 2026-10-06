@@ -12,15 +12,8 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from agent_adapters.application import (
-    AgentApplication,
-    Cancellation,
-    base_result,
-    safe_error,
-    snapshot_result,
-)
 from agent_adapters.cli_contract import IntentRunRequest, validate_authorization
 from agent_adapters.deepseek_model import DeepSeekSettings
 from agent_adapters.event_export import EventExporter, read_events
@@ -37,6 +30,13 @@ from agent_adapters.run_files import (
 from agent_adapters.simulated_runtime import validate_fixture
 from agent_core.attachment_import import AttachmentImportRejected
 from agent_core.runtime import TERMINAL_STATUSES
+
+
+def snapshot_result(*args, **kwargs):
+    """Lazy legacy v1 snapshot hook kept patchable for compatibility tests."""
+    from agent_adapters.application import snapshot_result as _snapshot_result
+
+    return _snapshot_result(*args, **kwargs)
 
 
 class Parser(argparse.ArgumentParser):
@@ -78,10 +78,24 @@ def parser():
     sensitive.add_argument("--run-dir", required=True)
     sensitive.add_argument("--task-run-id", required=True)
     sensitive.add_argument("--evidence-id", required=True)
-    for command in ("resume", "cancel", "status", "replay"):
+    candidate = commands.add_parser("candidate-read")
+    candidate.add_argument("--task-run-id", required=True)
+    candidate.add_argument("--candidate-id", required=True)
+    candidate.add_argument("--evidence-version", required=True)
+    directory = candidate.add_mutually_exclusive_group(required=True)
+    directory.add_argument("--state-dir")
+    directory.add_argument("--run-dir")
+    for command in ("resume", "cancel", "cleanup", "status", "replay"):
         item = commands.add_parser(command)
-        item.add_argument("--task-run-id", required=True)
-        item.add_argument("--state-dir", required=True)
+        if command == "status":
+            selector = item.add_mutually_exclusive_group(required=True)
+            selector.add_argument("--task-run-id")
+            selector.add_argument("--request-id")
+        else:
+            item.add_argument("--task-run-id", required=True)
+        directory = item.add_mutually_exclusive_group(required=True)
+        directory.add_argument("--state-dir")
+        directory.add_argument("--run-dir")
         if command == "resume":
             item.add_argument("--authorization")
             item.add_argument("--fixture", help="append-only v2 simulated fixture")
@@ -89,25 +103,284 @@ def parser():
             group.add_argument("--cleanup-only", action="store_true")
             group.add_argument("--verify-import", action="store_true")
             item.add_argument("--events")
+        elif command in {"cancel", "cleanup"}:
+            item.add_argument("--events")
         if command == "replay":
             item.add_argument("--after-sequence", type=int, default=0)
             item.add_argument("--limit", type=int, default=128)
     return result
 
 
+def _persisted_protocol_version(declaration):
+    if not isinstance(declaration, dict):
+        raise ValueError("invalid_run_declaration")
+    version = declaration.get("protocol_version")
+    if type(version) is not int or version not in {1, 2, 3}:
+        raise ValueError("unsupported_persisted_protocol_version")
+    return version
+
+
 def _snapshot(directory, declaration):
+    protocol_version = _persisted_protocol_version(declaration)
     try:
-        if declaration["protocol_version"] == 2:
+        if protocol_version == 3:
+            return _snapshot_v3(directory, declaration)
+        if protocol_version == 2:
             from agent_adapters.task_result import snapshot_task_result
 
             return snapshot_task_result(directory, declaration)
         return snapshot_result(directory, declaration)
     except Exception as exc:  # noqa: BLE001 -- sanitized CLI/process boundary
+        from agent_adapters.application import base_result
+
         result = base_result(declaration["task_run_id"], declaration["mode"])
         result["errors"].append(
             {"code": "state_read_failed", "category": type(exc).__name__}
         )
         return result
+
+
+def _snapshot_v3(directory: Path, declaration: dict) -> dict:
+    """Read the v3 TaskRun result through its versioned result adapter."""
+    from agent_adapters.d7_task_result import snapshot_v3_task_result
+
+    return snapshot_v3_task_result(directory, declaration)
+
+
+def _candidate_read_run_directory(args) -> tuple[Path, dict]:
+    """Validate the immutable v3 declaration and SQLite ownership before DPAPI."""
+    if args.run_dir is not None:
+        supplied = Path(args.run_dir)
+        if supplied.is_symlink() or not supplied.is_dir():
+            raise ValueError("d7_candidate_run_directory_invalid")
+        directory = supplied.resolve()
+    else:
+        directory = run_path(Path(args.state_dir), args.task_run_id)
+    declaration_path = directory / "run.json"
+    if declaration_path.is_symlink() or not declaration_path.is_file():
+        raise ValueError("d7_candidate_run_declaration_invalid")
+    declaration = immutable_read(declaration_path)
+    if (
+        not isinstance(declaration, dict)
+        or declaration.get("task_run_id") != args.task_run_id
+        or declaration.get("protocol_version") != 3
+    ):
+        raise ValueError("d7_candidate_run_declaration_invalid")
+    database = directory / "control.sqlite"
+    if database.is_symlink() or not database.is_file():
+        raise ValueError("d7_candidate_ownership_invalid")
+    from agent_core.sqlite_control_store import SqliteControlStore
+
+    try:
+        with SqliteControlStore.open_readonly(database) as ledger:
+            if (
+                ledger.list_task_run_refs() != (args.task_run_id,)
+                or ledger.load_task_run(args.task_run_id) is None
+            ):
+                raise ValueError("d7_candidate_ownership_invalid")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("d7_candidate_ownership_invalid") from exc
+    return directory, declaration
+
+
+def _existing_task_directory(args) -> Path:
+    """Resolve a previously-created run without allowing selector mixing."""
+    run_dir = getattr(args, "run_dir", None)
+    state_dir = getattr(args, "state_dir", None)
+    task_id = getattr(args, "task_run_id", None)
+    if run_dir is not None:
+        if state_dir is not None or not isinstance(task_id, str):
+            raise ValueError("invalid_run_directory_selector")
+        directory = Path(run_dir)
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("invalid_task_directory")
+        return directory.resolve()
+    if state_dir is None or not isinstance(task_id, str):
+        raise ValueError("invalid_run_directory_selector")
+    return run_path(Path(state_dir), task_id)
+
+
+def _request_status_error(request_id, code: str, exit_code: int) -> dict:
+    return {
+        "protocol_version": 3,
+        "request_id": request_id,
+        "errors": [{"code": code}],
+        "exit_code": exit_code,
+    }
+
+
+def _safe_request_receipt(receipt) -> dict:
+    return {
+        "request_id": receipt.request_id,
+        "state": receipt.state,
+        "task_run_id": receipt.task_run_id,
+        "reason": receipt.reason,
+        "staging_status": receipt.staging_status,
+        "conflict_count": receipt.conflict_count,
+        "request_exit_code": receipt.request_exit_code,
+        "attachments": [
+            {
+                "index": item.index,
+                "name": item.name,
+                "byte_size": item.byte_size,
+                "sha256": item.sha256,
+            }
+            for item in receipt.attachments
+        ],
+    }
+
+
+def _safe_overall_goal_summary(value) -> dict | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or value.get("outcome")
+        not in {"accepted", "rejected", "pending", "unknown", "not_evaluated"}
+    ):
+        raise ValueError("run_result_unavailable")
+    allowed = {
+        "schema_version",
+        "outcome",
+        "candidate_count",
+        "accepted_count",
+        "rejected_count",
+        "pending_count",
+    }
+    summary = {key: item for key, item in value.items() if key in allowed}
+    for key in allowed - {"schema_version", "outcome"}:
+        if key in summary and (type(summary[key]) is not int or summary[key] < 0):
+            raise ValueError("run_result_unavailable")
+    return summary
+
+
+def _status_by_request_id(args) -> dict:
+    request_id = args.request_id
+    if getattr(args, "run_dir", None) is not None or getattr(args, "state_dir", None) is None:
+        return _request_status_error(request_id, "request_status_requires_state_dir", 2)
+    try:
+        parsed = UUID(request_id) if isinstance(request_id, str) else None
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.version != 4 or str(parsed) != request_id:
+        return _request_status_error(request_id, "request_id_invalid", 2)
+
+    from agent_adapters.d7_request_staging import (
+        D7RequestStager,
+        RequestStagingError,
+    )
+
+    try:
+        stager = D7RequestStager.open_existing(Path(args.state_dir), clock=time.time)
+        receipt = stager.read_receipt(request_id)
+    except (KeyError, OSError, RequestStagingError, TypeError, ValueError):
+        return _request_status_error(request_id, "request_receipt_unavailable", 5)
+    if receipt is None:
+        return _request_status_error(request_id, "request_receipt_not_found", 2)
+
+    result = {
+        "protocol_version": 3,
+        "request_id": request_id,
+        "request_receipt": _safe_request_receipt(receipt),
+        "exit_code": 0,
+    }
+    task_run_id = receipt.task_run_id
+    if task_run_id is None:
+        return result
+
+    try:
+        directory = run_path(Path(args.state_dir), task_run_id)
+        declaration_path = directory / "run.json"
+        if (
+            not directory.is_dir()
+            or declaration_path.is_symlink()
+            or not declaration_path.is_file()
+        ):
+            raise ValueError("run_result_unavailable")
+        declaration = immutable_read(declaration_path)
+        if (
+            not isinstance(declaration, dict)
+            or declaration.get("task_run_id") != task_run_id
+            or declaration.get("request_id") != request_id
+            or type(declaration.get("protocol_version")) is not int
+            or declaration["protocol_version"] != 3
+        ):
+            raise ValueError("run_result_unavailable")
+        run_result = _snapshot_v3(directory, declaration)
+        if (
+            not isinstance(run_result, dict)
+            or run_result.get("task_run_id") != task_run_id
+            or any(
+                item.get("code") in {"state_read_failed", "run_result_unavailable"}
+                for item in run_result.get("errors", [])
+                if isinstance(item, dict)
+            )
+            or (
+                "run_exit_code" in run_result
+                and (
+                    type(run_result["run_exit_code"]) is not int
+                    or run_result["run_exit_code"] not in {0, 3, 4, 5, 130}
+                )
+            )
+        ):
+            raise ValueError("run_result_unavailable")
+        task_run = run_result.get("task_run")
+        run_status = task_run.get("status") if isinstance(task_run, dict) else None
+        run_exit_code = run_result.get("run_exit_code")
+        if run_exit_code is not None and run_status not in {
+            "achieved",
+            "assumed_achieved",
+            "partial",
+            "inconclusive",
+            "failed",
+            "cancelled",
+            "deadline_exceeded",
+        }:
+            raise ValueError("run_result_unavailable")
+        if run_status is not None and run_status not in {
+            "running",
+            "awaiting_confirmation",
+            "awaiting_external_feedback",
+            "achieved",
+            "assumed_achieved",
+            "partial",
+            "inconclusive",
+            "failed",
+            "cancelled",
+            "deadline_exceeded",
+        }:
+            raise ValueError("run_result_unavailable")
+        goal_evaluation = run_result.get("goal_evaluation", "unknown")
+        cleanup_status = run_result.get("cleanup_status", "unconfirmed")
+        recovery_status = run_result.get("recovery_status", "required")
+        if goal_evaluation not in {"accepted", "rejected", "unknown", "not_evaluated"}:
+            raise ValueError("run_result_unavailable")
+        if cleanup_status not in {"confirmed", "unconfirmed", "not_required", "not_confirmed"}:
+            raise ValueError("run_result_unavailable")
+        if recovery_status not in {"required", "not_required", "unknown"}:
+            raise ValueError("run_result_unavailable")
+        safe_run_result = {
+            "task_run_id": task_run_id,
+            "run_status": run_status,
+            "goal_evaluation": goal_evaluation,
+            "overall_goal_summary": _safe_overall_goal_summary(
+                run_result.get("overall_goal_summary")
+            ),
+            "cleanup_status": cleanup_status,
+            "recovery_status": recovery_status,
+        }
+        if run_exit_code is not None:
+            safe_run_result["run_exit_code"] = run_exit_code
+        result["run_result"] = safe_run_result
+        return result
+    except (KeyError, OSError, TypeError, ValueError):
+        unavailable = _request_status_error(request_id, "run_result_unavailable", 5)
+        unavailable["request_receipt"] = result["request_receipt"]
+        return unavailable
 
 
 def _worker(
@@ -121,6 +394,9 @@ def _worker(
     output_name,
     verify_import=False,
 ):
+    protocol_version = _persisted_protocol_version(declaration)
+    if protocol_version == 3:
+        raise ValueError("protocol_v3_lifecycle_unavailable")
     # Only the supervisor owns stdout/stderr, including library diagnostics.
     with open(os.devnull, "w") as sink:
         os.dup2(sink.fileno(), 1)
@@ -134,7 +410,7 @@ def _worker(
     directory = Path(directory_text)
     try:
         with run_lock(directory):
-            if declaration["protocol_version"] == 2:
+            if protocol_version == 2:
                 _owned_task_operation(
                     directory,
                     declaration,
@@ -166,6 +442,7 @@ def _worker(
 def _owned_task_operation(
     directory, declaration, cancel, operation, settings, output_name
 ):
+    from agent_adapters.application import Cancellation, safe_error
     from agent_adapters.task_application import TaskApplication
 
     app = None
@@ -216,6 +493,7 @@ def _owned_operation(
     output_name,
     verify_import,
 ):
+    from agent_adapters.application import AgentApplication, Cancellation, safe_error
     app = None
     errors = []
     try:
@@ -277,6 +555,8 @@ def supervise(
     events=None,
     verify_import=False,
 ):
+    from agent_adapters.application import safe_error
+
     context = multiprocessing.get_context("spawn")
     cancel, gate = context.Event(), context.Event()
     output_name = "operation-" + str(uuid4()) + ".json"
@@ -316,7 +596,10 @@ def supervise(
         tree = ProcessTree(worker.pid)
         if events:
             exporter = EventExporter(
-                Path(events), directory / "control.sqlite", declaration["task_run_id"]
+                Path(events),
+                directory / "control.sqlite",
+                declaration["task_run_id"],
+                append_existing=operation != "start",
             )
         gate.set()
         while worker.is_alive():
@@ -399,6 +682,38 @@ def supervise(
 
 def dispatch(args):
     settings = None
+    if args.command == "status" and getattr(args, "request_id", None) is not None:
+        return _status_by_request_id(args)
+    if args.command == "candidate-read":
+        if not (
+            sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()
+        ):
+            raise ValueError("d7_candidate_view_requires_terminal")
+        try:
+            if codecs.lookup(sys.stderr.encoding or "").name != "utf-8":
+                raise ValueError("d7_candidate_view_terminal_encoding_unsupported")
+        except LookupError as exc:
+            raise ValueError("d7_candidate_view_terminal_encoding_unsupported") from exc
+        directory, _declaration = _candidate_read_run_directory(args)
+        from agent_adapters.d7_candidate_evidence import D7CandidateEvidenceService
+        from agent_adapters.d7_candidate_operator_view import (
+            D7CandidateOperatorViewer,
+            OPERATOR_CANDIDATE_VIEW_ADAPTER_ID,
+        )
+
+        service = D7CandidateEvidenceService(
+            directory,
+            args.task_run_id,
+            trusted_adapter_ids=(OPERATOR_CANDIDATE_VIEW_ADAPTER_ID,),
+            create=False,
+        )
+        viewed = D7CandidateOperatorViewer(service).view(
+            args.candidate_id,
+            evidence_version=args.evidence_version,
+            stdin=sys.stdin,
+            stdout=sys.stderr,
+        )
+        return viewed.to_dict() | {"exit_code": 0}
     if args.command == "evidence-sensitive":
         if args.action == "view" and not (
             sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()
@@ -535,14 +850,21 @@ def dispatch(args):
             settings=settings,
             events=args.events,
         )
-    directory = run_path(Path(args.state_dir), args.task_run_id)
+    directory = _existing_task_directory(args)
     declaration = immutable_read(directory / "run.json")
-    if declaration["task_run_id"] != args.task_run_id:
+    protocol_version = _persisted_protocol_version(declaration)
+    if declaration.get("task_run_id") != args.task_run_id:
         raise ValueError("run_identity_mismatch")
-    if declaration["protocol_version"] == 2:
+    if protocol_version == 2:
         from agent_adapters.task_cli import dispatch_existing
 
         return dispatch_existing(args, directory, declaration)
+    if protocol_version == 3:
+        from agent_adapters.task_cli import dispatch_v3_existing
+
+        return dispatch_v3_existing(args, directory, declaration)
+    if args.command == "cleanup":
+        raise ValueError("cleanup_not_supported_for_protocol_version")
     if args.command == "replay":
         events = read_events(
             directory / "control.sqlite",
@@ -621,12 +943,23 @@ def main(argv=None):
         if result is None:
             return 0
     except KeyboardInterrupt:
+        from agent_adapters.application import base_result
+
         result = base_result()
         result["errors"].append({"code": "interrupted_before_run_started"})
     except Exception as exc:  # noqa: BLE001 -- sanitized CLI/process boundary
+        from agent_adapters.application import base_result, safe_error
+
         from agent_adapters.protected_evidence import ProtectedEvidenceError
+        from agent_adapters.d7_candidate_evidence import D7CandidateEvidenceError
+        from agent_adapters.d7_candidate_operator_view import (
+            D7CandidateOperatorViewError,
+        )
 
         if isinstance(exc, ProtectedEvidenceError):
+            result = base_result()
+            result.update(exit_code=2, errors=[{"code": exc.code}])
+        elif isinstance(exc, (D7CandidateEvidenceError, D7CandidateOperatorViewError)):
             result = base_result()
             result.update(exit_code=2, errors=[{"code": exc.code}])
         elif isinstance(exc, (ValueError, OSError)):

@@ -52,12 +52,26 @@ from agent_core.domain import (
     PlanStatus,
     TurnStatus,
 )
+from agent_core.d7_web_contracts import D7WebRunConfig
 from agent_core.dual_llm_contracts import D3CommitMetadata, D3RunConfig
 from agent_core.file_inspection import FILE_TOOL
 from agent_core.file_type_fact import FileTypeFactCandidate, fact_content
 from agent_core.file_type_verifier import (
     FileTypeProofEvidencePort,
     FileTypeVerificationError,
+)
+from agent_core.goal_candidates import D7AnswerCandidate, D7CommitMetadata
+from agent_core.goal_feedback import (
+    ExternalValidationCheckCompletion,
+    ExternalValidationCheckerPort,
+    ExternalValidationCheckRecord,
+    ExternalValidationCheckRequest,
+    ExternalValidationCheckResult,
+    ExternalValidationFeedback,
+    ExternalValidationFeedbackConflict,
+    external_validation_check_result_mutation_id,
+    project_candidate_feedback,
+    validate_external_check_binding,
 )
 from agent_core.intent_goal_evaluator import (
     IntentGoalEvaluation,
@@ -278,14 +292,28 @@ class TaskRunController(LegacyTaskRunController):
             raise StorageError("controller cache is invalid; reload the TaskRun state")
         return self._persistent
 
+    @staticmethod
+    def _load_frozen_d4_config(
+        store: Any, task_run_id: str
+    ) -> D3RunConfig | D7WebRunConfig | None:
+        load_d3 = getattr(store, "load_d3_run_config", None)
+        load_web = getattr(store, "load_d7_web_run_config", None)
+        d3_config = load_d3(task_run_id) if callable(load_d3) else None
+        web_config = load_web(task_run_id) if callable(load_web) else None
+        if d3_config is not None and web_config is not None:
+            raise D4RecoveryRequired("d4_run_configuration_ambiguous")
+        config = d3_config if d3_config is not None else web_config
+        if config is None or getattr(config, "d4_budget", None) is None:
+            return None
+        return config
+
     def _d4_audit_api(self):
         deps = self._persistent
         task_run_id = self._persistent_task_run_id
         if deps is None or task_run_id is None:
             return None
-        load_config = getattr(deps.store, "load_d3_run_config", None)
-        config = load_config(task_run_id) if callable(load_config) else None
-        if config is None or getattr(config, "d4_budget", None) is None:
+        config = self._load_frozen_d4_config(deps.store, task_run_id)
+        if config is None:
             return None
         record = getattr(deps.store, "record_d4_audit_event", None)
         load = getattr(deps.store, "load_d4_audit_event", None)
@@ -418,6 +446,7 @@ class TaskRunController(LegacyTaskRunController):
         d1_config: D1RunConfig | None = None,
         d2_config: D2RunConfig | None = None,
         d3_config: D3RunConfig | None = None,
+        d7_web_config: D7WebRunConfig | None = None,
     ) -> Any:
         if self._persistent is None:
             if (
@@ -428,11 +457,13 @@ class TaskRunController(LegacyTaskRunController):
                 or d1_config is not None
                 or d2_config is not None
                 or d3_config is not None
+                or d7_web_config is not None
             ):
                 raise InvalidTransition("persistent dependencies are required for this start signature")
             return super().start(request)
         return self._start_persistent(
-            request, effective_model_backend, mutation_id, source_root, task_run_id, d1_config, d2_config, d3_config,
+            request, effective_model_backend, mutation_id, source_root, task_run_id,
+            d1_config, d2_config, d3_config, d7_web_config,
         )
 
     def _start_persistent(
@@ -445,6 +476,7 @@ class TaskRunController(LegacyTaskRunController):
         d1_config: D1RunConfig | None = None,
         d2_config: D2RunConfig | None = None,
         d3_config: D3RunConfig | None = None,
+        d7_web_config: D7WebRunConfig | None = None,
     ) -> CommittedOperation:
         deps = self._require_persistent()
         if self._persistent_task_run_id is not None or self._closed:
@@ -483,10 +515,34 @@ class TaskRunController(LegacyTaskRunController):
                 or len(attachments) != len(d3_config.authorization.attachment_indices)
                 or any(item.kind != "local_path" for item in attachments)
             ):
-                raise TaskRequestError("D3 requires one or two frozen local attachments without network")
+                raise TaskRequestError("D3 requires frozen local attachments without network")
+        if d7_web_config is not None:
+            if not isinstance(d7_web_config, D7WebRunConfig):
+                raise TaskRequestError("d7_web_config must be a frozen D7WebRunConfig")
+            endpoints = request.target.endpoints
+            if (
+                d1_config is not None
+                or d2_config is not None
+                or d3_config is not None
+                or len(endpoints) != 1
+                or request.target.attachments
+                or endpoints[0].url != d7_web_config.endpoint
+                or self._target_network is None
+                or not callable(getattr(self._target_network, "create", None))
+                or not callable(getattr(self._target_network, "bind", None))
+                or not callable(getattr(self._target_network, "destroy", None))
+                or not callable(getattr(self._sandbox, "configure_target_network", None))
+            ):
+                raise TaskRequestError(
+                    "D7 Web requires one exact authorized origin, no attachments, and a target network adapter"
+                )
 
-        supplied_task_id = task_run_id is not None
+        supplied_task_id = task_run_id is not None or d7_web_config is not None
+        if task_run_id is None and d7_web_config is not None:
+            task_run_id = d7_web_config.task_run_id
         task_run_id = str(uuid.uuid4()) if task_run_id is None else _validate_mutation_id(task_run_id)
+        if d7_web_config is not None and d7_web_config.task_run_id != task_run_id:
+            raise TaskRequestError("d7_web_config_task_run_id_mismatch")
         if (
             d3_config is not None and d3_config.d6_authorization is not None
             and d3_config.d6_authorization.task_run_id != task_run_id
@@ -506,7 +562,12 @@ class TaskRunController(LegacyTaskRunController):
                 endpoints = request.target.endpoints
                 if len(endpoints) != 1:
                     raise TaskRequestError("T6 target network requires exactly one endpoint")
-                target_network = self._target_network.create(task_run_id, endpoints[0].url)
+                target_url = (
+                    d7_web_config.endpoint
+                    if d7_web_config is not None
+                    else endpoints[0].url
+                )
+                target_network = self._target_network.create(task_run_id, target_url)
                 configure = getattr(self._sandbox, "configure_target_network", None)
                 if not callable(configure):
                     raise InvalidTransition("Sandbox cannot bind a T6 target network")
@@ -546,6 +607,11 @@ class TaskRunController(LegacyTaskRunController):
                 d1_config=d1_config,
                 d2_config=d2_config,
                 d3=D3CommitMetadata(config=d3_config) if d3_config is not None else None,
+                d7=(
+                    D7CommitMetadata(run_config=d7_web_config)
+                    if d7_web_config is not None
+                    else None
+                ),
             )
             commit = deps.store.commit(mutation)
             committed = True
@@ -1768,6 +1834,336 @@ class TaskRunController(LegacyTaskRunController):
             failure_reason=task_run.failure_reason,
         )
 
+    def register_answer_candidate(
+        self,
+        candidate: D7AnswerCandidate,
+        mutation_id: str,
+    ) -> CommittedOperation:
+        """Persist candidate provenance and pause the TaskRun for trusted feedback."""
+
+        if self._persistent is None:
+            raise InvalidTransition("D7 candidate registration requires persistence")
+        if not isinstance(candidate, D7AnswerCandidate):
+            raise ValueError("candidate must be a D7AnswerCandidate")
+        mutation_id = _validate_mutation_id(mutation_id)
+        task_run, state = self._require_bound_state()
+        if candidate.task_run_id != task_run.task_run_id:
+            raise InvalidTransition("candidate belongs to another TaskRun")
+        deps = self._require_persistent()
+        replay = self._load_existing_commit(mutation_id)
+        now = replay.event.timestamp if replay is not None else self._now_utc()
+        if replay is None and task_run.status is not TaskRunStatus.RUNNING:
+            raise InvalidTransition("candidate registration requires a running TaskRun")
+        if replay is None and self._d7_has_feedback_conflict(deps.store, task_run.task_run_id):
+            raise InvalidTransition("D7 feedback conflict blocks further candidate registration")
+        if replay is None and now >= task_run.deadline_at:
+            return self._finish_persistent(
+                TaskRunStatus.DEADLINE_EXCEEDED,
+                mutation_id=mutation_id,
+                now=now,
+                failure_reason=task_run.failure_reason,
+            )
+        return self._commit_d7_lifecycle(
+            mutation_id=mutation_id,
+            operation="register_d7_candidate",
+            metadata=D7CommitMetadata(candidate=candidate),
+            status=TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+            now=now,
+            base_checkpoint_sequence=(
+                replay.checkpoint.sequence - 1
+                if replay is not None
+                else state.latest_checkpoint.sequence
+            ),
+            replay=replay,
+        )
+
+    def apply_external_validation_feedback(
+        self,
+        feedback: ExternalValidationFeedback,
+    ) -> CommittedOperation:
+        """Apply one trusted adapter result bound to its candidate evidence version."""
+
+        if self._persistent is None:
+            raise InvalidTransition("D7 feedback requires persistence")
+        if not isinstance(feedback, ExternalValidationFeedback):
+            raise ValueError("feedback must be an ExternalValidationFeedback")
+        task_run, state = self._require_bound_state()
+        if feedback.task_run_id != task_run.task_run_id:
+            raise InvalidTransition("feedback belongs to another TaskRun")
+        deps = self._require_persistent()
+        mutation_id = feedback.operation_id
+        replay = self._load_existing_commit(mutation_id)
+        now = replay.event.timestamp if replay is not None else self._now_utc()
+        if replay is not None:
+            return self._commit_d7_lifecycle(
+                mutation_id=mutation_id,
+                operation="apply_external_validation_feedback",
+                metadata=D7CommitMetadata(feedback=feedback),
+                status=self._d7_feedback_status(feedback.verdict),
+                now=now,
+                base_checkpoint_sequence=replay.checkpoint.sequence - 1,
+                replay=replay,
+            )
+        candidate = deps.store.load_d7_answer_candidate(feedback.candidate_id)
+        if (
+            candidate is None
+            or candidate.task_run_id != feedback.task_run_id
+            or candidate.evidence_version != feedback.evidence_version
+        ):
+            raise InvalidTransition("feedback does not match a saved candidate evidence version")
+        records = deps.store.list_d7_validation_feedback(
+            feedback.task_run_id,
+            feedback.candidate_id,
+            feedback.evidence_version,
+        )
+        prior_determinate = any(
+            item.verdict in {"accepted", "rejected"} for item in records
+        )
+        if prior_determinate or task_run.status in TERMINAL_STATUSES:
+            status = task_run.status
+        elif task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK:
+            status = (
+                TaskRunStatus.DEADLINE_EXCEEDED
+                if now >= task_run.deadline_at
+                else self._d7_feedback_status(feedback.verdict)
+            )
+        else:
+            raise InvalidTransition("feedback requires an awaited external candidate")
+        return self._commit_d7_lifecycle(
+            mutation_id=mutation_id,
+            operation="apply_external_validation_feedback",
+            metadata=D7CommitMetadata(feedback=feedback),
+            status=status,
+            now=now,
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+        )
+
+    def run_external_validation_check(
+        self,
+        request: ExternalValidationCheckRequest,
+        checker: ExternalValidationCheckerPort,
+    ) -> ExternalValidationCheckRecord:
+        """Persist a read-only check start before calling its trusted adapter."""
+
+        if self._persistent is None:
+            raise InvalidTransition("D7 external checks require persistence")
+        if not isinstance(request, ExternalValidationCheckRequest):
+            raise ValueError("request must be an ExternalValidationCheckRequest")
+        check = getattr(checker, "check", None)
+        if not callable(check):
+            raise ValueError("checker must provide a trusted check(request) method")
+        task_run, state = self._require_bound_state()
+        if request.task_run_id != task_run.task_run_id:
+            raise InvalidTransition("external check belongs to another TaskRun")
+        deps = self._require_persistent()
+        load = getattr(deps.store, "load_d7_external_validation_check", None)
+        if not callable(load):
+            raise StorageError("D7 external check ledger is unavailable")
+        record = load(request.query_id)
+        if record is not None and record.request != request:
+            raise ExternalValidationFeedbackConflict(
+                "query_id was already recorded for different check content"
+            )
+        if record is None:
+            if task_run.status is not TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK and not request.conflict_sources:
+                raise InvalidTransition("new external checks require an awaited candidate")
+            records = deps.store.list_d7_validation_feedback(request.task_run_id, request.candidate_id, request.evidence_version)
+            validate_external_check_binding(request, records)
+            if self._now_utc() >= task_run.deadline_at:
+                raise D4RecoveryRequired("d7_external_check_deadline_unknown_retained")
+            if request.checkpoint_sequence != state.latest_checkpoint.sequence + 1:
+                raise InvalidTransition(
+                    "external check must bind the checkpoint created by its start record"
+                )
+            self._commit_d7_lifecycle(
+                mutation_id=request.query_id,
+                operation="start_external_validation_check",
+                metadata=D7CommitMetadata(check_request=request),
+                status=task_run.status,
+                now=self._now_utc(),
+                base_checkpoint_sequence=state.latest_checkpoint.sequence,
+            )
+            record = load(request.query_id)
+            if record is None or record.request != request:
+                raise StorageError("D7 external check start was not durably reloaded")
+        if record.result is not None:
+            return record
+
+        if self._now_utc() >= task_run.deadline_at:
+            raise D4RecoveryRequired("d7_external_check_deadline_unknown_retained")
+
+        result = check(request)
+        if not isinstance(result, ExternalValidationCheckResult):
+            raise ValueError("trusted checker returned an invalid result")
+        if result.request != request:
+            raise ExternalValidationFeedbackConflict(
+                "trusted checker result differs from the persisted check request"
+            )
+        completion = ExternalValidationCheckCompletion.from_result(result)
+        task_run, state = self._require_bound_state()
+        records = deps.store.list_d7_validation_feedback(
+            request.task_run_id,
+            request.candidate_id,
+            request.evidence_version,
+        )
+        projected_records = (
+            records
+            if completion.reconciliation is None
+            else (*records, completion.reconciliation)
+        )
+        projection = project_candidate_feedback(
+            request.task_run_id,
+            request.candidate_id,
+            request.evidence_version,
+            projected_records,
+        )
+        if task_run.status in TERMINAL_STATUSES:
+            status = task_run.status
+        elif self._now_utc() >= task_run.deadline_at:
+            status = TaskRunStatus.DEADLINE_EXCEEDED
+        else:
+            status = {
+                "accepted": TaskRunStatus.ACHIEVED,
+                "rejected": TaskRunStatus.RUNNING,
+                "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+                "conflict": task_run.status,
+                "pending": task_run.status,
+            }[projection.state]
+        self._commit_d7_lifecycle(
+            mutation_id=external_validation_check_result_mutation_id(request),
+            operation="complete_external_validation_check",
+            metadata=D7CommitMetadata(check_completion=completion),
+            status=status,
+            now=self._now_utc(),
+            base_checkpoint_sequence=state.latest_checkpoint.sequence,
+        )
+        saved = load(request.query_id)
+        if saved is None or saved.request != request or saved.result != result:
+            raise StorageError("D7 external check result was not durably reloaded")
+        return saved
+
+    @staticmethod
+    def _d7_has_feedback_conflict(store: Any, task_run_id: str) -> bool:
+        list_candidates = getattr(store, "list_d7_answer_candidates", None)
+        list_feedback = getattr(store, "list_d7_validation_feedback", None)
+        if not callable(list_candidates) or not callable(list_feedback):
+            raise StorageError("D7 feedback projection is unavailable")
+        for candidate in list_candidates(task_run_id):
+            records = list_feedback(
+                task_run_id, candidate.candidate_id, candidate.evidence_version
+            )
+            if project_candidate_feedback(task_run_id, candidate.candidate_id, candidate.evidence_version, records).state == "conflict":
+                return True
+        return False
+
+    @staticmethod
+    def _d7_feedback_status(verdict: str) -> TaskRunStatus:
+        return {
+            "accepted": TaskRunStatus.ACHIEVED,
+            "rejected": TaskRunStatus.RUNNING,
+            "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+        }[verdict]
+
+    def _commit_d7_lifecycle(
+        self,
+        *,
+        mutation_id: str,
+        operation: str,
+        metadata: D7CommitMetadata,
+        status: TaskRunStatus,
+        now: float,
+        base_checkpoint_sequence: int,
+        replay: ControlCommitResult | None = None,
+    ) -> CommittedOperation:
+        deps = self._require_persistent()
+        task_run, state = self._require_bound_state()
+        if replay is not None:
+            self._assert_replay_operation(replay, operation)
+        finished_at = (
+            task_run.finished_at
+            if status is task_run.status and status in TERMINAL_STATUSES
+            else now
+            if status in TERMINAL_STATUSES
+            else None
+        )
+        change = UpsertTaskRun(
+            task_run_id=task_run.task_run_id,
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            started_at=task_run.started_at,
+            deadline_at=task_run.deadline_at,
+            status=status,
+            sandbox_id=task_run.sandbox_id,
+            confirmation_deadline=task_run.confirmation_deadline,
+            finished_at=finished_at,
+            failure_reason=task_run.failure_reason,
+            source_root=task_run.source_root,
+            target_network=task_run.target_network,
+        )
+        details: dict[str, object] = {
+            "operation": operation,
+            "entity_ids": [task_run.task_run_id],
+        }
+        if metadata.candidate is not None:
+            candidate = metadata.candidate
+            details["entity_ids"] = [task_run.task_run_id, candidate.candidate_id]
+            details["candidate_id"] = candidate.candidate_id
+            details["evidence_version"] = candidate.evidence_version
+            result = "awaiting_external_feedback"
+        elif metadata.feedback is not None:
+            feedback = metadata.feedback
+            details["entity_ids"] = [task_run.task_run_id, feedback.candidate_id]
+            details["candidate_id"] = feedback.candidate_id
+            details["evidence_version"] = feedback.evidence_version
+            details["feedback_operation_id"] = feedback.operation_id
+            details["verdict"] = feedback.verdict
+            result = feedback.verdict
+        elif metadata.check_request is not None:
+            request = metadata.check_request
+            details["entity_ids"] = [task_run.task_run_id, request.candidate_id]
+            details["candidate_id"] = request.candidate_id
+            details["evidence_version"] = request.evidence_version
+            details["feedback_operation_id"] = request.submission_operation_id
+            details["query_id"] = request.query_id
+            details["checkpoint_sequence"] = request.checkpoint_sequence
+            result = "check_started"
+        else:
+            assert metadata.check_completion is not None
+            checked = metadata.check_completion.result
+            request = checked.request
+            details["entity_ids"] = [task_run.task_run_id, request.candidate_id]
+            details["candidate_id"] = request.candidate_id
+            details["evidence_version"] = request.evidence_version
+            details["feedback_operation_id"] = request.submission_operation_id
+            details["query_id"] = request.query_id
+            details["verdict"] = checked.verdict
+            result = checked.verdict
+        details["result"] = result
+        event = RuntimeEvent(
+            type="control_state_committed",
+            task_run_id=task_run.task_run_id,
+            timestamp=now,
+            status=status,
+            details=details,
+        )
+        mutation = ControlMutation.create(
+            task_run_id=task_run.task_run_id,
+            mutation_id=mutation_id,
+            operation=operation,
+            request=task_run.request,
+            effective_model_backend=task_run.effective_model_backend,
+            base_checkpoint_sequence=base_checkpoint_sequence,
+            state_changes=(change,),
+            event=event,
+            d7=metadata,
+        )
+        if replay is not None:
+            return CommittedOperation.from_commit(deps.store.commit(mutation))
+        deps.repository.validate_candidate(state, mutation)
+        commit = deps.store.commit(mutation)
+        self._reload_after_commit(commit)
+        return CommittedOperation.from_commit(commit)
+
     def model_failed(
         self,
         reason: str | None = None,
@@ -1827,11 +2223,27 @@ class TaskRunController(LegacyTaskRunController):
         if status not in {TaskRunStatus.PARTIAL, TaskRunStatus.INCONCLUSIVE}:
             raise InvalidTransition("conclude only accepts partial or inconclusive")
         if reason is not None:
-            if reason != "single_intent_slice_finished" or status is not TaskRunStatus.INCONCLUSIVE:
+            if status is not TaskRunStatus.INCONCLUSIVE:
                 raise InvalidTransition("invalid slice conclusion")
-            if any(e.status in {ExecutionStatus.PENDING, ExecutionStatus.RUNNING}
-                   for e in self.control_state.executions):
-                raise InvalidTransition("slice has unresolved executions")
+            if reason == "single_intent_slice_finished":
+                if any(e.status in {ExecutionStatus.PENDING, ExecutionStatus.RUNNING}
+                       for e in self.control_state.executions):
+                    raise InvalidTransition("slice has unresolved executions")
+            elif reason == "capability_not_supported":
+                task_run, state = self._require_bound_state()
+                load_config = getattr(self._persistent.store, "load_d3_run_config", None)
+                config = load_config(task_run.task_run_id) if callable(load_config) else None
+                if (
+                    config is None
+                    or config.authorization.attachment_indices != ()
+                    or task_run.request.target.attachments
+                    or task_run.request.target.endpoints
+                    or state.turns
+                    or state.executions
+                ):
+                    raise InvalidTransition("capability conclusion requires an empty-input D3 run")
+            else:
+                raise InvalidTransition("invalid slice conclusion")
         return self._finish_public(
             status,
             mutation_id=mutation_id,
@@ -1888,9 +2300,10 @@ class TaskRunController(LegacyTaskRunController):
             self._assert_finish_replay(
                 replay, {status.value, TaskRunStatus.DEADLINE_EXCEEDED.value}
             )
+            fixed_reasons = {"single_intent_slice_finished", "capability_not_supported"}
             if (replay.event.status is not TaskRunStatus.DEADLINE_EXCEEDED
-                    and (failure_reason == "single_intent_slice_finished"
-                         or replay.event.details.get("reason") == "single_intent_slice_finished")
+                    and (failure_reason in fixed_reasons
+                         or replay.event.details.get("reason") in fixed_reasons)
                     and replay.event.details.get("reason") != failure_reason):
                 raise IdempotencyConflictError("terminal reason differs from original commit")
             return CommittedOperation.from_commit(replay)
@@ -1928,13 +2341,8 @@ class TaskRunController(LegacyTaskRunController):
                 self._assert_replay_operation(replay, "finish_task_run")
                 return CommittedOperation.from_commit(replay)
             raise InvalidTransition("cannot change a terminal TaskRun")
-        load_d3_config = getattr(deps.store, "load_d3_run_config", None)
-        config = (
-            load_d3_config(task_run.task_run_id)
-            if callable(load_d3_config)
-            else None
-        )
-        if config is not None and getattr(config, "d4_budget", None) is not None:
+        config = self._load_frozen_d4_config(deps.store, task_run.task_run_id)
+        if config is not None:
             list_unresolved = getattr(
                 deps.store, "list_d4_unresolved_operations", None
             )
@@ -1971,7 +2379,9 @@ class TaskRunController(LegacyTaskRunController):
                 "operation": "finish_task_run",
                 "entity_ids": [task_run.task_run_id],
                 "result": status.value,
-                **({"reason": failure_reason} if failure_reason == "single_intent_slice_finished" else {}),
+                **({"reason": failure_reason} if failure_reason in {
+                    "single_intent_slice_finished", "capability_not_supported"
+                } else {}),
             },
         )
         mutation = ControlMutation.create(
@@ -2423,12 +2833,46 @@ class TaskRunController(LegacyTaskRunController):
 
     def close(self) -> None:
         deps = self._require_persistent()
-        if self._persistent_task_run_id is None or self._persistent_snapshot is None:
+        task_run_id = self._persistent_task_run_id
+        if task_run_id is None or self._persistent_snapshot is None:
             raise InvalidTransition("TaskRunController has no bound TaskRun")
-        if self._persistent_snapshot.status not in TERMINAL_STATUSES:
-            raise InvalidTransition("close is only allowed after TaskRun reaches a terminal state")
+        state = deps.repository.load_control_state(task_run_id)
+        if state is None:
+            raise TaskRunNotFoundError(f"TaskRun does not exist: {task_run_id}")
+        if (
+            state.task_run.task_run_id != task_run_id
+            or state.latest_checkpoint.task_run_id != task_run_id
+        ):
+            raise StorageError("close state belongs to another TaskRun")
+        if state.task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK:
+            config = self._load_frozen_d4_config(deps.store, task_run_id)
+            list_unresolved = getattr(
+                deps.store, "list_d4_unresolved_operations", None
+            )
+            if (
+                config is None
+                or getattr(config, "d4_budget", None) is None
+                or not callable(list_unresolved)
+            ):
+                raise D4RecoveryRequired("d7_feedback_wait_recovery_evidence_unavailable")
+            unresolved = list_unresolved(task_run_id)
+            if any(item.start.task_run_id != task_run_id for item in unresolved):
+                raise D4RecoveryRequired("d7_feedback_wait_operation_owner_changed")
+            if unresolved:
+                raise D4RecoveryRequired("d7_feedback_wait_has_unresolved_operation")
+            if any(
+                execution.status is ExecutionStatus.RUNNING
+                for execution in state.executions
+            ):
+                raise D4RecoveryRequired("d7_feedback_wait_has_running_execution")
+        elif state.task_run.status not in TERMINAL_STATUSES:
+            raise InvalidTransition(
+                "close requires a terminal TaskRun or a quiescent external-feedback wait"
+            )
+        self._persistent_snapshot = state.task_run
+        self._persistent_state = state
         if not self._registry_released:
-            deps.registry.release(self._persistent_task_run_id, self)
+            deps.registry.release(task_run_id, self)
             self._registry_released = True
         self._closed = True
 

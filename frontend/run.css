@@ -6,6 +6,7 @@
 .run-header { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
 .run-header h2 { margin: 0; font-size: 20px; }
 .run-summary { display: grid; grid-template-columns: 1.4fr repeat(4, 1fr); gap: 1px; background: #dce5df; border: 1px solid #dce5df; border-radius: 6px; overflow: hidden; margin: 14px 0; }
+.run-summary.v3 { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 .run-metric { background: #fff; padding: 9px 14px; min-width: 0; }
 .run-metric span, .run-metric strong { display: block; }
 .run-metric span { color: #778981; font-size: 10px; margin-bottom: 3px; }
@@ -90,14 +91,15 @@ body.detail-open .detail-view .editor-panel { max-width: 920px; margin: 35px aut
   .run-dashboard { grid-template-columns: minmax(0, 1fr); height: auto; }
   .graph-viewport { min-height: 500px; max-height: 70vh; }
   .detail-column { border-left: 0; border-top: 1px solid #dce5df; min-height: 430px; max-height: 68vh; }
-  .run-summary { grid-template-columns: repeat(3, 1fr); }
+  .run-summary, .run-summary.v3 { grid-template-columns: repeat(3, 1fr); }
+  .run-summary.v3 .run-metric:last-child { grid-column: 1 / -1; }
 }
 @media (max-width: 680px) {
   body.detail-open .detail-heading { flex-wrap: wrap; gap: 5px; }
   body.detail-open .detail-heading-main { flex-basis: 100%; }
   .run-panel { padding: 13px 12px 0; }
   .run-header { align-items: start; flex-wrap: wrap; }
-  .run-summary { grid-template-columns: repeat(2, 1fr); }
+  .run-summary, .run-summary.v3 { grid-template-columns: repeat(2, 1fr); }
   .graph-heading { align-items: start; flex-wrap: wrap; }
   .graph-viewport { min-height: 440px; max-height: 60vh; }
   .detail-column { max-height: 65vh; }

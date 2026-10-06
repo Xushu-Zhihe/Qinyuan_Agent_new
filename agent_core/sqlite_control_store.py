@@ -61,6 +61,12 @@ from agent_core.control_store import (
     task_request_payload,
     validate_control_event,
 )
+from agent_core.d7_web_contracts import (
+    D7WebExecutionRecord,
+    D7WebPlanRecord,
+    D7WebRunConfig,
+    canonical_web_origin,
+)
 from agent_core.domain import (
     ExecutionStatus,
     FactStatus,
@@ -92,6 +98,16 @@ from agent_core.dual_llm_contracts import (
     D3TurnBinding,
     d3_payload,
 )
+from agent_core.goal_candidates import D7AnswerCandidate, D7WebExecutionBinding
+from agent_core.goal_feedback import (
+    ExternalValidationCheckRecord,
+    ExternalValidationCheckRequest,
+    ExternalValidationCheckResult,
+    ExternalValidationFeedbackRecord,
+    external_validation_feedback_from_dict,
+    project_candidate_feedback,
+    validate_external_check_binding,
+)
 from agent_core.intent_action_application import (
     IntentActionApplication,
     IntentActionApplicationConflict,
@@ -120,6 +136,7 @@ from agent_core.operation_accounting import (
     D4AuditEvent,
     D4AuditOutcome,
     D4BudgetExhausted,
+    D4BudgetPolicy,
     D4BudgetUsage,
     D4OperationCategory,
     D4OperationCompletion,
@@ -135,7 +152,7 @@ from agent_core.review_contracts import (
     D2MaxActionTimeout,
     d2_payload,
 )
-from agent_core.runtime import RuntimeEvent, TaskRunStatus
+from agent_core.runtime import TERMINAL_STATUSES, RuntimeEvent, TaskRunStatus
 from agent_core.turn_contracts import (
     D1_CATEGORY_LIMITS,
     D1BudgetExhausted,
@@ -145,12 +162,13 @@ from agent_core.turn_contracts import (
     D1OperationStart,
     D1RecoveryRequired,
     D1RunConfig,
+    D1RoleConfig,
     D1TurnBinding,
     D1TurnProof,
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 21
 
 MIGRATION_14 = """
 CREATE TABLE d4_operations (
@@ -203,6 +221,35 @@ CREATE TABLE process_facts (
 );
 """
 
+MIGRATION_16 = """
+CREATE TABLE d7_answer_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    plan_id TEXT NOT NULL REFERENCES d3_plan_bindings(plan_id),
+    execution_id TEXT NOT NULL REFERENCES executions(execution_id),
+    evidence_version TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    candidate_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL,
+    UNIQUE(task_run_id, candidate_id)
+);
+CREATE INDEX idx_d7_candidates_task_turn
+ON d7_answer_candidates(task_run_id, turn_id);
+CREATE TABLE d7_validation_feedback (
+    operation_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    candidate_id TEXT NOT NULL REFERENCES d7_answer_candidates(candidate_id),
+    evidence_version TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('accepted', 'rejected', 'unknown')),
+    feedback_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+CREATE INDEX idx_d7_feedback_candidate_version
+ON d7_validation_feedback(task_run_id, candidate_id, evidence_version);
+"""
+
 MIGRATION_11 = """
 CREATE TABLE d1_runs (
     task_run_id TEXT PRIMARY KEY REFERENCES task_runs(task_run_id),
@@ -230,6 +277,216 @@ CREATE TABLE d1_operations (
     completion_json TEXT,
     application_ref TEXT
 );
+"""
+
+MIGRATION_17 = """
+CREATE TABLE d7_external_validation_checks (
+    query_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    candidate_id TEXT NOT NULL REFERENCES d7_answer_candidates(candidate_id),
+    submission_operation_id TEXT NOT NULL,
+    evidence_version TEXT NOT NULL,
+    checkpoint_sequence INTEGER NOT NULL CHECK (checkpoint_sequence > 0),
+    request_json TEXT NOT NULL,
+    started_event_sequence INTEGER NOT NULL,
+    result_json TEXT,
+    result_event_sequence INTEGER,
+    UNIQUE(task_run_id, query_id),
+    CHECK ((result_json IS NULL) = (result_event_sequence IS NULL))
+);
+CREATE INDEX idx_d7_external_checks_candidate
+ON d7_external_validation_checks(task_run_id, candidate_id, evidence_version);
+"""
+
+MIGRATION_18 = """
+CREATE TABLE d7_web_run_configs (
+    task_run_id TEXT PRIMARY KEY REFERENCES task_runs(task_run_id),
+    request_id TEXT NOT NULL UNIQUE,
+    config_ref TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+"""
+
+MIGRATION_19 = """
+CREATE TABLE d7_candidate_registry (
+    candidate_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('d3', 'web')),
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    plan_id TEXT NOT NULL,
+    execution_id TEXT NOT NULL,
+    evidence_version TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    candidate_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL,
+    UNIQUE(task_run_id, candidate_id)
+);
+CREATE INDEX idx_d7_candidate_registry_task_turn
+ON d7_candidate_registry(task_run_id, turn_id);
+INSERT INTO d7_candidate_registry(
+    candidate_id, task_run_id, source_kind, turn_id, intent_id, plan_id,
+    execution_id, evidence_version, source_ref, candidate_json,
+    created_event_sequence
+)
+SELECT candidate_id, task_run_id, 'd3', turn_id, intent_id, plan_id,
+       execution_id, evidence_version, source_ref, candidate_json,
+       created_event_sequence
+FROM d7_answer_candidates;
+
+ALTER TABLE d7_validation_feedback RENAME TO d7_validation_feedback_d3_fk;
+CREATE TABLE d7_validation_feedback (
+    operation_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    candidate_id TEXT NOT NULL REFERENCES d7_candidate_registry(candidate_id),
+    evidence_version TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('accepted', 'rejected', 'unknown')),
+    feedback_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+INSERT INTO d7_validation_feedback
+SELECT operation_id, task_run_id, candidate_id, evidence_version, verdict,
+       feedback_json, created_event_sequence
+FROM d7_validation_feedback_d3_fk;
+DROP TABLE d7_validation_feedback_d3_fk;
+CREATE INDEX idx_d7_feedback_candidate_version
+ON d7_validation_feedback(task_run_id, candidate_id, evidence_version);
+
+ALTER TABLE d7_external_validation_checks RENAME TO d7_external_validation_checks_d3_fk;
+CREATE TABLE d7_external_validation_checks (
+    query_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    candidate_id TEXT NOT NULL REFERENCES d7_candidate_registry(candidate_id),
+    submission_operation_id TEXT NOT NULL,
+    evidence_version TEXT NOT NULL,
+    checkpoint_sequence INTEGER NOT NULL CHECK (checkpoint_sequence > 0),
+    request_json TEXT NOT NULL,
+    started_event_sequence INTEGER NOT NULL,
+    result_json TEXT,
+    result_event_sequence INTEGER,
+    UNIQUE(task_run_id, query_id),
+    CHECK ((result_json IS NULL) = (result_event_sequence IS NULL))
+);
+INSERT INTO d7_external_validation_checks
+SELECT query_id, task_run_id, candidate_id, submission_operation_id,
+       evidence_version, checkpoint_sequence, request_json,
+       started_event_sequence, result_json, result_event_sequence
+FROM d7_external_validation_checks_d3_fk;
+DROP TABLE d7_external_validation_checks_d3_fk;
+CREATE INDEX idx_d7_external_checks_candidate
+ON d7_external_validation_checks(task_run_id, candidate_id, evidence_version);
+"""
+
+MIGRATION_20 = """
+CREATE TABLE d7_web_plans (
+    plan_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d7_web_run_configs(task_run_id),
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    method TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    request_bytes INTEGER NOT NULL CHECK (request_bytes BETWEEN 0 AND 65536),
+    created_at REAL NOT NULL,
+    record_json TEXT NOT NULL,
+    UNIQUE(task_run_id, plan_id)
+);
+CREATE INDEX idx_d7_web_plans_task_turn
+ON d7_web_plans(task_run_id, turn_id);
+CREATE TABLE d7_web_executions (
+    execution_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d7_web_run_configs(task_run_id),
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    plan_id TEXT NOT NULL,
+    http_operation_id TEXT NOT NULL UNIQUE,
+    request_sha256 TEXT NOT NULL,
+    request_bytes INTEGER NOT NULL CHECK (request_bytes BETWEEN 0 AND 65536),
+    started_at REAL NOT NULL,
+    start_json TEXT NOT NULL,
+    UNIQUE(task_run_id, execution_id),
+    FOREIGN KEY(task_run_id, plan_id)
+        REFERENCES d7_web_plans(task_run_id, plan_id)
+);
+CREATE INDEX idx_d7_web_executions_task_turn
+ON d7_web_executions(task_run_id, turn_id);
+CREATE TABLE d7_web_execution_results (
+    execution_id TEXT PRIMARY KEY REFERENCES d7_web_executions(execution_id),
+    task_run_id TEXT NOT NULL REFERENCES d7_web_run_configs(task_run_id),
+    state TEXT NOT NULL CHECK (state IN ('completed', 'rejected', 'unknown')),
+    http_status INTEGER,
+    response_evidence_id TEXT,
+    response_sha256 TEXT,
+    response_bytes INTEGER,
+    finished_at REAL NOT NULL,
+    result_json TEXT NOT NULL,
+    CHECK (
+        (state = 'completed'
+            AND http_status BETWEEN 100 AND 599
+            AND response_evidence_id IS NOT NULL
+            AND response_sha256 IS NOT NULL
+            AND response_bytes BETWEEN 0 AND 2097152)
+        OR
+        (state IN ('rejected', 'unknown')
+            AND http_status IS NULL
+            AND response_evidence_id IS NULL
+            AND response_sha256 IS NULL
+            AND response_bytes IS NULL)
+    )
+);
+CREATE UNIQUE INDEX idx_d7_web_response_evidence
+ON d7_web_execution_results(task_run_id, response_evidence_id)
+WHERE response_evidence_id IS NOT NULL;
+"""
+
+MIGRATION_21 = """
+CREATE TABLE d4_operations_new (
+    operation_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    category TEXT NOT NULL,
+    resource_ref TEXT NOT NULL,
+    charged INTEGER NOT NULL CHECK (charged IN (0, 1)),
+    start_json TEXT NOT NULL,
+    completion_json TEXT,
+    application_ref TEXT,
+    unknown_disposition_json TEXT
+);
+INSERT INTO d4_operations_new(
+    operation_id, task_run_id, category, resource_ref, charged, start_json,
+    completion_json, application_ref, unknown_disposition_json
+)
+SELECT operation_id, task_run_id, category, resource_ref, charged, start_json,
+       completion_json, application_ref, unknown_disposition_json
+FROM d4_operations;
+DROP TABLE d4_operations;
+ALTER TABLE d4_operations_new RENAME TO d4_operations;
+CREATE INDEX idx_d4_operations_task_category
+ON d4_operations(task_run_id, category);
+
+CREATE TABLE d4_audit_events_new (
+    event_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    category TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    occurred_at REAL NOT NULL,
+    evidence_ref TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL,
+    related_ref TEXT,
+    event_json TEXT NOT NULL
+);
+INSERT INTO d4_audit_events_new(
+    event_id, task_run_id, category, outcome, occurred_at, evidence_ref,
+    evidence_sha256, related_ref, event_json
+)
+SELECT event_id, task_run_id, category, outcome, occurred_at, evidence_ref,
+       evidence_sha256, related_ref, event_json
+FROM d4_audit_events;
+DROP TABLE d4_audit_events;
+ALTER TABLE d4_audit_events_new RENAME TO d4_audit_events;
+CREATE INDEX idx_d4_audit_events_task_category
+ON d4_audit_events(task_run_id, category);
+CREATE INDEX idx_d4_audit_events_related
+ON d4_audit_events(task_run_id, related_ref);
 """
 
 MIGRATION_12 = """
@@ -678,8 +935,11 @@ class SqliteControlStore:
         connection.row_factory = sqlite3.Row
         try:
             version = connection.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0]
-            if version not in {10, 11, 12, 13, 14, CURRENT_SCHEMA_VERSION}:
-                raise StorageError("read-only history requires supported schema 10 through 15")
+            if version not in {
+                10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                CURRENT_SCHEMA_VERSION,
+            }:
+                raise StorageError("read-only history requires supported schema 10 through 21")
             connection.execute("BEGIN")
             store = cls(connection, database_path, clock=time.time)
             store._schema_version = int(version)
@@ -825,6 +1085,48 @@ class SqliteControlStore:
                 self._connection.execute(
                     "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                     (15, self._now()),
+                )
+            if version < 16:
+                for statement in _sql_statements(MIGRATION_16):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (16, self._now()),
+                )
+            if version < 17:
+                for statement in _sql_statements(MIGRATION_17):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (17, self._now()),
+                )
+            if version < 18:
+                for statement in _sql_statements(MIGRATION_18):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (18, self._now()),
+                )
+            if version < 19:
+                for statement in _sql_statements(MIGRATION_19):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (19, self._now()),
+                )
+            if version < 20:
+                for statement in _sql_statements(MIGRATION_20):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (20, self._now()),
+                )
+            if version < 21:
+                for statement in _sql_statements(MIGRATION_21):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (21, self._now()),
                 )
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
@@ -1729,6 +2031,513 @@ class SqliteControlStore:
             records.append(record)
         return tuple(records)
 
+    def load_d7_answer_candidate(
+        self, candidate_id: str
+    ) -> D7AnswerCandidate | None:
+        if self._schema_version < 16:
+            return None
+        if self._schema_version >= 19:
+            row = self._connection.execute(
+                "SELECT * FROM d7_candidate_registry WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        else:
+            row = self._connection.execute(
+                "SELECT * FROM d7_answer_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            candidate = D7AnswerCandidate.from_dict(
+                json.loads(row["candidate_json"])
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("stored D7 candidate is invalid") from exc
+        if (
+            candidate.candidate_id != row["candidate_id"]
+            or candidate.task_run_id != row["task_run_id"]
+            or candidate.turn_id != row["turn_id"]
+            or candidate.intent_id != row["intent_id"]
+            or candidate.plan_id != row["plan_id"]
+            or candidate.execution_id != row["execution_id"]
+            or candidate.evidence_version != row["evidence_version"]
+            or candidate.source_ref != row["source_ref"]
+            or self._schema_version >= 19
+            and candidate.source_kind != row["source_kind"]
+        ):
+            raise StorageError("D7 candidate row differs from its typed record")
+        return candidate
+
+    def list_d7_answer_candidates(
+        self, task_run_id: str
+    ) -> tuple[D7AnswerCandidate, ...]:
+        if self._schema_version < 16:
+            return ()
+        table = (
+            "d7_candidate_registry"
+            if self._schema_version >= 19
+            else "d7_answer_candidates"
+        )
+        rows = self._connection.execute(
+            f"SELECT candidate_id FROM {table} "
+            "WHERE task_run_id = ? ORDER BY created_event_sequence, rowid",
+            (task_run_id,),
+        ).fetchall()
+        candidates = tuple(
+            self.load_d7_answer_candidate(row["candidate_id"]) for row in rows
+        )
+        if any(item is None for item in candidates):
+            raise StorageError("D7 candidate disappeared while listing")
+        return tuple(item for item in candidates if item is not None)
+
+    def load_d7_web_run_config(self, task_run_id: str) -> D7WebRunConfig | None:
+        if self._schema_version < 18:
+            return None
+        row = self._connection.execute(
+            "SELECT request_id, config_ref, config_json FROM d7_web_run_configs "
+            "WHERE task_run_id = ?",
+            (task_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            config = D7WebRunConfig.from_dict(json.loads(row["config_json"]))
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("stored D7 Web run config is invalid") from exc
+        if (
+            config.task_run_id != task_run_id
+            or config.request_id != row["request_id"]
+            or config.config_ref != row["config_ref"]
+        ):
+            raise StorageError("D7 Web config row differs from its typed record")
+        return config
+
+    def load_d7_web_plan(self, plan_id: str) -> D7WebPlanRecord | None:
+        if self._schema_version < 20:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM d7_web_plans WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            record = D7WebPlanRecord.from_dict(json.loads(row["record_json"]))
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("stored D7 Web Plan is invalid") from exc
+        if (
+            record.plan_id != row["plan_id"]
+            or record.task_run_id != row["task_run_id"]
+            or record.turn_id != row["turn_id"]
+            or record.intent_id != row["intent_id"]
+            or record.method != row["method"]
+            or record.request_sha256 != row["request_sha256"]
+            or record.request_bytes != row["request_bytes"]
+            or record.created_at != row["created_at"]
+        ):
+            raise StorageError("D7 Web Plan row differs from its typed record")
+        return record
+
+    def list_d7_web_plans(self, task_run_id: str) -> tuple[D7WebPlanRecord, ...]:
+        if self._schema_version < 20:
+            return ()
+        rows = self._connection.execute(
+            "SELECT plan_id FROM d7_web_plans WHERE task_run_id = ? "
+            "ORDER BY created_at, rowid",
+            (task_run_id,),
+        ).fetchall()
+        records = tuple(self.load_d7_web_plan(row["plan_id"]) for row in rows)
+        if any(record is None for record in records):
+            raise StorageError("D7 Web Plan disappeared while listing")
+        return tuple(record for record in records if record is not None)
+
+    def load_d7_web_execution(
+        self, execution_id: str
+    ) -> D7WebExecutionRecord | None:
+        if self._schema_version < 20:
+            return None
+        row = self._connection.execute(
+            """SELECT e.*, r.state AS result_state, r.http_status,
+                      r.response_evidence_id, r.response_sha256,
+                      r.response_bytes, r.finished_at, r.result_json
+               FROM d7_web_executions AS e
+               LEFT JOIN d7_web_execution_results AS r
+                 ON r.execution_id = e.execution_id
+               WHERE e.execution_id = ?""",
+            (execution_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            started = D7WebExecutionRecord.from_dict(json.loads(row["start_json"]))
+            record = (
+                started
+                if row["result_json"] is None
+                else D7WebExecutionRecord.from_dict(json.loads(row["result_json"]))
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("stored D7 Web Execution is invalid") from exc
+        immutable_fields = (
+            "task_run_id", "turn_id", "intent_id", "plan_id", "execution_id",
+            "http_operation_id", "request_sha256", "request_bytes", "started_at",
+        )
+        if (
+            started.state != "started"
+            or any(getattr(started, name) != getattr(record, name) for name in immutable_fields)
+            or record.execution_id != row["execution_id"]
+            or record.task_run_id != row["task_run_id"]
+            or record.turn_id != row["turn_id"]
+            or record.intent_id != row["intent_id"]
+            or record.plan_id != row["plan_id"]
+            or record.http_operation_id != row["http_operation_id"]
+            or record.request_sha256 != row["request_sha256"]
+            or record.request_bytes != row["request_bytes"]
+            or record.started_at != row["started_at"]
+        ):
+            raise StorageError("D7 Web Execution row differs from its typed record")
+        if row["result_json"] is not None and (
+            record.state != row["result_state"]
+            or record.http_status != row["http_status"]
+            or record.response_evidence_id != row["response_evidence_id"]
+            or record.response_sha256 != row["response_sha256"]
+            or record.response_bytes != row["response_bytes"]
+            or record.finished_at != row["finished_at"]
+        ):
+            raise StorageError("D7 Web Execution result row differs from its record")
+        return record
+
+    def list_d7_web_executions(
+        self, task_run_id: str
+    ) -> tuple[D7WebExecutionRecord, ...]:
+        if self._schema_version < 20:
+            return ()
+        rows = self._connection.execute(
+            "SELECT execution_id FROM d7_web_executions WHERE task_run_id = ? "
+            "ORDER BY started_at, rowid",
+            (task_run_id,),
+        ).fetchall()
+        records = tuple(
+            self.load_d7_web_execution(row["execution_id"]) for row in rows
+        )
+        if any(record is None for record in records):
+            raise StorageError("D7 Web Execution disappeared while listing")
+        return tuple(record for record in records if record is not None)
+
+    def load_d7_web_execution_binding(
+        self, execution_id: str
+    ) -> D7WebExecutionBinding | None:
+        record = self.load_d7_web_execution(execution_id)
+        if record is None or record.state != "completed":
+            return None
+        assert record.response_evidence_id is not None
+        assert record.response_sha256 is not None
+        assert record.response_bytes is not None
+        return D7WebExecutionBinding(
+            task_run_id=record.task_run_id,
+            turn_id=record.turn_id,
+            intent_id=record.intent_id,
+            plan_id=record.plan_id,
+            execution_id=record.execution_id,
+            http_operation_id=record.http_operation_id,
+            response_evidence_id=record.response_evidence_id,
+            response_sha256=record.response_sha256,
+            response_bytes=record.response_bytes,
+        )
+
+    def _validate_d7_web_scope(
+        self, task_run_id: str, turn_id: str, intent_id: str
+    ) -> D7WebRunConfig:
+        config = self.load_d7_web_run_config(task_run_id)
+        state = self.load_control_state_rows(task_run_id)
+        if (
+            config is None
+            or self.load_d3_run_config(task_run_id) is not None
+            or state is None
+            or state.task_run.status.value != "running"
+        ):
+            raise StorageError("D7 Web operation requires a running Web TaskRun")
+        turns = {item.turn_id: item for item in state.turns}
+        intents = {item.intent_id: item for item in state.intents}
+        turn = turns.get(turn_id)
+        intent = intents.get(intent_id)
+        if (
+            turn is None
+            or turn.task_run_id != task_run_id
+            or turn.status is not TurnStatus.RUNNING
+            or intent is None
+            or intent.turn_id != turn_id
+            or intent.status is not IntentStatus.RUNNING
+        ):
+            raise StorageError("D7 Web operation is outside its active Turn and Intent")
+        return config
+
+    @staticmethod
+    def _same_d7_web_execution_start(
+        left: D7WebExecutionRecord, right: D7WebExecutionRecord
+    ) -> bool:
+        return all(
+            getattr(left, name) == getattr(right, name)
+            for name in (
+                "task_run_id", "turn_id", "intent_id", "plan_id", "execution_id",
+                "http_operation_id", "request_sha256", "request_bytes", "started_at",
+            )
+        )
+
+    def register_d7_web_plan(
+        self, record: D7WebPlanRecord
+    ) -> D7WebPlanRecord:
+        if not isinstance(record, D7WebPlanRecord):
+            raise TypeError("record must be D7WebPlanRecord")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self.load_d7_web_plan(record.plan_id)
+            if existing is not None:
+                if existing != record:
+                    raise IdempotencyConflictError("D7 Web Plan ID has different content")
+                self._connection.commit()
+                return existing
+            config = self._validate_d7_web_scope(
+                record.task_run_id, record.turn_id, record.intent_id
+            )
+            if record.method not in config.authorization.allowed_methods:
+                raise StorageError("D7 Web Plan method is not authorized")
+            self._connection.execute(
+                """INSERT INTO d7_web_plans(
+                       plan_id, task_run_id, turn_id, intent_id, method,
+                       request_sha256, request_bytes, created_at, record_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.plan_id,
+                    record.task_run_id,
+                    record.turn_id,
+                    record.intent_id,
+                    record.method,
+                    record.request_sha256,
+                    record.request_bytes,
+                    record.created_at,
+                    canonical_json(record.to_dict()),
+                ),
+            )
+            self._connection.commit()
+            return record
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def start_d7_web_execution(
+        self, record: D7WebExecutionRecord
+    ) -> tuple[D7WebExecutionRecord, bool]:
+        if not isinstance(record, D7WebExecutionRecord) or record.state != "started":
+            raise TypeError("record must be a started D7WebExecutionRecord")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self.load_d7_web_execution(record.execution_id)
+            if existing is not None:
+                if not self._same_d7_web_execution_start(existing, record):
+                    raise IdempotencyConflictError(
+                        "D7 Web Execution ID has different start content"
+                    )
+                self._connection.commit()
+                return existing, False
+            operation_row = self._connection.execute(
+                "SELECT execution_id FROM d7_web_executions WHERE http_operation_id = ?",
+                (record.http_operation_id,),
+            ).fetchone()
+            if operation_row is not None:
+                raise IdempotencyConflictError(
+                    "D7 HTTP operation ID is already bound to another Execution"
+                )
+            config = self._validate_d7_web_scope(
+                record.task_run_id, record.turn_id, record.intent_id
+            )
+            plan = self.load_d7_web_plan(record.plan_id)
+            if (
+                plan is None
+                or plan.task_run_id != record.task_run_id
+                or plan.turn_id != record.turn_id
+                or plan.intent_id != record.intent_id
+                or plan.request_sha256 != record.request_sha256
+                or plan.request_bytes != record.request_bytes
+                or plan.method not in config.authorization.allowed_methods
+            ):
+                raise StorageError("D7 Web Execution does not match its saved Plan")
+            self._connection.execute(
+                """INSERT INTO d7_web_executions(
+                       execution_id, task_run_id, turn_id, intent_id, plan_id,
+                       http_operation_id, request_sha256, request_bytes, started_at,
+                       start_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.execution_id,
+                    record.task_run_id,
+                    record.turn_id,
+                    record.intent_id,
+                    record.plan_id,
+                    record.http_operation_id,
+                    record.request_sha256,
+                    record.request_bytes,
+                    record.started_at,
+                    canonical_json(record.to_dict()),
+                ),
+            )
+            self._connection.commit()
+            return record, True
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def complete_d7_web_execution(
+        self, record: D7WebExecutionRecord
+    ) -> D7WebExecutionRecord:
+        if (
+            not isinstance(record, D7WebExecutionRecord)
+            or record.state not in {"completed", "rejected", "unknown"}
+        ):
+            raise TypeError("record must be a terminal D7WebExecutionRecord")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            started = self.load_d7_web_execution(record.execution_id)
+            if started is None or not self._same_d7_web_execution_start(started, record):
+                raise StorageError("D7 Web Execution completion has no matching start")
+            row = self._connection.execute(
+                "SELECT result_json FROM d7_web_execution_results WHERE execution_id = ?",
+                (record.execution_id,),
+            ).fetchone()
+            if row is not None:
+                existing = D7WebExecutionRecord.from_dict(json.loads(row["result_json"]))
+                if existing != record:
+                    raise IdempotencyConflictError(
+                        "D7 Web Execution terminal result is immutable"
+                    )
+                self._connection.commit()
+                return existing
+            self._validate_d7_web_scope(
+                record.task_run_id, record.turn_id, record.intent_id
+            )
+            self._connection.execute(
+                """INSERT INTO d7_web_execution_results(
+                       execution_id, task_run_id, state, http_status,
+                       response_evidence_id, response_sha256, response_bytes,
+                       finished_at, result_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.execution_id,
+                    record.task_run_id,
+                    record.state,
+                    record.http_status,
+                    record.response_evidence_id,
+                    record.response_sha256,
+                    record.response_bytes,
+                    record.finished_at,
+                    canonical_json(record.to_dict()),
+                ),
+            )
+            self._connection.commit()
+            return record
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def list_d7_validation_feedback(
+        self, task_run_id: str, candidate_id: str, evidence_version: str,
+        *, through_event_sequence: int | None = None,
+    ) -> tuple[ExternalValidationFeedbackRecord, ...]:
+        if through_event_sequence is not None and (
+            type(through_event_sequence) is not int or through_event_sequence < 1
+        ):
+            raise ValueError("feedback event sequence must be a positive integer")
+        if self._schema_version < 16:
+            return ()
+        boundary = (
+            "" if through_event_sequence is None
+            else "AND created_event_sequence <= ? "
+        )
+        parameters = (task_run_id, candidate_id, evidence_version)
+        if through_event_sequence is not None:
+            parameters += (through_event_sequence,)
+        rows = self._connection.execute(
+            "SELECT operation_id, feedback_json FROM d7_validation_feedback "
+            "WHERE task_run_id = ? AND candidate_id = ? AND evidence_version = ? "
+            + boundary + "ORDER BY created_event_sequence, rowid",
+            parameters,
+        ).fetchall()
+        records = []
+        for row in rows:
+            try:
+                feedback = external_validation_feedback_from_dict(
+                    json.loads(row["feedback_json"])
+                )
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise StorageError("stored D7 feedback is invalid") from exc
+            if (
+                feedback.operation_id != row["operation_id"]
+                or feedback.task_run_id != task_run_id
+                or feedback.candidate_id != candidate_id
+                or feedback.evidence_version != evidence_version
+            ):
+                raise StorageError("D7 feedback row differs from its typed record")
+            records.append(feedback)
+        return tuple(records)
+
+    def load_d7_external_validation_check(
+        self, query_id: str
+    ) -> ExternalValidationCheckRecord | None:
+        if self._schema_version < 17:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM d7_external_validation_checks WHERE query_id = ?",
+            (query_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            request = ExternalValidationCheckRequest.from_dict(
+                json.loads(row["request_json"])
+            )
+            result = (
+                None
+                if row["result_json"] is None
+                else ExternalValidationCheckResult.from_dict(
+                    json.loads(row["result_json"])
+                )
+            )
+            record = ExternalValidationCheckRecord(
+                request=request,
+                result=result,
+                started_event_sequence=row["started_event_sequence"],
+                result_event_sequence=row["result_event_sequence"],
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("stored D7 external validation check is invalid") from exc
+        if (
+            request.query_id != row["query_id"]
+            or request.task_run_id != row["task_run_id"]
+            or request.candidate_id != row["candidate_id"]
+            or request.submission_operation_id != row["submission_operation_id"]
+            or request.evidence_version != row["evidence_version"]
+            or request.checkpoint_sequence != row["checkpoint_sequence"]
+            or record.started_event_sequence <= 0
+        ):
+            raise StorageError("D7 external validation row differs from its request")
+        return record
+
+    def list_d7_external_validation_checks(
+        self, task_run_id: str
+    ) -> tuple[ExternalValidationCheckRecord, ...]:
+        if self._schema_version < 17:
+            return ()
+        rows = self._connection.execute(
+            "SELECT query_id FROM d7_external_validation_checks "
+            "WHERE task_run_id = ? ORDER BY started_event_sequence, rowid",
+            (task_run_id,),
+        ).fetchall()
+        records = tuple(
+            self.load_d7_external_validation_check(row["query_id"]) for row in rows
+        )
+        if any(record is None for record in records):
+            raise StorageError("D7 external validation check disappeared while listing")
+        return tuple(record for record in records if record is not None)
+
     def load_d4_operation(self, operation_id: str) -> D4OperationRecord | None:
         if self._schema_version < 14:
             return None
@@ -2025,12 +2834,17 @@ class SqliteControlStore:
     def _prepare_control_commit_audit(
         self, mutation: ControlMutation
     ) -> D4AuditEvent | None:
-        config = self.load_d3_run_config(mutation.task_run_id)
-        d4_enabled = config is not None and config.d4_budget is not None
+        configuration = self._d4_policy_and_roles(mutation.task_run_id)
+        d4_enabled = configuration is not None
         if not d4_enabled and mutation.d3 is not None:
             d4_enabled = (
                 mutation.d3.config is not None
                 and mutation.d3.config.d4_budget is not None
+            )
+        if not d4_enabled and mutation.d7 is not None:
+            d4_enabled = (
+                mutation.d7.run_config is not None
+                and mutation.d7.run_config.d4_budget is not None
             )
         if not d4_enabled:
             return None
@@ -2055,13 +2869,13 @@ class SqliteControlStore:
         event = self._control_commit_audit_event(
             mutation, "control_commit_started", "known", self._now()
         )
-        if config is not None and config.d4_budget is not None:
+        if configuration is not None:
             self.record_d4_audit_event(event)
         return event
 
     def _record_control_commit_failure(self, mutation: ControlMutation) -> None:
-        config = self.load_d3_run_config(mutation.task_run_id)
-        if config is None or config.d4_budget is None:
+        configuration = self._d4_policy_and_roles(mutation.task_run_id)
+        if configuration is None:
             return
         try:
             row = self._connection.execute(
@@ -2160,8 +2974,7 @@ class SqliteControlStore:
     def record_d4_audit_event(self, event: D4AuditEvent) -> D4AuditEvent:
         if not isinstance(event, D4AuditEvent):
             raise TypeError("event must be D4AuditEvent")
-        config = self.load_d3_run_config(event.task_run_id)
-        if config is None or config.d4_budget is None:
+        if self._d4_policy_and_roles(event.task_run_id) is None:
             raise D4OperationConflict("audit event requires a registered D4 TaskRun")
         try:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -2178,12 +2991,28 @@ class SqliteControlStore:
             self._rollback_quietly()
             raise
 
+    def _d4_policy_and_roles(
+        self, task_run_id: str
+    ) -> tuple[D4BudgetPolicy, D1RoleConfig, D1RoleConfig] | None:
+        d3_config = self.load_d3_run_config(task_run_id)
+        web_config = self.load_d7_web_run_config(task_run_id)
+        if d3_config is not None and web_config is not None:
+            raise D4OperationConflict("TaskRun has conflicting D4 configuration owners")
+        if d3_config is not None:
+            if d3_config.d4_budget is None:
+                return None
+            return d3_config.d4_budget, d3_config.outer_role, d3_config.inner_role
+        if web_config is not None:
+            return web_config.d4_budget, web_config.outer_role, web_config.inner_role
+        return None
+
     def d4_budget_usage(self, task_run_id: str) -> D4BudgetUsage:
-        config = self.load_d3_run_config(task_run_id)
-        if config is None or config.d4_budget is None:
+        configuration = self._d4_policy_and_roles(task_run_id)
+        if configuration is None:
             raise D4OperationConflict("budget usage requires an explicitly registered D4 TaskRun")
+        budget, _outer_role, _inner_role = configuration
         records = self.list_d4_operations(task_run_id)
-        if any(record.start.budget_policy_ref != config.d4_budget.budget_policy_ref for record in records):
+        if any(record.start.budget_policy_ref != budget.budget_policy_ref for record in records):
             raise D4OperationConflict("operation budget differs from frozen configuration")
         counts = tuple(
             (category, sum(record.start.category == category for record in records))
@@ -2191,7 +3020,7 @@ class SqliteControlStore:
         )
         return D4BudgetUsage(
             task_run_id,
-            config.d4_budget.budget_policy_ref,
+            budget.budget_policy_ref,
             sum(record.start.charged for record in records),
             counts,
             sum(not record.start.charged for record in records),
@@ -2211,13 +3040,14 @@ class SqliteControlStore:
 
     def _begin_d4_operation(self, start: D4OperationStart) -> D4OperationRecord | None:
         """Admit a start inside the caller's transaction before any dispatch."""
-        config = self.load_d3_run_config(start.task_run_id)
-        if config is None or config.d4_budget is None:
+        configuration = self._d4_policy_and_roles(start.task_run_id)
+        if configuration is None:
             raise D4OperationConflict("operation requires an explicitly registered D4 TaskRun")
-        if start.budget_policy_ref != config.d4_budget.budget_policy_ref:
+        budget, outer_role, inner_role = configuration
+        if start.budget_policy_ref != budget.budget_policy_ref:
             raise D4OperationConflict("operation budget differs from frozen configuration")
         if start.role is not None:
-            role = config.outer_role if start.role == "outer_planning" else config.inner_role
+            role = outer_role if start.role == "outer_planning" else inner_role
             if start.role_config_ref != role.role_config_ref:
                 raise D4OperationConflict("model role differs from frozen configuration")
         existing = self.load_d4_operation(start.operation_id)
@@ -2253,9 +3083,9 @@ class SqliteControlStore:
             raise D4RecoveryRequired("an earlier operation result remains unknown")
         records = self.list_d4_operations(start.task_run_id)
         if start.charged:
-            if sum(record.start.charged for record in records) >= config.d4_budget.total:
+            if sum(record.start.charged for record in records) >= budget.total:
                 raise D4BudgetExhausted("D4 total operation-start budget exhausted")
-            if sum(record.start.category == start.category for record in records) >= getattr(config.d4_budget, start.category):
+            if sum(record.start.category == start.category for record in records) >= getattr(budget, start.category):
                 raise D4BudgetExhausted(f"D4 {start.category} budget exhausted")
         self._connection.execute(
             "INSERT INTO d4_operations(operation_id, task_run_id, category, resource_ref, charged, start_json) "
@@ -2995,6 +3825,420 @@ class SqliteControlStore:
         )
         self._mark_d4_operation_applied(fact.model_request_id, fact.process_fact_id)
 
+    def _validate_d7_mutation(self, mutation: ControlMutation) -> None:
+        metadata = mutation.d7
+        if metadata is not None and metadata.run_config is not None:
+            config = metadata.run_config
+            task_change = next(
+                (item for item in mutation.state_changes if isinstance(item, UpsertTaskRun)),
+                None,
+            )
+            endpoints = mutation.request.target.endpoints
+            if (
+                mutation.operation != "start_task_run"
+                or mutation.d3 is not None
+                or mutation.d1_config is not None
+                or mutation.d2_config is not None
+                or self.load_d7_web_run_config(mutation.task_run_id) is not None
+                or self.load_d3_run_config(mutation.task_run_id) is not None
+                or self.load_d1_run_config(mutation.task_run_id) is not None
+                or self.load_d2_run_config(mutation.task_run_id) is not None
+                or config.task_run_id != mutation.task_run_id
+                or task_change is None
+                or len(mutation.state_changes) != 1
+                or task_change.task_run_id != mutation.task_run_id
+                or task_change.request != mutation.request
+                or task_change.status is not TaskRunStatus.RUNNING
+                or len(endpoints) != 1
+                or mutation.request.target.attachments
+                or canonical_web_origin(endpoints[0].url) != config.endpoint
+                or config.authorization.allowed_origin != config.endpoint
+            ):
+                raise StorageError("D7 Web config must bind its explicit Web TaskRun start")
+            return
+        if mutation.operation not in {
+            "register_d7_candidate", "apply_external_validation_feedback",
+            "start_external_validation_check", "complete_external_validation_check",
+        }:
+            if mutation.d7 is not None:
+                raise StorageError("D7 metadata is not allowed for this operation")
+            return
+        if metadata is None:
+            raise StorageError("D7 lifecycle operation requires typed metadata")
+        d3_config = self.load_d3_run_config(mutation.task_run_id)
+        web_config = self.load_d7_web_run_config(mutation.task_run_id)
+        if (d3_config is None) == (web_config is None):
+            raise StorageError("D7 lifecycle requires exactly one D3 or Web TaskRun config")
+        state = self.load_control_state_rows(mutation.task_run_id)
+        task_change = next(
+            (item for item in mutation.state_changes if isinstance(item, UpsertTaskRun)),
+            None,
+        )
+        if (
+            state is None
+            or task_change is None
+            or len(mutation.state_changes) != 1
+            or task_change.task_run_id != mutation.task_run_id
+            or task_change.request != state.task_run.request
+            or task_change.effective_model_backend != state.task_run.effective_model_backend
+            or task_change.started_at != state.task_run.started_at
+            or task_change.deadline_at != state.task_run.deadline_at
+            or task_change.sandbox_id != state.task_run.sandbox_id
+        ):
+            raise StorageError("D7 lifecycle requires one immutable TaskRun update")
+        if self.list_d4_unresolved_operations(mutation.task_run_id):
+            raise D4RecoveryRequired("D7 feedback cannot apply with unresolved operations")
+
+        if mutation.operation == "register_d7_candidate":
+            candidate = metadata.candidate
+            if (
+                candidate is None
+                or metadata.feedback is not None
+                or state.task_run.status is not TaskRunStatus.RUNNING
+                or task_change.status is not TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
+                or candidate.task_run_id != mutation.task_run_id
+                or self.load_d7_answer_candidate(candidate.candidate_id) is not None
+            ):
+                raise StorageError("D7 candidate registration is not admitted")
+            turns = {item.turn_id: item for item in state.turns}
+            intents = {item.intent_id: item for item in state.intents}
+            turn = turns.get(candidate.turn_id)
+            intent = intents.get(candidate.intent_id)
+            if (
+                turn is None
+                or turn.task_run_id != mutation.task_run_id
+                or turn.status is not TurnStatus.COMPLETED
+                or intent is None
+                or intent.turn_id != candidate.turn_id
+                or intent.status is not IntentStatus.SUCCEEDED
+            ):
+                raise StorageError("D7 candidate Turn or Intent is not complete and owned")
+            if candidate.source_kind == "d3":
+                plans = {item.plan_id: item for item in state.plans}
+                executions = {item.execution_id: item for item in state.executions}
+                plan = plans.get(candidate.plan_id)
+                execution = executions.get(candidate.execution_id)
+                binding = self.load_d3_plan_binding(candidate.plan_id)
+                result = self.load_d3_plan_result(candidate.plan_id)
+                if (
+                    d3_config is None
+                    or web_config is not None
+                    or plan is None
+                    or plan.intent_id != candidate.intent_id
+                    or plan.status is not PlanStatus.COMPLETED
+                    or execution is None
+                    or execution.plan_id != candidate.plan_id
+                    or execution.status is not ExecutionStatus.SUCCEEDED
+                    or execution.output_ref is None
+                    or binding is None
+                    or binding.task_run_id != mutation.task_run_id
+                    or binding.intent_id != candidate.intent_id
+                    or binding.artifact_version_id != candidate.source_ref
+                    or result is None
+                    or result.task_run_id != mutation.task_run_id
+                    or result.evidence_sha256 != candidate.evidence_version
+                ):
+                    raise StorageError("D7 candidate source is not a completed owned D3 Execution")
+                if any(item.status is ExecutionStatus.RUNNING for item in state.executions):
+                    raise StorageError("D7 candidate cannot be registered with a running Execution")
+            elif candidate.source_kind == "web":
+                persisted_binding = self.load_d7_web_execution_binding(
+                    candidate.execution_id
+                )
+                plan = self.load_d7_web_plan(candidate.plan_id)
+                execution = self.load_d7_web_execution(candidate.execution_id)
+                if (
+                    web_config is None
+                    or d3_config is not None
+                    or plan is None
+                    or plan.task_run_id != mutation.task_run_id
+                    or plan.turn_id != candidate.turn_id
+                    or plan.intent_id != candidate.intent_id
+                    or execution is None
+                    or execution.state != "completed"
+                    or execution.task_run_id != mutation.task_run_id
+                    or execution.turn_id != candidate.turn_id
+                    or execution.intent_id != candidate.intent_id
+                    or execution.plan_id != candidate.plan_id
+                    or persisted_binding != candidate.web_execution_binding
+                    or persisted_binding is None
+                    or persisted_binding.response_evidence_id != candidate.source_ref
+                    or persisted_binding.response_sha256 != candidate.evidence_version
+                ):
+                    raise StorageError("D7 candidate source is not a completed owned Web Execution")
+            else:
+                raise StorageError("D7 candidate source kind is invalid")
+            if self._d7_has_feedback_conflict(mutation.task_run_id):
+                raise StorageError("D7 feedback conflict blocks further candidate registration")
+            return
+
+        if mutation.operation == "start_external_validation_check":
+            request = metadata.check_request
+            candidate = (
+                None
+                if request is None
+                else self.load_d7_answer_candidate(request.candidate_id)
+            )
+            prior = (
+                ()
+                if request is None
+                else self.list_d7_validation_feedback(
+                    request.task_run_id,
+                    request.candidate_id,
+                    request.evidence_version,
+                )
+            )
+            if request is not None:
+                validate_external_check_binding(request, prior)
+            if (
+                request is None
+                or metadata.feedback is not None
+                or metadata.check_completion is not None
+                or state.task_run.status is not TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK and not request.conflict_sources
+                or task_change.status is not state.task_run.status
+                or mutation.event.timestamp >= state.task_run.deadline_at
+                or request.task_run_id != mutation.task_run_id
+                or request.checkpoint_sequence != mutation.checkpoint.sequence
+                or candidate is None
+                or candidate.task_run_id != mutation.task_run_id
+                or candidate.evidence_version != request.evidence_version
+                or self.load_d7_external_validation_check(request.query_id) is not None
+            ):
+                raise StorageError("D7 external check start is not bound to unresolved feedback")
+            return
+
+        if mutation.operation == "complete_external_validation_check":
+            completion = metadata.check_completion
+            if completion is None or metadata.check_request is not None:
+                raise StorageError("D7 external check completion metadata is invalid")
+            request = completion.result.request
+            record = self.load_d7_external_validation_check(request.query_id)
+            if (
+                record is None
+                or record.request != request
+                or record.result is not None
+                or request.task_run_id != mutation.task_run_id
+                or completion.result.verdict == "unknown"
+                and completion.reconciliation is not None
+                or completion.result.verdict != "unknown"
+                and completion.reconciliation is None
+            ):
+                raise StorageError("D7 external check result has no matching incomplete start")
+            candidate = self.load_d7_answer_candidate(request.candidate_id)
+            prior = self.list_d7_validation_feedback(
+                request.task_run_id,
+                request.candidate_id,
+                request.evidence_version,
+            )
+            if (
+                candidate is None
+                or candidate.task_run_id != mutation.task_run_id
+                or candidate.evidence_version != request.evidence_version
+            ):
+                raise StorageError("D7 external check result lost its unknown submission")
+            validate_external_check_binding(request, prior)
+            proposed = (
+                prior
+                if completion.reconciliation is None
+                else (*prior, completion.reconciliation)
+            )
+            projection = project_candidate_feedback(
+                request.task_run_id,
+                request.candidate_id,
+                request.evidence_version,
+                proposed,
+            )
+            previous_task = self.load_task_run(mutation.task_run_id)
+            if previous_task is None:
+                raise StorageError("D7 external check TaskRun disappeared")
+            if previous_task.status in TERMINAL_STATUSES:
+                expected_status = previous_task.status
+            elif mutation.event.timestamp >= previous_task.deadline_at:
+                expected_status = TaskRunStatus.DEADLINE_EXCEEDED
+            else:
+                expected_status = {
+                    "accepted": TaskRunStatus.ACHIEVED,
+                    "rejected": TaskRunStatus.RUNNING,
+                    "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+                    "conflict": previous_task.status,
+                    "pending": previous_task.status,
+                }[projection.state]
+            if task_change.status is not expected_status:
+                raise StorageError("D7 external check TaskRun transition is not admitted")
+            return
+
+        feedback = metadata.feedback
+        if feedback is None or metadata.candidate is not None:
+            raise StorageError("D7 feedback metadata is invalid")
+        candidate = self.load_d7_answer_candidate(feedback.candidate_id)
+        prior = self.list_d7_validation_feedback(
+            mutation.task_run_id,
+            feedback.candidate_id,
+            feedback.evidence_version,
+        )
+        prior_determinate = any(
+            item.verdict in {"accepted", "rejected"} for item in prior
+        )
+        if prior_determinate:
+            expected_status = state.task_run.status
+        elif state.task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK:
+            expected_status = (
+                TaskRunStatus.DEADLINE_EXCEEDED
+                if mutation.event.timestamp >= state.task_run.deadline_at
+                else {
+                    "accepted": TaskRunStatus.ACHIEVED,
+                    "rejected": TaskRunStatus.RUNNING,
+                    "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+                }[feedback.verdict]
+            )
+        elif state.task_run.status in TERMINAL_STATUSES:
+            expected_status = state.task_run.status
+        else:
+            expected_status = None
+        if (
+            feedback.task_run_id != mutation.task_run_id
+            or candidate is None
+            or candidate.task_run_id != mutation.task_run_id
+            or candidate.evidence_version != feedback.evidence_version
+            or expected_status is None
+            or task_change.status is not expected_status
+        ):
+            raise StorageError("D7 feedback is not bound to the awaited candidate version")
+
+    def _d7_has_feedback_conflict(self, task_run_id: str) -> bool:
+        for candidate in self.list_d7_answer_candidates(task_run_id):
+            records = self.list_d7_validation_feedback(
+                task_run_id,
+                candidate.candidate_id,
+                candidate.evidence_version,
+            )
+            if project_candidate_feedback(task_run_id, candidate.candidate_id, candidate.evidence_version, records).state == "conflict":
+                return True
+        return False
+
+    def _save_d7_mutation(self, mutation: ControlMutation, event_sequence: int) -> None:
+        metadata = mutation.d7
+        if metadata is None:
+            return
+        if metadata.run_config is not None:
+            config = metadata.run_config
+            self._connection.execute(
+                "INSERT INTO d7_web_run_configs VALUES (?, ?, ?, ?, ?)",
+                (
+                    config.task_run_id,
+                    config.request_id,
+                    config.config_ref,
+                    canonical_json(config.to_dict()),
+                    event_sequence,
+                ),
+            )
+        elif metadata.candidate is not None:
+            candidate = metadata.candidate
+            self._connection.execute(
+                """INSERT INTO d7_candidate_registry(
+                       candidate_id, task_run_id, source_kind, turn_id, intent_id,
+                       plan_id, execution_id, evidence_version, source_ref,
+                       candidate_json, created_event_sequence
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    candidate.candidate_id,
+                    candidate.task_run_id,
+                    candidate.source_kind,
+                    candidate.turn_id,
+                    candidate.intent_id,
+                    candidate.plan_id,
+                    candidate.execution_id,
+                    candidate.evidence_version,
+                    candidate.source_ref,
+                    canonical_json(candidate.to_dict()),
+                    event_sequence,
+                ),
+            )
+            if candidate.source_kind == "d3":
+                self._connection.execute(
+                    """INSERT INTO d7_answer_candidates(
+                           candidate_id, task_run_id, turn_id, intent_id, plan_id,
+                           execution_id, evidence_version, source_ref, candidate_json,
+                           created_event_sequence
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        candidate.candidate_id,
+                        candidate.task_run_id,
+                        candidate.turn_id,
+                        candidate.intent_id,
+                        candidate.plan_id,
+                        candidate.execution_id,
+                        candidate.evidence_version,
+                        candidate.source_ref,
+                        canonical_json(candidate.to_dict()),
+                        event_sequence,
+                    ),
+                )
+        elif metadata.feedback is not None:
+            feedback = metadata.feedback
+            self._connection.execute(
+                "INSERT INTO d7_validation_feedback VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    feedback.operation_id,
+                    feedback.task_run_id,
+                    feedback.candidate_id,
+                    feedback.evidence_version,
+                    feedback.verdict,
+                    canonical_json(feedback.to_dict()),
+                    event_sequence,
+                ),
+            )
+        elif metadata.check_request is not None:
+            request = metadata.check_request
+            self._connection.execute(
+                """INSERT INTO d7_external_validation_checks(
+                       query_id, task_run_id, candidate_id, submission_operation_id,
+                       evidence_version, checkpoint_sequence, request_json,
+                       started_event_sequence, result_json, result_event_sequence
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
+                (
+                    request.query_id,
+                    request.task_run_id,
+                    request.candidate_id,
+                    request.submission_operation_id,
+                    request.evidence_version,
+                    request.checkpoint_sequence,
+                    canonical_json(request.to_dict()),
+                    event_sequence,
+                ),
+            )
+        else:
+            assert metadata.check_completion is not None
+            completion = metadata.check_completion
+            request = completion.result.request
+            cursor = self._connection.execute(
+                """UPDATE d7_external_validation_checks
+                   SET result_json = ?, result_event_sequence = ?
+                   WHERE query_id = ? AND task_run_id = ? AND result_json IS NULL""",
+                (
+                    canonical_json(completion.result.to_dict()),
+                    event_sequence,
+                    request.query_id,
+                    request.task_run_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError("D7 external check result was already completed")
+            if completion.reconciliation is not None:
+                feedback = completion.reconciliation
+                self._connection.execute(
+                    "INSERT INTO d7_validation_feedback VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        feedback.operation_id,
+                        feedback.task_run_id,
+                        feedback.candidate_id,
+                        feedback.evidence_version,
+                        feedback.verdict,
+                        canonical_json(feedback.to_dict()),
+                        event_sequence,
+                    ),
+                )
+
     def _validate_d3_mutation(self, mutation: ControlMutation) -> None:
         metadata = mutation.d3
         config = self.load_d3_run_config(mutation.task_run_id)
@@ -3011,7 +4255,7 @@ class SqliteControlStore:
                 or len(mutation.state_changes) != 1
                 or not isinstance(mutation.state_changes[0], UpsertTaskRun)
             ):
-                raise StorageError("D3 requires one or two frozen local attachments without network")
+                raise StorageError("D3 requires frozen local attachments without network")
             return
         if config is None:
             if metadata is not None or any(
@@ -3029,13 +4273,44 @@ class SqliteControlStore:
             "complete_d3_turn", "advance_d3_turn", "exhaust_d3_turn",
             "append_plan_validation_record", "create_execution", "start_execution",
             "complete_execution", "finish_d3_execution",
+            "register_d7_candidate", "apply_external_validation_feedback",
+            "start_external_validation_check", "complete_external_validation_check",
         }
         if mutation.operation not in allowed:
             raise StorageError("legacy control operation is not admitted for D3")
-        if any(
+        success_change = any(
             isinstance(change, UpsertTaskRun)
             and change.status in {TaskRunStatus.ACHIEVED, TaskRunStatus.ASSUMED_ACHIEVED}
             for change in mutation.state_changes
+        )
+        feedback = None if mutation.d7 is None else mutation.d7.feedback
+        check_completion = (
+            None if mutation.d7 is None else mutation.d7.check_completion
+        )
+        previous_task = self.load_task_run(mutation.task_run_id)
+        accepted_feedback = (
+            mutation.operation == "apply_external_validation_feedback"
+            and feedback is not None
+            and feedback.verdict == "accepted"
+        )
+        accepted_check = (
+            mutation.operation == "complete_external_validation_check"
+            and check_completion is not None
+            and check_completion.result.verdict == "accepted"
+            and mutation.event.status is TaskRunStatus.ACHIEVED
+        )
+        preserved_achieved_feedback = (
+            mutation.operation in {"apply_external_validation_feedback", "start_external_validation_check", "complete_external_validation_check"}
+            and previous_task is not None
+            and previous_task.status is TaskRunStatus.ACHIEVED
+            and any(
+                isinstance(change, UpsertTaskRun)
+                and change.status is TaskRunStatus.ACHIEVED
+                for change in mutation.state_changes
+            )
+        )
+        if success_change and not (
+            accepted_feedback or accepted_check or preserved_achieved_feedback
         ):
             raise StorageError("D3 has no whole-task success evaluator")
         turn_changes = [change for change in mutation.state_changes if isinstance(change, UpsertTurn)]
@@ -3048,12 +4323,12 @@ class SqliteControlStore:
                 mutation.operation not in {"register_d3_turn", "advance_d3_turn"}
                 or metadata is None or metadata.turn_binding is None
                 or len(new_turns) != 1
-                or self._connection.execute(
+                or config.max_turns is not None and self._connection.execute(
                     "SELECT COUNT(*) FROM turns WHERE task_run_id = ?",
                     (mutation.task_run_id,),
-                ).fetchone()[0] >= 2
+                ).fetchone()[0] >= config.max_turns
             ):
-                raise StorageError("D3 Turn requires one bound registration within the two-Turn limit")
+                raise StorageError("D3 Turn requires one bound registration within its versioned limit")
             turn = new_turns[0]
             binding = metadata.turn_binding
             children = sorted(
@@ -3313,9 +4588,13 @@ class SqliteControlStore:
             if before.turns:
                 old_turn = before.turns[-1]
                 outcome = self.load_d3_outcome(old_turn.turn_id)
+                allowed_reasons = {
+                    "turn_goal_satisfied",
+                    "candidates_exhausted_after_strategy_abandonment",
+                }
                 if (
                     outcome is None
-                    or outcome.reason != "candidates_exhausted_after_strategy_abandonment"
+                    or outcome.reason not in allowed_reasons
                     or not any(
                         item.turn_id == old_turn.turn_id
                         and item.review_scope == "turn_end"
@@ -3646,6 +4925,7 @@ class SqliteControlStore:
             before = self.load_control_state_rows(mutation.task_run_id)
             self._validate_d1_mutation(mutation)
             self._validate_d2_mutation(mutation)
+            self._validate_d7_mutation(mutation)
             self._validate_d3_mutation(mutation)
             self._validate_d5_mutation(mutation)
             self._validate_existing_owners(mutation)
@@ -3658,6 +4938,7 @@ class SqliteControlStore:
             self._save_d2_mutation(mutation, event_sequence)
             self._save_d3_mutation(mutation, event_sequence)
             self._save_d5_mutation(mutation, event_sequence)
+            self._save_d7_mutation(mutation, event_sequence)
             self._insert_event(mutation.event, event_sequence)
             checkpoint = Checkpoint(
                 task_run_id=mutation.task_run_id,
@@ -3855,7 +5136,9 @@ class SqliteControlStore:
                 FROM control_mutations m
                 JOIN runtime_events e
                   ON e.task_run_id = m.task_run_id AND e.sequence = m.event_sequence
-                WHERE m.task_run_id = ? AND e.status NOT IN ('running', 'awaiting_confirmation')
+                WHERE m.task_run_id = ? AND e.status NOT IN (
+                    'running', 'awaiting_confirmation', 'awaiting_external_feedback'
+                )
                 ORDER BY m.event_sequence LIMIT 1
                 """,
                 (task_run_id,),
@@ -4103,7 +5386,14 @@ class SqliteControlStore:
 
     def _decode_task_run(self, row: sqlite3.Row) -> TaskRunSnapshot:
         request_value = json.loads(row["request_json"])
-        request = TaskRequest.from_dict(request_value)
+        d3_config = self.load_d3_run_config(row["task_run_id"])
+        allow_empty_target = (
+            d3_config is not None
+            and d3_config.authorization.attachment_indices == ()
+        )
+        request = TaskRequest.from_dict(
+            request_value, allow_empty_target=allow_empty_target
+        )
         if request.model_backend is not None:
             raise StorageError("persisted TaskRequest must not contain model_backend")
         return TaskRunSnapshot(

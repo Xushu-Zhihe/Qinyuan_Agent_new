@@ -128,7 +128,7 @@ class Target:
     attachments: tuple[Attachment, ...] = ()
 
     @classmethod
-    def from_dict(cls, value: Any) -> "Target":
+    def from_dict(cls, value: Any, *, allow_empty: bool = False) -> "Target":
         if not isinstance(value, Mapping):
             raise TaskRequestError("target must be an object")
 
@@ -141,7 +141,7 @@ class Target:
         attachments = tuple(
             Attachment.from_dict(item) for item in attachment_values
         )
-        if not endpoints and not attachments:
+        if not endpoints and not attachments and not allow_empty:
             raise TaskRequestError(
                 "target.endpoints or target.attachments must contain at least one item"
             )
@@ -162,12 +162,16 @@ class TaskRequest:
     model_backend: ModelBackend | None = None
 
     @classmethod
-    def from_dict(cls, value: Any) -> "TaskRequest":
+    def from_dict(
+        cls, value: Any, *, allow_empty_target: bool = False
+    ) -> "TaskRequest":
         if not isinstance(value, Mapping):
             raise TaskRequestError("TaskRequest must be a JSON object")
 
         goal = _required_string(value.get("goal"), "goal")
-        target = Target.from_dict(value.get("target"))
+        target = Target.from_dict(
+            value.get("target"), allow_empty=allow_empty_target
+        )
 
         deadline = value.get("deadline_seconds", 3600)
         if isinstance(deadline, bool) or not isinstance(deadline, int):

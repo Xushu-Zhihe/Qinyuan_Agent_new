@@ -60,3 +60,35 @@ class T6TaskRunSandbox(TaskRunSandbox):
             ),
         }
         return spec
+
+    def execute_d7_http(
+        self,
+        sandbox_id: str,
+        *,
+        task_run_id: str,
+        run_config,
+        authorization,
+        network_binding,
+        target_network,
+        method: str,
+        path_query: str,
+        headers: tuple[tuple[str, str], ...],
+        body: bytes,
+        timeout_seconds: float,
+    ):
+        """Send one frozen D7 HTTP action through this TaskRun's forwarder."""
+        from Sandbox.d7_http_runtime import D7SandboxHttpRuntime
+
+        return D7SandboxHttpRuntime(self).execute(
+            sandbox_id,
+            task_run_id=task_run_id,
+            run_config=run_config,
+            authorization=authorization,
+            network_binding=network_binding,
+            target_network=target_network,
+            method=method,
+            path_query=path_query,
+            headers=headers,
+            body=body,
+            timeout_seconds=timeout_seconds,
+        )

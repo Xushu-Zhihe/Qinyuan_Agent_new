@@ -18,6 +18,7 @@ class InvalidTransition(RuntimeError):
 class TaskRunStatus(StrEnum):
     RUNNING = "running"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
+    AWAITING_EXTERNAL_FEEDBACK = "awaiting_external_feedback"
     ACHIEVED = "achieved"
     ASSUMED_ACHIEVED = "assumed_achieved"
     PARTIAL = "partial"
@@ -205,6 +206,7 @@ class TaskRunController:
         if self.task_run.status not in {
             TaskRunStatus.RUNNING,
             TaskRunStatus.AWAITING_CONFIRMATION,
+            TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
         }:
             raise InvalidTransition("model failure cannot change a terminal TaskRun")
         self.task_run.failure_reason = reason
@@ -217,6 +219,7 @@ class TaskRunController:
         if self.task_run.status not in {
             TaskRunStatus.RUNNING,
             TaskRunStatus.AWAITING_CONFIRMATION,
+            TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
         }:
             raise InvalidTransition("cancel cannot change a terminal TaskRun")
         self._finish(TaskRunStatus.CANCELLED, now=now)

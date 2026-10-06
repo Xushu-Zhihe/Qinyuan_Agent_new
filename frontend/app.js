@@ -54,7 +54,7 @@ function selectTask(id, navigate = true) {
 }
 function renderRun(run, events = [], progress = null) {
   const active = ["starting", "running", "cancelling", "cleaning", "paused", "recovery_required"].includes(run?.status);
-  const recoverableCancel = run?.status === "recovery_required" && run?.result?.protocol_version === 2 && !!run?.agent_task_run_id && run?.result?.task_run_id === run?.agent_task_run_id && ["running", "awaiting_confirmation"].includes(run?.result?.task_run?.status);
+  const recoverableCancel = run?.status === "recovery_required" && [2, 3].includes(run?.result?.protocol_version) && !!run?.agent_task_run_id && run?.result?.task_run_id === run?.agent_task_run_id && ["running", "awaiting_confirmation", "awaiting_external_feedback"].includes(run?.result?.task_run?.status);
   $("run-panel").hidden = !state.selected;
   $("start-run").hidden = !state.selected || active || !!state.tasks.find((task) => task.id === state.selected)?.archived;
   $("cancel-run").hidden = !recoverableCancel && !["starting", "running", "cancelling", "paused"].includes(run?.status);

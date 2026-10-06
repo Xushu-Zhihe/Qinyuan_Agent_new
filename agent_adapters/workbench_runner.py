@@ -8,6 +8,7 @@ directory. Scheduling and lifecycle transitions remain owned by the CLI.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -15,14 +16,20 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
-from agent_adapters.run_files import encode, immutable_write
+from agent_adapters.run_files import encode, immutable_read, immutable_write
 from agent_adapters.workbench_contracts import ACTIVE_RUN_STATUSES, WorkbenchError
+from agent_core.d7_web_contracts import canonical_web_origin
+from agent_core.operation_accounting import D4BudgetPolicy
 from agent_core.command_contracts import T6EvidenceError
 from agent_core.runtime import TERMINAL_STATUSES
+
+D7_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+D7_ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 
 
 @dataclass
@@ -51,29 +58,122 @@ class Runner:
             raise ValueError("invalid_attachment_name")
         return name
 
+    @staticmethod
+    def _subprocess_environment(protocol_version: int):
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent) + os.pathsep + env.get("PYTHONPATH", "")
+        if protocol_version == 3:
+            for key in (
+                "QINYUAN_RUNTIME_MODEL", "QINYUAN_RUNTIME_API_KEY",
+                "QINYUAN_RUNTIME_BASE_URL", "QINYUAN_RUNTIME_PROVIDER",
+                "QINYUAN_MODEL", "QINYUAN_LLM_BACKEND", "QINYUAN_LLM_TIMEOUT_SECONDS",
+                "OPENAI_API_KEY", "OPENAI_BASE_URL",
+            ):
+                env.pop(key, None)
+        return env
+
+    @staticmethod
+    def _d7_model_from_env() -> str:
+        """Read only the non-secret D7 model identifier from the repository env file."""
+        env_file = D7_ENV_FILE
+        try:
+            if env_file.is_symlink() or not env_file.is_file():
+                raise ValueError("env_file_unavailable")
+            from dotenv import dotenv_values
+
+            values = dotenv_values(env_file, interpolate=False)
+            backend = values.get("QINYUAN_LLM_BACKEND")
+            model = values.get("QINYUAN_MODEL")
+            api_key = values.get("OPENAI_API_KEY")
+            base_url = values.get("OPENAI_BASE_URL")
+            timeout_raw = values.get("QINYUAN_LLM_TIMEOUT_SECONDS") or "180"
+            if (
+                backend != "openai"
+                or not isinstance(model, str)
+                or not model.strip()
+                or len(model.strip()) > 128
+                or not isinstance(api_key, str)
+                or not api_key.strip()
+                or len(api_key) > 8192
+                or any(ord(char) < 32 for char in api_key)
+                or not isinstance(base_url, str)
+            ):
+                raise ValueError("env_configuration_unsupported")
+            try:
+                timeout = float(timeout_raw)
+                parsed = urlsplit(base_url)
+            except (TypeError, ValueError):
+                raise ValueError("env_configuration_unsupported") from None
+            if (
+                not math.isfinite(timeout)
+                or not 0 < timeout <= 180
+                or parsed.scheme != "https"
+                or parsed.hostname != "api.deepseek.com"
+                or parsed.netloc not in {"api.deepseek.com", "api.deepseek.com:443"}
+                or parsed.path not in {"", "/", "/v1", "/v1/"}
+                or parsed.query
+                or parsed.fragment
+                or parsed.username
+                or parsed.password
+            ):
+                raise ValueError("env_configuration_unsupported")
+            return model.strip()
+        except (OSError, UnicodeError, ValueError, ImportError):
+            raise WorkbenchError("d7_model_env_configuration_unsupported", 409) from None
+
+    @staticmethod
+    def _append_saved_d7_env_file(command: list[str], agent_directory: Path) -> None:
+        try:
+            declaration = immutable_read(agent_directory / "run.json")
+        except (OSError, ValueError, TypeError):
+            raise WorkbenchError("run_identity_unavailable", 409) from None
+        if (
+            not isinstance(declaration, dict)
+            or declaration.get("task_run_id") != agent_directory.name
+        ):
+            raise WorkbenchError("run_identity_unavailable", 409)
+        if declaration.get("protocol_version") == 3 and declaration.get("mode") == "real":
+            command.extend(["--env-file", str(D7_ENV_FILE)])
+
     def _preflight(self, challenge):
         if challenge["archived"]:
             raise WorkbenchError("challenge_archived", 409)
         if challenge["status"] in ACTIVE_RUN_STATUSES:
             raise WorkbenchError("challenge_already_running", 409)
-        if not self.workbench.api_key:
+        if self.workbench.protocol_version == 2 and not self.workbench.api_key:
             raise WorkbenchError("model_key_not_configured", 409)
         if not 1 <= challenge["step_timeout_seconds"] <= 300:
             raise WorkbenchError("invalid_step_timeout", 409)
         if not challenge["description"].strip():
             raise WorkbenchError("challenge_description_required_for_run", 409)
         attachments = challenge["attachments"]
-        if not challenge["endpoint"] and not attachments:
+        d7_model = None
+        if self.workbench.protocol_version == 3:
+            if self.workbench.d7_mode == "simulated":
+                if challenge["endpoint"]:
+                    raise WorkbenchError("v3_network_not_supported", 409)
+            else:
+                if not challenge["endpoint"]:
+                    raise WorkbenchError("d7_web_endpoint_required", 409)
+                if attachments:
+                    raise WorkbenchError("d7_web_attachments_unsupported", 409)
+                try:
+                    canonical_web_origin(challenge["endpoint"])
+                except (TypeError, ValueError):
+                    raise WorkbenchError("d7_web_endpoint_invalid", 409) from None
+                d7_model = self._d7_model_from_env()
+        if self.workbench.protocol_version == 2 and not challenge["endpoint"] and not attachments:
             raise WorkbenchError("runner_requires_local_attachment", 409)
         if len(attachments) > 16:
             raise WorkbenchError("too_many_attachments", 409)
         if sum(int(item["byte_size"]) for item in attachments) > 64 * 1024 * 1024:
             raise WorkbenchError("attachment_run_capacity_exceeded", 409)
+        return d7_model
 
     def start(self, challenge_id: str):
         with self.workbench.lock:
             challenge = self.workbench.get(challenge_id)
-            self._preflight(challenge)
+            d7_model = self._preflight(challenge)
             names = [self._safe_filename(item["name"]) for item in challenge["attachments"]]
             if len(set(names)) != len(names):
                 raise WorkbenchError("duplicate_attachment_names", 409)
@@ -90,55 +190,152 @@ class Runner:
                     raise WorkbenchError("attachment_path_rejected", 409)
                 shutil.copyfile(source, target)
 
-            request = {
-                "protocol_version": 2,
-                "task_request": {
-                    "goal": challenge["description"],
-                    "target": {"attachments": [
-                        {"kind": "local_path", "path": "input/" + name}
-                        for name in names
-                    ], "endpoints": ([{"url": challenge["endpoint"]}]
-                                    if challenge["endpoint"] else [])},
-                    "deadline_seconds": challenge["deadline_minutes"] * 60,
-                    "model_backend": "deepseek_openai",
-                },
-                "authorization": {
-                    "allowed_tools": ["sandbox.command"],
-                    "allowed_target_urls": ([challenge["endpoint"]]
-                                            if challenge["endpoint"] else []),
-                },
-            }
+            if self.workbench.protocol_version == 3 and self.workbench.d7_mode == "simulated":
+                # Temporary D7 simulation envelope.  It intentionally has no
+                # endpoint/network capability and uses deterministic local
+                # role snapshots; the child remains the sole scheduler.
+                role_outer = {
+                    "role": "outer_planning", "provider": "fixture",
+                    "model": "d7-simulated-outer", "prompt_template": "d7-simulated-outer-v1",
+                    "parameters": [],
+                }
+                role_inner = {
+                    "role": "inner_action", "provider": "fixture",
+                    "model": "d7-simulated-inner", "prompt_template": "d7-simulated-inner-v1",
+                    "parameters": [],
+                }
+                request = {
+                    "protocol_version": 3,
+                    "request_id": str(uuid4()),
+                    "task_request": {
+                        "goal": challenge["description"],
+                        "target": {
+                            "source_root": str(input_dir.resolve()),
+                            "attachments": [
+                                {"kind": "local_path", "local_path": name}
+                                for name in names
+                            ],
+                            "endpoints": [],
+                        },
+                        "deadline_seconds": challenge["deadline_minutes"] * 60,
+                    },
+                    "authorization": {
+                        "authorization_id": str(uuid4()),
+                        "attachment_indices": list(range(len(names))),
+                        "allowed_tool": "d3_fixed_readonly",
+                        "network_allowed": False,
+                    },
+                    "dual_llm_config": {
+                        "outer_role": role_outer,
+                        "inner_role": role_inner,
+                        "d4_budget": {
+                            "total": 48, "planning": 4, "action": 16,
+                            "review": 8, "refinement": 4, "tool_dispatch": 6,
+                            "sha_observation": 4, "artifact_share": 4,
+                            "attachment_import": 2,
+                        },
+                    },
+                }
+            elif self.workbench.protocol_version == 3:
+                origin = canonical_web_origin(challenge["endpoint"])
+                role_outer = {
+                    "role": "outer_planning", "provider": "deepseek",
+                    "model": d7_model, "prompt_template": "qinyuan.d7.outer.v1",
+                    "parameters": [],
+                }
+                role_inner = {
+                    "role": "inner_action", "provider": "deepseek",
+                    "model": d7_model, "prompt_template": "qinyuan.d7.inner.v1",
+                    "parameters": [],
+                }
+                request = {
+                    "protocol_version": 3,
+                    "request_id": str(uuid4()),
+                    "task_request": {
+                        "goal": challenge["description"],
+                        "target": {
+                            "attachments": [],
+                            "endpoints": [{"url": origin}],
+                        },
+                        "deadline_seconds": challenge["deadline_minutes"] * 60,
+                    },
+                    "authorization": {
+                        "authorization_id": str(uuid4()),
+                        "allowed_origin": origin,
+                        "allowed_methods": list(D7_ALLOWED_METHODS),
+                        "allowed_tool": "d7_http_request",
+                        "network_allowed": True,
+                        "attachment_indices": [],
+                    },
+                    "dual_llm_config": {
+                        "outer_role": role_outer,
+                        "inner_role": role_inner,
+                        "d4_budget": asdict(D4BudgetPolicy()),
+                    },
+                }
+                from agent_adapters.d7_web_request import D7WebRequest
+
+                try:
+                    D7WebRequest.parse(request)
+                except (TypeError, ValueError):
+                    raise WorkbenchError("d7_web_request_invalid", 409) from None
+            else:
+                request = {
+                    "protocol_version": 2,
+                    "task_request": {
+                        "goal": challenge["description"],
+                        "target": {"attachments": [
+                            {"kind": "local_path", "path": "input/" + name}
+                            for name in names
+                        ], "endpoints": ([{"url": challenge["endpoint"]}]
+                                        if challenge["endpoint"] else [])},
+                        "deadline_seconds": challenge["deadline_minutes"] * 60,
+                        "model_backend": "deepseek_openai",
+                    },
+                    "authorization": {
+                        "allowed_tools": ["sandbox.command"],
+                        "allowed_target_urls": ([challenge["endpoint"]]
+                                                if challenge["endpoint"] else []),
+                    },
+                }
             (directory / "request.json").write_bytes(encode(request))
             events = directory / "events.jsonl"
-            env = os.environ.copy()
-            project_root = str(Path(__file__).resolve().parent.parent)
-            env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
-            env.update(
-                {
-                    "QINYUAN_RUNTIME_MODEL": self.workbench.model,
-                    "QINYUAN_RUNTIME_API_KEY": self.workbench.api_key,
-                    "QINYUAN_RUNTIME_BASE_URL": self.workbench.base_url,
-                    "QINYUAN_RUNTIME_PROVIDER": self.workbench.provider,
-                    "QINYUAN_RUNTIME_MODEL_TIMEOUT": "180",
-                    "QINYUAN_T6_STEP_TIMEOUT_SECONDS": str(challenge["step_timeout_seconds"]),
-                }
-            )
+            env = self._subprocess_environment(self.workbench.protocol_version)
+            # v3 loads its frozen provider settings from the explicit env file;
+            # neither simulation nor real mode receives secrets in process env.
+            env["QINYUAN_RUNTIME_MODEL_TIMEOUT"] = "180"
+            env["QINYUAN_T6_STEP_TIMEOUT_SECONDS"] = str(challenge["step_timeout_seconds"])
+            if self.workbench.protocol_version == 2:
+                env.update(
+                    {
+                        "QINYUAN_RUNTIME_MODEL": self.workbench.model,
+                        "QINYUAN_RUNTIME_API_KEY": self.workbench.api_key,
+                        "QINYUAN_RUNTIME_BASE_URL": self.workbench.base_url,
+                        "QINYUAN_RUNTIME_PROVIDER": self.workbench.provider,
+                    }
+                )
             command = [
                 sys.executable,
                 "-m",
                 "agent",
                 "run-task",
                 "--mode",
-                "real",
+                (
+                    self.workbench.d7_mode
+                    if self.workbench.protocol_version == 3
+                    else "real"
+                ),
                 "--request",
                 str(directory / "request.json"),
                 "--state-dir",
                 str(state_dir),
                 "--events",
                 str(events),
-                "--env-file",
-                str(directory / "unused.env"),
             ]
+            if self.workbench.protocol_version == 3 and self.workbench.d7_mode == "real":
+                command.extend(["--env-file", str(D7_ENV_FILE)])
+            elif self.workbench.protocol_version == 2:
+                command.extend(["--env-file", str(directory / "unused.env")])
             self.workbench._insert_run(run_id, challenge_id, directory)
             try:
                 stdout_file = (directory / "agent.stdout.log").open("wb")
@@ -203,20 +400,21 @@ class Runner:
                 result = run.get("result")
                 task = result.get("task_run") if isinstance(result, dict) else None
                 if (not isinstance(result, dict)
-                        or result.get("protocol_version") != 2
+                        or result.get("protocol_version") not in {2, 3}
                         or not run["agent_task_run_id"]
                         or result.get("task_run_id") != run["agent_task_run_id"]
                         or not isinstance(task, dict)
-                        or task.get("status") not in {"running", "awaiting_confirmation"}):
+                        or task.get("status") not in {"running", "awaiting_confirmation", "awaiting_external_feedback"}):
                     raise WorkbenchError("cancel_not_available", 409)
             directory = Path(run["directory"])
             agent_dir = self._find_agent_directory(directory)
             if agent_dir is None or agent_dir.name != run["agent_task_run_id"]:
                 raise WorkbenchError("run_identity_unavailable", 409)
             command = [sys.executable, "-m", "agent", "cancel", "--task-run-id",
-                       agent_dir.name, "--state-dir", str(agent_dir.parent)]
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent) + os.pathsep + env.get("PYTHONPATH", "")
+                       agent_dir.name, "--state-dir", str(agent_dir.parent),
+                       "--events", str(directory / "events.jsonl")]
+            self._append_saved_d7_env_file(command, agent_dir)
+            env = self._subprocess_environment((run.get("result") or {}).get("protocol_version", 2))
             try:
                 with (directory / "agent.stdout.log").open("wb") as stdout, (directory / "agent.stderr.log").open("wb") as stderr:
                     process = subprocess.Popen(command, cwd=directory, env=env,
@@ -239,7 +437,7 @@ class Runner:
             task = result.get("task_run") if isinstance(result, dict) else None
             cleanup = result.get("cleanup") if isinstance(result, dict) else None
             if (not run or run["status"] != "recovery_required"
-                    or result.get("protocol_version") != 2
+                    or result.get("protocol_version") not in {2, 3}
                     or not isinstance(task, dict)
                     or task.get("status") not in TERMINAL_STATUSES
                     or not isinstance(cleanup, dict)
@@ -252,9 +450,10 @@ class Runner:
             command = [
                 sys.executable, "-m", "agent", "resume", "--task-run-id",
                 agent_dir.name, "--state-dir", str(agent_dir.parent), "--cleanup-only",
+                "--events", str(directory / "events.jsonl"),
             ]
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent) + os.pathsep + env.get("PYTHONPATH", "")
+            self._append_saved_d7_env_file(command, agent_dir)
+            env = self._subprocess_environment(result.get("protocol_version", 2))
             try:
                 with (directory / "agent.stdout.log").open("wb") as stdout, (directory / "agent.stderr.log").open("wb") as stderr:
                     process = subprocess.Popen(
@@ -319,11 +518,17 @@ class Runner:
                 return {"run_id": run["run_id"], "run": run, "events": events, "progress": None}
             try:
                 from agent_adapters.run_files import immutable_read
-                from agent_adapters.task_result import snapshot_task_progress
+                declaration = immutable_read(directory / "run.json")
+                if declaration.get("protocol_version") == 3:
+                    # v3's projection is deliberately safe and read-only;
+                    # workbench never interprets or schedules its state.
+                    from agent_adapters.d7_task_result import snapshot_v3_task_result
 
-                progress = snapshot_task_progress(
-                    directory, immutable_read(directory / "run.json")
-                )
+                    progress = snapshot_v3_task_result(directory, declaration)
+                else:
+                    from agent_adapters.task_result import snapshot_task_progress
+
+                    progress = snapshot_task_progress(directory, declaration)
             except (OSError, ValueError, KeyError, TypeError):
                 progress = {
                     "recovery": {"required": True, "reason": "state_or_evidence_unreadable"}
@@ -339,7 +544,20 @@ class Runner:
         if directory is None:
             raise WorkbenchError("execution_not_available", 404)
         try:
-            return execution_detail(directory, immutable_read(directory / "run.json"), execution_id)
+            declaration = immutable_read(directory / "run.json")
+            if declaration.get("protocol_version") == 3:
+                from agent_adapters.d7_task_result import snapshot_v3_task_result
+
+                progress = snapshot_v3_task_result(directory, declaration)
+                item = next((value for value in progress.get("executions", [])
+                             if value["execution_id"] == execution_id), None)
+                if item is None:
+                    raise ValueError("execution_not_available")
+                # The v3 operator reads candidate plaintext through its
+                # separately authorised CLI, never the legacy raw-output API.
+                return {"protocol_version": 3, "task_run_id": declaration["task_run_id"],
+                        "execution": item, "body_withheld": True}
+            return execution_detail(directory, declaration, execution_id)
         except (OSError, ValueError, KeyError, TypeError, T6EvidenceError) as exc:
             raise WorkbenchError("execution_evidence_unavailable", 409) from exc
 
@@ -386,7 +604,9 @@ class Runner:
             result["errors"] = [{"code": "agent_process_stderr"}]
         agent_status = (result.get("task_run") or {}).get("status")
         exit_code = int(result.get("exit_code", 4))
-        if (result.get("protocol_version") == 2
+        if result.get("protocol_version") == 3 and "run_exit_code" in result:
+            exit_code = int(result["run_exit_code"])
+        if (result.get("protocol_version") in {2, 3}
                 and agent_status in TERMINAL_STATUSES
                 and result.get("cleanup", {}).get("status") == "succeeded"
                 and (active.cleanup_only or exit_code in (4, 5)
@@ -394,7 +614,7 @@ class Runner:
             status = "cleanup_confirmed"
         elif exit_code == 2 and result.get("task_run_id") is None:
             status = "failed"
-        elif (result.get("protocol_version") == 2 and exit_code == 4
+        elif (result.get("protocol_version") in {2, 3} and exit_code == 4
               and result.get("task_run_id") and not result.get("recovery", {}).get("required", True)):
             status = "paused"
         elif exit_code in (4, 5) or agent_status in {"pending", "running", "awaiting_confirmation"} or result.get("task_run_id") is None:

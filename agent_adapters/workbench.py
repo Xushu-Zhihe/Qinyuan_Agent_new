@@ -84,7 +84,13 @@ def challenge_fields(value: object) -> tuple[str, str, str, str, int, int]:
 
 
 class Workbench:
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        protocol_version: int | None = None,
+        d7_mode: str | None = None,
+    ):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.uploads = self.root / "attachments"
@@ -95,6 +101,24 @@ class Workbench:
         self.model = ""
         self.base_url = "https://api.deepseek.com"
         self.api_key = ""
+        # Preserve legacy v2 by default; v3 defaults to its isolated simulation
+        # profile unless the operator explicitly selects the real Web profile.
+        if protocol_version is None:
+            try:
+                protocol_version = int(os.environ.get("QINYUAN_WORKBENCH_PROTOCOL_VERSION", "2"))
+            except ValueError as exc:
+                raise ValueError("unsupported_workbench_protocol_version") from exc
+        if protocol_version not in {2, 3}:
+            raise ValueError("unsupported_workbench_protocol_version")
+        explicit_d7_mode = d7_mode is not None
+        if d7_mode is None:
+            d7_mode = "simulated"
+        if d7_mode not in {"simulated", "real"} or (
+            explicit_d7_mode and protocol_version != 3
+        ):
+            raise ValueError("unsupported_d7_mode")
+        self.protocol_version = protocol_version
+        self.d7_mode = d7_mode
         with self._db() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS challenges (
@@ -192,14 +216,14 @@ class Workbench:
         cleanup = outcome.get("cleanup") if isinstance(outcome, dict) else None
         task = outcome.get("task_run") if isinstance(outcome, dict) else None
         if (has_remote_target and result["status"] not in {"starting", "running", "cancelling", "cleaning"}
-                and isinstance(outcome, dict) and outcome.get("protocol_version") == 2
+                and isinstance(outcome, dict) and outcome.get("protocol_version") in {2, 3}
                 and isinstance(task, dict) and task.get("status") in TERMINAL_STATUSES
                 and isinstance(cleanup, dict) and cleanup.get("status") == "succeeded"
                 and cleanup.get("target_network_confirmed") is not True):
             outcome["cleanup"] = {**cleanup, "status": "not_confirmed"}
             result["status"] = "recovery_required"
         if (result["status"] == "recovery_required" and isinstance(outcome, dict)
-                and outcome.get("protocol_version") == 2
+                and outcome.get("protocol_version") in {2, 3}
                 and isinstance(outcome.get("task_run"), dict)
                 and outcome["task_run"].get("status") in TERMINAL_STATUSES
                 and isinstance(outcome.get("cleanup"), dict)
@@ -418,6 +442,7 @@ class Workbench:
                 "model": self.model,
                 "base_url": self.base_url,
                 "key_configured": bool(self.api_key),
+                "protocol_version": self.protocol_version,
             }
 
     def configure_model(self, value):
@@ -501,7 +526,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, (FRONTEND / name).read_bytes(), mime + "; charset=utf-8")
             return
         if parts == ["api", "health"] and self.command == "GET":
-            self._send(HTTPStatus.OK, {"status": "ready", "agent_execution": "connected", "capabilities": {"current_cli": "t6_run_task_real", "t6_scheduler": True, "remote_network": True}})
+            self._send(HTTPStatus.OK, {"status": "ready", "agent_execution": "connected", "capabilities": {
+                "current_cli": (
+                    f"run-task-v3-{self.server.workbench.d7_mode}"
+                    if self.server.workbench.protocol_version == 3
+                    else "t6_run_task_real"
+                ),
+                "protocol_version": self.server.workbench.protocol_version,
+                "d7_mode": self.server.workbench.d7_mode if self.server.workbench.protocol_version == 3 else None,
+                "t6_scheduler": self.server.workbench.protocol_version == 2,
+                "remote_network": (
+                    self.server.workbench.protocol_version == 2
+                    or self.server.workbench.protocol_version == 3
+                    and self.server.workbench.d7_mode == "real"
+                ),
+            }})
             return
         if parts == ["api", "model"]:
             if self.command == "GET":
@@ -622,12 +661,20 @@ def main(argv=None):
     )
     parser.add_argument("--port", type=int, default=4174)
     parser.add_argument("--data-dir", type=Path, default=Path("workbench_data"))
+    parser.add_argument("--protocol-version", type=int, choices=(2, 3), default=None)
+    parser.add_argument("--d7-mode", choices=("simulated", "real"), default=None)
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     try:
-        workbench = Workbench(args.data_dir)
+        workbench = Workbench(
+            args.data_dir,
+            protocol_version=args.protocol_version,
+            d7_mode=args.d7_mode,
+        )
         server = WorkbenchServer(("127.0.0.1", args.port), workbench)
+    except ValueError as exc:
+        parser.exit(2, f"Cannot start backend: {exc}.\n")
     except OSError as exc:
         if isinstance(exc, PermissionError):
             parser.exit(1, "Cannot start backend: permission denied for the data directory or local port.\n")
@@ -641,7 +688,13 @@ def main(argv=None):
         print(f"Open: http://127.0.0.1:{server.server_port}/", flush=True)
         print(f"Data: {workbench.root}", flush=True)
         print("Management API: ready (challenges, attachments, model settings)", flush=True)
-        print("Agent execution: T6 run-task real (0-16 local attachments, 64 MiB total; public target endpoint optional)", flush=True)
+        if workbench.protocol_version == 3:
+            if workbench.d7_mode == "real":
+                print("Agent execution: run-task protocol v3 real (authorized single-origin Web)", flush=True)
+            else:
+                print("Agent execution: run-task protocol v3 simulated (attachment_digest_only; no network)", flush=True)
+        else:
+            print("Agent execution: T6 run-task real (0-16 local attachments, 64 MiB total; public target endpoint optional)", flush=True)
         print("Keep this terminal open. Press Ctrl+C to stop the backend.", flush=True)
         try:
             server.serve_forever()

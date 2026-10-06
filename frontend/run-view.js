@@ -3,7 +3,7 @@
 // Presentation only: no scheduling, state transitions, or success inference.
 const RunView = (() => {
   const get = (id) => document.getElementById(id);
-  const labels = { pending: "待执行", running: "运行中", succeeded: "已通过", completed: "已完成", failed: "失败", inconclusive: "无法判定", timed_out: "超时", cancelled: "已取消", rejected: "已拒绝", starting: "启动中", cancelling: "取消与清理中", cleaning: "资源清理中", cleanup_confirmed: "资源已清理", paused: "已暂停 · Sandbox 保留", recovery_required: "需要显式恢复", deadline_exceeded: "总时限已到", finished: "已结束" };
+  const labels = { pending: "待执行", running: "运行中", awaiting_external_feedback: "等待外部反馈", achieved: "目标已确认", accepted: "已接受", unknown: "未知，待核查", conflict: "裁决冲突，待核查", not_evaluated: "未评估", succeeded: "已通过", completed: "已完成", failed: "失败", inconclusive: "无法判定", timed_out: "超时", cancelled: "已取消", rejected: "已拒绝", starting: "启动中", cancelling: "取消与清理中", cleaning: "资源清理中", cleanup_confirmed: "资源已清理", paused: "已暂停 · Sandbox 保留", recovery_required: "需要显式恢复", deadline_exceeded: "总时限已到", finished: "已结束" };
   const actionLabels = { probe: "提出下一次探测", complete_intent: "提出完成 Intent", abandon_intent: "放弃当前 Intent", candidate_flag: "提交待验证候选", awaiting_response: "等待模型响应", model_error: "模型错误", invalid_structure: "结构校验失败" };
   let current = null;
   let filter = null;
@@ -28,7 +28,7 @@ const RunView = (() => {
     const progress = data.progress || run?.result || {};
     const live = ["starting", "running", "cancelling", "cleaning"].includes(run?.status);
     get("run-dashboard").hidden = !run; get("run-raw").hidden = !run;
-    get("run-status").textContent = run ? `${label(run.status)} · ${progress.task_run_id || run.agent_task_run_id || run.run_id}` : "保存题目与模型配置后，可开始真实运行。";
+    get("run-status").textContent = run ? `${label(run.status)} · ${progress.mode === "simulated" ? "本地模拟 · " : ""}${progress.task_run_id || run.agent_task_run_id || run.run_id}` : "保存题目后，可开始运行。";
     const executions = progress.executions || [];
     const activeExecution = executions.find((item) => ["pending", "running"].includes(item.status));
     const activeIntent = (progress.turns || []).flatMap((turn) => turn.intents).find((item) => item.status === "running");
@@ -40,7 +40,14 @@ const RunView = (() => {
       const seconds = Math.max(0, Math.ceil(progress.task_run.deadline_at - Date.now() / 1000));
       remaining = progress.task_run.finished_at ? "已结束" : `${Math.floor(seconds / 60)}分 ${seconds % 60}秒`;
     }
-    get("run-summary").replaceChildren(metric("当前阶段", phase), metric("剩余总时限", remaining), metric("已验证观察", String(progress.verified_facts?.length || 0)), metric("待验证候选", String(progress.pending_candidates?.length || 0)), metric("整题目标", "未验证"));
+    const goal = progress.protocol_version === 3 ? `${progress.mode === "simulated" ? "模拟：" : ""}${label(progress.goal_evaluation)}` : "未验证";
+    const metrics = [metric("当前阶段", phase), metric("剩余总时限", remaining), metric("已验证观察", String(progress.verified_facts?.length || 0)), metric("待验证候选", String(progress.pending_candidates?.length || 0)), metric("目标评估", goal)];
+    if (progress.protocol_version === 3) {
+      metrics.push(metric("已提交 Checkpoint", String(progress.checkpoint?.sequence ?? "—")));
+      if (progress.budget?.status === "available") metrics.push(metric("操作预算", `${progress.budget.total_used} / ${progress.budget.total_limit}`));
+    }
+    get("run-summary").classList.toggle("v3", progress.protocol_version === 3);
+    get("run-summary").replaceChildren(...metrics);
     get("run-result").textContent = JSON.stringify({ ...data, challengeId: undefined }, null, 2);
     draw(progress, live);
   }
@@ -148,7 +155,7 @@ const RunView = (() => {
       const planIds = new Set(plans.map((plan) => plan.plan_id));
       const executions = (progress.executions || []).filter((execution) => planIds.has(execution.plan_id));
       const executionIds = new Set(executions.map((execution) => execution.execution_id));
-      const facts = (progress.verified_facts || []).filter((fact) => executionIds.has(fact.source_ref));
+      const facts = (progress.verified_facts || []).filter((fact) => executionIds.has(fact.source_execution_id || fact.source_ref));
       host.append(node("strong", `Turn ${selectedIntent.turn.sequence} / Intent ${selectedIntent.priority}`, "detail-title"), badge(selectedIntent.status), node("p", selectedIntent.description, "detail-description"));
       host.append(node("p", `${plans.length} 个短 Plan · ${executions.length} 次执行 · ${facts.length} 条已验证观察`, "run-meta"));
       for (const plan of plans) {
@@ -161,6 +168,20 @@ const RunView = (() => {
       host.append(node("strong", `Turn ${selectedTurn.sequence}`, "detail-title"), badge(selectedTurn.status), node("p", `${selectedTurn.intents.length} 个已提交 Intent`, "run-meta"), node("p", selectedTurn.turn_id, "run-ref"));
     } else {
       host.append(node("strong", "TaskRun", "detail-title"), badge(progress.task_run?.status), node("p", `${turns.length} 轮已提交`, "run-meta"));
+    }
+    if (progress.protocol_version === 3) {
+      const binding = detail("v3-binding", "已提交运行信息");
+      binding.append(node("p", `Checkpoint ${progress.checkpoint?.sequence ?? "—"} · 事件水位 ${progress.checkpoint?.watermark_event_sequence ?? "—"}`, "run-meta"));
+      if (progress.budget?.status === "available") binding.append(code("分类预算", JSON.stringify(progress.budget.category_counts, null, 2)));
+      for (const imported of progress.imports || []) binding.append(node("p", `${imported.name} · ${imported.byte_size} B · ${imported.status}`, "run-ref"));
+      host.append(binding);
+      for (const review of progress.retrospective || []) {
+        const item = detail(`review-${review.review_id}`, `复盘 · ${review.scope} · ${review.decision}`);
+        item.append(node("p", review.review_id, "run-ref"));
+        if (review.paused) item.append(node("p", review.pause_reason, "run-condition"));
+        host.append(item);
+      }
+      for (const fact of progress.process_facts || []) host.append(node("p", `Process_Fact ${fact.process_fact_id} · v${fact.version} · ${fact.source_count} 项来源 · ${fact.conflict_count} 项冲突`, "run-ref"));
     }
   }
   function renderTimeline(progress, opened) {
@@ -181,12 +202,17 @@ const RunView = (() => {
     }
     for (const execution of progress.executions || []) {
       if (!fits(execution.plan_id)) continue;
-      const item = detail(`execution-${execution.execution_id}`, `${time(execution.started_at)} · Bash · ${execution.status === "succeeded" ? "执行已结束" : label(execution.status)}${execution.exit_code !== undefined && execution.exit_code !== null ? ` · exit ${execution.exit_code}` : ""}`);
+      const item = detail(`execution-${execution.execution_id}`, `${time(execution.started_at)} · ${progress.protocol_version === 3 ? "受控动作" : "Bash"} · ${execution.status === "succeeded" ? "执行已结束" : label(execution.status)}${execution.exit_code !== undefined && execution.exit_code !== null ? ` · exit ${execution.exit_code}` : ""}`);
       item.append(node("p", `Plan ${short(execution.plan_id)} · step ${execution.step_index} · ${execution.execution_id}`, "run-ref"));
       const body = node("div"); item.append(body);
       const key = `${execution.execution_id}:${execution.status}`;
       const load = async () => {
         if (!item.open || body.dataset.loaded) return;
+        if (progress.protocol_version === 3) {
+          body.dataset.loaded = "true";
+          body.replaceChildren(code("执行引用", JSON.stringify(execution, null, 2)), node("p", "正文：受保护", "run-meta"));
+          return;
+        }
         body.dataset.loaded = "true"; empty(body, "读取命令证据…");
         const captured = generation;
         try {
@@ -232,10 +258,20 @@ const RunView = (() => {
     if (!live) stop.append(node("p", `清理：${progress.cleanup?.status || "未确认"}`, "run-meta"));
     for (const error of [...(progress.errors || []), ...(current.run?.result?.errors || [])]) stop.append(node("p", error.code || error.category, "run-read-error"));
     const facts = get("run-facts"); facts.replaceChildren();
-    for (const fact of progress.verified_facts || []) { const item = node("article", undefined, "run-fact"); item.append(node("p", fact.content), node("p", `Fact ${fact.fact_id}\nExecution ${fact.source_ref}`, "run-ref")); facts.append(item); }
+    for (const fact of progress.verified_facts || []) { const item = node("article", undefined, "run-fact"); item.append(node("p", progress.protocol_version === 3 ? `验证状态：${label(fact.status)}` : fact.content), node("p", `Fact ${fact.fact_id}\nExecution ${fact.source_execution_id || fact.source_ref}`, "run-ref")); facts.append(item); }
     if (!facts.children.length) empty(facts, "尚无已验证观察。原始输出不会自动成为 Fact。");
     const candidates = get("run-candidates"); candidates.replaceChildren();
-    for (const candidate of progress.pending_candidates || []) { const item = node("article", undefined, "run-candidate"); item.append(node("pre", candidate.value), node("p", `未验证 · 来源 ${candidate.source_execution_ids.join(", ")}`, "run-ref")); candidates.append(item); }
+    get("run-candidate-heading").textContent = progress.protocol_version === 3 ? "答案候选 · Candidates" : "待验证候选 · Pending";
+    if (progress.protocol_version === 3) {
+      for (const candidate of progress.answer_candidates || []) {
+        const item = node("article", undefined, "run-candidate");
+        item.append(node("strong", label(candidate.validation_state)), node("p", `候选 ${candidate.candidate_id}\n证据版本 ${candidate.evidence_version}\nExecution ${candidate.execution_id}`, "run-ref"));
+        for (const feedback of candidate.feedback || []) item.append(node("p", `${progress.mode === "simulated" ? "模拟反馈" : "反馈"}：${label(feedback.verdict)} · ${feedback.operation_id}`, "run-ref"));
+        candidates.append(item);
+      }
+    } else {
+      for (const candidate of progress.pending_candidates || []) { const item = node("article", undefined, "run-candidate"); item.append(node("pre", candidate.value), node("p", `未验证 · 来源 ${candidate.source_execution_ids.join(", ")}`, "run-ref")); candidates.append(item); }
+    }
     if (!candidates.children.length) empty(candidates, "尚无待验证候选。");
     const failures = get("run-failures"); failures.replaceChildren();
     for (const failure of progress.failure_summaries || []) { const item = node("article", undefined, "run-failure"); item.append(node("strong", failure.failure_type), node("p", failure.short_reason), node("p", failure.evidence_ref, "run-ref")); failures.append(item); }

@@ -197,6 +197,9 @@ class Model:
         self.fail_stage = None
         self.proof_override = None
         self.modify_action = lambda request, value: value
+        self.candidate_values = ["test-candidate"]
+        self.candidate_index = 0
+        self.candidate_review_requested = False
 
     def invoke(self, request, timeout_seconds, token):
         self.calls.append(request)
@@ -229,6 +232,22 @@ class Model:
                 )
                 if self.reuse_saved_proof and context.prior_plan_ids
                 else None,
+            }
+        if request.stage == "inner_candidate":
+            context = request.context
+            candidate_value = self.candidate_values[
+                min(self.candidate_index, len(self.candidate_values) - 1)
+            ]
+            self.candidate_index += 1
+            return {
+                "action": {
+                    "kind": "candidate_flag",
+                    "value": candidate_value,
+                    "execution_id": context.execution_id,
+                    "evidence_version": context.plan_result.evidence_sha256,
+                    "source_ref": context.plan_binding.artifact_version_id,
+                },
+                "review_requested": self.candidate_review_requested,
             }
         context = request.context
         if request.stage == "inner_complete":

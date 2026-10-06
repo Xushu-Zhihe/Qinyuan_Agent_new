@@ -126,8 +126,8 @@ class D3Authorization:
 
     def __post_init__(self) -> None:
         _uuid(self.authorization_id, "authorization_id")
-        if self.attachment_indices not in {(0,), (0, 1)}:
-            raise ValueError("D3 authorizes one or two ordered local attachments")
+        if self.attachment_indices not in {(), (0,), (0, 1)}:
+            raise ValueError("D3 authorizes zero, one, or two ordered local attachments")
         if (
             self.allowed_tool != "d3_fixed_readonly"
             or self.network_allowed is not False
@@ -208,9 +208,17 @@ class D3RunConfig:
         if (
             self.chain_id != "dual_llm_d3"
             or type(self.contract_version) is not int
-            or self.contract_version != 1
+            or self.contract_version not in {1, 2}
         ):
             raise ValueError("unsupported D3 chain contract")
+        if self.contract_version == 2 and (
+            self.d4_budget is None or not self.d5_enabled
+        ):
+            raise ValueError("D7 requires explicit D4 budgets and D5 projection")
+
+    @property
+    def max_turns(self) -> int | None:
+        return 2 if self.contract_version == 1 else None
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> D3RunConfig:

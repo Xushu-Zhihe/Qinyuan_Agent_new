@@ -7,7 +7,7 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import Literal, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from agent_core.actions import (
     CompleteIntentAction,
@@ -19,10 +19,12 @@ from agent_core.dual_llm_contracts import (
     D3OperationCompletion,
     D3OperationStart,
     D3PlanBinding,
+    D3PlanResult,
     D3RecoveryRequired,
     D3RunConfig,
     D3TurnBinding,
 )
+from agent_core.goal_candidates import D7AnswerCandidate
 from agent_core.modeling import (
     CancellationToken,
     IntentCandidate,
@@ -38,7 +40,10 @@ D3ModelStage = Literal[
     "inner_size",
     "inner_sha256",
     "inner_complete",
+    "inner_candidate",
 ]
+
+MAX_D3_CANDIDATE_VALUE_BYTES = 16 * 1024
 
 
 class D3ProposalRejected(ValueError):
@@ -143,12 +148,82 @@ def parse_d3_plan_proposal(raw: object) -> D3PlanProposal:
 
 
 @dataclass(frozen=True, slots=True)
+class D3CandidateFlagAction:
+    value: str
+    execution_id: str
+    evidence_version: str
+    source_ref: str
+
+
+@dataclass(frozen=True, slots=True)
 class D3ActionProposal:
-    action: ProbeAction | CompleteIntentAction
+    action: ProbeAction | CompleteIntentAction | D3CandidateFlagAction
     review_requested: bool
 
 
+def _candidate_text(value: object, *, code: str, nonblank: bool) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or (nonblank and not value.strip())
+        or "\x00" in value
+    ):
+        raise D3ProposalRejected(code)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise D3ProposalRejected(code) from exc
+    return value
+
+
+def _parse_d3_candidate_action(raw: object) -> D3ActionProposal:
+    envelope = _fields(raw, {"action", "review_requested"})
+    review_requested = envelope["review_requested"]
+    if type(review_requested) is not bool:
+        raise D3ProposalRejected("d3_review_requested_invalid", structural=True)
+    action = _fields(
+        envelope["action"],
+        {"kind", "value", "execution_id", "evidence_version", "source_ref"},
+    )
+    if action["kind"] != "candidate_flag":
+        raise D3ProposalRejected("d3_candidate_action_required")
+
+    value = _candidate_text(
+        action["value"], code="d3_candidate_value_invalid", nonblank=False
+    )
+    if len(value.encode("utf-8")) > MAX_D3_CANDIDATE_VALUE_BYTES:
+        raise D3ProposalRejected("d3_candidate_value_too_large")
+
+    execution_id = _candidate_text(
+        action["execution_id"], code="d3_candidate_execution_id_invalid", nonblank=True
+    )
+    try:
+        parsed_execution_id = UUID(execution_id)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise D3ProposalRejected("d3_candidate_execution_id_invalid") from exc
+    if parsed_execution_id.version != 4 or str(parsed_execution_id) != execution_id:
+        raise D3ProposalRejected("d3_candidate_execution_id_invalid")
+
+    evidence_version = action["evidence_version"]
+    if (
+        not isinstance(evidence_version, str)
+        or len(evidence_version) != 64
+        or any(character not in "0123456789abcdef" for character in evidence_version)
+    ):
+        raise D3ProposalRejected("d3_candidate_evidence_version_invalid")
+
+    source_ref = _candidate_text(
+        action["source_ref"], code="d3_candidate_source_ref_invalid", nonblank=True
+    )
+    return D3ActionProposal(
+        D3CandidateFlagAction(value, execution_id, evidence_version, source_ref),
+        review_requested,
+    )
+
+
 def parse_d3_action(raw: object, stage: D3ModelStage) -> D3ActionProposal:
+    if stage == "inner_candidate":
+        return _parse_d3_candidate_action(raw)
     try:
         candidate = raw
         step_indices: tuple[int, ...] = ()
@@ -254,6 +329,40 @@ class D3ActionContext:
 
 
 @dataclass(frozen=True, slots=True)
+class D3CandidateContext:
+    """Trusted provenance supplied to the protected candidate model stage."""
+
+    turn_binding: D3TurnBinding
+    plan_binding: D3PlanBinding
+    execution_id: str
+    plan_result: D3PlanResult
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.turn_binding, D3TurnBinding):
+            raise ValueError("D3 candidate requires a typed Turn binding")
+        if not isinstance(self.plan_binding, D3PlanBinding):
+            raise ValueError("D3 candidate requires a typed Plan binding")
+        if not isinstance(self.plan_result, D3PlanResult):
+            raise ValueError("D3 candidate requires a typed Plan result")
+        try:
+            parsed = UUID(self.execution_id)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("D3 candidate requires a trusted Execution ID") from exc
+        if parsed.version != 4 or str(parsed) != self.execution_id:
+            raise ValueError("D3 candidate requires a trusted Execution ID")
+        if (
+            self.turn_binding.task_run_id != self.plan_binding.task_run_id
+            or self.turn_binding.turn_id != self.plan_binding.turn_id
+            or self.plan_result.task_run_id != self.plan_binding.task_run_id
+            or self.plan_result.plan_id != self.plan_binding.plan_id
+            or self.plan_result.artifact_version_id
+            != self.plan_binding.artifact_version_id
+            or self.plan_result.outcome != "satisfied"
+        ):
+            raise ValueError("D3 candidate provenance binding is inconsistent")
+
+
+@dataclass(frozen=True, slots=True)
 class D3ModelRequest:
     model_request_id: str
     task_run_id: str
@@ -262,7 +371,7 @@ class D3ModelRequest:
     role_config_ref: str
     resource_ref: str
     stage: D3ModelStage
-    context: D3OuterContext | D3PlanContext | D3ActionContext
+    context: D3OuterContext | D3PlanContext | D3ActionContext | D3CandidateContext
     correction_of_model_request_id: str | None = None
     rejection_code: str | None = None
     process_facts: tuple[dict[str, object], ...] = ()
@@ -307,6 +416,16 @@ class D3ModelEvidencePort(Protocol):
     def read_rejection(self, model_request_id: str) -> D3ModelRejection | None: ...
 
 
+class D3ProtectedCandidatePort(Protocol):
+    def save_pending(
+        self, candidate: object, value: str, model_request_id: str
+    ) -> dict[str, object]: ...
+
+    def load_pending_for_request(
+        self, model_request_id: str
+    ) -> tuple[object, dict[str, object]] | None: ...
+
+
 class D3ModelAdapterPort(ModelTransport[D3ModelRequest, object], Protocol):
     @property
     def role_config(self) -> D1RoleConfig: ...
@@ -347,6 +466,8 @@ class D3AuditedModel:
             if request.stage == "outer_turn"
             else D3PlanContext
             if request.stage == "inner_plan"
+            else D3CandidateContext
+            if request.stage == "inner_candidate"
             else D3ActionContext
         )
         if (
@@ -358,6 +479,313 @@ class D3AuditedModel:
             or request.task_run_id != self.controller.control_state.task_run.task_run_id
         ):
             raise D3RecoveryRequired("d3_model_configuration_or_context_changed")
+
+    async def propose_candidate(
+        self,
+        request: D3ModelRequest,
+        token: CancellationToken,
+        protected: D3ProtectedCandidatePort,
+    ):
+        """Run the candidate stage with body-only protected persistence.
+
+        The model call is started once under the normal D3/D4 ``inner_model``
+        ledger. A missing protected result after a started call is unresolved
+        and is never dispatched again. A protected result is sufficient to
+        repair the ordinary, body-free D3 evidence and later Controller commit.
+        """
+        if request.stage != "inner_candidate" or not isinstance(
+            request.context, D3CandidateContext
+        ):
+            raise D3RecoveryRequired("d3_candidate_request_invalid")
+        if not callable(getattr(protected, "save_pending", None)) or not callable(
+            getattr(protected, "load_pending_for_request", None)
+        ):
+            raise D3RecoveryRequired("d3_candidate_protected_store_required")
+        self._check(request)
+
+        context = request.context
+        expected_start = D3OperationStart(
+            request.model_request_id,
+            request.task_run_id,
+            "inner_model",
+            self.clock(),
+            request.base_checkpoint_sequence,
+            request.context_sha256,
+            request.resource_ref,
+            request.role,
+            request.role_config_ref,
+        )
+        record = self.ledger.load_d3_operation(request.model_request_id)
+        if record is not None:
+            start = record.start
+            if (
+                start.task_run_id != expected_start.task_run_id
+                or start.category != expected_start.category
+                or start.base_checkpoint_sequence
+                != expected_start.base_checkpoint_sequence
+                or start.context_sha256 != expected_start.context_sha256
+                or start.resource_ref != expected_start.resource_ref
+                or start.role != expected_start.role
+                or start.role_config_ref != expected_start.role_config_ref
+            ):
+                raise D3RecoveryRequired("d3_candidate_call_identity_changed")
+
+        pending = None
+        if record is None:
+            pending = protected.load_pending_for_request(request.model_request_id)
+            if pending is not None:
+                raise D3RecoveryRequired("d3_candidate_result_without_started_call")
+        elif record.completion is None:
+            pending = protected.load_pending_for_request(request.model_request_id)
+            if pending is None:
+                raise D3RecoveryRequired("d3_candidate_model_call_outcome_unknown")
+        if record is None:
+            state = self.controller.control_state
+            if (
+                token.is_cancelled
+                or state.task_run.status.value != "running"
+                or self.clock() >= state.task_run.deadline_at
+                or state.latest_checkpoint.sequence
+                != request.base_checkpoint_sequence
+            ):
+                raise D3RecoveryRequired("d3_candidate_dispatch_stopped")
+            self.ledger.begin_d3_operation(expected_start)
+            raw = await self._invoke(
+                request,
+                min(180.0, state.task_run.deadline_at - self.clock()),
+                token,
+            )
+            try:
+                proposal = parse_d3_action(raw, "inner_candidate")
+                action = proposal.action
+                if not isinstance(action, D3CandidateFlagAction):
+                    raise D3ProposalRejected("d3_candidate_action_required")
+                if proposal.review_requested:
+                    raise D3ProposalRejected("d3_candidate_review_not_supported")
+                if (
+                    action.execution_id != context.execution_id
+                    or action.evidence_version != context.plan_result.evidence_sha256
+                    or action.source_ref != context.plan_binding.artifact_version_id
+                ):
+                    raise D3ProposalRejected("d3_candidate_binding_rejected")
+            except D3ProposalRejected as exc:
+                safe_raw = {
+                    "outcome": "rejected",
+                    "reason": exc.code,
+                    "structural": exc.structural,
+                    "retryable": exc.retryable,
+                }
+                evidence = D3ModelEvidence(
+                    request.model_request_id,
+                    request.task_run_id,
+                    request.stage,
+                    request.role_config_ref,
+                    request.resource_ref,
+                    request.base_checkpoint_sequence,
+                    request.context_sha256,
+                    request.correction_of_model_request_id,
+                    "invalid_structure" if exc.structural else "rejected",
+                    safe_raw,
+                    exc.code,
+                    self.clock(),
+                )
+                checksum = self.evidence.save(evidence)
+                self.ledger.complete_d3_operation(
+                    D3OperationCompletion(
+                        request.model_request_id,
+                        evidence.finished_at,
+                        "rejected",
+                        request.model_request_id,
+                        checksum,
+                    )
+                )
+                raise D3ProposalRejected(
+                    exc.code,
+                    structural=exc.structural,
+                    retryable=exc.retryable,
+                    model_request_id=request.model_request_id,
+                ) from exc
+
+            candidate = D7AnswerCandidate(
+                task_run_id=request.task_run_id,
+                candidate_id=str(uuid4()),
+                turn_id=context.plan_binding.turn_id,
+                intent_id=context.plan_binding.intent_id,
+                plan_id=context.plan_binding.plan_id,
+                execution_id=context.execution_id,
+                evidence_version=context.plan_result.evidence_sha256,
+                source_ref=context.plan_binding.artifact_version_id,
+            )
+            metadata = protected.save_pending(
+                candidate, action.value, request.model_request_id
+            )
+            pending = (candidate, metadata)
+            safe_raw = self._candidate_safe_raw(candidate, metadata)
+            evidence = D3ModelEvidence(
+                request.model_request_id,
+                request.task_run_id,
+                request.stage,
+                request.role_config_ref,
+                request.resource_ref,
+                request.base_checkpoint_sequence,
+                request.context_sha256,
+                request.correction_of_model_request_id,
+                "accepted",
+                safe_raw,
+                None,
+                self.clock(),
+            )
+            checksum = self.evidence.save(evidence)
+            self.ledger.complete_d3_operation(
+                D3OperationCompletion(
+                    request.model_request_id,
+                    evidence.finished_at,
+                    "completed",
+                    request.model_request_id,
+                    checksum,
+                )
+            )
+            record = self.ledger.load_d3_operation(request.model_request_id)
+        elif record.completion is None:
+            candidate, metadata = pending
+            self._validate_pending_candidate(request, candidate, metadata)
+            safe_raw = self._candidate_safe_raw(candidate, metadata)
+            evidence = D3ModelEvidence(
+                request.model_request_id,
+                request.task_run_id,
+                request.stage,
+                request.role_config_ref,
+                request.resource_ref,
+                request.base_checkpoint_sequence,
+                request.context_sha256,
+                request.correction_of_model_request_id,
+                "accepted",
+                safe_raw,
+                None,
+                self.clock(),
+            )
+            checksum = self.evidence.save(evidence)
+            self.ledger.complete_d3_operation(
+                D3OperationCompletion(
+                    request.model_request_id,
+                    evidence.finished_at,
+                    "completed",
+                    request.model_request_id,
+                    checksum,
+                )
+            )
+            record = self.ledger.load_d3_operation(request.model_request_id)
+
+        if record is None or record.completion is None:
+            raise D3RecoveryRequired("d3_candidate_call_completion_missing")
+        evidence = self.evidence.read(request.model_request_id)
+        if evidence is None:
+            raise D3RecoveryRequired("d3_candidate_call_evidence_missing")
+        if record.completion.result_kind == "rejected":
+            rejection = evidence.raw
+            if (
+                evidence.outcome not in {"rejected", "invalid_structure"}
+                or evidence.reason is None
+                or not isinstance(rejection, Mapping)
+                or set(rejection)
+                != {"outcome", "reason", "structural", "retryable"}
+                or rejection.get("outcome") != "rejected"
+                or rejection.get("reason") != evidence.reason
+                or type(rejection.get("structural")) is not bool
+                or type(rejection.get("retryable")) is not bool
+                or evidence.outcome
+                != ("invalid_structure" if rejection.get("structural") else "rejected")
+                or evidence.model_request_id != request.model_request_id
+                or evidence.task_run_id != request.task_run_id
+                or evidence.stage != request.stage
+                or evidence.role_config_ref != request.role_config_ref
+                or evidence.resource_ref != request.resource_ref
+                or evidence.base_checkpoint_sequence
+                != request.base_checkpoint_sequence
+                or evidence.context_sha256 != request.context_sha256
+                or evidence.correction_of_model_request_id
+                != request.correction_of_model_request_id
+                or record.completion.evidence_ref != request.model_request_id
+                or record.completion.evidence_sha256 != digest(asdict(evidence))
+            ):
+                raise D3RecoveryRequired("d3_candidate_rejection_evidence_changed")
+            raise D3ProposalRejected(
+                evidence.reason,
+                structural=rejection["structural"],
+                retryable=rejection["retryable"],
+                model_request_id=request.model_request_id,
+            )
+        pending = protected.load_pending_for_request(request.model_request_id)
+        if record.completion.result_kind != "completed" or pending is None:
+            raise D3RecoveryRequired("d3_candidate_protected_result_missing")
+        candidate, metadata = pending
+        self._validate_pending_candidate(request, candidate, metadata)
+        if (
+            evidence.outcome != "accepted"
+            or evidence.model_request_id != request.model_request_id
+            or evidence.task_run_id != request.task_run_id
+            or evidence.stage != request.stage
+            or evidence.role_config_ref != request.role_config_ref
+            or evidence.resource_ref != request.resource_ref
+            or evidence.base_checkpoint_sequence != request.base_checkpoint_sequence
+            or evidence.context_sha256 != request.context_sha256
+            or evidence.correction_of_model_request_id
+            != request.correction_of_model_request_id
+            or record.completion.result_kind != "completed"
+            or evidence.raw != self._candidate_safe_raw(candidate, metadata)
+            or record.completion.evidence_ref != request.model_request_id
+            or record.completion.evidence_sha256 != digest(asdict(evidence))
+        ):
+            raise D3RecoveryRequired("d3_candidate_completion_evidence_changed")
+        return request.model_request_id, candidate
+
+    @staticmethod
+    def _candidate_safe_raw(candidate: object, metadata: Mapping[str, object]):
+        if not isinstance(metadata, Mapping):
+            raise D3RecoveryRequired("d3_candidate_protected_metadata_invalid")
+        body_sha256 = metadata.get("body_sha256")
+        byte_size = metadata.get("byte_size")
+        if (
+            not isinstance(body_sha256, str)
+            or len(body_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in body_sha256)
+            or type(byte_size) is not int
+            or byte_size <= 0
+        ):
+            raise D3RecoveryRequired("d3_candidate_protected_metadata_invalid")
+        return {
+            "candidate_id": getattr(candidate, "candidate_id", None),
+            "evidence_version": getattr(candidate, "evidence_version", None),
+            "execution_id": getattr(candidate, "execution_id", None),
+            "body_sha256": body_sha256,
+            "byte_size": byte_size,
+        }
+
+    @staticmethod
+    def _validate_pending_candidate(
+        request: D3ModelRequest,
+        candidate: object,
+        metadata: Mapping[str, object],
+    ) -> None:
+        context = request.context
+        if not isinstance(context, D3CandidateContext):
+            raise D3RecoveryRequired("d3_candidate_context_invalid")
+        if (
+            not isinstance(candidate, D7AnswerCandidate)
+            or candidate.task_run_id != request.task_run_id
+            or candidate.turn_id != context.plan_binding.turn_id
+            or candidate.intent_id != context.plan_binding.intent_id
+            or candidate.plan_id != context.plan_binding.plan_id
+            or candidate.execution_id != context.execution_id
+            or candidate.evidence_version != context.plan_result.evidence_sha256
+            or candidate.source_ref != context.plan_binding.artifact_version_id
+            or metadata.get("model_request_id") != request.model_request_id
+            or metadata.get("candidate_id") != candidate.candidate_id
+            or metadata.get("task_run_id") != request.task_run_id
+            or metadata.get("execution_id") != context.execution_id
+            or metadata.get("evidence_version") != context.plan_result.evidence_sha256
+        ):
+            raise D3RecoveryRequired("d3_candidate_protected_binding_changed")
 
     def _saved(
         self, request: D3ModelRequest
@@ -465,6 +893,8 @@ class D3AuditedModel:
         refresh: Callable[[D3ModelRequest], D3ModelRequest] | None = None,
         validate: Callable[[D3ModelRequest, object], None] | None = None,
     ):
+        if request.stage == "inner_candidate":
+            raise D3RecoveryRequired("d3_candidate_protected_store_required")
         self._check(request)
         d4_enabled = self.config.d4_budget is not None
         if d4_enabled and (refresh is None or validate is None):
