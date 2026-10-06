@@ -24,7 +24,7 @@ from agent_adapters.windows_evidence_protection import (
     WindowsEvidenceProtection,
     WindowsEvidenceProtectionError,
 )
-from agent_core.d7_web_contracts import (
+from agent_core.v7.web_contracts import (
     D7_WEB_MAX_HEADER_BYTES,
     D7_WEB_MAX_HEADER_COUNT,
     D7_WEB_MAX_HEADER_VALUE_BYTES,

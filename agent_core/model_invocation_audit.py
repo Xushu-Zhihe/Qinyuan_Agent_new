@@ -15,6 +15,7 @@ from agent_core.modeling import (
     IntentActionResponse,
     IntentCandidate,
     IntentGenerationResponse,
+    IntentGoalEvaluationResponse,
     ModelError,
     ModelErrorKind,
     ModelRequestType,
@@ -24,8 +25,14 @@ from agent_core.modeling import (
     parse_intent_action,
 )
 
-AuditedResult = IntentGenerationResponse | PlanGenerationResponse | IntentActionResponse | ModelError
-AuditedResultKind = Literal["intent_generation", "plan", "intent_action", "invalid_structure", "model_error"]
+AuditedResult = (
+    IntentGenerationResponse | IntentGoalEvaluationResponse | PlanGenerationResponse
+    | IntentActionResponse | ModelError
+)
+AuditedResultKind = Literal[
+    "intent_generation", "intent_goal_evaluation", "plan", "intent_action",
+    "invalid_structure", "model_error",
+]
 
 
 def _uuid4(value: str | None, field: str) -> None:
@@ -109,6 +116,10 @@ class ModelInvocationCompletion:
             self.result, IntentGenerationResponse
         ) and self.result.candidates:
             return
+        if self.result_kind == "intent_goal_evaluation" and isinstance(
+            self.result, IntentGoalEvaluationResponse
+        ):
+            return
         if self.result_kind == "plan" and isinstance(
             self.result, PlanGenerationResponse
         ):
@@ -162,6 +173,11 @@ def result_payload(completion: ModelInvocationCompletion) -> dict[str, object]:
         return {"candidates": [{"description": candidate.description,
                                 "intent_type": candidate.intent_type}
                                for candidate in result.candidates]}
+    if isinstance(result, IntentGoalEvaluationResponse):
+        return {
+            "decision": result.decision,
+            "evidence_ids": list(result.evidence_ids),
+        }
     if isinstance(result, PlanGenerationResponse):
         return {"steps": [{"description": step.description} for step in result.candidate.steps]}
     if isinstance(result, IntentActionResponse):
@@ -181,8 +197,14 @@ def result_payload(completion: ModelInvocationCompletion) -> dict[str, object]:
             return {"action": {"kind": "stop", "short_reason": action.short_reason}}
         raise ValueError("unsupported Intent action")
     assert isinstance(result, ModelError)
-    return {"kind": result.kind.value, "short_reason": result.short_reason,
-            "evidence_ref": result.evidence_ref}
+    payload = {
+        "kind": result.kind.value,
+        "short_reason": result.short_reason,
+        "evidence_ref": result.evidence_ref,
+    }
+    if result.validation_code is not None:
+        payload["validation_code"] = result.validation_code
+    return payload
 
 
 def result_from_payload(kind: AuditedResultKind, payload: object) -> AuditedResult:
@@ -197,6 +219,15 @@ def result_from_payload(kind: AuditedResultKind, payload: object) -> AuditedResu
                 raise ValueError("invalid persisted Intent candidate")
             candidates.append(IntentCandidate(item["description"], item["intent_type"]))
         return IntentGenerationResponse(tuple(candidates))
+    if kind == "intent_goal_evaluation":
+        if (
+            set(payload) != {"decision", "evidence_ids"}
+            or not isinstance(payload["evidence_ids"], list)
+        ):
+            raise ValueError("invalid persisted Intent goal evaluation")
+        return IntentGoalEvaluationResponse(
+            payload["decision"], tuple(payload["evidence_ids"])
+        )
     if kind == "plan":
         if set(payload) != {"steps"} or not isinstance(payload["steps"], list):
             raise ValueError("invalid persisted Plan summary")
@@ -208,8 +239,14 @@ def result_from_payload(kind: AuditedResultKind, payload: object) -> AuditedResu
             raise ValueError("invalid persisted Intent action")
         return IntentActionResponse(parse_intent_action(payload["action"]))
     if kind in {"invalid_structure", "model_error"}:
-        if set(payload) != {"kind", "short_reason", "evidence_ref"}:
+        required = {"kind", "short_reason", "evidence_ref"}
+        if set(payload) not in (required, required | {"validation_code"}):
             raise ValueError("invalid persisted ModelError")
         error_kind = ModelErrorKind(payload["kind"])
-        return ModelError(error_kind, payload["short_reason"], payload["evidence_ref"])
+        return ModelError(
+            error_kind,
+            payload["short_reason"],
+            payload["evidence_ref"],
+            payload.get("validation_code"),
+        )
     raise ValueError("unsupported persisted model result kind")

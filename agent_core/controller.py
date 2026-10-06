@@ -52,7 +52,7 @@ from agent_core.domain import (
     PlanStatus,
     TurnStatus,
 )
-from agent_core.d7_web_contracts import D7WebRunConfig
+from agent_core.v7.web_contracts import D7WebRunConfig
 from agent_core.dual_llm_contracts import D3CommitMetadata, D3RunConfig
 from agent_core.file_inspection import FILE_TOOL
 from agent_core.file_type_fact import FileTypeFactCandidate, fact_content

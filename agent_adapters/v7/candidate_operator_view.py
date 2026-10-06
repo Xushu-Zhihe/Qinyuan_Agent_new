@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
-from agent_adapters.d7_candidate_evidence import (
+from agent_adapters.v7.candidate_evidence import (
     D7CandidateEvidenceError,
     D7CandidateEvidenceService,
 )

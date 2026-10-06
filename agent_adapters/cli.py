@@ -142,7 +142,7 @@ def _snapshot(directory, declaration):
 
 def _snapshot_v3(directory: Path, declaration: dict) -> dict:
     """Read the v3 TaskRun result through its versioned result adapter."""
-    from agent_adapters.d7_task_result import snapshot_v3_task_result
+    from agent_adapters.v7.task_result import snapshot_v3_task_result
 
     return snapshot_v3_task_result(directory, declaration)
 
@@ -269,7 +269,7 @@ def _status_by_request_id(args) -> dict:
     if parsed is None or parsed.version != 4 or str(parsed) != request_id:
         return _request_status_error(request_id, "request_id_invalid", 2)
 
-    from agent_adapters.d7_request_staging import (
+    from agent_adapters.v7.request_staging import (
         D7RequestStager,
         RequestStagingError,
     )
@@ -695,8 +695,8 @@ def dispatch(args):
         except LookupError as exc:
             raise ValueError("d7_candidate_view_terminal_encoding_unsupported") from exc
         directory, _declaration = _candidate_read_run_directory(args)
-        from agent_adapters.d7_candidate_evidence import D7CandidateEvidenceService
-        from agent_adapters.d7_candidate_operator_view import (
+        from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
+        from agent_adapters.v7.candidate_operator_view import (
             D7CandidateOperatorViewer,
             OPERATOR_CANDIDATE_VIEW_ADAPTER_ID,
         )
@@ -951,8 +951,8 @@ def main(argv=None):
         from agent_adapters.application import base_result, safe_error
 
         from agent_adapters.protected_evidence import ProtectedEvidenceError
-        from agent_adapters.d7_candidate_evidence import D7CandidateEvidenceError
-        from agent_adapters.d7_candidate_operator_view import (
+        from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceError
+        from agent_adapters.v7.candidate_operator_view import (
             D7CandidateOperatorViewError,
         )
 

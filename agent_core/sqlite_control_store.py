@@ -61,7 +61,7 @@ from agent_core.control_store import (
     task_request_payload,
     validate_control_event,
 )
-from agent_core.d7_web_contracts import (
+from agent_core.v7.web_contracts import (
     D7WebExecutionRecord,
     D7WebPlanRecord,
     D7WebRunConfig,
@@ -168,7 +168,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 21
+CURRENT_SCHEMA_VERSION = 22
 
 MIGRATION_14 = """
 CREATE TABLE d4_operations (
@@ -487,6 +487,51 @@ CREATE INDEX idx_d4_audit_events_task_category
 ON d4_audit_events(task_run_id, category);
 CREATE INDEX idx_d4_audit_events_related
 ON d4_audit_events(task_run_id, related_ref);
+"""
+
+MIGRATION_22 = """
+ALTER TABLE turns ADD COLUMN parent_turn_id TEXT REFERENCES turns(turn_id);
+ALTER TABLE turns ADD COLUMN triggering_intent_id TEXT REFERENCES intents(intent_id);
+CREATE INDEX idx_turns_parent ON turns(parent_turn_id) WHERE parent_turn_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_turns_triggering_intent
+ON turns(triggering_intent_id) WHERE triggering_intent_id IS NOT NULL;
+CREATE TRIGGER turns_parent_metadata_pair_insert
+BEFORE INSERT ON turns
+WHEN (NEW.parent_turn_id IS NULL) != (NEW.triggering_intent_id IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'Turn parent metadata must be set together');
+END;
+CREATE TRIGGER turns_parent_metadata_pair_update
+BEFORE UPDATE OF parent_turn_id, triggering_intent_id ON turns
+WHEN (NEW.parent_turn_id IS NULL) != (NEW.triggering_intent_id IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'Turn parent metadata must be set together');
+END;
+CREATE TRIGGER turns_parent_reference_insert
+BEFORE INSERT ON turns
+WHEN NEW.parent_turn_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM turns AS current_turn WHERE current_turn.turn_id = NEW.turn_id
+) AND NOT EXISTS (
+    SELECT 1
+    FROM turns AS parent
+    JOIN intents AS trigger_intent
+      ON trigger_intent.intent_id = NEW.triggering_intent_id
+    WHERE parent.turn_id = NEW.parent_turn_id
+      AND parent.task_run_id = NEW.task_run_id
+      AND parent.status = 'running'
+      AND trigger_intent.turn_id = parent.turn_id
+      AND trigger_intent.status = 'succeeded'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Turn parent reference is invalid');
+END;
+CREATE TRIGGER turns_parent_metadata_immutable
+BEFORE UPDATE OF parent_turn_id, triggering_intent_id ON turns
+WHEN NEW.parent_turn_id IS NOT OLD.parent_turn_id
+  OR NEW.triggering_intent_id IS NOT OLD.triggering_intent_id
+BEGIN
+    SELECT RAISE(ABORT, 'Turn parent metadata is immutable');
+END;
 """
 
 MIGRATION_12 = """
@@ -935,11 +980,10 @@ class SqliteControlStore:
         connection.row_factory = sqlite3.Row
         try:
             version = connection.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0]
-            if version not in {
-                10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-                CURRENT_SCHEMA_VERSION,
-            }:
-                raise StorageError("read-only history requires supported schema 10 through 21")
+            if not isinstance(version, int) or not 10 <= version <= CURRENT_SCHEMA_VERSION:
+                raise StorageError(
+                    f"read-only history requires supported schema 10 through {CURRENT_SCHEMA_VERSION}"
+                )
             connection.execute("BEGIN")
             store = cls(connection, database_path, clock=time.time)
             store._schema_version = int(version)
@@ -1127,6 +1171,13 @@ class SqliteControlStore:
                 self._connection.execute(
                     "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                     (21, self._now()),
+                )
+            if version < 22:
+                for statement in _sql_statements(MIGRATION_22):
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                    (22, self._now()),
                 )
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
@@ -5215,6 +5266,14 @@ class SqliteControlStore:
                     turn_target=row["turn_target"],
                     intent_ids=tuple(json.loads(row["intent_ids_json"])),
                     status=TurnStatus(row["status"]),
+                    parent_turn_id=(
+                        row["parent_turn_id"] if self._schema_version >= 22 else None
+                    ),
+                    triggering_intent_id=(
+                        row["triggering_intent_id"]
+                        if self._schema_version >= 22
+                        else None
+                    ),
                 )
                 for row in self._connection.execute(
                     """
@@ -5650,13 +5709,18 @@ class SqliteControlStore:
         self._connection.execute(
             """
             INSERT INTO turns(
-                turn_id, task_run_id, sequence, turn_target, intent_ids_json, status
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                turn_id, task_run_id, sequence, turn_target, intent_ids_json, status,
+                parent_turn_id, triggering_intent_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(turn_id) DO UPDATE SET
                 sequence = excluded.sequence,
                 turn_target = excluded.turn_target,
                 intent_ids_json = excluded.intent_ids_json,
-                status = excluded.status
+                status = excluded.status,
+                parent_turn_id = COALESCE(excluded.parent_turn_id, turns.parent_turn_id),
+                triggering_intent_id = COALESCE(
+                    excluded.triggering_intent_id, turns.triggering_intent_id
+                )
             WHERE turns.task_run_id = excluded.task_run_id
             """,
             (
@@ -5666,6 +5730,8 @@ class SqliteControlStore:
                 change.turn_target,
                 canonical_json(list(change.intent_ids)),
                 change.status.value,
+                change.parent_turn_id,
+                change.triggering_intent_id,
             ),
         )
         self._require_owner("turns", "turn_id", change.turn_id, change.task_run_id)

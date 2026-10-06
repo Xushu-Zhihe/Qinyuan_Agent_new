@@ -59,7 +59,7 @@ def test_candidate_read_rejects_non_v3_before_service_use(tmp_path, monkeypatch)
         def __init__(self, *args, **kwargs):
             service_created.append((args, kwargs))
 
-    import agent_adapters.d7_candidate_evidence as evidence
+    import agent_adapters.v7.candidate_evidence as evidence
 
     monkeypatch.setattr(evidence, "D7CandidateEvidenceService", Service)
     args = SimpleNamespace(
@@ -134,8 +134,8 @@ def test_candidate_read_passes_version_and_keeps_body_out_of_result(
                 }
             )
 
-    import agent_adapters.d7_candidate_evidence as evidence
-    import agent_adapters.d7_candidate_operator_view as operator_view
+    import agent_adapters.v7.candidate_evidence as evidence
+    import agent_adapters.v7.candidate_operator_view as operator_view
 
     monkeypatch.setattr(evidence, "D7CandidateEvidenceService", Service)
     monkeypatch.setattr(operator_view, "D7CandidateOperatorViewer", Viewer)

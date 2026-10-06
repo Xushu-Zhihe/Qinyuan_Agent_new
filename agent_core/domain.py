@@ -132,12 +132,21 @@ class Turn:
     turn_target: str
     intent_ids: tuple[str, ...]
     status: TurnStatus = TurnStatus.PENDING
+    parent_turn_id: str | None = None
+    triggering_intent_id: str | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.turn_id, "turn_id")
         _non_empty(self.task_run_id, "task_run_id")
         _positive_integer(self.sequence, "sequence")
         _non_empty(self.turn_target, "turn_target")
+        if (self.parent_turn_id is None) != (self.triggering_intent_id is None):
+            raise DomainError(
+                "parent_turn_id and triggering_intent_id must be set together"
+            )
+        if self.parent_turn_id is not None:
+            _non_empty(self.parent_turn_id, "parent_turn_id")
+            _non_empty(self.triggering_intent_id, "triggering_intent_id")
         if not isinstance(self.status, TurnStatus):
             raise DomainError("Turn status must be a TurnStatus")
         if not isinstance(self.intent_ids, tuple):

@@ -310,7 +310,7 @@ def _make_application(
 
 
 def _propose_completed_turn_candidate(app: D3Application, directory: Path, token) -> None:
-    from agent_adapters.d7_candidate_evidence import D7CandidateEvidenceService
+    from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
 
     candidate_evidence = D7CandidateEvidenceService(
         directory,
@@ -327,7 +327,7 @@ def run_simulated_task(
     operation: str = "start",
 ) -> dict:
     """Run or recover one local simulated D3 TaskRun and return its projection."""
-    from agent_adapters.d7_task_result import snapshot_v3_task_result
+    from agent_adapters.v7.task_result import snapshot_v3_task_result
 
     directory = Path(directory)
     task_id = declaration["task_run_id"]
@@ -381,7 +381,7 @@ def run_simulated_task(
             result.get("cleanup_status") == "confirmed"
             and declaration.get("request_id")
         ):
-            from agent_adapters.d7_request_staging import D7RequestStager
+            from agent_adapters.v7.request_staging import D7RequestStager
 
             stager = D7RequestStager.open_existing(
                 # ``directory`` is ``<state-dir>/<task-run-id>``.  Request

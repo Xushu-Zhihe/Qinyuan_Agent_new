@@ -16,14 +16,17 @@ from agent_adapters.deepseek_model import (
     build_payload,
 )
 from agent_adapters.event_export import EventExporter
+from agent_core.actions import T6ActionValidationCode, T6ActionValidationFailure
 from agent_core.contracts import Target
 from agent_core.file_inspection import LEGACY_FILE_INSPECTION_SCRIPT
 from agent_core.modeling import (
     IntentContext,
     ModelErrorKind,
     ModelInvocationCoordinator,
+    ModelError,
     ModelRequest,
     ModelRequestType,
+    ModelValidationCode,
 )
 from agent_core.tool_contracts import MCPCommand, ToolRequest
 from agent_core.tool_policy import FileToolPolicy
@@ -43,6 +46,20 @@ def request():
         (),
         (),
         IntentContext(str(uuid4()), "identify file type"),
+    )
+
+
+def intent_generation_request():
+    return ModelRequest(
+        str(uuid4()),
+        str(uuid4()),
+        str(uuid4()),
+        ModelRequestType.INTENT_GENERATION,
+        "find flag",
+        Target.from_dict({"endpoints": [{"url": "https://example.test/"}]}),
+        "inspect the authorized target",
+        (),
+        (),
     )
 
 
@@ -90,7 +107,7 @@ def test_correction_uses_existing_coordinator_and_json_without_tools():
     r = request()
     payload = build_payload(r, settings)
     assert "tools" not in payload
-    assert payload["thinking"] == {"type": "disabled"}
+    assert "thinking" not in payload
     assert payload["response_format"] == {"type": "json_object"}
     adapter = DeepSeekModelAdapter(settings, worker=structured_worker)
     result = ModelInvocationCoordinator(adapter, Deadline(), Evidence()).invoke(
@@ -98,6 +115,73 @@ def test_correction_uses_existing_coordinator_and_json_without_tools():
     )
     assert result.candidate.steps[0].description == "inspect file"
     assert "test-key" not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        T6ActionValidationCode.PROVIDER_JSON_INVALID,
+        T6ActionValidationCode.PROVIDER_ENVELOPE_INVALID,
+        T6ActionValidationCode.PROVIDER_CHOICES_INVALID,
+        T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
+    ],
+)
+def test_intent_adapter_preserves_fixed_provider_parse_code(monkeypatch, code):
+    adapter = DeepSeekModelAdapter(DeepSeekSettings("deepseek-test", "test-key"))
+    monkeypatch.setattr(
+        adapter,
+        "_invoke_payload",
+        lambda *args: T6ActionValidationFailure(code),
+    )
+
+    result = adapter.invoke(intent_generation_request(), 5, Token())
+
+    assert isinstance(result, ModelError)
+    assert result.kind is ModelErrorKind.INVALID_RESPONSE
+    assert result.validation_code == code.value
+    assert "test-key" not in repr(result)
+
+
+def test_provider_parse_diagnostic_contains_only_a_fixed_code():
+    class Pipe:
+        def __init__(self):
+            self.values = []
+
+        def send(self, value):
+            self.values.append(value)
+
+    pipe = Pipe()
+    deepseek_model._invalid_provider_payload(
+        pipe, T6ActionValidationCode.PROVIDER_JSON_INVALID
+    )
+
+    assert pipe.values == [
+        {
+            "payload": None,
+            "validation_code": T6ActionValidationCode.PROVIDER_JSON_INVALID.value,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"candidates": [], "extra": "model-controlled text"},
+        ["candidate object"],
+    ],
+)
+def test_intent_adapter_rejects_mismatched_top_level_fields(monkeypatch, payload):
+    adapter = DeepSeekModelAdapter(DeepSeekSettings("deepseek-test", "test-key"))
+    monkeypatch.setattr(adapter, "_invoke_payload", lambda *args: payload)
+
+    result = adapter.invoke(intent_generation_request(), 5, Token())
+
+    assert isinstance(result, ModelError)
+    assert result.validation_code == (
+        ModelValidationCode.INTENT_RESPONSE_FIELDS_INVALID.value
+    )
+    assert "model-controlled text" not in repr(result)
 
 
 @pytest.mark.parametrize("cancel", [False, True])

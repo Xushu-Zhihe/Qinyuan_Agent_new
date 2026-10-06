@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from agent_adapters.d7_http_adapter import (
+from agent_adapters.v7.http_adapter import (
     D7HttpAdapter,
     D7HttpError,
     D7HttpEvidenceMetadata,

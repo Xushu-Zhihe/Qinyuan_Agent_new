@@ -18,12 +18,16 @@ from agent_core.control_store import StorageError
 from agent_core.controller import TaskRunController, TaskRunControllerRegistry
 from agent_core.fake_model_adapters import FakeCodexAdapter
 from agent_core.intent_generation import AuditedTurnGenerator, OrderedIntentGenerator
-from agent_core.model_invocation_audit import ModelInvocationRecoveryRequired
+from agent_core.model_invocation_audit import (
+    ModelInvocationRecoveryRequired,
+    result_payload,
+)
 from agent_core.modeling import (
     IntentGenerationResponse,
     ModelInvocationCoordinator,
     ModelRequest,
     ModelRequestType,
+    ModelValidationCode,
 )
 from agent_core.sqlite_control_store import CURRENT_SCHEMA_VERSION, SqliteControlStore
 
@@ -293,7 +297,18 @@ def test_started_model_call_without_result_is_never_redispatched(tmp_path):
 
 def test_structural_correction_is_separately_audited(tmp_path):
     fixture = Fixture(tmp_path, [
-        {"event": "result", "payload": {"intents": [4]}},
+        {
+            "event": "result",
+            "payload": {
+                "intents": [
+                    {
+                        "description": "candidate",
+                        "intent_type": None,
+                        "untrusted_extra": "must not be persisted",
+                    }
+                ]
+            },
+        },
         response(2),
     ])
     result = fixture.generate(str(uuid4()))
@@ -302,6 +317,10 @@ def test_structural_correction_is_separately_audited(tmp_path):
         "invalid_structure", "intent_generation"
     ]
     assert calls[1].start.correction_of_model_request_id == calls[0].start.model_request_id
+    assert calls[0].completion.result.validation_code == (
+        ModelValidationCode.INTENT_CANDIDATE_STRUCTURE_INVALID.value
+    )
+    assert "untrusted_extra" not in str(result_payload(calls[0].completion))
 
 
 def test_cancelled_task_cannot_apply_completed_generation(tmp_path, monkeypatch):

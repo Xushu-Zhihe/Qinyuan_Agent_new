@@ -11,10 +11,10 @@ from uuid import uuid4
 import pytest
 
 from agent_adapters.run_files import immutable_write
-from agent_adapters.d7_web_request import D7WebRequest
+from agent_adapters.v7.web_request import D7WebRequest
 from agent_adapters.workbench import Workbench, WorkbenchError
 from agent_adapters.workbench_runner import D7_ALLOWED_METHODS
-from agent_core.d7_web_contracts import canonical_web_origin
+from agent_core.v7.web_contracts import canonical_web_origin
 
 
 class _Process:

@@ -30,6 +30,7 @@ def _non_empty(value: Any, field_name: str) -> str:
 
 class ModelRequestType(StrEnum):
     INTENT_GENERATION = "intent_generation"
+    INTENT_GOAL_EVALUATION = "intent_goal_evaluation"
     PLAN_GENERATION = "plan_generation"
     INTENT_ACTION = "intent_action"
 
@@ -42,6 +43,19 @@ class ModelErrorKind(StrEnum):
     REFUSED = "refused"
     INVALID_RESPONSE = "invalid_response"
     PROVIDER_FAILURE = "provider_failure"
+
+
+class ModelValidationCode(StrEnum):
+    PROVIDER_RESPONSE_INVALID = "provider_response_invalid"
+    PROVIDER_JSON_INVALID = "provider_json_invalid"
+    PROVIDER_ENVELOPE_INVALID = "provider_envelope_invalid"
+    PROVIDER_CHOICES_INVALID = "provider_choices_invalid"
+    PROVIDER_CONTENT_INVALID = "provider_content_invalid"
+    INTENT_RESPONSE_FIELDS_INVALID = "intent_response_fields_invalid"
+    INTENT_CANDIDATES_NOT_ARRAY = "intent_candidates_not_array"
+    INTENT_CANDIDATES_EMPTY = "intent_candidates_empty"
+    INTENT_CANDIDATE_STRUCTURE_INVALID = "intent_candidate_structure_invalid"
+    INTENT_GOAL_EVALUATION_INVALID = "intent_goal_evaluation_invalid"
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +191,11 @@ class ModelRequest:
                 raise ModelContractError("intent_action requires Intent and action context")
             if self.action_context.intent_id != self.intent.intent_id:
                 raise ModelContractError("Intent action context belongs to another Intent")
+        elif self.request_type is ModelRequestType.INTENT_GOAL_EVALUATION:
+            if not isinstance(self.intent, IntentContext) or self.action_context is not None:
+                raise ModelContractError(
+                    "intent_goal_evaluation requires Intent context only"
+                )
         elif self.intent is not None or self.action_context is not None:
             raise ModelContractError("intent_generation must not include Intent context")
         if self.request_type is not ModelRequestType.INTENT_GENERATION and any(
@@ -231,6 +250,12 @@ class NormalizedIntentResponse:
     """Adapter-normalized, but not yet structurally validated, Intent output."""
 
     candidates: object
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedIntentGoalEvaluationResponse:
+    decision: object
+    evidence_ids: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,13 +315,36 @@ def parse_intent_action(raw: object) -> IntentAction:
 
 
 NormalizedModelResponse: TypeAlias = (
-    NormalizedIntentResponse | NormalizedPlanResponse | NormalizedIntentActionResponse
+    NormalizedIntentResponse | NormalizedIntentGoalEvaluationResponse
+    | NormalizedPlanResponse | NormalizedIntentActionResponse
 )
 
 
 @dataclass(frozen=True, slots=True)
 class IntentGenerationResponse:
     candidates: tuple[IntentCandidate, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class IntentGoalEvaluationResponse:
+    decision: str
+    evidence_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision, str) or self.decision not in {
+            "satisfied", "not_satisfied", "inconclusive",
+        }:
+            raise ModelContractError("Intent goal decision is invalid")
+        if not isinstance(self.evidence_ids, tuple):
+            raise ModelContractError("evidence_ids must be a tuple")
+        if any(not isinstance(item, str) or not item.strip() for item in self.evidence_ids):
+            raise ModelContractError("evidence_ids must contain non-empty strings")
+        if len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise ModelContractError("evidence_ids must be unique")
+        if self.decision == "inconclusive" and self.evidence_ids:
+            raise ModelContractError("inconclusive decisions cannot cite evidence")
+        if self.decision != "inconclusive" and not self.evidence_ids:
+            raise ModelContractError("conclusive decisions require evidence_ids")
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,7 +358,8 @@ class IntentActionResponse:
 
 
 ModelResponse: TypeAlias = (
-    IntentGenerationResponse | PlanGenerationResponse | IntentActionResponse
+    IntentGenerationResponse | IntentGoalEvaluationResponse
+    | PlanGenerationResponse | IntentActionResponse
 )
 
 
@@ -374,10 +423,18 @@ class ModelAdapter(ModelTransport[ModelRequest, NormalizedModelResponse | ModelE
 
 
 class StructuredResponseValidationError(ValueError):
-    def __init__(self, kind: ModelErrorKind, short_reason: str) -> None:
+    def __init__(
+        self,
+        kind: ModelErrorKind,
+        short_reason: str,
+        validation_code: ModelValidationCode | None = None,
+    ) -> None:
         super().__init__(short_reason)
         self.kind = kind
         self.short_reason = short_reason
+        self.validation_code = (
+            validation_code.value if validation_code is not None else None
+        )
 
 
 class StructuredResponseValidator:
@@ -390,6 +447,8 @@ class StructuredResponseValidator:
     ) -> ModelResponse:
         if request.request_type is ModelRequestType.INTENT_GENERATION:
             return self._intent_response(response)
+        if request.request_type is ModelRequestType.INTENT_GOAL_EVALUATION:
+            return self._intent_goal_evaluation_response(response)
         if request.request_type is ModelRequestType.PLAN_GENERATION:
             return self._plan_response(response)
         return self._intent_action_response(response)
@@ -417,16 +476,19 @@ class StructuredResponseValidator:
             raise StructuredResponseValidationError(
                 ModelErrorKind.INVALID_RESPONSE,
                 "response does not match intent_generation",
+                ModelValidationCode.INTENT_RESPONSE_FIELDS_INVALID,
             )
         if not isinstance(response.candidates, (list, tuple)):
             raise StructuredResponseValidationError(
                 ModelErrorKind.INVALID_RESPONSE,
                 "intent candidates must be an array",
+                ModelValidationCode.INTENT_CANDIDATES_NOT_ARRAY,
             )
         if not response.candidates:
             raise StructuredResponseValidationError(
                 ModelErrorKind.EMPTY_RESPONSE,
                 "intent candidates must not be empty",
+                ModelValidationCode.INTENT_CANDIDATES_EMPTY,
             )
         try:
             candidates = tuple(
@@ -436,8 +498,44 @@ class StructuredResponseValidator:
             raise StructuredResponseValidationError(
                 ModelErrorKind.INVALID_RESPONSE,
                 "intent candidate structure is invalid",
+                ModelValidationCode.INTENT_CANDIDATE_STRUCTURE_INVALID,
             ) from exc
         return IntentGenerationResponse(candidates=candidates)
+
+    def _intent_goal_evaluation_response(
+        self, response: NormalizedModelResponse
+    ) -> IntentGoalEvaluationResponse:
+        if not isinstance(response, NormalizedIntentGoalEvaluationResponse):
+            raise StructuredResponseValidationError(
+                ModelErrorKind.INVALID_RESPONSE,
+                "response does not match intent_goal_evaluation",
+                ModelValidationCode.INTENT_GOAL_EVALUATION_INVALID,
+            )
+        if not isinstance(response.decision, str) or response.decision not in {
+            "satisfied", "not_satisfied", "inconclusive",
+        }:
+            raise StructuredResponseValidationError(
+                ModelErrorKind.INVALID_RESPONSE,
+                "intent goal decision is invalid",
+                ModelValidationCode.INTENT_GOAL_EVALUATION_INVALID,
+            )
+        if not isinstance(response.evidence_ids, (list, tuple)):
+            raise StructuredResponseValidationError(
+                ModelErrorKind.INVALID_RESPONSE,
+                "intent goal evidence_ids must be an array",
+                ModelValidationCode.INTENT_GOAL_EVALUATION_INVALID,
+            )
+        try:
+            result = IntentGoalEvaluationResponse(
+                response.decision, tuple(response.evidence_ids)
+            )
+        except (ModelContractError, TypeError, ValueError) as exc:
+            raise StructuredResponseValidationError(
+                ModelErrorKind.INVALID_RESPONSE,
+                "intent goal evaluation fields are invalid",
+                ModelValidationCode.INTENT_GOAL_EVALUATION_INVALID,
+            ) from exc
+        return result
 
     def _plan_response(
         self,
@@ -473,6 +571,8 @@ class StructuredResponseValidator:
             return value
         if not isinstance(value, Mapping):
             raise ModelContractError("intent candidate must be an object")
+        if set(value) not in ({"description"}, {"description", "intent_type"}):
+            raise ModelContractError("intent candidate fields are invalid")
         intent_type = value.get("intent_type")
         if intent_type is not None and not isinstance(intent_type, str):
             raise ModelContractError("intent_type must be a string")
@@ -649,7 +749,17 @@ class ModelInvocationCoordinator:
         kind: Literal["plan", "intent_action", "invalid_structure", "model_error", "intent_generation"]
         if isinstance(raw, ModelError):
             result: ModelResponse | ModelError = self._validate_model_error(request, raw)
-            kind = "model_error"
+            correctable_codes = {code.value for code in ModelValidationCode}
+            kind = (
+                "invalid_structure"
+                if request.request_type is ModelRequestType.INTENT_GENERATION
+                and result.kind in {
+                    ModelErrorKind.INVALID_RESPONSE,
+                    ModelErrorKind.EMPTY_RESPONSE,
+                }
+                and result.validation_code in correctable_codes
+                else "model_error"
+            )
         else:
             try:
                 result = self._validator.validate(request, raw)
@@ -661,7 +771,11 @@ class ModelInvocationCoordinator:
                     else "intent_generation"
                 )
             except StructuredResponseValidationError as issue:
-                result = ModelError(kind=issue.kind, short_reason=issue.short_reason)
+                result = ModelError(
+                    kind=issue.kind,
+                    short_reason=issue.short_reason,
+                    validation_code=issue.validation_code,
+                )
                 kind = "invalid_structure"
         if audit is not None:
             from agent_core.model_invocation_audit import ModelInvocationCompletion

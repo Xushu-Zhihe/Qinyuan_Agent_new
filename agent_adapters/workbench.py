@@ -443,9 +443,41 @@ class Workbench:
                 "base_url": self.base_url,
                 "key_configured": bool(self.api_key),
                 "protocol_version": self.protocol_version,
+                "dual_llm_enabled": hasattr(self, 'outer_model') and hasattr(self, 'inner_model'),
+                "outer_model": getattr(self, 'outer_model', None),
+                "inner_model": getattr(self, 'inner_model', None),
             }
 
     def configure_model(self, value):
+        # Support both single-model and dual-LLM configuration
+        if isinstance(value, dict) and "outer_model" in value and "inner_model" in value:
+            # Dual-LLM configuration mode
+            if set(value) != {"outer_model", "inner_model", "api_key"}:
+                raise WorkbenchError("invalid_dual_model_fields")
+            outer = value["outer_model"]
+            inner = value["inner_model"]
+            api_key = value["api_key"]
+
+            # Validate outer model
+            if not isinstance(outer, str) or not outer.strip() or len(outer) > 128:
+                raise WorkbenchError("invalid_outer_model")
+            # Validate inner model
+            if not isinstance(inner, str) or not inner.strip() or len(inner) > 128:
+                raise WorkbenchError("invalid_inner_model")
+            # Validate API key
+            if not isinstance(api_key, str) or not api_key.strip() or len(api_key) > 8192 or any(ord(char) < 32 for char in api_key):
+                raise WorkbenchError("invalid_model_key")
+
+            with self.lock:
+                self.outer_model = outer.strip()
+                self.inner_model = inner.strip()
+                self.api_key = api_key
+                # Set model to outer_model as default (used for protocol < 3)
+                # Protocol 3 will use outer_model and inner_model separately
+                self.model = outer.strip()
+                return self.model_status()
+
+        # Legacy single-model configuration mode
         if not isinstance(value, dict) or set(value) != {"provider", "model", "base_url", "api_key"}:
             raise WorkbenchError("invalid_model_fields")
         provider, model, base_url, api_key = (value[key] for key in ("provider", "model", "base_url", "api_key"))
@@ -464,6 +496,11 @@ class Workbench:
             raise WorkbenchError("invalid_model_key")
         with self.lock:
             self.provider, self.model, self.base_url, self.api_key = provider, model.strip(), base_url.rstrip("/"), api_key
+            # Clear dual-LLM fields if they exist
+            if hasattr(self, 'outer_model'):
+                delattr(self, 'outer_model')
+            if hasattr(self, 'inner_model'):
+                delattr(self, 'inner_model')
             return self.model_status()
 
     def clear_model_key(self):
@@ -562,6 +599,16 @@ class Handler(BaseHTTPRequestHandler):
                 raise WorkbenchError("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
             return
         if len(parts) >= 3 and parts[:2] == ["api", "challenges"]:
+            # Batch cleanup route - must be checked before canonical_id validation
+            if len(parts) == 3 and parts[2] == "batch-cleanup" and self.command == "POST":
+                workbench = self.server.workbench
+                challenge_ids = self._json().get("challenge_ids", [])
+                if not isinstance(challenge_ids, list) or len(challenge_ids) > 50:
+                    raise WorkbenchError("invalid_batch_cleanup_request")
+                results = workbench.runner.batch_cleanup(challenge_ids)
+                self._send(HTTPStatus.OK, {"results": results})
+                return
+            # Regular challenge routes
             challenge_id = canonical_id(parts[2])
             workbench = self.server.workbench
             if len(parts) == 3:

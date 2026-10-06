@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import UUID
 
 from agent_core.contracts import TaskRequest
-from agent_core.d7_web_contracts import D7WebAuthorization, D7WebRunConfig, canonical_web_origin
+from agent_core.v7.web_contracts import D7WebAuthorization, D7WebRunConfig, canonical_web_origin
 from agent_core.operation_accounting import D4BudgetPolicy
 from agent_core.turn_contracts import D1RoleConfig
 

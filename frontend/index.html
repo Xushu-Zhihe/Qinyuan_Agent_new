@@ -25,9 +25,9 @@
         <header class="topbar"><div class="crumb">本地工作台 <span>/</span> <b id="current-view">题目管理</b></div><div class="top-actions"><span class="connection"><span class="status-dot"></span><span id="connection-text">检查服务</span></span><button id="refresh" class="quiet-button" type="button" title="刷新任务列表">↻ 刷新</button></div></header>
 
         <section id="tasks-view" class="view active">
-          <div class="page-head"><div><p class="eyebrow">TASK RUN PREPARATION</p><h1>题目管理</h1><p class="subheading">每题独立保存附件和可选的公网目标。</p></div><button id="new-task" class="primary-button" type="button">＋ 新建题目</button></div>
+          <div class="page-head"><div><p class="eyebrow">TASK RUN PREPARATION</p><h1>题目管理</h1><p class="subheading">每题独立保存附件和可选的公网目标。</p></div><div class="page-head-actions"><button id="batch-cleanup" class="secondary-button" type="button" hidden>批量清理</button><button id="new-task" class="primary-button" type="button">＋ 新建题目</button></div></div>
           <div class="notice"><span class="notice-mark">!</span><div><strong>执行状态来自真实 Agent 进程</strong><p>附件可选，运行总量最多 64 MiB。已验证观察、Intent 完成和候选 flag 分别记录；整题目标尚未验证。</p></div></div>
-          <section class="task-list-panel section-block"><div class="section-heading"><div><span class="section-index">01</span><h2>题目列表</h2></div><label class="toggle-label"><input id="show-archived" type="checkbox"><span>显示归档</span></label></div><div id="task-list" class="task-list"><div class="empty-state">正在读取任务...</div></div></section>
+          <section class="task-list-panel section-block"><div class="section-heading"><div><span class="section-index">01</span><h2>题目列表</h2></div><div class="section-actions"><label class="toggle-label"><input id="select-mode" type="checkbox"><span>多选模式</span></label><label class="toggle-label"><input id="show-archived" type="checkbox"><span>显示归档</span></label></div></div><div id="task-list" class="task-list"><div class="empty-state">正在读取任务...</div></div></section>
         </section>
 
         <section id="detail-view" class="view detail-view" hidden>
@@ -69,8 +69,70 @@
         </section>
 
         <section id="model-view" class="view" hidden>
-          <div class="page-head"><div><p class="eyebrow">PROCESS MEMORY ONLY</p><h1>模型配置</h1><p class="subheading">选择 DeepSeek 或自定义 OpenAI Chat Completions 兼容端点。</p></div><span class="phase-pill">Key 不落盘</span></div>
-          <div class="model-grid"><section class="section-block"><div class="section-heading"><div><span class="section-index">01</span><h2>供应商</h2></div><span id="model-state" class="section-meta">未读取</span></div><form id="model-form"><label class="field"><span>接口类型</span><select id="model-provider"><option value="deepseek">DeepSeek</option><option value="openai_compatible">自定义 OpenAI 兼容</option></select></label><label class="field"><span>模型名称</span><input id="model-name" required maxlength="128" placeholder="deepseek-chat"></label><label class="field"><span>Base URL</span><input id="model-url" required maxlength="2048" spellcheck="false" placeholder="https://api.deepseek.com"></label><label class="field"><span>API Key</span><input id="model-key" type="password" autocomplete="new-password" required placeholder="仅发送到本地服务内存"></label><div class="form-actions"><button class="primary-button" type="submit">应用配置</button><button id="clear-key" class="secondary-button" type="button">清除内存 Key</button></div></form></section><aside class="side-note"><h2>配置边界</h2><p>服务进程重启后必须重新填写 Key。页面不使用 localStorage、草稿文件或 URL 保存密钥。</p><dl><div><dt>协议</dt><dd>OpenAI Chat Completions JSON</dd></div><div><dt>DeepSeek</dt><dd>仅 HTTPS 官方地址</dd></div><div><dt>自定义端点</dt><dd>仅 HTTPS，无凭据嵌入</dd></div></dl></aside></div>
+          <div class="page-head"><div><p class="eyebrow">PROCESS MEMORY ONLY</p><h1>模型配置</h1><p class="subheading">选择 DeepSeek 或自定义 OpenAI Chat Completions 兼容端点。支持双 LLM 角色配置。</p></div><span class="phase-pill">Key 不落盘</span></div>
+
+          <div class="model-mode-toggle">
+            <button id="mode-single" class="mode-button active" type="button">单模型模式</button>
+            <button id="mode-dual" class="mode-button" type="button">双 LLM 角色模式</button>
+          </div>
+
+          <div id="single-model-section" class="model-grid">
+            <section class="section-block">
+              <div class="section-heading"><div><span class="section-index">01</span><h2>供应商</h2></div><span id="model-state" class="section-meta">未读取</span></div>
+              <form id="model-form">
+                <label class="field"><span>接口类型</span><select id="model-provider"><option value="deepseek">DeepSeek</option><option value="openai_compatible">自定义 OpenAI 兼容</option></select></label>
+                <label class="field"><span>模型名称</span><input id="model-name" required maxlength="128" placeholder="deepseek-chat"></label>
+                <label class="field"><span>Base URL</span><input id="model-url" required maxlength="2048" spellcheck="false" placeholder="https://api.deepseek.com"></label>
+                <label class="field"><span>API Key</span><input id="model-key" type="password" autocomplete="new-password" required placeholder="仅发送到本地服务内存"></label>
+                <div class="form-actions"><button class="primary-button" type="submit">应用配置</button><button id="clear-key" class="secondary-button" type="button">清除内存 Key</button></div>
+              </form>
+            </section>
+            <aside class="side-note"><h2>配置边界</h2><p>服务进程重启后必须重新填写 Key。页面不使用 localStorage、草稿文件或 URL 保存密钥。</p><dl><div><dt>协议</dt><dd>OpenAI Chat Completions JSON</dd></div><div><dt>DeepSeek</dt><dd>仅 HTTPS 官方地址</dd></div><div><dt>自定义端点</dt><dd>仅 HTTPS，无凭据嵌入</dd></div></dl></aside>
+          </div>
+
+          <div id="dual-model-section" class="model-grid" hidden>
+            <section class="section-block dual-llm-config">
+              <div class="section-heading"><div><span class="section-index">01</span><h2>双 LLM 角色配置</h2></div><span id="dual-model-state" class="section-meta">未配置</span></div>
+              <div class="dual-llm-info">
+                <strong>双模型协同架构</strong>：外层模型负责规划和决策，内层模型执行具体操作。两者协同工作可提升任务完成质量和准确性。
+              </div>
+              <form id="dual-model-form">
+                <div class="dual-role-container">
+                  <div class="role-card outer-role-card">
+                    <div class="role-header">
+                      <span class="role-icon">◐</span>
+                      <div>
+                        <h3>Outer Role</h3>
+                        <p class="role-desc">外层规划模型 · 负责决策和审查</p>
+                      </div>
+                    </div>
+                    <label class="field"><span>模型名称</span><input id="outer-model-name" required maxlength="128" placeholder="deepseek-chat"></label>
+                  </div>
+
+                  <div class="role-separator">
+                    <span class="separator-line"></span>
+                    <span class="separator-icon">⇄</span>
+                    <span class="separator-line"></span>
+                  </div>
+
+                  <div class="role-card inner-role-card">
+                    <div class="role-header">
+                      <span class="role-icon">◑</span>
+                      <div>
+                        <h3>Inner Role</h3>
+                        <p class="role-desc">内层执行模型 · 负责具体操作</p>
+                      </div>
+                    </div>
+                    <label class="field"><span>模型名称</span><input id="inner-model-name" required maxlength="128" placeholder="deepseek-chat"></label>
+                  </div>
+                </div>
+
+                <label class="field shared-key-field"><span>共享 API Key</span><input id="dual-model-key" type="password" autocomplete="new-password" required placeholder="仅发送到本地服务内存"></label>
+                <div class="form-actions"><button class="primary-button" type="submit">应用双角色配置</button></div>
+              </form>
+            </section>
+            <aside class="side-note"><h2>双 LLM 架构</h2><p>使用两个独立模型分工协作，提升任务执行的规划质量和操作准确性。</p><dl><div><dt>Outer Role</dt><dd>高层决策、任务规划、结果审查</dd></div><div><dt>Inner Role</dt><dd>工具调用、代码执行、观察记录</dd></div><div><dt>协同机制</dt><dd>外层制定计划，内层执行操作，外层验证结果</dd></div></dl></aside>
+          </div>
         </section>
       </main>
     </div>

@@ -10,7 +10,7 @@ from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias, cast
 
 from agent_core.contracts import ModelBackend, TaskRequest
-from agent_core.d7_web_contracts import (
+from agent_core.v7.web_contracts import (
     D7WebExecutionRecord,
     D7WebPlanRecord,
     D7WebRunConfig,
@@ -256,12 +256,21 @@ class UpsertTurn:
     turn_target: str
     intent_ids: tuple[str, ...]
     status: TurnStatus
+    parent_turn_id: str | None = None
+    triggering_intent_id: str | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.turn_id, "UpsertTurn.turn_id")
         _non_empty(self.task_run_id, "UpsertTurn.task_run_id")
         _positive_integer(self.sequence, "UpsertTurn.sequence")
         _non_empty(self.turn_target, "UpsertTurn.turn_target")
+        if (self.parent_turn_id is None) != (self.triggering_intent_id is None):
+            raise ValueError(
+                "UpsertTurn parent_turn_id and triggering_intent_id must be set together"
+            )
+        if self.parent_turn_id is not None:
+            _non_empty(self.parent_turn_id, "UpsertTurn.parent_turn_id")
+            _non_empty(self.triggering_intent_id, "UpsertTurn.triggering_intent_id")
         if not isinstance(self.intent_ids, tuple):
             raise ValueError("UpsertTurn.intent_ids must be a tuple")
         if any(not isinstance(item, str) or not item.strip() for item in self.intent_ids):
@@ -580,6 +589,8 @@ class TurnRegistration:
     base_checkpoint_sequence: int
     turn_id: str
     state_changes: tuple[StateChange, ...]
+    parent_turn_id: str | None = None
+    triggering_intent_id: str | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.task_run_id, "TurnRegistration.task_run_id")
@@ -600,6 +611,15 @@ class TurnRegistration:
             raise ValueError("TurnRegistration may only contain UpsertIntent after Turn")
         if turn.task_run_id != self.task_run_id or turn.turn_id != self.turn_id:
             raise ValueError("TurnRegistration Turn belongs to another TaskRun")
+        if (self.parent_turn_id is None) != (self.triggering_intent_id is None):
+            raise ValueError(
+                "TurnRegistration parent_turn_id and triggering_intent_id must be set together"
+            )
+        if (turn.parent_turn_id, turn.triggering_intent_id) != (
+            self.parent_turn_id,
+            self.triggering_intent_id,
+        ):
+            raise ValueError("TurnRegistration parent metadata differs from its Turn")
         if turn.status is not TurnStatus.PENDING:
             raise ValueError("TurnRegistration Turn must begin pending")
 
@@ -1709,6 +1729,8 @@ class TurnSnapshot:
     turn_target: str
     intent_ids: tuple[str, ...]
     status: TurnStatus
+    parent_turn_id: str | None = None
+    triggering_intent_id: str | None = None
 
     def to_domain(self) -> Turn:
         return Turn(
@@ -1718,6 +1740,8 @@ class TurnSnapshot:
             turn_target=self.turn_target,
             intent_ids=self.intent_ids,
             status=self.status,
+            parent_turn_id=self.parent_turn_id,
+            triggering_intent_id=self.triggering_intent_id,
         )
 
 
@@ -1988,6 +2012,8 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
             "turn_target": change.turn_target,
             "intent_ids": list(change.intent_ids),
             "status": change.status.value,
+            "parent_turn_id": change.parent_turn_id,
+            "triggering_intent_id": change.triggering_intent_id,
         }
     if isinstance(change, UpsertIntent):
         return {

@@ -13,10 +13,10 @@ from uuid import uuid4
 
 import pytest
 
-from agent_adapters.d7_http_adapter import D7HttpError
-from agent_adapters.d7_sandbox_transport import D7SandboxHttpTransport
+from agent_adapters.v7.http_adapter import D7HttpError
+from agent_adapters.v7.sandbox_transport import D7SandboxHttpTransport
 from agent_core.control_store import TargetNetworkBinding
-from agent_core.d7_web_contracts import D7WebAuthorization, D7WebRunConfig
+from agent_core.v7.web_contracts import D7WebAuthorization, D7WebRunConfig
 from agent_core.operation_accounting import D4BudgetPolicy
 from agent_core.turn_contracts import D1RoleConfig
 from Sandbox.command_sandbox import T6TaskRunSandbox
@@ -476,6 +476,6 @@ def test_d7_http_unknown_result_is_not_redispatched():
 
 
 def transport_origin(endpoint: str):
-    from agent_adapters.d7_http_adapter import D7HttpOrigin
+    from agent_adapters.v7.http_adapter import D7HttpOrigin
 
     return D7HttpOrigin.parse(endpoint)

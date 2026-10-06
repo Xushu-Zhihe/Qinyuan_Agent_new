@@ -10,7 +10,7 @@ import pytest
 from test_d7_controller_lifecycle import _completed_candidate
 from test_d7_turn_budget import make_case
 
-from agent_adapters.d7_task_result import snapshot_v3_task_result
+from agent_adapters.v7.task_result import snapshot_v3_task_result
 from agent_adapters.run_files import immutable_write
 from agent_core.goal_feedback import (
     ExternalValidationCheckRequest,

@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from agent_adapters import cli
-from agent_adapters.d7_request_staging import D7RequestStager
+from agent_adapters.v7.request_staging import D7RequestStager
 from agent_adapters.run_files import immutable_write, run_path
 
 

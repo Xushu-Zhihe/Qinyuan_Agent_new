@@ -13,8 +13,8 @@ import pytest
 
 from d7_fake_judge_fixture import FakeJudge
 
-from agent_adapters.d7_candidate_evidence import D7CandidateEvidenceService
-from agent_adapters.d7_simulated_application import _Token, _make_application
+from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
+from agent_adapters.v7.simulated_application import _Token, _make_application
 from agent_adapters.run_files import immutable_read
 from agent_adapters.workbench import Workbench
 from agent_core.runtime import TaskRunStatus

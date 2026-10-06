@@ -12,8 +12,8 @@ from uuid import uuid4
 import pytest
 from test_d7_turn_budget import make_case
 
-from agent_adapters import d7_candidate_evidence as candidate_evidence
-from agent_adapters.d7_candidate_evidence import (
+from agent_adapters.v7 import candidate_evidence as candidate_evidence
+from agent_adapters.v7.candidate_evidence import (
     MAX_D7_CANDIDATE_BYTES,
     D7CandidateEvidenceConflict,
     D7CandidateEvidenceError,

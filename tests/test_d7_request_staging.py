@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from agent_adapters.d7_request_staging import (
+from agent_adapters.v7.request_staging import (
     MAX_V3_REQUEST_ATTACHMENTS,
     D7RequestStager,
     RequestStagingError,

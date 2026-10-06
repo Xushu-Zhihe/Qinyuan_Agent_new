@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from agent_core.control_store import (
     ControlMutation,
@@ -12,6 +12,7 @@ from agent_core.control_store import (
     StorageError,
     TaskRunNotFoundError,
     TaskRunSnapshot,
+    UpsertTurn,
 )
 from agent_core.control_candidate import project_candidate, validate_control_ownership, validate_running_transition
 from agent_core.domain import (
@@ -22,6 +23,7 @@ from agent_core.domain import (
     FailureSummary,
     FailureType,
     FactStatus,
+    IntentStatus,
     PlanStatus,
     PlanValidationStatus,
     TurnStatus,
@@ -97,6 +99,57 @@ class ControlStateRepository:
         """Recheck the resulting candidate, without writing or retaining evidence."""
         try:
             rows = project_candidate(state, mutation)
+            old_turns = {item.turn_id: item for item in state.turns}
+            old_intents = {item.intent_id: item for item in state.intents}
+            changes_by_turn = {
+                item.turn_id: item
+                for item in mutation.state_changes
+                if isinstance(item, UpsertTurn)
+            }
+            normalized_turns = []
+            for turn in rows.turns:
+                old = old_turns.get(turn.turn_id)
+                change = changes_by_turn.get(turn.turn_id)
+                if old is not None:
+                    if change is not None and (
+                        change.parent_turn_id is not None
+                        or change.triggering_intent_id is not None
+                    ) and (
+                        change.parent_turn_id,
+                        change.triggering_intent_id,
+                    ) != (old.parent_turn_id, old.triggering_intent_id):
+                        raise StorageError("Turn parent metadata is immutable")
+                    # Older transition call sites update Turn status without
+                    # repeating its immutable parent declaration.
+                    turn = replace(
+                        turn,
+                        parent_turn_id=old.parent_turn_id,
+                        triggering_intent_id=old.triggering_intent_id,
+                    )
+                else:
+                    if change is not None:
+                        turn = replace(
+                            turn,
+                            parent_turn_id=change.parent_turn_id,
+                            triggering_intent_id=change.triggering_intent_id,
+                        )
+                    if turn.parent_turn_id is not None:
+                        parent = old_turns.get(turn.parent_turn_id)
+                        trigger = old_intents.get(turn.triggering_intent_id)
+                        if parent is None or parent.status is not TurnStatus.RUNNING:
+                            raise StorageError(
+                                "child Turn requires an existing running parent Turn"
+                            )
+                        if (
+                            trigger is None
+                            or trigger.turn_id != parent.turn_id
+                            or trigger.status is not IntentStatus.SUCCEEDED
+                        ):
+                            raise StorageError(
+                                "child Turn requires its already-succeeded parent Intent"
+                            )
+                normalized_turns.append(turn)
+            rows = replace(rows, turns=tuple(normalized_turns))
             self._validate_rows(rows)
             validate_running_transition(state, rows, mutation)
             executions = {item.execution_id: item for item in rows.executions}
@@ -269,6 +322,46 @@ class ControlStateRepository:
             registered_turn.to_domain()
             if tuple(intents_by_turn[registered_turn.turn_id]) != registered_turn.intent_ids:
                 raise StorageError("Turn.intent_ids do not match its persisted Intents")
+
+        child_by_intent: dict[str, str] = {}
+        for registered_turn in rows.turns:
+            parent_turn_id = registered_turn.parent_turn_id
+            triggering_intent_id = registered_turn.triggering_intent_id
+            if (parent_turn_id is None) != (triggering_intent_id is None):
+                raise StorageError("Turn parent metadata must be set together")
+            if parent_turn_id is None:
+                continue
+            parent = turns.get(parent_turn_id)
+            trigger = intents.get(triggering_intent_id)
+            if (
+                parent is None
+                or parent.task_run_id != registered_turn.task_run_id
+                or parent.turn_id == registered_turn.turn_id
+            ):
+                raise StorageError("child Turn references an invalid parent Turn")
+            if (
+                trigger is None
+                or trigger.turn_id != parent.turn_id
+                or trigger.status is not IntentStatus.SUCCEEDED
+            ):
+                raise StorageError(
+                    "child Turn trigger must be a succeeded Intent in its parent Turn"
+                )
+            if triggering_intent_id in child_by_intent:
+                raise StorageError("one Intent cannot trigger multiple child Turns")
+            child_by_intent[triggering_intent_id] = registered_turn.turn_id
+
+        for registered_turn in rows.turns:
+            seen: set[str] = set()
+            current = registered_turn
+            while current.parent_turn_id is not None:
+                if current.turn_id in seen:
+                    raise StorageError("Turn parent relationships contain a cycle")
+                seen.add(current.turn_id)
+                parent = turns.get(current.parent_turn_id)
+                if parent is None:
+                    break
+                current = parent
 
         plan_by_intent: dict[str, PlanStatus] = {}
         for registered_plan in rows.plans:

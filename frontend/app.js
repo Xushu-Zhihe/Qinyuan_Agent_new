@@ -1,6 +1,6 @@
 "use strict";
 
-const state = { tasks: [], selected: null, pendingFiles: [], showArchived: false };
+const state = { tasks: [], selected: null, pendingFiles: [], showArchived: false, selectMode: false, selectedTasks: new Set() };
 const $ = (id) => document.getElementById(id);
 let toastTimer;
 let runPoll;
@@ -27,9 +27,31 @@ function renderTaskList() {
   const tasks = state.tasks.filter((task) => state.showArchived || !task.archived);
   if (!tasks.length) { const empty = document.createElement("div"); empty.className = "empty-state"; empty.textContent = "还没有题目，先创建一个准备任务。"; list.append(empty); return; }
   tasks.forEach((task) => {
-    const [kind, label] = statusLabel(task); const row = document.createElement("button"); row.type = "button"; row.className = `task-row${state.selected === task.id ? " selected" : ""}`; row.addEventListener("click", () => selectTask(task.id));
-    const title = document.createElement("strong"); title.textContent = task.title; const meta = document.createElement("small"); meta.textContent = `${task.category.toUpperCase()} · ${task.attachments.length} 个附件 · ${task.endpoint || "无远程目标"}`; const badge = document.createElement("span"); badge.className = `status-badge ${kind}`; badge.textContent = label; row.append(title, meta, badge); list.append(row);
+    const [kind, label] = statusLabel(task);
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `task-row${state.selected === task.id ? " selected" : ""}${state.selectMode && state.selectedTasks.has(task.id) ? " multi-selected" : ""}`;
+    row.addEventListener("click", () => {
+      if (state.selectMode) {
+        toggleTaskSelection(task.id);
+      } else {
+        selectTask(task.id);
+      }
+    });
+    if (state.selectMode) {
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "task-checkbox";
+      checkbox.checked = state.selectedTasks.has(task.id);
+      checkbox.addEventListener("click", (e) => e.stopPropagation());
+      row.prepend(checkbox);
+    }
+    const title = document.createElement("strong"); title.textContent = task.title;
+    const meta = document.createElement("small"); meta.textContent = `${task.category.toUpperCase()} · ${task.attachments.length} 个附件 · ${task.endpoint || "无远程目标"}`;
+    const badge = document.createElement("span"); badge.className = `status-badge ${kind}`; badge.textContent = label;
+    row.append(title, meta, badge); list.append(row);
   });
+  $("batch-cleanup").hidden = !state.selectMode || state.selectedTasks.size === 0;
 }
 function renderAttachments() {
   const list = $("attachment-list"); list.replaceChildren(); $("attachment-count").textContent = `${state.pendingFiles.length} / 16`;
@@ -106,8 +128,10 @@ async function saveTask(event) {
 async function archiveTask() { const task = state.tasks.find((item) => item.id === state.selected); if (!task) return; try { await request(`/api/challenges/${task.id}/archive`, { method: "POST", body: "{}", headers: { "Content-Type": "application/json" } }); state.showArchived = true; $("show-archived").checked = true; notify("题目已归档；现在可永久清理"); await loadTasks(); } catch (error) { notify(`归档失败：${error.message === "cancel_running_challenge_first" ? "请先取消并清理运行" : error.message}`); } }
 async function restoreTask() { const task = state.tasks.find((item) => item.id === state.selected); if (!task) return; try { await request(`/api/challenges/${task.id}/restore`, { method: "POST", body: "{}", headers: { "Content-Type": "application/json" } }); notify("题目已恢复"); await loadTasks(); } catch (error) { notify(`恢复失败：${error.message}`); } }
 async function purgeTask() { const task = state.tasks.find((item) => item.id === state.selected); if (!task) return; const confirmation = window.prompt(`永久清理“${task.title}”及其附件？\n请输入题目名称确认。`); if (confirmation === null) return; try { await request(`/api/challenges/${task.id}/purge`, { method: "POST", body: JSON.stringify({ confirm_title: confirmation }), headers: { "Content-Type": "application/json" } }); notify("题目和附件已永久清理"); resetForm(); await loadTasks(); showView("tasks"); } catch (error) { notify(`清理失败：${error.message === "archive_terminal_challenge_first" ? "请先结束运行并归档题目" : error.message}`); } }
-async function loadModel() { try { const value = await request("/api/model"); $("model-provider").value = value.provider; $("model-name").value = value.model; $("model-url").value = value.base_url; $("model-key").value = ""; $("model-state").textContent = value.key_configured ? "Key 已在内存" : "未配置 Key"; } catch (error) { notify(`读取模型配置失败：${error.message}`); } }
+async function loadModel() { try { const value = await request("/api/model"); $("model-provider").value = value.provider; $("model-name").value = value.model; $("model-url").value = value.base_url; $("model-key").value = ""; $("model-state").textContent = value.key_configured ? "Key 已在内存" : "未配置 Key"; if (value.dual_llm_enabled) { $("outer-model-name").value = value.outer_model || ""; $("inner-model-name").value = value.inner_model || ""; $("dual-model-state").textContent = value.key_configured ? "双角色已配置" : "未配置"; } else { $("dual-model-state").textContent = "未配置"; } } catch (error) { notify(`读取模型配置失败：${error.message}`); } }
 async function saveModel(event) { event.preventDefault(); const key = $("model-key").value; if (!key) { notify("请输入 API Key；页面不会保存它"); return; } try { const value = await request("/api/model", { method: "PUT", body: JSON.stringify({ provider: $("model-provider").value, model: $("model-name").value.trim(), base_url: $("model-url").value.trim(), api_key: key }), headers: { "Content-Type": "application/json" } }); $("model-key").value = ""; $("model-state").textContent = value.key_configured ? "Key 已在内存" : "未配置 Key"; notify("模型配置已应用"); } catch (error) { notify(`配置失败：${error.message}`); } }
+async function saveDualModel(event) { event.preventDefault(); const key = $("dual-model-key").value; const outerModel = $("outer-model-name").value.trim(); const innerModel = $("inner-model-name").value.trim(); if (!key) { notify("请输入 API Key"); return; } if (!outerModel || !innerModel) { notify("请填写外层和内层模型名称"); return; } try { const value = await request("/api/model", { method: "PUT", body: JSON.stringify({ outer_model: outerModel, inner_model: innerModel, api_key: key }), headers: { "Content-Type": "application/json" } }); $("dual-model-key").value = ""; $("dual-model-state").textContent = value.key_configured ? "双角色已配置" : "未配置"; notify("双 LLM 角色配置已应用"); } catch (error) { notify(`配置失败：${error.message}`); } }
+function toggleModelMode(mode) { const isSingle = mode === "single"; $("mode-single").classList.toggle("active", isSingle); $("mode-dual").classList.toggle("active", !isSingle); $("single-model-section").hidden = !isSingle; $("dual-model-section").hidden = isSingle; notify(isSingle ? "已切换到单模型模式" : "已切换到双 LLM 角色模式"); }
 function showView(name, updateHistory = true) {
   if (name !== "detail") { clearTimeout(runPoll); runSelection += 1; }
   document.body.classList.toggle("detail-open", name === "detail");
@@ -130,5 +154,56 @@ function syncRoute() {
   showView(route === "#model" ? "model" : "tasks", false);
 }
 async function health() { try { const value = await request("/api/health"); $("service-status").textContent = value.status === "ready" ? "服务已连接" : "服务状态异常"; $("connection-text").textContent = "回环服务"; } catch (_) { $("service-status").textContent = "服务未连接"; $("connection-text").textContent = "未连接"; } }
-function init() { document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view))); $("new-task").addEventListener("click", () => { resetForm(); showView("detail"); }); $("back-to-tasks").addEventListener("click", () => showView("tasks")); $("cancel-edit").addEventListener("click", () => showView("tasks")); $("refresh").addEventListener("click", () => loadTasks().catch((error) => notify(`刷新失败：${error.message}`))); $("show-archived").addEventListener("change", (event) => { state.showArchived = event.target.checked; renderTaskList(); }); $("task-form").addEventListener("submit", saveTask); $("attachments").addEventListener("change", (event) => { const files = Array.from(event.target.files); const existing = state.tasks.find((item) => item.id === state.selected); if (state.pendingFiles.length + files.length + (existing?.attachments.length || 0) > 16) { notify("每题最多 16 个附件"); return; } state.pendingFiles.push(...files); renderAttachments(); if (existing) renderSavedAttachments(existing); }); $("archive-task").addEventListener("click", archiveTask); $("restore-task").addEventListener("click", restoreTask); $("purge-task").addEventListener("click", purgeTask); $("start-run").addEventListener("click", startRun); $("cancel-run").addEventListener("click", cancelRun); $("cleanup-run").addEventListener("click", cleanupRun); $("model-form").addEventListener("submit", saveModel); $("clear-key").addEventListener("click", async () => { try { await request("/api/model/key", { method: "DELETE" }); $("model-key").value = ""; $("model-state").textContent = "未配置 Key"; notify("服务端内存 Key 已清除"); } catch (error) { notify(`清除失败：${error.message}`); } }); window.addEventListener("popstate", syncRoute); window.addEventListener("hashchange", syncRoute); health(); loadTasks().then(syncRoute).catch((error) => { $("task-list").textContent = `服务未连接：${error.message}`; }); }
+function toggleTaskSelection(taskId) {
+  if (state.selectedTasks.has(taskId)) {
+    state.selectedTasks.delete(taskId);
+  } else {
+    state.selectedTasks.add(taskId);
+  }
+  renderTaskList();
+}
+function toggleSelectMode(enabled) {
+  state.selectMode = enabled;
+  if (!enabled) {
+    state.selectedTasks.clear();
+  }
+  renderTaskList();
+}
+async function batchCleanup() {
+  const ids = Array.from(state.selectedTasks);
+  if (ids.length === 0) {
+    notify("请先选择需要清理的任务");
+    return;
+  }
+  const confirmation = window.confirm(`确定要清理 ${ids.length} 个任务的资源吗？`);
+  if (!confirmation) return;
+  try {
+    const result = await request("/api/challenges/batch-cleanup", {
+      method: "POST",
+      body: JSON.stringify({ challenge_ids: ids }),
+      headers: { "Content-Type": "application/json" }
+    });
+    const succeeded = result.results.filter(r => r.status === "started").length;
+    const failed = result.results.filter(r => r.status === "failed").length;
+    const skipped = result.results.filter(r => r.status === "skipped").length;
+
+    // Show detailed error info for failed tasks
+    const failedDetails = result.results
+      .filter(r => r.status === "failed")
+      .map(r => `${r.error || "unknown"}`)
+      .join(", ");
+
+    let message = `批量清理结果：${succeeded} 个已启动`;
+    if (failed > 0) message += `，${failed} 个失败 (${failedDetails})`;
+    if (skipped > 0) message += `，${skipped} 个跳过`;
+
+    notify(message);
+    console.log("Batch cleanup results:", result.results);
+    state.selectedTasks.clear();
+    await loadTasks();
+  } catch (error) {
+    notify(`批量清理失败：${error.message}`);
+  }
+}
+function init() { document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view))); $("new-task").addEventListener("click", () => { resetForm(); showView("detail"); }); $("back-to-tasks").addEventListener("click", () => showView("tasks")); $("cancel-edit").addEventListener("click", () => showView("tasks")); $("refresh").addEventListener("click", () => loadTasks().catch((error) => notify(`刷新失败：${error.message}`))); $("show-archived").addEventListener("change", (event) => { state.showArchived = event.target.checked; renderTaskList(); }); $("select-mode").addEventListener("change", (event) => { toggleSelectMode(event.target.checked); }); $("batch-cleanup").addEventListener("click", batchCleanup); $("task-form").addEventListener("submit", saveTask); $("attachments").addEventListener("change", (event) => { const files = Array.from(event.target.files); const existing = state.tasks.find((item) => item.id === state.selected); if (state.pendingFiles.length + files.length + (existing?.attachments.length || 0) > 16) { notify("每题最多 16 个附件"); return; } state.pendingFiles.push(...files); renderAttachments(); if (existing) renderSavedAttachments(existing); }); $("archive-task").addEventListener("click", archiveTask); $("restore-task").addEventListener("click", restoreTask); $("purge-task").addEventListener("click", purgeTask); $("start-run").addEventListener("click", startRun); $("cancel-run").addEventListener("click", cancelRun); $("cleanup-run").addEventListener("click", cleanupRun); $("model-form").addEventListener("submit", saveModel); $("dual-model-form").addEventListener("submit", saveDualModel); $("mode-single").addEventListener("click", () => toggleModelMode("single")); $("mode-dual").addEventListener("click", () => toggleModelMode("dual")); $("clear-key").addEventListener("click", async () => { try { await request("/api/model/key", { method: "DELETE" }); $("model-key").value = ""; $("model-state").textContent = "未配置 Key"; notify("服务端内存 Key 已清除"); } catch (error) { notify(`清除失败：${error.message}`); } }); window.addEventListener("popstate", syncRoute); window.addEventListener("hashchange", syncRoute); health(); loadTasks().then(syncRoute).catch((error) => { $("task-list").textContent = `服务未连接：${error.message}`; }); }
 document.addEventListener("DOMContentLoaded", init);

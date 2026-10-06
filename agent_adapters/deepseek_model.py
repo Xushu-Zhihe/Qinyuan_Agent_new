@@ -20,6 +20,7 @@ from agent_core.modeling import (
     ModelError,
     ModelErrorKind,
     ModelRequestType,
+    ModelValidationCode,
     NormalizedIntentActionResponse,
     NormalizedIntentResponse,
     NormalizedPlanResponse,
@@ -33,14 +34,10 @@ CONNECT_TIMEOUT_SECONDS = 10.0
 
 
 def _invalid_provider_payload(
-    connection, code: T6ActionValidationCode, *, diagnostic_codes: bool,
+    connection, code: T6ActionValidationCode,
 ) -> None:
     """Send only a fixed diagnostic; never include provider-controlled content."""
-
-    if diagnostic_codes:
-        connection.send({"payload": None, "validation_code": code.value})
-    else:
-        connection.send({"payload": None})
+    connection.send({"payload": None, "validation_code": code.value})
 
 
 def _workspace_attachment_rule(target) -> str:
@@ -237,7 +234,6 @@ def build_payload(request, settings):
             {"role": "user", "content": context},
         ],
         "response_format": {"type": "json_object"},
-        "thinking": {"type": "disabled"},
         "stream": False,
         "max_tokens": 1024,
     }
@@ -245,7 +241,7 @@ def build_payload(request, settings):
 
 def _http_worker(
     connection, settings, payload, timeout,
-    max_response_bytes=MAX_RESPONSE_BYTES, diagnostic_codes=False,
+    max_response_bytes=MAX_RESPONSE_BYTES,
 ):
     """Never print or transmit raw errors/credentials through the result channel."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -301,20 +297,17 @@ def _http_worker(
         except (TypeError, ValueError):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_JSON_INVALID,
-                diagnostic_codes=diagnostic_codes,
             )
             return
         if not isinstance(data, dict):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_ENVELOPE_INVALID,
-                diagnostic_codes=diagnostic_codes,
             )
             return
         choices = data.get("choices")
         if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CHOICES_INVALID,
-                diagnostic_codes=diagnostic_codes,
             )
             return
         choice = choices[0]
@@ -322,13 +315,11 @@ def _http_worker(
         if not isinstance(message, dict):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CHOICES_INVALID,
-                diagnostic_codes=diagnostic_codes,
             )
             return
         if message.get("tool_calls") or message.get("function_call"):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
-                diagnostic_codes=diagnostic_codes,
             )
             return
         if message.get("refusal"):
@@ -337,7 +328,6 @@ def _http_worker(
         if choice.get("finish_reason") != "stop":
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
-                diagnostic_codes=diagnostic_codes,
             )
             return
         content = message.get("content")
@@ -349,13 +339,11 @@ def _http_worker(
         except (TypeError, ValueError):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
-                diagnostic_codes=diagnostic_codes,
             )
             return
         if not isinstance(result, dict):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
-                diagnostic_codes=diagnostic_codes,
             )
             return
         if settings.api_key in json.dumps(result, ensure_ascii=False):
@@ -388,15 +376,27 @@ class DeepSeekModelAdapter:
         if isinstance(raw, ModelError):
             return raw
         if isinstance(raw, T6ActionValidationFailure):
+            if request.request_type is ModelRequestType.INTENT_GENERATION:
+                try:
+                    code = ModelValidationCode(raw.code.value)
+                except ValueError:
+                    code = ModelValidationCode.PROVIDER_RESPONSE_INVALID
+                return ModelError(
+                    ModelErrorKind.INVALID_RESPONSE,
+                    "provider response could not be parsed",
+                    validation_code=code.value,
+                )
             value = None
         else:
             value = raw
         if request.request_type is ModelRequestType.INTENT_GENERATION:
-            candidates = (
-                value.get("candidates")
-                if isinstance(value, dict) and set(value) == {"candidates"}
-                else None
-            )
+            if not isinstance(value, dict) or set(value) != {"candidates"}:
+                return ModelError(
+                    ModelErrorKind.INVALID_RESPONSE,
+                    "intent response must contain only the candidates field",
+                    validation_code=ModelValidationCode.INTENT_RESPONSE_FIELDS_INVALID.value,
+                )
+            candidates = value["candidates"]
             return NormalizedIntentResponse(candidates)
         if request.request_type is ModelRequestType.PLAN_GENERATION:
             steps = (
@@ -489,7 +489,6 @@ class DeepSeekModelAdapter:
 def _t6_http_worker(connection, settings, payload, timeout):
     return _http_worker(
         connection, settings, payload, timeout, MAX_T6_RESPONSE_BYTES,
-        diagnostic_codes=True,
     )
 
 
@@ -588,7 +587,6 @@ class DeepSeekT6ActionAdapter:
                 {"role": "user", "content": context},
             ],
             "response_format": {"type": "json_object"},
-            "thinking": {"type": "disabled"},
             "stream": False,
             "max_tokens": self.output_tokens,
         }

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from agent_adapters.d7_http_adapter import (
+from agent_adapters.v7.http_adapter import (
     MAX_D7_HTTP_RESPONSE_BYTES,
     D7HttpError,
     D7HttpOrigin,
     D7HttpWireResponse,
 )
 from agent_core.control_store import TargetNetworkBinding
-from agent_core.d7_web_contracts import D7WebRunConfig
+from agent_core.v7.web_contracts import D7WebRunConfig
 from Sandbox.task_run_sandbox import TaskRunSandboxError
 
 

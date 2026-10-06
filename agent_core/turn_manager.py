@@ -192,6 +192,8 @@ class TurnManager:
         mutation_id: str,
         turn_target: str,
         candidates: tuple[IntentCandidate, ...],
+        parent_turn_id: str | None = None,
+        triggering_intent_id: str | None = None,
     ) -> TurnRegistration:
         """Build, but do not submit, the first mutation for a new Turn."""
 
@@ -218,7 +220,55 @@ class TurnManager:
             raise DomainTransitionError(
                 "Turn registration requires a running TaskRun"
             )
-        if any(item.status not in _TURN_TERMINAL_STATUSES for item in state.turns):
+        if (parent_turn_id is None) != (triggering_intent_id is None):
+            raise DomainError(
+                "parent_turn_id and triggering_intent_id must be set together"
+            )
+        if parent_turn_id is not None and (
+            not isinstance(parent_turn_id, str)
+            or not parent_turn_id.strip()
+            or not isinstance(triggering_intent_id, str)
+            or not triggering_intent_id.strip()
+        ):
+            raise DomainError("Turn parent metadata must contain non-empty IDs")
+        turn_by_id = {item.turn_id: item for item in state.turns}
+        intent_by_id = {item.intent_id: item for item in state.intents}
+        parent = None if parent_turn_id is None else turn_by_id.get(parent_turn_id)
+        if parent_turn_id is not None:
+            trigger = intent_by_id.get(triggering_intent_id)
+            if parent is None or parent.status is not TurnStatus.RUNNING:
+                raise DomainTransitionError(
+                    "child Turn registration requires an existing running parent Turn"
+                )
+            if (
+                trigger is None
+                or trigger.turn_id != parent.turn_id
+                or trigger.status is not IntentStatus.SUCCEEDED
+            ):
+                raise DomainTransitionError(
+                    "child Turn registration requires a succeeded Intent in its parent"
+                )
+            if any(
+                item.triggering_intent_id == triggering_intent_id
+                for item in state.turns
+            ):
+                raise DomainError("triggering Intent already has a child Turn")
+            ancestor = parent
+            seen_ancestors: set[str] = set()
+            while ancestor is not None:
+                if ancestor.turn_id in seen_ancestors:
+                    raise DomainError("existing Turn parent relationships contain a cycle")
+                seen_ancestors.add(ancestor.turn_id)
+                ancestor = (
+                    turn_by_id.get(ancestor.parent_turn_id)
+                    if ancestor.parent_turn_id is not None
+                    else None
+                )
+        if any(
+            item.status not in _TURN_TERMINAL_STATUSES
+            and item.turn_id != parent_turn_id
+            for item in state.turns
+        ):
             raise DomainTransitionError(
                 "a previous Turn must be terminal before registering another Turn"
             )
@@ -249,6 +299,8 @@ class TurnManager:
                 turn_target=turn_target,
                 intent_ids=intent_ids,
                 status=TurnStatus.PENDING,
+                parent_turn_id=parent_turn_id,
+                triggering_intent_id=triggering_intent_id,
             ),
             *(
                 UpsertIntent(
@@ -270,6 +322,8 @@ class TurnManager:
             base_checkpoint_sequence=state.latest_checkpoint.sequence,
             turn_id=turn_id,
             state_changes=changes,
+            parent_turn_id=parent_turn_id,
+            triggering_intent_id=triggering_intent_id,
         )
 
     @staticmethod
@@ -288,8 +342,48 @@ class TurnManager:
             raise DomainError("duplicate turn_id")
         if any(item.sequence == turn.sequence for item in self.turns.values()):
             raise DomainError("Turn sequence must be unique within a TaskRun")
+        if (turn.parent_turn_id is None) != (turn.triggering_intent_id is None):
+            raise DomainError(
+                "Turn parent_turn_id and triggering_intent_id must be set together"
+            )
+        parent = (
+            None
+            if turn.parent_turn_id is None
+            else self.turns.get(turn.parent_turn_id)
+        )
+        if turn.parent_turn_id is not None:
+            trigger = self.intents.get(turn.triggering_intent_id)
+            if parent is None or parent.status is not TurnStatus.RUNNING:
+                raise DomainTransitionError(
+                    "child Turn registration requires an existing running parent Turn"
+                )
+            if (
+                trigger is None
+                or trigger.turn_id != parent.turn_id
+                or trigger.status is not IntentStatus.SUCCEEDED
+            ):
+                raise DomainTransitionError(
+                    "child Turn registration requires a succeeded Intent in its parent"
+                )
+            if any(
+                item.triggering_intent_id == turn.triggering_intent_id
+                for item in self.turns.values()
+            ):
+                raise DomainError("triggering Intent already has a child Turn")
+            ancestor = parent
+            seen_ancestors: set[str] = set()
+            while ancestor is not None:
+                if ancestor.turn_id in seen_ancestors:
+                    raise DomainError("existing Turn parent relationships contain a cycle")
+                seen_ancestors.add(ancestor.turn_id)
+                ancestor = (
+                    self.turns.get(ancestor.parent_turn_id)
+                    if ancestor.parent_turn_id is not None
+                    else None
+                )
         if any(
             item.status not in _TURN_TERMINAL_STATUSES
+            and item.turn_id != turn.parent_turn_id
             for item in self.turns.values()
         ):
             raise DomainTransitionError(

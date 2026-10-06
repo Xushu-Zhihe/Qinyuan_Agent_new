@@ -34,8 +34,12 @@ from agent_core.fake_model_adapters import (
     FakeCodexAdapter,
     FakeDeepSeekAdapter,
 )
+from agent_core.modeling import ModelValidationCode
 from agent_core.model_invocation_audit import (
+    ModelInvocationCompletion,
     ModelInvocationRecord,
+    result_from_payload,
+    result_payload,
 )
 
 
@@ -371,7 +375,7 @@ def test_structured_empty_response_is_corrected_once_with_fresh_id() -> None:
 
 
 @pytest.mark.parametrize(
-    ("responses", "expected_kind"),
+    ("responses", "expected_kind", "expected_code"),
     [
         (
             [
@@ -379,6 +383,7 @@ def test_structured_empty_response_is_corrected_once_with_fresh_id() -> None:
                 {"event": "completed", "payload": {"intents": "still invalid"}},
             ],
             ModelErrorKind.INVALID_RESPONSE,
+            ModelValidationCode.INTENT_CANDIDATES_NOT_ARRAY.value,
         ),
         (
             [
@@ -386,18 +391,64 @@ def test_structured_empty_response_is_corrected_once_with_fresh_id() -> None:
                 {"event": "completed", "payload": {"intents": []}},
             ],
             ModelErrorKind.EMPTY_RESPONSE,
+            ModelValidationCode.INTENT_CANDIDATES_EMPTY.value,
+        ),
+        (
+            [
+                {
+                    "event": "completed",
+                    "payload": {
+                        "intents": [{"description": "candidate", "extra": "rejected"}]
+                    },
+                },
+                {
+                    "event": "completed",
+                    "payload": {
+                        "intents": [{"description": "candidate", "extra": "rejected"}]
+                    },
+                },
+            ],
+            ModelErrorKind.INVALID_RESPONSE,
+            ModelValidationCode.INTENT_CANDIDATE_STRUCTURE_INVALID.value,
         ),
     ],
 )
 def test_corrected_structural_failure_ends_without_a_second_correction(
-    responses: list[object], expected_kind: ModelErrorKind
+    responses: list[object], expected_kind: ModelErrorKind, expected_code: str
 ) -> None:
     adapter = FakeCodexAdapter(responses)
     result = coordinator(adapter).invoke(make_request(), FakeCancellationToken())
 
     assert isinstance(result, ModelError)
     assert result.kind is expected_kind
+    assert result.validation_code == expected_code
     assert len(adapter.invocations) == 2
+
+
+def test_model_validation_code_round_trips_in_audit_and_reads_legacy_payload() -> None:
+    error = ModelError(
+        ModelErrorKind.INVALID_RESPONSE,
+        "intent candidates must be an array",
+        validation_code=ModelValidationCode.INTENT_CANDIDATES_NOT_ARRAY.value,
+    )
+    completion = ModelInvocationCompletion(
+        str(uuid4()), 1.0, "invalid_structure", error
+    )
+
+    payload = result_payload(completion)
+
+    assert payload["validation_code"] == (
+        ModelValidationCode.INTENT_CANDIDATES_NOT_ARRAY.value
+    )
+    assert result_from_payload("invalid_structure", payload) == error
+    assert result_from_payload(
+        "invalid_structure",
+        {
+            "kind": ModelErrorKind.INVALID_RESPONSE.value,
+            "short_reason": error.short_reason,
+            "evidence_ref": None,
+        },
+    ) == ModelError(ModelErrorKind.INVALID_RESPONSE, error.short_reason)
 
 
 @pytest.mark.parametrize(

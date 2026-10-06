@@ -14,8 +14,8 @@ from test_d3_chain import Model, ReviewModel
 from test_d5_chain import RefinementModel
 from test_d7_turn_budget import make_case
 
-from agent_adapters import d7_candidate_evidence
-from agent_adapters.d7_candidate_evidence import D7CandidateEvidenceService
+from agent_adapters.v7 import candidate_evidence
+from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
 from agent_adapters.multi_turn_application import D3Application
 from agent_core.goal_feedback import ExternalValidationFeedback
 from agent_core.runtime import TaskRunStatus

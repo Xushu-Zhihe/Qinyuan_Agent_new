@@ -9,9 +9,9 @@ from uuid import uuid4
 
 import pytest
 
-from agent_adapters import d7_candidate_operator_view as operator_view
-from agent_adapters.d7_candidate_evidence import D7CandidateEvidenceService
-from agent_adapters.d7_candidate_operator_view import (
+from agent_adapters.v7 import candidate_operator_view as operator_view
+from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
+from agent_adapters.v7.candidate_operator_view import (
     OPERATOR_CANDIDATE_VIEW_ADAPTER_ID,
     D7CandidateOperatorViewer,
     D7CandidateOperatorViewError,

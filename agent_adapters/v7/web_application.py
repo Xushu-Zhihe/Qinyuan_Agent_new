@@ -12,19 +12,19 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from agent_adapters.application import RecordedSandbox, evidence_components
 from agent_adapters.deepseek_model import DeepSeekSettings
-from agent_adapters.d7_candidate_evidence import D7CandidateEvidenceService
-from agent_adapters.d7_http_adapter import (
+from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
+from agent_adapters.v7.http_adapter import (
     D7HttpAdapter,
     D7HttpRequest,
     D7HttpResponseEvidenceService,
 )
-from agent_adapters.d7_model_adapter import (
+from agent_adapters.v7.model_adapter import (
     d7_model_transport_config_ref,
     invoke_d7_web_role,
 )
-from agent_adapters.d7_request_contract import V3SimulationRequest
-from agent_adapters.d7_sandbox_transport import D7SandboxHttpTransport
-from agent_adapters.d7_web_request import D7WebRequest
+from agent_adapters.v7.request_contract import V3SimulationRequest
+from agent_adapters.v7.sandbox_transport import D7SandboxHttpTransport
+from agent_adapters.v7.web_request import D7WebRequest
 from agent_adapters.target_network_cleanup import RecordedTargetNetwork
 from agent_core.contracts import ModelBackend
 from agent_core.control_state_repository import ControlStateRepository
@@ -42,7 +42,7 @@ from agent_core.domain import (
     PlanValidationStatus,
     TurnStatus,
 )
-from agent_core.d7_web_contracts import D7WebExecutionRecord, D7WebPlanRecord, D7WebRunConfig
+from agent_core.v7.web_contracts import D7WebExecutionRecord, D7WebPlanRecord, D7WebRunConfig
 from agent_core.goal_candidates import D7AnswerCandidate
 from agent_core.operation_accounting import (
     D4OperationCompletion,
@@ -283,7 +283,7 @@ class D7WebApplication:
                         raise D4RecoveryRequired("d7_web_resume_checkpoint_not_replayable")
             else:
                 raise ValueError("unsupported_v3_operation")
-            from agent_adapters.d7_task_result import snapshot_v3_task_result
+            from agent_adapters.v7.task_result import snapshot_v3_task_result
 
             return snapshot_v3_task_result(self.directory, self.declaration)
         finally:
@@ -399,7 +399,7 @@ class D7WebApplication:
         self._commit(lambda working: working.select_next_intent(turn_id))
 
     def _run_http_action(self, turn, intent, action: dict, operation_id: str) -> tuple[str, str]:
-        from agent_adapters.d7_http_adapter import D7HttpRequest
+        from agent_adapters.v7.http_adapter import D7HttpRequest
 
         request = D7HttpRequest(
             str(uuid4()),

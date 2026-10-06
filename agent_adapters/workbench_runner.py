@@ -23,7 +23,7 @@ from uuid import uuid4
 
 from agent_adapters.run_files import encode, immutable_read, immutable_write
 from agent_adapters.workbench_contracts import ACTIVE_RUN_STATUSES, WorkbenchError
-from agent_core.d7_web_contracts import canonical_web_origin
+from agent_core.v7.web_contracts import canonical_web_origin
 from agent_core.operation_accounting import D4BudgetPolicy
 from agent_core.command_contracts import T6EvidenceError
 from agent_core.runtime import TERMINAL_STATUSES
@@ -273,7 +273,7 @@ class Runner:
                         "d4_budget": asdict(D4BudgetPolicy()),
                     },
                 }
-                from agent_adapters.d7_web_request import D7WebRequest
+                from agent_adapters.v7.web_request import D7WebRequest
 
                 try:
                     D7WebRequest.parse(request)
@@ -470,6 +470,42 @@ class Runner:
         threading.Thread(target=self._watch, args=(run["run_id"],), daemon=True).start()
         return self.status(challenge_id)
 
+    def batch_cleanup(self, challenge_ids: list[str]):
+        """Cleanup multiple challenges at once."""
+        results = []
+        for challenge_id in challenge_ids:
+            try:
+                # Get current run info for better error reporting
+                run = self._current(challenge_id)
+                if not run:
+                    results.append({
+                        "challenge_id": challenge_id,
+                        "status": "skipped",
+                        "reason": "no_active_run"
+                    })
+                    continue
+
+                result = self.cleanup(challenge_id)
+                results.append({
+                    "challenge_id": challenge_id,
+                    "status": "started",
+                    "result": result
+                })
+            except WorkbenchError as exc:
+                results.append({
+                    "challenge_id": challenge_id,
+                    "status": "failed",
+                    "error": exc.code,
+                    "run_status": run.get("status") if run else None
+                })
+            except Exception as exc:
+                results.append({
+                    "challenge_id": challenge_id,
+                    "status": "failed",
+                    "error": str(exc)
+                })
+        return results
+
     @staticmethod
     def _find_agent_directory(directory: Path):
         candidates = list((directory / "agent-state").glob("*/run.json"))
@@ -522,7 +558,7 @@ class Runner:
                 if declaration.get("protocol_version") == 3:
                     # v3's projection is deliberately safe and read-only;
                     # workbench never interprets or schedules its state.
-                    from agent_adapters.d7_task_result import snapshot_v3_task_result
+                    from agent_adapters.v7.task_result import snapshot_v3_task_result
 
                     progress = snapshot_v3_task_result(directory, declaration)
                 else:
@@ -546,7 +582,7 @@ class Runner:
         try:
             declaration = immutable_read(directory / "run.json")
             if declaration.get("protocol_version") == 3:
-                from agent_adapters.d7_task_result import snapshot_v3_task_result
+                from agent_adapters.v7.task_result import snapshot_v3_task_result
 
                 progress = snapshot_v3_task_result(directory, declaration)
                 item = next((value for value in progress.get("executions", [])
