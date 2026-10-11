@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 
 from agent_core.artifact_proofs import d3_fact_content
+from agent_core.conclusion_contracts import D8Conclusion
 from agent_core.control_store import (
     StateChange,
     UpsertFact,
@@ -50,6 +51,8 @@ class D3Control:
                 if isinstance(change, UpsertIntent)
                 else change.plan_id
                 if isinstance(change, UpsertPlan)
+                else change.record_id
+                if isinstance(change, D8Conclusion)
                 else change.fact_id
                 for change in changes
             )
@@ -235,6 +238,7 @@ class D3Control:
         binding: D3PlanBinding,
         result: D3PlanResult,
         source_execution_id: str | None = None,
+        *, conclusion: D8Conclusion | None = None, content: str | None = None,
     ):
         state = self.state
         plan = next(item for item in state.plans if item.plan_id == binding.plan_id)
@@ -260,7 +264,7 @@ class D3Control:
                 UpsertFact(
                     result.supporting_fact_id,
                     binding.turn_id,
-                    d3_fact_content(result.proof_id),
+                    content if content is not None else d3_fact_content(result.proof_id),
                     source_execution_id,
                     FactStatus.VERIFIED,
                     f"d3:{result.proof_id}",
@@ -268,6 +272,8 @@ class D3Control:
             )
         elif source_execution_id is not None:
             raise D3RecoveryRequired("d3_reused_plan_cannot_create_fact")
+        if conclusion is not None:
+            changes.append(conclusion)
         return self._commit(
             f"plan/{plan.plan_id}/result",
             "complete_d3_plan",

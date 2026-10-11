@@ -35,6 +35,7 @@ from agent_core.domain import (
 )
 from agent_core.dual_llm_contracts import D3ReviewApplication
 from agent_core.process_facts import D5ProcessFact
+from agent_core.conclusion_contracts import D8Conclusion
 from agent_core.runtime import TaskRunStatus
 
 
@@ -60,7 +61,7 @@ def project_candidate(
     failures = list(state.failure_summaries)
     seen: set[tuple[type, str]] = set()
     for ordinal, change in enumerate(mutation.state_changes):
-        if isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact)):
+        if isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion)):
             # D2 review applications are append-only control metadata; they do
             # not alter the projected TaskRun graph.
             continue

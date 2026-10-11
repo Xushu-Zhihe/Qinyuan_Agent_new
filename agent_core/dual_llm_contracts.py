@@ -8,7 +8,7 @@ from typing import Literal
 from uuid import UUID
 
 from agent_core.execution_authorization import D6Authorization
-from agent_core.operation_accounting import D4BudgetPolicy
+from agent_core.operation_accounting import D4BudgetPolicy, D8BudgetPolicy
 from agent_core.review_contracts import (
     D2AllowedActionKinds,
     D2Constraint,
@@ -89,6 +89,11 @@ def d3_payload(value: object) -> dict[str, object]:
     payload = (
         asdict(value) if is_dataclass(value) and not isinstance(value, type) else {}
     )
+    if isinstance(value, D3RunConfig) and not value.d8_enabled:
+        payload.pop("d8_enabled")
+    elif (isinstance(value, D3CommitMetadata) and value.config is not None
+          and not value.config.d8_enabled):
+        payload["config"].pop("d8_enabled")
     if isinstance(value, D3RunConfig) and value.d6_authorization is None:
         payload.pop("d6_authorization")
     elif (
@@ -147,6 +152,7 @@ class D3RunConfig:
     d5_enabled: bool = False
     d5_sensitive_requirements: tuple[tuple[str, str], ...] | None = None
     d6_authorization: D6Authorization | None = None
+    d8_enabled: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -215,6 +221,14 @@ class D3RunConfig:
             self.d4_budget is None or not self.d5_enabled
         ):
             raise ValueError("D7 requires explicit D4 budgets and D5 projection")
+        if type(self.d8_enabled) is not bool:
+            raise ValueError("D8 enablement must be explicit boolean")
+        if self.d8_enabled:
+            if (not isinstance(self.d4_budget, D8BudgetPolicy)
+                    or not self.d5_enabled or self.contract_version != 1):
+                raise ValueError("D8 requires its internal chain, budget and D5 redaction")
+        elif isinstance(self.d4_budget, D8BudgetPolicy):
+            raise ValueError("D8 budget requires explicit D8 enablement")
 
     @property
     def max_turns(self) -> int | None:
@@ -236,7 +250,7 @@ class D3RunConfig:
             fields | {"d4_budget", "d5_enabled"},
             fields | {"d4_budget", "d5_enabled", "d5_sensitive_requirements"},
         )
-        if set(value) - {"d6_authorization"} not in allowed:
+        if set(value) - {"d6_authorization", "d8_enabled"} not in allowed:
             raise ValueError("invalid D3RunConfig fields")
         budget = value.get("d4_budget")
         if budget is not None and not isinstance(budget, dict):
@@ -268,13 +282,15 @@ class D3RunConfig:
             value["review_role_ref"],  # type: ignore[arg-type]
             value["chain_id"],  # type: ignore[arg-type]
             value["contract_version"],  # type: ignore[arg-type]
-            D4BudgetPolicy.from_dict(budget) if budget is not None else None,
+            (D8BudgetPolicy.from_dict(budget) if value.get("d8_enabled") is True
+             else D4BudgetPolicy.from_dict(budget)) if budget is not None else None,
             value.get("d5_enabled", False),  # type: ignore[arg-type]
             tuple(tuple(item) for item in requirements)
             if requirements is not None
             else None,  # type: ignore[arg-type]
             D6Authorization.from_dict(value["d6_authorization"])
             if value.get("d6_authorization") is not None else None,
+            value.get("d8_enabled", False),  # type: ignore[arg-type]
         )
 
 

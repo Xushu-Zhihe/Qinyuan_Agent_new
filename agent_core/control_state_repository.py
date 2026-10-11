@@ -39,6 +39,7 @@ from agent_core.observation_proof import (
     observation_fact_content,
 )
 from agent_core.artifact_proofs import D3ObservationProofVerifier, d3_fact_content
+from agent_core.conclusion_contracts import D8Conclusion, d8_fact_content
 
 
 MAX_CONTEXT_FACTS = 64
@@ -150,7 +151,7 @@ class ControlStateRepository:
                             )
                 normalized_turns.append(turn)
             rows = replace(rows, turns=tuple(normalized_turns))
-            self._validate_rows(rows)
+            self._validate_rows(rows, tuple(c for c in mutation.state_changes if isinstance(c, D8Conclusion)))
             validate_running_transition(state, rows, mutation)
             executions = {item.execution_id: item for item in rows.executions}
             targets = {item.url for item in rows.task_run.request.target.endpoints} | {
@@ -274,7 +275,7 @@ class ControlStateRepository:
             failure_summaries=tuple(item.to_domain() for item in selected_failures),
         )
 
-    def _validate_rows(self, rows: ControlStateRows) -> None:
+    def _validate_rows(self, rows: ControlStateRows, d8_pending: tuple[D8Conclusion, ...] = ()) -> None:
         validate_control_ownership(rows)
         task_run_id = rows.task_run.task_run_id
         turns = {item.turn_id: item for item in rows.turns}
@@ -480,12 +481,20 @@ class ControlStateRepository:
                     proof, evidence = self._d3_observation_proofs.read_verified(
                         fact.source_ref, fact.verification_ref.removeprefix("d3:")
                     )
+                    config = self._store.load_d3_run_config(task_run_id)
+                    expected_content = d3_fact_content(proof.proof_id)
+                    if config is not None and config.d8_enabled:
+                        expected_content = d8_fact_content(proof.artifact_version_id, proof.observed_sha256, proof.proof_id)
+                        approvals = (*self._store.list_d8_conclusions(task_run_id), *d8_pending)
+                        if not any(r.outcome == "verified_fact" and r.fact_id == fact.fact_id
+                                   and r.plan_id == source_plan.plan_id for r in approvals):
+                            raise StorageError("D8 observation Fact has no approval record")
                     if (
                         fact.status is not FactStatus.VERIFIED
                         or proof.intent_id != source_intent.intent_id
                         or proof.turn_id != fact.turn_id
                         or proof.task_run_id != task_run_id
-                        or fact.content != d3_fact_content(proof.proof_id)
+                        or fact.content != expected_content
                         or evidence.task_run_id != task_run_id
                     ):
                         raise StorageError("D3 observation Fact proof does not match control state")

@@ -98,6 +98,7 @@ tests
 !/tests/test_d4_budget.py
 !/tests/test_d4_chain.py
 !/tests/test_d4_lifecycle.py
+!/tests/test_d8_conclusion_review.py
 !/tests/test_d6_core_slice.py
 !/tests/test_d6_execution_authorization.py
 !/tests/test_d6_windows_protection.py

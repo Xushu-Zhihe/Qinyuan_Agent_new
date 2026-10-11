@@ -10,6 +10,7 @@ from typing import Callable
 from agent_core.actions import CompleteIntentAction, ProbeAction
 from agent_core.artifact_operations import fixed_size_script, parse_size_output
 from agent_core.artifact_proofs import d3_fact_content
+from agent_core.conclusion_contracts import D8Conclusion
 from agent_core.attachment_workspace import fixed_digest_script
 from agent_core.control_store import (
     AppendPlanValidationRecord,
@@ -63,6 +64,7 @@ class D3EvidenceValidator:
         proofs,
         source_loader: Callable[[str], object],
     ) -> None:
+        self.conclusions = None
         self.ledger = ledger
         self.imports = imports
         self.workspace = workspace
@@ -127,6 +129,10 @@ class D3EvidenceValidator:
         return request_id, proposal
 
     def _review_action(self, task_run_id: str, request_id: str, intent_id: str):
+        if self.conclusions is not None:
+            trigger = self.conclusions.review_trigger(request_id, intent_id)
+            if trigger is not None:
+                return trigger
         evidence = self.models.read(request_id)
         operation = self.ledger.load_d3_operation(request_id)
         if evidence is None or operation is None or ":" not in evidence.resource_ref:
@@ -264,7 +270,7 @@ class D3EvidenceValidator:
             or fact.turn_id != binding.turn_id
             or fact.source_ref != proof.source_execution_id
             or fact.verification_ref != f"d3:{proof_id}"
-            or fact.content != d3_fact_content(proof_id)
+            or fact.content != self._fact_content(proof_id, state.task_run.task_run_id)
             or proof.task_run_id != binding.task_run_id
             or proof.turn_id != binding.turn_id
             or proof.intent_id != binding.intent_id
@@ -484,7 +490,7 @@ class D3EvidenceValidator:
             )
             if review_plan_id != prior[-1].plan_id:
                 raise D3RecoveryRequired("d3_replan_review_plan_changed")
-            if prior[-1].status is PlanStatus.RUNNING:
+            if prior[-1].status is PlanStatus.RUNNING and review_stage != "fact_proposal":
                 size_execution = next(
                     (
                         item
@@ -533,7 +539,7 @@ class D3EvidenceValidator:
                     )
                 ):
                     raise D3RecoveryRequired("d3_replan_first_step_not_saved")
-            elif review_stage not in {"inner_sha256", "inner_complete"}:
+            elif prior[-1].status is PlanStatus.COMPLETED and review_stage not in {"inner_sha256", "inner_complete"}:
                 raise D3RecoveryRequired("d3_replan_final_step_review_missing")
         if binding.observation_mode == "reuse_saved_proof":
             if binding.source_proof_id is None or binding.source_fact_id is None:
@@ -713,7 +719,7 @@ class D3EvidenceValidator:
                 or changes[0].fact_id != result.supporting_fact_id
                 or changes[0].source_ref != proof.source_execution_id
                 or changes[0].verification_ref != f"d3:{proof.proof_id}"
-                or changes[0].content != d3_fact_content(proof.proof_id)
+                or changes[0].content != self._fact_content(proof.proof_id, mutation.task_run_id)
                 or proof.plan_id != binding.plan_id
                 or proof.artifact_version_id != binding.artifact_version_id
                 or proof.observation_id != result.observation_id
@@ -940,7 +946,26 @@ class D3EvidenceValidator:
         if output.decision == "adjust_turn_target" and len(state.turns) >= 2:
             raise ValueError("d3_turn_limit_reached")
 
+    def _fact_content(self, proof_id, task_run_id):
+        config = self.ledger.load_d3_run_config(task_run_id)
+        if config is not None and config.d8_enabled:
+            if self.conclusions is None:
+                raise D3RecoveryRequired("d8_validator_not_configured")
+            return self.conclusions.observation(proof_id).fact_content()
+        return d3_fact_content(proof_id)
+
     def __call__(self, mutation: ControlMutation, state) -> None:
+        config = self.ledger.load_d3_run_config(mutation.task_run_id)
+        records = [c for c in mutation.state_changes if isinstance(c, D8Conclusion)]
+        if config is not None and config.d8_enabled:
+            if self.conclusions is None:
+                raise D3RecoveryRequired("d8_validator_not_configured")
+            for record in records:
+                self.conclusions.validate_record(record, state)
+            if any(isinstance(c, UpsertFact) for c in mutation.state_changes) and len(records) != 1:
+                raise D3RecoveryRequired("d8_fact_approval_missing")
+        elif records:
+            raise D3RecoveryRequired("d8_not_enabled")
         operation = mutation.operation
         if operation in {"register_d3_turn", "advance_d3_turn"}:
             self._turn_proposal(mutation, state)
@@ -1011,5 +1036,6 @@ class D3EvidenceValidator:
             "select_d3_intent",
             "register_d3_plan",
             "replan_d3_plan",
+            "append_d8_conclusion",
         }:
             raise D3RecoveryRequired("d3_unvalidated_transition")

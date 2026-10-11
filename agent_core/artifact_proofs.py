@@ -137,7 +137,7 @@ class D3ObservationProofVerifier:
             raise D3RecoveryRequired("d3_proof_command_evidence_changed")
         return execution, record
 
-    def _observation(self, binding: D3PlanBinding, observation_id: str):
+    def _observation(self, binding: D3PlanBinding, observation_id: str, *, allow_inactive_plan: bool = False):
         state = self.ledger.load_control_state_rows(binding.task_run_id)
         turn = self.ledger.load_d3_turn_binding(binding.turn_id)
         plan = (
@@ -163,7 +163,7 @@ class D3ObservationProofVerifier:
             or self.ledger.load_d3_plan_binding(binding.plan_id) != binding
             or binding.observation_mode != "new_observation"
             or plan.intent_id != binding.intent_id
-            or plan.status not in {PlanStatus.RUNNING, PlanStatus.COMPLETED}
+            or not allow_inactive_plan and plan.status not in {PlanStatus.RUNNING, PlanStatus.COMPLETED}
             or intent.turn_id != binding.turn_id
             or binding.rule_binding_sha256 != digest(asdict(turn))
             or turn.task_run_id != binding.task_run_id
@@ -306,7 +306,7 @@ class D3ObservationProofVerifier:
         self.proofs.save(proof)
         return proof
 
-    def read_verified(self, execution_id: str, proof_id: str):
+    def read_verified(self, execution_id: str, proof_id: str, *, allow_inactive_plan: bool = False):
         proof = self.proofs.read(proof_id)
         if proof is None or proof.source_execution_id != execution_id:
             raise D3RecoveryRequired("d3_proof_missing_or_mismatched")
@@ -314,7 +314,7 @@ class D3ObservationProofVerifier:
         if binding is None:
             raise D3RecoveryRequired("d3_proof_plan_missing")
         state, turn, execution, size_id, receipt = self._observation(
-            binding, proof.observation_id
+            binding, proof.observation_id, allow_inactive_plan=allow_inactive_plan
         )
         if (
             (

@@ -13,7 +13,8 @@ from uuid import uuid4
 
 from agent_adapters.attachment_import_recorder import FileAttachmentImportRecorder
 from agent_adapters.budgeted_review_ledger import D4ReviewLedger
-from agent_adapters.command_recorder import T6CommandRecorder
+from agent_adapters.command_recorder import T6CommandRecorder, T6EvidenceError
+from agent_adapters.conclusion_evidence import FileD8Evidence
 from agent_adapters.cross_run_artifacts import (
     CrossTaskRunArtifactStore,
     D6ArtifactImportError,
@@ -27,6 +28,8 @@ from agent_adapters.process_fact_model import D5RedactingModel
 from agent_adapters.process_sources import D5SourceReader
 from agent_adapters.review_ledger import FileD2ReviewLedger
 from agent_adapters.run_files import run_lock
+from agent_core.conclusion_contracts import D8ReviewRequestAction
+from agent_core.conclusion_review import ConclusionReview
 from agent_adapters.workspace_evidence import FileD3WorkspaceEvidence
 from agent_core.actions import CompleteIntentAction, ProbeAction
 from agent_core.artifact_operations import D3WorkspaceOperations, fixed_size_script
@@ -206,6 +209,7 @@ class D3Application:
         refinement_model=None,
         sensitive_config: Mapping[str, D5SensitiveValue] | None = None,
         refinement_timeout_seconds: float = 180.0,
+        fact_review_model=None,
         d6_artifact_store: CrossTaskRunArtifactStore | None = None,
         d6_artifact_transfer: D6ArtifactTransfer | None = None,
     ) -> None:
@@ -333,6 +337,18 @@ class D3Application:
             clock,
         )
         self.control = D3Control(self.controller, self.store)
+        self.conclusions = (
+            ConclusionReview(
+                self.controller, self.store, FileD8Evidence(directory / "d8-conclusions"),
+                self.proofs, self.workspace_evidence, config,
+                D5RedactingModel(inner_model, self.redactor,
+                                 configured=self._redaction_configured, redact_response=False),
+                D5RedactingModel(fact_review_model or outer_model, self.redactor,
+                                 configured=self._redaction_configured, redact_response=False),
+                self.redactor, clock, self._dispatch_stopped,
+            ) if config.d8_enabled else None
+        )
+        self.validator.conclusions = self.conclusions
         self.command_sandbox = command_sandbox
         self.review_coordinator = D2ReviewCoordinator(
             self.review_ledger,
@@ -474,6 +490,8 @@ class D3Application:
             return
         task_run_id = self.state.task_run.task_run_id
         self.store.reconcile_d4_control_commit_audit(task_run_id)
+        if self.conclusions is not None:
+            self.conclusions.reconcile()
         if self.refinement is not None:
             try:
                 self.refinement.reconcile()
@@ -1623,6 +1641,16 @@ class D3Application:
         return request_id, proposal
 
     def _source(self, reference: str) -> object:
+        if self.conclusions is not None:
+            request = self.conclusions.evidence.read_request(reference)
+            if request is not None:
+                result = self.conclusions._known(request)
+                if result is None:
+                    raise D3RecoveryRequired("d8_review_source_unknown")
+                return {"kind": "d8_model_proposal", "task_run_id": request.task_run_id,
+                        "stage": request.stage, "outcome": result["outcome"],
+                        "context_sha256": request.context_sha256,
+                        "reason": result["raw"].get("reason") if result["raw"] else None}
         outcome = self.store.load_d3_outcome(reference)
         if outcome is not None:
             return {"kind": "d3_outcome", **asdict(outcome)}
@@ -2462,6 +2490,8 @@ class D3Application:
                 digest(asdict(receipt)),
                 fact_id,
             )
+            if self.conclusions is not None:
+                return await self._review_d8_observation(plan_binding, proof, receipts, token)
             self.control.complete_plan(plan_binding, result, proof.source_execution_id)
         if proposal.review_requested:
             sources = (
@@ -2490,7 +2520,44 @@ class D3Application:
             )
         return False
 
+    async def _review_d8_observation(self, binding, proof, receipts, token):
+        try:
+            return await self._review_d8_observation_impl(binding, proof, receipts, token)
+        except (StorageError, OSError, T6EvidenceError, CommittedStateReloadError) as exc:
+            raise D3RecoveryRequired("d8_conclusion_persistence_recovery_required") from exc
+
+    async def _review_d8_observation_impl(self, binding, proof, receipts, token):
+        while True:
+            self._check_dispatch()
+            proposal_id, result = await self.conclusions.propose(proof.proof_id, token)
+            if isinstance(result, D8ReviewRequestAction):
+                review_id, output = self._review(
+                    binding.turn_id, binding.intent_id, "action", proposal_id,
+                    (proposal_id, proof.observation_id),
+                )
+                self.store.mark_d4_operation_applied(proposal_id, review_id)
+                if await self._route(review_id, output, binding.intent_id, receipts, token):
+                    return True
+                continue
+            if result.outcome == "verified_fact":
+                receipt = self.workspace_evidence.read_digest(proof.observation_id)
+                observed = D3PlanResult(binding.task_run_id, binding.plan_id, "satisfied",
+                                        binding.artifact_version_id, proof.observation_id,
+                                        proof.proof_id, digest(asdict(receipt)), result.fact_id)
+                content = self.conclusions.observation(proof.proof_id).fact_content()
+                self.control.complete_plan(binding, observed, proof.source_execution_id,
+                                           conclusion=result, content=content)
+                return False
+            self.controller.commit_d3_transition(
+                "append_d8_conclusion", (result,), (result.record_id,), result.outcome,
+                self._id(f"d8-conclusion/{result.record_id}"),
+            )
+
     async def _run_plan(self, plan_binding, receipts, token: CancellationToken) -> bool:
+        if self.conclusions is not None and plan_binding.observation_mode == "new_observation":
+            proof = self.proof_store.read(self._id(f"proof/{plan_binding.plan_id}"))
+            if proof is not None:
+                return await self._review_d8_observation(plan_binding, proof, receipts, token)
         turn = self.store.load_d3_turn_binding(plan_binding.turn_id)
         if turn is None:
             raise D3RecoveryRequired("d3_plan_turn_missing")
@@ -2546,6 +2613,17 @@ class D3Application:
         ):
             raise D3RecoveryRequired("d3_completion_support_unavailable")
         fact_id = result.supporting_fact_id
+        if self.conclusions is not None and binding.observation_mode == "new_observation":
+            action_id, action = self.validator._known_action(binding.task_run_id, binding.plan_id, "inner_sha256")
+            if action.review_requested:
+                step_index = 1 if binding.template == "size_then_sha256" else 0
+                review_id, output = self._review(
+                    intent.turn_id, intent_id, "action", action_id,
+                    (action_id, self._id(f"tool/{binding.plan_id}/{step_index}"),
+                     result.observation_id, fact_id),
+                )
+                if await self._route(review_id, output, intent_id, receipts, token):
+                    return True
         context = D3ActionContext(
             next(
                 item.turn_target

@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias, cast
 
 from agent_core.contracts import ModelBackend, TaskRequest
+from agent_core.conclusion_contracts import D8Conclusion
 from agent_core.v7.web_contracts import (
     D7WebExecutionRecord,
     D7WebPlanRecord,
@@ -563,6 +564,7 @@ StateChange: TypeAlias = (
     | AppendD2ReviewApplication
     | D3ReviewApplication
     | D5ProcessFact
+    | D8Conclusion
 )
 
 STATE_CHANGE_TYPES = (
@@ -578,6 +580,7 @@ STATE_CHANGE_TYPES = (
     AppendD2ReviewApplication,
     D3ReviewApplication,
     D5ProcessFact,
+    D8Conclusion,
 )
 
 
@@ -886,6 +889,10 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"applied"}),
         ),
+        "append_d8_conclusion": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"reviewed_inference", "rejected", "insufficient"}),
+        ),
         "register_d3_plan": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             dynamic_result_entity="plan",
@@ -1077,15 +1084,28 @@ def validate_control_event(
         raise ValueError("Process_Fact requires one typed append change")
     if operation != "append_process_fact" and any(isinstance(change, D5ProcessFact) for change in state_changes):
         raise ValueError("Process_Fact may only be appended by its dedicated operation")
+    conclusions = [c for c in state_changes if isinstance(c, D8Conclusion)]
+    if operation == "append_d8_conclusion" and (
+        len(state_changes) != 1 or len(conclusions) != 1
+        or conclusions[0].outcome == "verified_fact"
+    ):
+        raise ValueError("D8 inference/rejection requires its dedicated typed append")
+    if conclusions and operation not in {"append_d8_conclusion", "complete_d3_plan"}:
+        raise ValueError("D8 conclusion requires its dedicated operation")
     if operation == "complete_d3_plan" and (
-        len(state_changes) not in {1, 2}
+        len(state_changes) not in {1, 2, 3}
         or not isinstance(state_changes[0], UpsertPlan)
         or state_changes[0].status is not PlanStatus.COMPLETED
-        or len(state_changes) == 2 and (
+        or len(state_changes) >= 2 and (
             not isinstance(state_changes[1], UpsertFact)
             or state_changes[1].status is not FactStatus.VERIFIED
             or state_changes[1].verification_ref is None
             or not state_changes[1].verification_ref.startswith("d3:")
+        )
+        or len(state_changes) == 3 and (
+            not isinstance(state_changes[2], D8Conclusion)
+            or state_changes[2].outcome != "verified_fact"
+            or state_changes[2].fact_id != state_changes[1].fact_id
         )
     ):
         raise ValueError("D3 Plan completion requires its checked Plan and optional verified Fact")
@@ -1273,6 +1293,10 @@ def validate_control_event(
         assert isinstance(fact, D5ProcessFact)
         if details.get("entity_ids") != [fact.process_fact_id]:
             raise ValueError("Process_Fact event does not match its typed append")
+    if operation == "append_d8_conclusion":
+        record = state_changes[0]
+        if details.get("entity_ids") != [record.record_id] or details.get("result") != record.outcome:
+            raise ValueError("D8 event does not match its typed append")
     if operation == "bind_intent_goal":
         _uuid4(details.get("import_id"), "RuntimeEvent.details.import_id")
     if operation == "commit_verified_file_type_fact":
@@ -1968,6 +1992,7 @@ class ControlStore(Protocol):
     ): ...
 
     def list_process_facts(self, task_run_id: str) -> tuple[D5ProcessFact, ...]: ...
+    def list_d8_conclusions(self, task_run_id: str) -> tuple[D8Conclusion, ...]: ...
 
     def load_terminal_commit(self, task_run_id: str) -> ControlCommitResult | None:
         """First persisted terminal result for repeated cancellation; no new mutation."""
@@ -2107,6 +2132,8 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
         return {"type": "append_d3_review_application", **d3_payload(change)}
     if isinstance(change, D5ProcessFact):
         return {"type": "append_process_fact", **d3_payload(change)}
+    if isinstance(change, D8Conclusion):
+        return {"type": "append_d8_conclusion", **d3_payload(change)}
     raise TypeError("unsupported state change")
 
 
