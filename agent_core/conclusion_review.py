@@ -25,6 +25,7 @@ class ConclusionReview:
         self.proofs, self.workspace, self.config = proofs, workspace, config
         self.inner_model, self.outer_model = inner_model, outer_model
         self.redactor, self.clock, self.stopped = redactor, clock, stopped
+        self.request_capacity_check = None
 
     def _id(self, name):
         return stable_id(self.controller.control_state.task_run.task_run_id, f"d8/{name}")
@@ -186,6 +187,8 @@ class ConclusionReview:
         result = self._known(request)
         if result is None:
             self._scope(request.observation)
+            if self.request_capacity_check is not None:
+                self.request_capacity_check(request)
             self.store.begin_d4_operation(D4OperationStart(
                 request.model_request_id, request.task_run_id,
                 "action" if request.stage == "fact_proposal" else "fact_review",

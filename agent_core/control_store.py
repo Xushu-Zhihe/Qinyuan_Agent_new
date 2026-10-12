@@ -11,6 +11,8 @@ from typing import Literal, Protocol, TypeAlias, cast
 
 from agent_core.contracts import ModelBackend, TaskRequest
 from agent_core.conclusion_contracts import D8Conclusion
+from agent_core.handoff_contracts import D8HandoffVersion, D8CapacityVersion, D8TreeRecord
+from agent_core.handoff_storage import D8_CHANGES, D8_OPERATIONS
 from agent_core.v7.web_contracts import (
     D7WebExecutionRecord,
     D7WebPlanRecord,
@@ -565,6 +567,9 @@ StateChange: TypeAlias = (
     | D3ReviewApplication
     | D5ProcessFact
     | D8Conclusion
+    | D8HandoffVersion
+    | D8CapacityVersion
+    | D8TreeRecord
 )
 
 STATE_CHANGE_TYPES = (
@@ -581,6 +586,9 @@ STATE_CHANGE_TYPES = (
     D3ReviewApplication,
     D5ProcessFact,
     D8Conclusion,
+    D8HandoffVersion,
+    D8CapacityVersion,
+    D8TreeRecord,
 )
 
 
@@ -1051,6 +1059,16 @@ def validate_control_event(
     state_changes: tuple[StateChange, ...],
     event: RuntimeEvent,
 ) -> None:
+    if operation in D8_OPERATIONS:
+        records = [c for c in state_changes if isinstance(c, D8_CHANGES)]
+        if (len(records) != 1 or event.type != _CONTROL_EVENT_TYPE
+                or event.status is not TaskRunStatus.RUNNING
+                or set(event.details) != {"operation", "entity_ids", "result"}
+                or event.details["operation"] != operation
+                or event.details["entity_ids"] != [records[0].record_id]
+                or event.details["result"] != records[0].record_id):
+            raise ValueError("D8-2 event does not bind its exact metadata")
+        return
     rule = CONTROL_OPERATION_RULES.get(operation)
     if rule is None:
         raise ValueError(f"unsupported ControlMutation.operation: {operation}")
@@ -1514,7 +1532,7 @@ class ControlMutation:
             if self.d3.config is not None and self.operation != "start_task_run":
                 raise ValueError("D3 run configuration requires explicit start")
             if self.d3.turn_binding is not None and self.operation not in {
-                "register_d3_turn", "advance_d3_turn",
+                "register_d3_turn", "advance_d3_turn", "register_d8_tree_turn",
             }:
                 raise ValueError("D3 Turn binding requires its registration transaction")
             if self.d3.plan_binding is not None and self.operation not in {
@@ -2134,6 +2152,8 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
         return {"type": "append_process_fact", **d3_payload(change)}
     if isinstance(change, D8Conclusion):
         return {"type": "append_d8_conclusion", **d3_payload(change)}
+    if isinstance(change, D8_CHANGES):
+        return {"type": type(change).__name__, **d3_payload(change)}
     raise TypeError("unsupported state change")
 
 

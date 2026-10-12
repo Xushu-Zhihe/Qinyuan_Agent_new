@@ -8,7 +8,8 @@ from typing import Literal
 from uuid import UUID
 
 from agent_core.execution_authorization import D6Authorization
-from agent_core.operation_accounting import D4BudgetPolicy, D8BudgetPolicy
+from agent_core.operation_accounting import D4BudgetPolicy, D8BudgetPolicy, D8HandoffBudgetPolicy
+from agent_core.handoff_contracts import D8HandoffConfig
 from agent_core.review_contracts import (
     D2AllowedActionKinds,
     D2Constraint,
@@ -89,6 +90,10 @@ def d3_payload(value: object) -> dict[str, object]:
     payload = (
         asdict(value) if is_dataclass(value) and not isinstance(value, type) else {}
     )
+    if isinstance(value, D3RunConfig) and value.handoff_config is None:
+        payload.pop("handoff_config")
+    elif isinstance(value, D3CommitMetadata) and value.config is not None and value.config.handoff_config is None:
+        payload["config"].pop("handoff_config")
     if isinstance(value, D3RunConfig) and not value.d8_enabled:
         payload.pop("d8_enabled")
     elif (isinstance(value, D3CommitMetadata) and value.config is not None
@@ -153,6 +158,7 @@ class D3RunConfig:
     d5_sensitive_requirements: tuple[tuple[str, str], ...] | None = None
     d6_authorization: D6Authorization | None = None
     d8_enabled: bool = False
+    handoff_config: D8HandoffConfig | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -214,7 +220,7 @@ class D3RunConfig:
         if (
             self.chain_id != "dual_llm_d3"
             or type(self.contract_version) is not int
-            or self.contract_version not in {1, 2}
+            or self.contract_version not in {1, 2, 3}
         ):
             raise ValueError("unsupported D3 chain contract")
         if self.contract_version == 2 and (
@@ -225,10 +231,16 @@ class D3RunConfig:
             raise ValueError("D8 enablement must be explicit boolean")
         if self.d8_enabled:
             if (not isinstance(self.d4_budget, D8BudgetPolicy)
-                    or not self.d5_enabled or self.contract_version != 1):
+                    or not self.d5_enabled or self.contract_version not in {1, 3}):
                 raise ValueError("D8 requires its internal chain, budget and D5 redaction")
         elif isinstance(self.d4_budget, D8BudgetPolicy):
             raise ValueError("D8 budget requires explicit D8 enablement")
+        if self.contract_version == 3:
+            if (not self.d8_enabled or not isinstance(self.d4_budget, D8HandoffBudgetPolicy)
+                    or not isinstance(self.handoff_config, D8HandoffConfig)):
+                raise ValueError("D8-2 requires its explicit handoff configuration and budget")
+        elif self.handoff_config is not None or isinstance(self.d4_budget, D8HandoffBudgetPolicy):
+            raise ValueError("handoff configuration cannot upgrade an older contract")
 
     @property
     def max_turns(self) -> int | None:
@@ -250,7 +262,7 @@ class D3RunConfig:
             fields | {"d4_budget", "d5_enabled"},
             fields | {"d4_budget", "d5_enabled", "d5_sensitive_requirements"},
         )
-        if set(value) - {"d6_authorization", "d8_enabled"} not in allowed:
+        if set(value) - {"d6_authorization", "d8_enabled", "handoff_config"} not in allowed:
             raise ValueError("invalid D3RunConfig fields")
         budget = value.get("d4_budget")
         if budget is not None and not isinstance(budget, dict):
@@ -282,7 +294,8 @@ class D3RunConfig:
             value["review_role_ref"],  # type: ignore[arg-type]
             value["chain_id"],  # type: ignore[arg-type]
             value["contract_version"],  # type: ignore[arg-type]
-            (D8BudgetPolicy.from_dict(budget) if value.get("d8_enabled") is True
+            (D8HandoffBudgetPolicy.from_dict(budget) if value.get("contract_version") == 3
+             else D8BudgetPolicy.from_dict(budget) if value.get("d8_enabled") is True
              else D4BudgetPolicy.from_dict(budget)) if budget is not None else None,
             value.get("d5_enabled", False),  # type: ignore[arg-type]
             tuple(tuple(item) for item in requirements)
@@ -291,6 +304,7 @@ class D3RunConfig:
             D6Authorization.from_dict(value["d6_authorization"])
             if value.get("d6_authorization") is not None else None,
             value.get("d8_enabled", False),  # type: ignore[arg-type]
+            D8HandoffConfig.from_dict(value["handoff_config"]) if "handoff_config" in value else None,
         )
 
 

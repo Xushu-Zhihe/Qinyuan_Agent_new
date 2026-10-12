@@ -384,6 +384,41 @@ class D3ModelRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class D8ExecutionModelRequest(D3ModelRequest):
+    history_context: str = ""
+    history_capacity_version: int = 1
+
+    @property
+    def context_sha256(self) -> str:
+        return digest({"context": asdict(self.context), "process_facts": self.process_facts,
+                       "history_context": self.history_context,
+                       "history_capacity_version": self.history_capacity_version})
+
+
+@dataclass(frozen=True, slots=True)
+class D8HistoryReadAction:
+    kind: str
+    value: object
+
+    @classmethod
+    def parse(cls, raw):
+        from agent_core.handoff_contracts import _fields
+        key = {"history_query": "query", "history_details": "refs", "history_next_page": "cursor"}.get(raw.get("kind")) if isinstance(raw, dict) else None
+        if key is None:
+            return None
+        value = _fields(raw, {"kind", key})
+        if key == "query":
+            if not isinstance(value[key], dict) or set(value[key]) - {"turn_id", "intent_id", "artifact_version_id", "record_type"}:
+                raise D3ProposalRejected("d8_history_query_invalid", structural=True)
+        elif key == "refs":
+            if not isinstance(value[key], list) or not 1 <= len(value[key]) <= 2 or any(not isinstance(i, str) for i in value[key]) or len(set(value[key])) != len(value[key]):
+                raise D3ProposalRejected("d8_history_details_invalid", structural=True)
+        elif not isinstance(value[key], str):
+            raise D3ProposalRejected("d8_history_cursor_invalid", structural=True)
+        return cls(value["kind"], value[key])
+
+
+@dataclass(frozen=True, slots=True)
 class D3ModelEvidence:
     model_request_id: str
     task_run_id: str
@@ -447,11 +482,19 @@ class D3AuditedModel:
         self.adapter = adapter
         self.config = config
         self.clock = clock
+        self.request_capacity_check = None
 
     def _parse(self, request: D3ModelRequest, raw: object):
         if request.stage == "outer_turn":
             return parse_d3_turn_proposal(raw)
         if request.stage == "inner_plan":
+            if self.config.contract_version == 3:
+                try:
+                    read = D8HistoryReadAction.parse(raw)
+                except (ValueError, TypeError) as exc:
+                    raise D3ProposalRejected("d8_history_read_structure_invalid", structural=True) from exc
+                if read is not None:
+                    return read
             return parse_d3_plan_proposal(raw)
         return parse_d3_action(raw, request.stage)
 
@@ -915,6 +958,8 @@ class D3AuditedModel:
                     != current.base_checkpoint_sequence
                 ):
                     raise D3RecoveryRequired("d3_model_dispatch_stopped")
+                if self.request_capacity_check is not None:
+                    self.request_capacity_check(current)
                 self.ledger.begin_d3_operation(
                     D3OperationStart(
                         current.model_request_id,

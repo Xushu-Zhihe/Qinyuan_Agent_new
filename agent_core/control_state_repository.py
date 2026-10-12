@@ -302,7 +302,16 @@ class ControlStateRepository:
             item.turn_id for item in rows.turns if item.status is TurnStatus.RUNNING
         ]
         if len(running_turns) > 1:
-            raise StorageError("control state contains multiple running Turns")
+            config = self._store.load_d3_run_config(rows.task_run.task_run_id)
+            if config is None or config.contract_version != 3:
+                raise StorageError("control state contains multiple running Turns")
+            leaf = max((turns[i] for i in running_turns), key=lambda t: t.sequence)
+            chain = set()
+            while leaf is not None and leaf.turn_id not in chain:
+                chain.add(leaf.turn_id)
+                leaf = turns.get(leaf.parent_turn_id) if leaf.parent_turn_id else None
+            if set(running_turns) - chain:
+                raise StorageError("D8-2 running Turns must form one ancestor chain")
         running_executions = [
             item.execution_id
             for item in rows.executions

@@ -146,6 +146,10 @@ from agent_core.operation_accounting import (
 )
 from agent_core.process_facts import D5Attempt, D5ProcessFact
 from agent_core.conclusion_contracts import D8Conclusion
+from agent_core.handoff_storage import (
+    D8_HANDOFF_SCHEMA, D8_CHANGES, D8_OPERATIONS,
+    load_records, validate_handoff_mutation, save_handoff_mutation,
+)
 from agent_core.review_contracts import (
     D2AllowedActionKinds,
     D2Constraint,
@@ -168,7 +172,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 23
+CURRENT_SCHEMA_VERSION = 24
 
 MIGRATION_23 = """
 CREATE TABLE d8_conclusions (
@@ -1200,6 +1204,11 @@ class SqliteControlStore:
                     "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                     (23, self._now()),
                 )
+            if version < 24:
+                for statement in _sql_statements(D8_HANDOFF_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                                         (24, self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -3215,7 +3224,7 @@ class SqliteControlStore:
                 "UPDATE d4_operations SET completion_json = ? WHERE operation_id = ?",
                 (canonical_json(asdict(completion)), completion.operation_id),
             )
-        if record.start.category in {"planning", "action", "review", "refinement", "fact_review"}:
+        if record.start.category in {"planning", "action", "review", "refinement", "fact_review", "handoff_summary"}:
             event = D4AuditEvent(
                 self._d4_audit_event_id(
                     record.start.task_run_id,
@@ -4331,6 +4340,92 @@ class SqliteControlStore:
             records.append(record)
         return tuple(records)
 
+    def list_d8_handoffs(self, task_run_id):
+        return load_records(self, "d8_handoff_versions", task_run_id)
+
+    def list_d8_capacities(self, task_run_id):
+        return load_records(self, "d8_capacity_versions", task_run_id)
+
+    def list_d8_tree_records(self, task_run_id):
+        return load_records(self, "d8_tree_records", task_run_id)
+
+    def d8_history_sequences(self, task_run_id):
+        result = {}
+        for row in self._connection.execute("SELECT sequence, details_json FROM runtime_events WHERE task_run_id=? ORDER BY sequence", (task_run_id,)):
+            for identity in json.loads(row["details_json"]).get("entity_ids", []):
+                result[identity] = row["sequence"]
+        if self._schema_version >= 24:
+            for row in self._connection.execute("SELECT event_sequence, metadata_json FROM d8_tree_records WHERE task_run_id=? ORDER BY event_sequence", (task_run_id,)):
+                data = json.loads(row["metadata_json"])
+                result["tree/" + data["record_id"]] = row["event_sequence"]
+                for identity in (data["turn_id"], data["intent_id"]):
+                    if identity:
+                        result[identity] = row["event_sequence"]
+            for row in self._connection.execute("SELECT record_id, event_sequence FROM d8_conclusions WHERE task_run_id=?", (task_run_id,)):
+                result["review/" + row["record_id"]] = row["event_sequence"]
+        return result
+
+    def list_d8_reads(self, task_run_id):
+        if self._schema_version < 24:
+            return ()
+        return tuple((row["request_id"], json.loads(row["start_json"]),
+                      json.loads(row["completion_json"]) if row["completion_json"] else None)
+                     for row in self._connection.execute("SELECT * FROM d8_history_reads WHERE task_run_id=? ORDER BY rowid", (task_run_id,)))
+
+    def load_d8_read(self, request_id):
+        if self._schema_version < 24:
+            return None
+        row = self._connection.execute("SELECT * FROM d8_history_reads WHERE request_id=?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["start_json"]), json.loads(row["completion_json"]) if row["completion_json"] else None
+
+    def begin_d8_read(self, start):
+        from agent_core.handoff_contracts import D8ReadStart
+        if not isinstance(start, D8ReadStart):
+            raise TypeError("D8 read start must be typed")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self.load_d8_read(start.request_id)
+            if existing is not None:
+                if existing[0] != asdict(start):
+                    raise StorageError("D8 read identity differs from its frozen snapshot")
+                self._connection.commit()
+                return existing
+            config = self.load_d3_run_config(start.task_run_id)
+            task = self.load_task_run(start.task_run_id)
+            latest = self._connection.execute("SELECT MAX(sequence) FROM checkpoints WHERE task_run_id=?", (start.task_run_id,)).fetchone()[0]
+            if (config is None or config.contract_version != 3 or task.status is not TaskRunStatus.RUNNING
+                    or latest != start.checkpoint_sequence or not task.started_at <= start.started_at < task.deadline_at
+                    or self._now() >= task.deadline_at or self.list_d4_unresolved_operations(start.task_run_id)
+                    or self._connection.execute("SELECT 1 FROM d4_audit_events WHERE task_run_id=? AND category='cancellation_requested'", (start.task_run_id,)).fetchone()):
+                raise StorageError("D8 read admission is stopped or stale")
+            count = self._connection.execute("SELECT COUNT(*) FROM d8_history_reads WHERE task_run_id=?", (start.task_run_id,)).fetchone()[0]
+            if count >= 8:
+                raise StorageError("d8_read_budget_exhausted")
+            if start.capacity_version != len(self.list_d8_capacities(start.task_run_id)):
+                raise StorageError("D8 read capacity is stale")
+            self._connection.execute("INSERT INTO d8_history_reads VALUES (?,?,?,NULL)",
+                                     (start.request_id, start.task_run_id, canonical_json(asdict(start))))
+            self._connection.commit()
+            return None
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def complete_d8_read(self, request_id, completion):
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            known = self.load_d8_read(request_id)
+            if known is None or (known[1] is not None and known[1] != completion):
+                raise StorageError("D8 read completion is missing or changed")
+            self._connection.execute("UPDATE d8_history_reads SET completion_json=? WHERE request_id=?",
+                                     (canonical_json(completion), request_id))
+            self._connection.commit()
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
     def _validate_d8_mutation(self, mutation: ControlMutation) -> None:
         config = self.load_d3_run_config(mutation.task_run_id)
         records = [c for c in mutation.state_changes if isinstance(c, D8Conclusion)]
@@ -4375,6 +4470,8 @@ class SqliteControlStore:
                 self._mark_d4_operation_applied(request_id, record.record_id)
 
     def _validate_d3_mutation(self, mutation: ControlMutation) -> None:
+        if validate_handoff_mutation(self, mutation):
+            return
         metadata = mutation.d3
         config = self.load_d3_run_config(mutation.task_run_id)
         if metadata is not None and metadata.config is not None:
@@ -4708,7 +4805,8 @@ class SqliteControlStore:
                     (previous.status, current.status), set()
                 ):
                     raise StorageError(f"D3 {kind} state transition is not admitted")
-        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1:
+        config = self.load_d3_run_config(mutation.task_run_id)
+        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1 and config.contract_version != 3:
             raise StorageError("D3 may run only one Turn")
         if sum(item.status is IntentStatus.RUNNING for item in after.intents) > 1:
             raise StorageError("D3 may run only one Intent")
@@ -5076,6 +5174,7 @@ class SqliteControlStore:
             self._save_d3_mutation(mutation, event_sequence)
             self._save_d5_mutation(mutation, event_sequence)
             self._save_d8_mutation(mutation, event_sequence)
+            save_handoff_mutation(self, mutation, event_sequence)
             self._save_d7_mutation(mutation, event_sequence)
             self._insert_event(mutation.event, event_sequence)
             checkpoint = Checkpoint(
@@ -5591,7 +5690,7 @@ class SqliteControlStore:
         order = {kind: index for index, kind in enumerate((
             UpsertTaskRun, UpsertTurn, UpsertIntent, UpsertIntentGoal, UpsertPlan, UpsertExecution,
             UpsertFact, AppendPlanValidationRecord, AppendFailureSummary,
-            AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion,
+            AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion, *D8_CHANGES,
         ))}
         for ordinal, change in sorted(enumerate(mutation.state_changes), key=lambda entry: order[type(entry[1])]):
             self._validate_change_owner(change, mutation.task_run_id)
@@ -5622,7 +5721,7 @@ class SqliteControlStore:
                 )
             elif isinstance(change, AppendPlanValidationRecord):
                 self._append_plan_validation(change, committed_at)
-            elif isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion)):
+            elif isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion, *D8_CHANGES)):
                 # Append-only review rows are saved with the same event and checkpoint.
                 pass
             else:
@@ -5713,7 +5812,7 @@ class SqliteControlStore:
             ).fetchone() is None:
                 raise StorageError("D2 review application TaskRun does not exist")
             return
-        elif isinstance(change, (D3ReviewApplication, D5ProcessFact, D8Conclusion)):
+        elif isinstance(change, (D3ReviewApplication, D5ProcessFact, D8Conclusion, *D8_CHANGES)):
             if change.task_run_id != task_run_id or self._connection.execute(
                 "SELECT 1 FROM task_runs WHERE task_run_id = ?", (task_run_id,)
             ).fetchone() is None:

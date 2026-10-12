@@ -134,7 +134,16 @@ class TurnManager:
         manager.failures = [item.to_domain() for item in state.failure_summaries]
         running_turns = [item.turn_id for item in state.turns if item.status is TurnStatus.RUNNING]
         if len(running_turns) > 1:
-            raise DomainError("snapshot contains multiple running Turns")
+            leaf = max((manager.turns[i] for i in running_turns), key=lambda t: t.sequence)
+            chain, cursor = set(), leaf
+            while cursor is not None:
+                if cursor.turn_id in chain:
+                    raise DomainError("snapshot Turn ancestors contain a cycle")
+                chain.add(cursor.turn_id)
+                cursor = manager.turns.get(cursor.parent_turn_id) if cursor.parent_turn_id else None
+            if set(running_turns) - chain:
+                raise DomainError("snapshot contains unrelated running Turns")
+            running_turns = [leaf.turn_id]
         manager._active_turn_id = next(iter(running_turns), None)
 
         # Appended evidence is not consumed until its separate domain mutation commits.

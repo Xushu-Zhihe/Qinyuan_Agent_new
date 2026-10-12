@@ -46,6 +46,7 @@ class ProcessRefinement:
         self.sources = sources
         self.adapter = adapter
         self.config = config
+        self.request_capacity_check = None
         self.clock = clock
         self.stopped = stopped
         self.redactor = redactor
@@ -355,6 +356,8 @@ class ProcessRefinement:
             attempt.role_config_ref,
         )
         self.evidence.save_request(request)
+        if self.request_capacity_check is not None:
+            self.request_capacity_check(request)
         try:
             self.store.begin_d5_attempt(attempt, start)
         except D4BudgetExhausted:

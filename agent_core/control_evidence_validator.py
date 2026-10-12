@@ -65,6 +65,7 @@ class D3EvidenceValidator:
         source_loader: Callable[[str], object],
     ) -> None:
         self.conclusions = None
+        self.handoff = None
         self.ledger = ledger
         self.imports = imports
         self.workspace = workspace
@@ -397,6 +398,16 @@ class D3EvidenceValidator:
         ):
             raise D3RecoveryRequired("d3_turn_proposal_or_import_changed")
 
+    def _plan_context_digest(self, request_id, context):
+        if self.handoff is not None:
+            saved = self.handoff.evidence.read("execution-context", request_id)
+            if saved is None:
+                raise D3RecoveryRequired("d8_execution_context_missing")
+            return digest({"context": asdict(context), "process_facts": (),
+                           "history_context": saved["history_context"],
+                           "history_capacity_version": saved["capacity_version"]})
+        return digest(asdict(context))
+
     def _plan_proposal(self, mutation: ControlMutation, state) -> None:
         metadata = mutation.d3
         if metadata is None or metadata.plan_binding is None:
@@ -446,8 +457,7 @@ class D3EvidenceValidator:
             or evidence.resource_ref != f"plan:{binding.intent_id}:{len(prior) + 1}"
             or evidence.base_checkpoint_sequence != state.latest_checkpoint.sequence
             or evidence.context_sha256
-            != digest(
-                asdict(
+            != self._plan_context_digest(binding.proposal_request_id,
                     D3PlanContext(
                         registered_turn.turn_target,
                         turn,
@@ -456,7 +466,6 @@ class D3EvidenceValidator:
                         reusable,
                         shared,
                     )
-                )
             )
             or binding.task_run_id != mutation.task_run_id
             or binding.rule_binding_sha256 != digest(asdict(turn))
@@ -955,6 +964,12 @@ class D3EvidenceValidator:
         return d3_fact_content(proof_id)
 
     def __call__(self, mutation: ControlMutation, state) -> None:
+        from agent_core.handoff_storage import D8_OPERATIONS
+        if mutation.operation in D8_OPERATIONS:
+            if self.handoff is None:
+                raise D3RecoveryRequired("d8_handoff_validator_not_configured")
+            self.handoff.validate_mutation(mutation, state)
+            return
         config = self.ledger.load_d3_run_config(mutation.task_run_id)
         records = [c for c in mutation.state_changes if isinstance(c, D8Conclusion)]
         if config is not None and config.d8_enabled:

@@ -210,6 +210,8 @@ class D3Application:
         sensitive_config: Mapping[str, D5SensitiveValue] | None = None,
         refinement_timeout_seconds: float = 180.0,
         fact_review_model=None,
+        handoff_model=None,
+        capacity_port=None,
         d6_artifact_store: CrossTaskRunArtifactStore | None = None,
         d6_artifact_transfer: D6ArtifactTransfer | None = None,
     ) -> None:
@@ -349,6 +351,24 @@ class D3Application:
             ) if config.d8_enabled else None
         )
         self.validator.conclusions = self.conclusions
+        self.handoff = None
+        if config.contract_version == 3:
+            from agent_core.handoff import HandoffContext
+            from agent_adapters.handoff_evidence import FileD8HandoffEvidence
+            if capacity_port is None:
+                raise ValueError("D8-2 requires an explicit role capacity adapter")
+            self.handoff = HandoffContext(
+                self, FileD8HandoffEvidence(directory / "d8-handoff"),
+                D3AuditedModel(self.controller, self.store, self.model_evidence,
+                               D5RedactingModel(handoff_model or outer_model, self.redactor,
+                                                configured=self._redaction_configured, redact_response=False),
+                               config, clock), capacity_port)
+            self.validator.handoff = self.handoff
+            self.inner.request_capacity_check = self.handoff.freeze_execution_request
+            self.outer.request_capacity_check = self.handoff.check_role_request_capacity
+            self.review_ledger.request_capacity_check = self.handoff.check_role_request_capacity
+            self.conclusions.request_capacity_check = self.handoff.check_role_request_capacity
+            self.refinement.request_capacity_check = self.handoff.check_role_request_capacity
         self.command_sandbox = command_sandbox
         self.review_coordinator = D2ReviewCoordinator(
             self.review_ledger,
@@ -1009,6 +1029,11 @@ class D3Application:
                         or stopped.endswith("cleanup_unknown")
                     ),
                 )
+            if self.handoff is not None:
+                try:
+                    self.handoff.resume_pending_read_once()
+                except (D3RecoveryRequired, OSError, StorageError) as exc:
+                    return self.result("d8_local_read_recovery_required", recovery_required=True)
         return await self.run(token)
 
     async def register_next_d7_turn(self, token: CancellationToken):
@@ -1358,12 +1383,16 @@ class D3Application:
         self, stage: D3ModelStage, resource_ref: str, context, name: str
     ) -> D3ModelRequest:
         task_id = self.state.task_run.task_run_id
+        if self.handoff is not None and stage == "inner_plan":
+            count = self.handoff.read_count(context.intent_id)
+            if count:
+                name += f"/after-read/{count}"
         request_id = self._id(name)
         prior = self.store.load_d3_operation(request_id)
         role = (
             self.config.outer_role if stage == "outer_turn" else self.config.inner_role
         )
-        return D3ModelRequest(
+        request = D3ModelRequest(
             request_id,
             task_id,
             prior.start.base_checkpoint_sequence
@@ -1376,6 +1405,7 @@ class D3Application:
             context,
             process_facts=self.refinement.context_for(resource_ref) if self.refinement is not None else (),
         )
+        return self.handoff.wrap_execution_request(request) if self.handoff is not None else request
 
     async def propose_d7_candidate(self, token, protected_candidate_evidence):
         """Generate and durably register a candidate for the completed Turn."""
@@ -1641,6 +1671,21 @@ class D3Application:
         return request_id, proposal
 
     def _source(self, reference: str) -> object:
+        if self.handoff is not None:
+            from agent_core.handoff_contracts import D8HandoffRequest
+            value = self.handoff.evidence.read("request", reference)
+            if value is not None:
+                request = D8HandoffRequest.from_dict(value)
+                result = self.handoff._known_call(request)
+                if result is None:
+                    raise D3RecoveryRequired("d8_tree_source_unknown")
+                return {"kind": "d8_tree_model_result", "task_run_id": request.task_run_id,
+                        "stage": request.stage, "outcome": result["outcome"],
+                        "context_sha256": request.context_sha256}
+            terminal = next((r for r in self.store.list_d8_tree_records(self.state.task_run.task_run_id)
+                             if r.turn_id == reference and r.kind == "turn_exhausted"), None)
+            if terminal is not None:
+                return {"kind": "d8_tree_outcome", **asdict(terminal)}
         if self.conclusions is not None:
             request = self.conclusions.evidence.read_request(reference)
             if request is not None:
@@ -2092,6 +2137,13 @@ class D3Application:
             )
 
         def validate(_current: D3ModelRequest, proposal) -> None:
+            from agent_core.dual_llm_modeling import D8HistoryReadAction
+            if isinstance(proposal, D8HistoryReadAction):
+                try:
+                    self.handoff.validate_read_action(_current, proposal)
+                except (ValueError, TypeError) as exc:
+                    raise D3ProposalRejected("d8_history_read_action_rejected") from exc
+                return
             live_context = _current.context
             if (
                 ordinal == 1
@@ -2124,6 +2176,10 @@ class D3Application:
             request_id, proposal = await self.inner.propose(
                 request, token, refresh=refresh, validate=validate
             )
+        from agent_core.dual_llm_modeling import D8HistoryReadAction
+        if isinstance(proposal, D8HistoryReadAction):
+            self.handoff.apply_read_action(request_id, proposal)
+            return
         plan_id = self._id(f"plan/{intent_id}/{ordinal}")
         source_fact_id = None
         if proposal.observation_mode == "reuse_saved_proof":
@@ -2762,6 +2818,9 @@ class D3Application:
             "complete_intent",
             None,
         )
+        if self.handoff is not None:
+            await self.handoff.evaluate_intent(intent_id, plan.plan_id, fact_id, request_id, token)
+            return True
         self.control.complete_intent(
             intent_id,
             plan.plan_id,
@@ -2801,7 +2860,73 @@ class D3Application:
         if output.decision != "acknowledge_turn_end":
             raise D3RecoveryRequired("d3_tail_review_not_read_only")
 
+    async def _run_tree(self, token: CancellationToken) -> D3Result:
+        self.handoff.reconcile()
+        self.handoff.reconcile_reads()
+        self._reconcile_known_d4_operations()
+        self._check_role()
+        self._check_dispatch()
+        self.handoff.capacity()
+        receipts = await self._import_all(token)
+        if not self.state.turns:
+            exhausted = any(r.kind == "expansion_exhausted" and r.turn_id is None
+                            for r in self.store.list_d8_tree_records(self.state.task_run.task_run_id))
+            if exhausted:
+                return self.result("search_exhausted")
+            await self.handoff.plan_expansion(None, None, receipts, token)
+        while True:
+            self._check_dispatch()
+            records = self.store.list_d8_tree_records(self.state.task_run.task_run_id)
+            if any(i.status is IntentStatus.INCONCLUSIVE for i in self.state.intents):
+                return self.result("d8_local_goal_inconclusive", recovery_required=True)
+            active = [t for t in self.state.turns if t.status in {TurnStatus.PENDING, TurnStatus.RUNNING}]
+            if not active:
+                return self.result("search_exhausted")
+            turn = max(active, key=lambda t: t.sequence)
+            current = next((i for i in self.state.intents if i.turn_id == turn.turn_id and i.status is IntentStatus.RUNNING), None)
+            if current is None:
+                unfinished = next((i for i in sorted(self.state.intents, key=lambda i: i.priority)
+                                   if i.turn_id == turn.turn_id and i.status is IntentStatus.SUCCEEDED
+                                   and not any(t.triggering_intent_id == i.intent_id for t in self.state.turns)
+                                   and not any(r.kind == "expansion_exhausted" and r.intent_id == i.intent_id for r in records)), None)
+                if unfinished is not None:
+                    await self.handoff.plan_expansion(turn.turn_id, unfinished.intent_id, receipts, token)
+                    continue
+                pending = [i for i in self.state.intents if i.turn_id == turn.turn_id and i.status is IntentStatus.PENDING]
+                if pending:
+                    current = min(pending, key=lambda i: i.priority)
+                    self.handoff.select_intent(turn, current)
+                    continue
+                self.handoff.exhaust_turn(turn)
+                self._tail(turn.turn_id)
+                await self.handoff.summarize(turn.turn_id, token)
+                if turn.parent_turn_id:
+                    await self.handoff.summarize(turn.parent_turn_id, token)
+                continue
+            plans = [p for p in self.state.plans if p.intent_id == current.intent_id]
+            if not plans:
+                turn_binding = self.store.load_d3_turn_binding(turn.turn_id)
+                review_id, output = self._review(turn.turn_id, current.intent_id, "turn_start", None,
+                                                 (turn_binding.import_id, turn_binding.proposal_request_id))
+                if await self._route(review_id, output, current.intent_id, receipts, token):
+                    continue
+                await self._new_plan(current.intent_id, token)
+                continue
+            plan = plans[-1]
+            binding = self.store.load_d3_plan_binding(plan.plan_id)
+            if plan.status is PlanStatus.RUNNING:
+                await self._run_plan(binding, receipts, token)
+            elif plan.status is PlanStatus.COMPLETED:
+                await self._complete_intent(current.intent_id, receipts, token)
+            else:
+                raise D3RecoveryRequired("d8_current_plan_not_usable")
+
     async def _run(self, token: CancellationToken) -> D3Result:
+        if self.handoff is not None:
+            try:
+                return await self._run_tree(token)
+            except (OSError, StorageError) as exc:
+                raise D3RecoveryRequired("d8_handoff_persistence_recovery_required") from exc
         self._reconcile_known_d4_operations()
         if isinstance(self.review_ledger, D4ReviewLedger):
             self.review_ledger.reconcile_known_completions(

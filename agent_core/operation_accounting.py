@@ -19,6 +19,7 @@ D4ChargedCategory = Literal[
     "artifact_share",
     "attachment_import",
     "fact_review",
+    "handoff_summary",
 ]
 D4OperationCategory = Literal[
     "planning",
@@ -32,6 +33,7 @@ D4OperationCategory = Literal[
     "copy_preparation",
     "intent_stop",
     "fact_review",
+    "handoff_summary",
 ]
 D4OperationResult = Literal["completed", "rejected", "stale", "not_satisfied", "failed"]
 D4AuditCategory = Literal[
@@ -153,6 +155,31 @@ class D8BudgetPolicy(D4BudgetPolicy):
 
 
 @dataclass(frozen=True, slots=True)
+class D8HandoffBudgetPolicy(D8BudgetPolicy):
+    """Explicit D8-2 matrix; capacity changes never upgrade an older budget."""
+
+    total: int = 60
+    handoff_summary: int = 4
+
+    def __post_init__(self) -> None:
+        expected = {"total": 60, **D4_CATEGORY_LIMITS,
+                    "fact_review": 8, "handoff_summary": 4}
+        if any(type(getattr(self, key)) is not int or getattr(self, key) != limit
+               for key, limit in expected.items()):
+            raise ValueError("D8-2 supports only the confirmed 60-start budget matrix")
+
+    @property
+    def category_limits(self) -> dict[str, int]:
+        return {**D4_CATEGORY_LIMITS, "fact_review": 8, "handoff_summary": 4}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> D8HandoffBudgetPolicy:
+        if set(value) != {"total", *D4_CATEGORY_LIMITS, "fact_review", "handoff_summary"}:
+            raise ValueError("invalid D8HandoffBudgetPolicy fields")
+        return cls(**value)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
 class D4OperationStart:
     operation_id: str
     task_run_id: str
@@ -171,7 +198,7 @@ class D4OperationStart:
         if (
             self.category not in D4_CATEGORY_LIMITS
             and self.category not in D4_AUDIT_ONLY_CATEGORIES
-            and self.category != "fact_review"
+            and self.category not in {"fact_review", "handoff_summary"}
         ):
             raise ValueError("unsupported D4 operation category")
         _time(self.started_at, "started_at")
@@ -189,7 +216,7 @@ class D4OperationStart:
         _sha(self.budget_policy_ref[7:], "budget_policy_ref")
         expected_role = (
             "outer_planning"
-            if self.category in {"planning", "review", "refinement", "fact_review"}
+            if self.category in {"planning", "review", "refinement", "fact_review", "handoff_summary"}
             else "inner_action"
             if self.category == "action"
             else None
@@ -207,7 +234,7 @@ class D4OperationStart:
 
     @property
     def charged(self) -> bool:
-        return self.category in D4_CATEGORY_LIMITS or self.category == "fact_review"
+        return self.category in D4_CATEGORY_LIMITS or self.category in {"fact_review", "handoff_summary"}
 
 
 @dataclass(frozen=True, slots=True)

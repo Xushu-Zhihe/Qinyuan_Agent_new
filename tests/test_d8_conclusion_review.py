@@ -356,7 +356,7 @@ def test_schema22_readonly_and_compatible_migration_do_not_enable_d8(tmp_path):
         assert store.list_d8_conclusions(str(uuid4())) == ()
     assert path.read_bytes() == before
     with schema.SqliteControlStore.open(path, clock=Clock()) as store:
-        assert store._schema_version == 23
+        assert store._schema_version == schema.CURRENT_SCHEMA_VERSION
         assert not store.list_d8_conclusions(str(uuid4()))
         assert not store.list_task_run_refs()
 
@@ -436,7 +436,7 @@ def test_controller_refuses_fact_without_atomic_approval_record(case, monkeypatc
 
 def test_schema22_migration_preserves_legacy_run_config_facts_and_calls(tmp_path):
     import sqlite3
-    from agent_core.sqlite_control_store import SqliteControlStore
+    from agent_core.sqlite_control_store import SqliteControlStore, CURRENT_SCHEMA_VERSION
     from test_d4_chain import close_scenario, make_d4_scenario, reopen_scenario
     legacy = make_d4_scenario(tmp_path, attachment_count=1)
     try:
@@ -448,9 +448,11 @@ def test_schema22_migration_preserves_legacy_run_config_facts_and_calls(tmp_path
         operations = app.store.list_d4_operations(task_id)
         path = app.directory / "control.sqlite"
         app.store.close()
-        # Migration23 only creates this empty table/index; removing exactly those
-        # additions recreates the actual schema22 while retaining legacy rows.
+        # Remove the exact schema24 and schema23 additions to recreate schema22.
         with sqlite3.connect(path) as connection:
+            for table in ("d8_handoff_versions", "d8_capacity_versions", "d8_tree_records", "d8_history_index", "d8_history_reads"):
+                connection.execute(f"DROP TABLE {table}")
+            connection.execute("DELETE FROM schema_versions WHERE version=24")
             connection.execute("DROP TABLE d8_conclusions")
             connection.execute("DELETE FROM schema_versions WHERE version=23")
         before = path.read_bytes()
@@ -461,7 +463,7 @@ def test_schema22_migration_preserves_legacy_run_config_facts_and_calls(tmp_path
             assert readonly.list_d8_conclusions(task_id) == ()
         assert path.read_bytes() == before
         app = reopen_scenario(legacy)
-        assert app.store._schema_version == 23 and app.conclusions is None
+        assert app.store._schema_version == CURRENT_SCHEMA_VERSION and app.conclusions is None
         assert app.state.facts == facts and app.store.load_d3_run_config(task_id) == config
         assert app.store.list_d4_operations(task_id) == operations
         assert config.d4_budget.total == 48 and not config.d8_enabled

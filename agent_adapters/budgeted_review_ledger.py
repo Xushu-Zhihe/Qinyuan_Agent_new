@@ -48,6 +48,7 @@ class D4ReviewLedger(FileD2ReviewLedger):
         self.config = config
         self.budget = config.d4_budget
         self.clock = clock
+        self.request_capacity_check = None
 
     @staticmethod
     def _items(root: dict[str, object] | None, key: str) -> tuple[dict, ...]:
@@ -185,6 +186,8 @@ class D4ReviewLedger(FileD2ReviewLedger):
             self._repair_completion(request, call)
             raise D4RecoveryRequired("d4_review_known_result_requires_replay")
         if prior is None:
+            if self.request_capacity_check is not None:
+                self.request_capacity_check(request)
             self._save_pending_request(request)
         try:
             self.store.begin_d4_operation(self._start(request))
