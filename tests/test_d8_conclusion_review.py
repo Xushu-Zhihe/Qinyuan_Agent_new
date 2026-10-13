@@ -448,8 +448,10 @@ def test_schema22_migration_preserves_legacy_run_config_facts_and_calls(tmp_path
         operations = app.store.list_d4_operations(task_id)
         path = app.directory / "control.sqlite"
         app.store.close()
-        # Remove the exact schema24 and schema23 additions to recreate schema22.
+        # Remove the exact schema25, schema24 and schema23 additions to recreate schema22.
         with sqlite3.connect(path) as connection:
+            connection.execute("DROP TABLE d8_conclusion_revisions")
+            connection.execute("DELETE FROM schema_versions WHERE version=25")
             for table in ("d8_handoff_versions", "d8_capacity_versions", "d8_tree_records", "d8_history_index", "d8_history_reads"):
                 connection.execute(f"DROP TABLE {table}")
             connection.execute("DELETE FROM schema_versions WHERE version=24")

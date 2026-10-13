@@ -107,6 +107,8 @@ class D3EvidenceValidator:
             raise D3RecoveryRequired("d3_model_proposal_evidence_unavailable")
         if stage == "outer_turn":
             return parse_d3_turn_proposal(evidence.raw)
+        if config.contract_version == 4 and operation.application_ref is None:
+            self.handoff.app.revisions.validate_frozen_execution(request_id)
         if stage == "inner_plan":
             return parse_d3_plan_proposal(evidence.raw)
         return parse_d3_action(evidence.raw, stage)
@@ -114,9 +116,23 @@ class D3EvidenceValidator:
     def _known_action(self, task_run_id: str, plan_id: str, stage: D3ModelStage):
         base_id = stable_id(task_run_id, f"d3/action/{plan_id}/{stage}")
         correction_id = stable_id(task_run_id, f"d3/{base_id}/correction")
+        config = self.ledger.load_d3_run_config(task_run_id)
+        if config is not None and config.contract_version == 4:
+            operations = [r for r in self.ledger.list_d3_operations(task_run_id)
+                          if r.start.resource_ref == f"{plan_id}:{stage}"
+                          and (e := self.models.read(r.start.operation_id)) is not None
+                          and not (isinstance(e.raw, dict) and e.raw.get("kind") == "conclusion_change")]
+            applied = [r.start.operation_id for r in operations if r.application_ref is not None]
+            revision = len(self.ledger.list_d8_revisions(task_run_id))
+            if revision:
+                base_id = stable_id(task_run_id, f"d3/action/{plan_id}/{stage}/after-revision/{revision}")
+                correction_id = stable_id(task_run_id, f"d3/{base_id}/correction")
+            candidates = applied or (base_id, correction_id)
+        else:
+            candidates = (base_id, correction_id)
         accepted = [
             request_id
-            for request_id in (base_id, correction_id)
+            for request_id in candidates
             if (evidence := self.models.read(request_id)) is not None
             and evidence.outcome == "accepted"
             and self.models.read_rejection(request_id) is None
@@ -970,6 +986,10 @@ class D3EvidenceValidator:
                 raise D3RecoveryRequired("d8_handoff_validator_not_configured")
             self.handoff.validate_mutation(mutation, state)
             return
+        if (self.handoff is not None and self.handoff.app.revisions is not None
+                and mutation.operation in {"register_d3_plan", "replan_d3_plan", "complete_d3_plan",
+                                           "complete_d3_intent", "complete_d3_turn"}):
+            self.handoff.app.revisions.check_required()
         config = self.ledger.load_d3_run_config(mutation.task_run_id)
         records = [c for c in mutation.state_changes if isinstance(c, D8Conclusion)]
         if config is not None and config.d8_enabled:

@@ -130,6 +130,10 @@ class D8HistoryItem:
     def from_dict(cls, raw):
         value = dict(raw)
         value["source_refs"] = tuple(value["source_refs"])
+        if "logical_root_id" in value:
+            from agent_core.conclusion_revision_contracts import D8RevisionHistoryItem
+            value["validated_by_refs"] = tuple(value.get("validated_by_refs", ()))
+            return D8RevisionHistoryItem(**value)
         return cls(**value)
 
 

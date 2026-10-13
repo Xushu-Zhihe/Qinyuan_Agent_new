@@ -578,6 +578,8 @@ def test_actual_schema23_readonly_and_upgrade_keep_d8_1_history_and_budget(case)
     database = app.directory / "control.sqlite"
     app.store.close()
     connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE d8_conclusion_revisions")
+    connection.execute("DELETE FROM schema_versions WHERE version=25")
     for table in ("d8_handoff_versions", "d8_capacity_versions", "d8_tree_records", "d8_history_index", "d8_history_reads"):
         connection.execute(f"DROP TABLE {table}")
     connection.execute("DELETE FROM schema_versions WHERE version=24")

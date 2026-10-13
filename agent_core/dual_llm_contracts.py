@@ -220,7 +220,7 @@ class D3RunConfig:
         if (
             self.chain_id != "dual_llm_d3"
             or type(self.contract_version) is not int
-            or self.contract_version not in {1, 2, 3}
+            or self.contract_version not in {1, 2, 3, 4}
         ):
             raise ValueError("unsupported D3 chain contract")
         if self.contract_version == 2 and (
@@ -231,11 +231,11 @@ class D3RunConfig:
             raise ValueError("D8 enablement must be explicit boolean")
         if self.d8_enabled:
             if (not isinstance(self.d4_budget, D8BudgetPolicy)
-                    or not self.d5_enabled or self.contract_version not in {1, 3}):
+                    or not self.d5_enabled or self.contract_version not in {1, 3, 4}):
                 raise ValueError("D8 requires its internal chain, budget and D5 redaction")
         elif isinstance(self.d4_budget, D8BudgetPolicy):
             raise ValueError("D8 budget requires explicit D8 enablement")
-        if self.contract_version == 3:
+        if self.contract_version in {3, 4}:
             if (not self.d8_enabled or not isinstance(self.d4_budget, D8HandoffBudgetPolicy)
                     or not isinstance(self.handoff_config, D8HandoffConfig)):
                 raise ValueError("D8-2 requires its explicit handoff configuration and budget")
@@ -294,7 +294,7 @@ class D3RunConfig:
             value["review_role_ref"],  # type: ignore[arg-type]
             value["chain_id"],  # type: ignore[arg-type]
             value["contract_version"],  # type: ignore[arg-type]
-            (D8HandoffBudgetPolicy.from_dict(budget) if value.get("contract_version") == 3
+            (D8HandoffBudgetPolicy.from_dict(budget) if value.get("contract_version") in {3, 4}
              else D8BudgetPolicy.from_dict(budget) if value.get("d8_enabled") is True
              else D4BudgetPolicy.from_dict(budget)) if budget is not None else None,
             value.get("d5_enabled", False),  # type: ignore[arg-type]

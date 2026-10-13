@@ -12,6 +12,7 @@ from typing import Literal, Protocol, TypeAlias, cast
 from agent_core.contracts import ModelBackend, TaskRequest
 from agent_core.conclusion_contracts import D8Conclusion
 from agent_core.handoff_contracts import D8HandoffVersion, D8CapacityVersion, D8TreeRecord
+from agent_core.conclusion_revision_contracts import D8RevisionRecord
 from agent_core.handoff_storage import D8_CHANGES, D8_OPERATIONS
 from agent_core.v7.web_contracts import (
     D7WebExecutionRecord,
@@ -570,6 +571,7 @@ StateChange: TypeAlias = (
     | D8HandoffVersion
     | D8CapacityVersion
     | D8TreeRecord
+    | D8RevisionRecord
 )
 
 STATE_CHANGE_TYPES = (
@@ -589,6 +591,7 @@ STATE_CHANGE_TYPES = (
     D8HandoffVersion,
     D8CapacityVersion,
     D8TreeRecord,
+    D8RevisionRecord,
 )
 
 

@@ -483,12 +483,21 @@ class D3AuditedModel:
         self.config = config
         self.clock = clock
         self.request_capacity_check = None
+        self.change_response_sensitive = None
 
     def _parse(self, request: D3ModelRequest, raw: object):
         if request.stage == "outer_turn":
             return parse_d3_turn_proposal(raw)
+        if self.config.contract_version == 4:
+            from agent_core.conclusion_revision_contracts import D8ConclusionChange
+            try:
+                change = D8ConclusionChange.parse_action(raw)
+            except (ValueError, TypeError) as exc:
+                raise D3ProposalRejected("d8_change_structure_invalid", structural=True) from exc
+            if change is not None:
+                return change
         if request.stage == "inner_plan":
-            if self.config.contract_version == 3:
+            if self.config.contract_version in {3, 4}:
                 try:
                     read = D8HistoryReadAction.parse(raw)
                 except (ValueError, TypeError) as exc:
@@ -984,18 +993,25 @@ class D3AuditedModel:
                     "accepted", "invalid_structure", "rejected", "model_error", "stale"
                 ] = "accepted"
                 reason = None
+                change_response = (self.config.contract_version == 4 and isinstance(raw, dict)
+                                   and raw.get("kind") == "conclusion_change")
+                if change_response and self.change_response_sensitive is not None and self.change_response_sensitive(raw):
+                    raw = None
+                    outcome, reason = "rejected", "d8_change_sensitive_rejected"
                 if isinstance(raw, ModelError):
                     outcome, reason, raw = (
                         "model_error",
                         raw.short_reason,
                         raw.to_dict(),
                     )
-                else:
+                elif reason is None:
                     try:
                         self._parse(current, raw)
                     except D3ProposalRejected as exc:
                         outcome = "invalid_structure" if exc.structural else "rejected"
                         reason = exc.code
+                        if change_response:
+                            raw = None
                 state = self.controller.control_state
                 if (
                     token.is_cancelled
@@ -1031,6 +1047,8 @@ class D3AuditedModel:
                 )
 
             rejection_code = evidence.reason
+            if evidence.reason == "d8_change_sensitive_rejected":
+                raise D3ProposalRejected(evidence.reason, retryable=False, model_request_id=current.model_request_id)
             retryable = False
             if evidence.outcome == "accepted":
                 rejection = self.evidence.read_rejection(current.model_request_id)

@@ -147,7 +147,7 @@ from agent_core.operation_accounting import (
 from agent_core.process_facts import D5Attempt, D5ProcessFact
 from agent_core.conclusion_contracts import D8Conclusion
 from agent_core.handoff_storage import (
-    D8_HANDOFF_SCHEMA, D8_CHANGES, D8_OPERATIONS,
+    D8_HANDOFF_SCHEMA, D8_REVISION_SCHEMA, D8_CHANGES, D8_OPERATIONS,
     load_records, validate_handoff_mutation, save_handoff_mutation,
 )
 from agent_core.review_contracts import (
@@ -172,7 +172,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 24
+CURRENT_SCHEMA_VERSION = 25
 
 MIGRATION_23 = """
 CREATE TABLE d8_conclusions (
@@ -1209,6 +1209,11 @@ class SqliteControlStore:
                     self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                                          (24, self._now()))
+            if version < 25:
+                for statement in _sql_statements(D8_REVISION_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                                         (25, self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -4343,6 +4348,9 @@ class SqliteControlStore:
     def list_d8_handoffs(self, task_run_id):
         return load_records(self, "d8_handoff_versions", task_run_id)
 
+    def list_d8_revisions(self, task_run_id):
+        return load_records(self, "d8_conclusion_revisions", task_run_id)
+
     def list_d8_capacities(self, task_run_id):
         return load_records(self, "d8_capacity_versions", task_run_id)
 
@@ -4395,7 +4403,7 @@ class SqliteControlStore:
             config = self.load_d3_run_config(start.task_run_id)
             task = self.load_task_run(start.task_run_id)
             latest = self._connection.execute("SELECT MAX(sequence) FROM checkpoints WHERE task_run_id=?", (start.task_run_id,)).fetchone()[0]
-            if (config is None or config.contract_version != 3 or task.status is not TaskRunStatus.RUNNING
+            if (config is None or config.contract_version not in {3, 4} or task.status is not TaskRunStatus.RUNNING
                     or latest != start.checkpoint_sequence or not task.started_at <= start.started_at < task.deadline_at
                     or self._now() >= task.deadline_at or self.list_d4_unresolved_operations(start.task_run_id)
                     or self._connection.execute("SELECT 1 FROM d4_audit_events WHERE task_run_id=? AND category='cancellation_requested'", (start.task_run_id,)).fetchone()):
@@ -4806,7 +4814,7 @@ class SqliteControlStore:
                 ):
                     raise StorageError(f"D3 {kind} state transition is not admitted")
         config = self.load_d3_run_config(mutation.task_run_id)
-        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1 and config.contract_version != 3:
+        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1 and config.contract_version not in {3, 4}:
             raise StorageError("D3 may run only one Turn")
         if sum(item.status is IntentStatus.RUNNING for item in after.intents) > 1:
             raise StorageError("D3 may run only one Intent")

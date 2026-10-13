@@ -30,6 +30,7 @@ from agent_adapters.review_ledger import FileD2ReviewLedger
 from agent_adapters.run_files import run_lock
 from agent_core.conclusion_contracts import D8ReviewRequestAction
 from agent_core.conclusion_review import ConclusionReview
+from agent_core.conclusion_revision_contracts import D8ConclusionChange
 from agent_adapters.workspace_evidence import FileD3WorkspaceEvidence
 from agent_core.actions import CompleteIntentAction, ProbeAction
 from agent_core.artifact_operations import D3WorkspaceOperations, fixed_size_script
@@ -334,6 +335,7 @@ class D3Application:
             D5RedactingModel(
                 inner_model, self.redactor, enabled=config.d5_enabled,
                 configured=self._redaction_configured,
+                preserve_conclusion_change=config.contract_version == 4,
             ),
             config,
             clock,
@@ -352,7 +354,8 @@ class D3Application:
         )
         self.validator.conclusions = self.conclusions
         self.handoff = None
-        if config.contract_version == 3:
+        self.revisions = None
+        if config.contract_version in {3, 4}:
             from agent_core.handoff import HandoffContext
             from agent_adapters.handoff_evidence import FileD8HandoffEvidence
             if capacity_port is None:
@@ -369,6 +372,10 @@ class D3Application:
             self.review_ledger.request_capacity_check = self.handoff.check_role_request_capacity
             self.conclusions.request_capacity_check = self.handoff.check_role_request_capacity
             self.refinement.request_capacity_check = self.handoff.check_role_request_capacity
+            if config.contract_version == 4:
+                from agent_core.conclusion_revisions import ConclusionRevisions
+                self.revisions = ConclusionRevisions(self, FileD8HandoffEvidence(directory / "d8-revisions"))
+                self.inner.change_response_sensitive = self.conclusions._sensitive
         self.command_sandbox = command_sandbox
         self.review_coordinator = D2ReviewCoordinator(
             self.review_ledger,
@@ -825,7 +832,7 @@ class D3Application:
         self.store.mark_d3_operation_applied(operation_id, plan.plan_id)
 
     def _check_dispatch(
-        self, *, allow_admitted_operation_id: str | None = None
+        self, *, allow_admitted_operation_id: str | None = None, allow_conclusion_repair: bool = False
     ) -> None:
         if self.config.d4_budget is not None:
             stopped = self._settle_stoppage(
@@ -852,6 +859,21 @@ class D3Application:
         ):
             if application.paused_gate:
                 raise D3RecoveryRequired(application.pause_reason or "d3_review_paused")
+        if self.revisions is not None and not allow_conclusion_repair:
+            self.revisions.check_required()
+
+    async def repair_conclusions(self, intent_id, request_id, token):
+        """Internal, explicit D8-3 maintenance; no tool or completion dispatch."""
+        if self.revisions is None:
+            raise D3RecoveryRequired("d8_revision_not_enabled")
+        with run_lock(self.directory):
+            previous_token = self._token
+            self._token = token
+            try:
+                self.controller.reload_state()
+                return await self.revisions.repair(intent_id, request_id, token)
+            finally:
+                self._token = previous_token
 
     def result(self, reason: str, *, recovery_required: bool = False) -> D3Result:
         state = self.state
@@ -1387,6 +1409,10 @@ class D3Application:
             count = self.handoff.read_count(context.intent_id)
             if count:
                 name += f"/after-read/{count}"
+        if self.revisions is not None and stage != "outer_turn":
+            count = len(self.revisions.records())
+            if count:
+                name += f"/after-revision/{count}"
         request_id = self._id(name)
         prior = self.store.load_d3_operation(request_id)
         role = (
@@ -2138,6 +2164,9 @@ class D3Application:
 
         def validate(_current: D3ModelRequest, proposal) -> None:
             from agent_core.dual_llm_modeling import D8HistoryReadAction
+            if isinstance(proposal, D8ConclusionChange):
+                self.revisions.validate_action(proposal, self.revisions.visible_from_request(_current))
+                return
             if isinstance(proposal, D8HistoryReadAction):
                 try:
                     self.handoff.validate_read_action(_current, proposal)
@@ -2177,6 +2206,10 @@ class D3Application:
                 request, token, refresh=refresh, validate=validate
             )
         from agent_core.dual_llm_modeling import D8HistoryReadAction
+        if isinstance(proposal, D8ConclusionChange):
+            await self.revisions.review(proposal, intent_id, request_id,
+                                        self.revisions.visible_for_execution(request_id), token)
+            return
         if isinstance(proposal, D8HistoryReadAction):
             self.handoff.apply_read_action(request_id, proposal)
             return
@@ -2409,6 +2442,9 @@ class D3Application:
             )
 
         def validate(_current: D3ModelRequest, candidate) -> None:
+            if isinstance(candidate, D8ConclusionChange):
+                self.revisions.validate_action(candidate, self.revisions.visible_from_request(_current))
+                return
             action = candidate.action
             if (
                 not isinstance(action, ProbeAction)
@@ -2456,6 +2492,10 @@ class D3Application:
             ):
                 return True
             raise D3RecoveryRequired(str(exc)) from exc
+        if isinstance(proposal, D8ConclusionChange):
+            await self.revisions.review(proposal, plan_binding.intent_id, request_id,
+                                        self.revisions.visible_for_execution(request_id), token)
+            return True
         action = proposal.action
         if (
             not isinstance(action, ProbeAction)
@@ -2747,6 +2787,9 @@ class D3Application:
             )
 
         def validate(_current: D3ModelRequest, candidate) -> None:
+            if isinstance(candidate, D8ConclusionChange):
+                self.revisions.validate_action(candidate, self.revisions.visible_from_request(_current))
+                return
             if not isinstance(
                 candidate.action, CompleteIntentAction
             ) or candidate.action.fact_ids != (fact_id,):
@@ -2787,6 +2830,10 @@ class D3Application:
             if await self._route(review_id, output, intent_id, receipts, token):
                 return True
             raise D3RecoveryRequired(str(exc)) from exc
+        if isinstance(proposal, D8ConclusionChange):
+            await self.revisions.review(proposal, intent_id, request_id,
+                                        self.revisions.visible_for_execution(request_id), token)
+            return True
         if not isinstance(
             proposal.action, CompleteIntentAction
         ) or proposal.action.fact_ids != (fact_id,):
@@ -2861,6 +2908,9 @@ class D3Application:
             raise D3RecoveryRequired("d3_tail_review_not_read_only")
 
     async def _run_tree(self, token: CancellationToken) -> D3Result:
+        if self.revisions is not None:
+            self.revisions.reconcile()
+            await self.revisions.refresh_summaries(token)
         self.handoff.reconcile()
         self.handoff.reconcile_reads()
         self._reconcile_known_d4_operations()

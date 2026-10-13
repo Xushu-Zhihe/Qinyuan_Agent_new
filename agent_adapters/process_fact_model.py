@@ -18,12 +18,14 @@ class D5RedactingModel:
         enabled: bool = True,
         configured: bool = True,
         redact_response: bool = True,
+        preserve_conclusion_change: bool = False,
     ) -> None:
         self.adapter = adapter
         self.redactor = redactor
         self.enabled = enabled
         self.configured = configured
         self.redact_response = redact_response
+        self.preserve_conclusion_change = preserve_conclusion_change
 
     @property
     def role_config(self):
@@ -36,6 +38,11 @@ class D5RedactingModel:
             raise D3RecoveryRequired("d5_redaction_configuration_unavailable")
         safe_request = self.redactor.redact_model_input(request)
         result = self.adapter.invoke(safe_request, *args)
+        if (self.preserve_conclusion_change and isinstance(result, dict)
+                and result.get("kind") == "conclusion_change"):
+            # D8-3's mandatory consumer rejects the entire sensitive candidate;
+            # redacting here would conceal that the original candidate was unsafe.
+            return result
         if self.redact_response:
             if isinstance(result, ModelError):
                 return replace(
