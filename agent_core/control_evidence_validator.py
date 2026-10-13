@@ -107,17 +107,24 @@ class D3EvidenceValidator:
             raise D3RecoveryRequired("d3_model_proposal_evidence_unavailable")
         if stage == "outer_turn":
             return parse_d3_turn_proposal(evidence.raw)
-        if config.contract_version == 4 and operation.application_ref is None:
+        if config.contract_version in {4, 5, 6} and operation.application_ref is None:
             self.handoff.app.revisions.validate_frozen_execution(request_id)
         if stage == "inner_plan":
             return parse_d3_plan_proposal(evidence.raw)
+        if config.contract_version in {5, 6} and stage == "inner_complete":
+            from agent_core.dual_llm_modeling import parse_session_completion
+            sessions = self.handoff.app.sessions
+            snapshot = sessions.evidence.read("request", request_id)
+            if snapshot is None:
+                raise D3RecoveryRequired("d8_completion_snapshot_missing")
+            return parse_session_completion(evidence.raw, sessions.visible(snapshot["request"]["session_context"]))
         return parse_d3_action(evidence.raw, stage)
 
     def _known_action(self, task_run_id: str, plan_id: str, stage: D3ModelStage):
         base_id = stable_id(task_run_id, f"d3/action/{plan_id}/{stage}")
         correction_id = stable_id(task_run_id, f"d3/{base_id}/correction")
         config = self.ledger.load_d3_run_config(task_run_id)
-        if config is not None and config.contract_version == 4:
+        if config is not None and config.contract_version in {4, 5, 6}:
             operations = [r for r in self.ledger.list_d3_operations(task_run_id)
                           if r.start.resource_ref == f"{plan_id}:{stage}"
                           and (e := self.models.read(r.start.operation_id)) is not None
@@ -145,7 +152,18 @@ class D3EvidenceValidator:
             raise D3RecoveryRequired("d3_fixed_action_proposal_invalid")
         return request_id, proposal
 
-    def _review_action(self, task_run_id: str, request_id: str, intent_id: str):
+    def _review_action(self, task_run_id: str, request_id: str, intent_id: str, *, progress=False):
+        if progress and self.handoff is not None and self.handoff.app.sessions is not None:
+            sessions = self.handoff.app.sessions
+            record = next((r for r in sessions.records(intent_id) if r.model_request_id == request_id), None)
+            if record is not None:
+                sessions.validate_record(record, self.handoff.app.state)
+                data = sessions.payload(record)["request"]
+                if data["stage"] == "fact_proposal" and "observation" in data:
+                    source = self.conclusions.observation(data["observation"]["proof_id"], historical=True)
+                    if asdict(source) != data["observation"]:
+                        raise D3RecoveryRequired("d8_progress_observation_changed")
+                    return "fact_proposal", source.plan_id
         if self.conclusions is not None:
             trigger = self.conclusions.review_trigger(request_id, intent_id)
             if trigger is not None:
@@ -177,7 +195,9 @@ class D3EvidenceValidator:
             or operation.completion.evidence_sha256 != digest(asdict(evidence))
         ):
             raise D3RecoveryRequired("d3_review_action_owner_changed")
-        proposal = parse_d3_action(evidence.raw, stage)
+        proposal = (self._known_model(task_run_id, request_id, stage)
+                    if config.contract_version in {5, 6} and stage == "inner_complete"
+                    else parse_d3_action(evidence.raw, stage))
         if (
             not proposal.review_requested
             and self.models.read_rejection(request_id) is None
@@ -199,6 +219,13 @@ class D3EvidenceValidator:
         fields = dict(call["request"])
         fields["source_versions"] = tuple(fields["source_versions"])
         request = D2ReviewRequest(**fields)
+        config = self.ledger.load_d3_run_config(task_run_id)
+        if config is not None and config.contract_version in {5, 6}:
+            import json
+            context = json.loads(request.context_summary)
+            context.pop("checkpoint", None)
+            if digest(context) != request.context_version:
+                raise D3RecoveryRequired("d8_review_frozen_context_changed")
         output = parse_d3_review_output(call["response"], request)
         if (
             request.task_run_id != task_run_id
@@ -419,9 +446,16 @@ class D3EvidenceValidator:
             saved = self.handoff.evidence.read("execution-context", request_id)
             if saved is None:
                 raise D3RecoveryRequired("d8_execution_context_missing")
-            return digest({"context": asdict(context), "process_facts": (),
+            value = digest({"context": asdict(context), "process_facts": (),
                            "history_context": saved["history_context"],
                            "history_capacity_version": saved["capacity_version"]})
+            if self.handoff.app.sessions is not None:
+                session = self.handoff.app.sessions.evidence.read("request", request_id)
+                if session is None:
+                    raise D3RecoveryRequired("d8_frozen_session_missing")
+                value = digest({"execution": value, "session_id": session["request"]["session_id"],
+                                "session_context": session["request"]["session_context"]})
+            return value
         return digest(asdict(context))
 
     def _plan_proposal(self, mutation: ControlMutation, state) -> None:
@@ -498,7 +532,7 @@ class D3EvidenceValidator:
             review_id = binding.replan_review_id
             if review_id is None:
                 raise D3RecoveryRequired("d3_replan_review_unavailable")
-            self._review_call(mutation.task_run_id, review_id)
+            _, _, reviewed = self._review_call(mutation.task_run_id, review_id)
             review = self.ledger.load_d3_review_application(
                 mutation.task_run_id, review_id
             )
@@ -510,9 +544,12 @@ class D3EvidenceValidator:
                 or prior[-1].status not in {PlanStatus.RUNNING, PlanStatus.COMPLETED}
             ):
                 raise D3RecoveryRequired("d3_replan_review_unavailable")
-            review_stage, review_plan_id = self._review_action(
-                mutation.task_run_id, review.action_candidate_id, binding.intent_id
-            )
+            if getattr(reviewed, "progress", None) is not None:
+                review_stage, review_plan_id = self._review_action(
+                    mutation.task_run_id, review.action_candidate_id, binding.intent_id, progress=True)
+            else:
+                review_stage, review_plan_id = self._review_action(
+                    mutation.task_run_id, review.action_candidate_id, binding.intent_id)
             if review_plan_id != prior[-1].plan_id:
                 raise D3RecoveryRequired("d3_replan_review_plan_changed")
             if prior[-1].status is PlanStatus.RUNNING and review_stage != "fact_proposal":
@@ -564,7 +601,8 @@ class D3EvidenceValidator:
                     )
                 ):
                     raise D3RecoveryRequired("d3_replan_first_step_not_saved")
-            elif prior[-1].status is PlanStatus.COMPLETED and review_stage not in {"inner_sha256", "inner_complete"}:
+            elif prior[-1].status is PlanStatus.COMPLETED and review_stage not in {"inner_sha256", "inner_complete"} and not (
+                    review_stage == "fact_proposal" and getattr(reviewed, "progress", None) is not None):
                 raise D3RecoveryRequired("d3_replan_final_step_review_missing")
         if binding.observation_mode == "reuse_saved_proof":
             if binding.source_proof_id is None or binding.source_fact_id is None:
@@ -956,13 +994,24 @@ class D3EvidenceValidator:
         if request.review_scope == "action":
             if request.action_candidate_id not in request.source_versions:
                 raise D3RecoveryRequired("d3_action_review_source_missing")
-            self._review_action(
-                mutation.task_run_id, request.action_candidate_id, intent.intent_id
-            )
+            if "d8_progress" in summary:
+                sessions = self.handoff.app.sessions if self.handoff is not None else None
+                rows = sessions.records(intent.intent_id) if sessions is not None else ()
+                if (sessions is None or not sessions.due(intent.intent_id)
+                        or summary["d8_progress"] != sessions.review_context(intent.intent_id,
+                                                          mode=summary["d8_progress"].get("mode", "ordinary"))):
+                    raise D3RecoveryRequired("d8_progress_checkpoint_changed")
+                if request.action_candidate_id != rows[-1].model_request_id:
+                    self._review_action(mutation.task_run_id, request.action_candidate_id, intent.intent_id)
+            else:
+                self._review_action(
+                    mutation.task_run_id, request.action_candidate_id, intent.intent_id
+                )
         if output.decision == "switch_sibling_intent" and not any(
             item.turn_id == turn.turn_id and item.status is IntentStatus.PENDING
             for item in state.intents
-        ):
+        ) and not (self.ledger.load_d3_run_config(mutation.task_run_id).contract_version in {5, 6}
+                   and getattr(getattr(output, "progress", None), "classification", None) == "repetitive"):
             raise ValueError("d3_no_sibling_candidate")
         if output.decision == "replan_current_intent":
             plans = [item for item in state.plans if item.intent_id == intent.intent_id]
@@ -1022,7 +1071,7 @@ class D3EvidenceValidator:
             self._complete_intent(mutation, state)
         elif operation == "complete_d3_turn":
             self._complete_turn(mutation, state)
-        elif operation == "switch_d3_intent":
+        elif operation in {"switch_d3_intent", "abandon_d8_intent"}:
             outcome = (
                 mutation.d3.outcomes[0]
                 if mutation.d3 and mutation.d3.outcomes
@@ -1033,7 +1082,7 @@ class D3EvidenceValidator:
             review_id, stop_id = outcome.evidence_refs
             review, _, _ = self._review_call(mutation.task_run_id, review_id)
             if (
-                review.decision != "switch_sibling_intent"
+                review.decision not in {"switch_sibling_intent", "abandon_current_intent"}
                 or review.intent_id != outcome.entity_id
             ):
                 raise D3RecoveryRequired("d3_switch_review_changed")

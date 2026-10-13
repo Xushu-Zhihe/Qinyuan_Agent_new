@@ -277,6 +277,12 @@ class D8HandoffRequest:
         value = dict(raw)
         value["history"] = tuple(D8HistoryItem.from_dict(i) for i in value["history"])
         value["capacity"] = D8Capacity(**value["capacity"])
+        if "inner_suggestions" in value:
+            from agent_core.session_contracts import D8SuggestedPlanningRequest, D8NextIntentSuggestion
+            value["inner_suggestions"] = tuple(D8NextIntentSuggestion(
+                i["description"], i["intent_type"], tuple(i["dependency_refs"]),
+                i["reason"], tuple(i["evidence_refs"])) for i in value["inner_suggestions"])
+            return D8SuggestedPlanningRequest(**value)
         return cls(**value)
 
 

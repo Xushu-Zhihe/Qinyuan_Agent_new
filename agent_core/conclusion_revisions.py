@@ -429,6 +429,14 @@ class ConclusionRevisions:
         if call.start != expected:
             raise D3RecoveryRequired("d8_revision_start_binding_changed")
         if data is None:
+            boundary = self.app.output_boundary
+            failure = boundary.failure(request) if boundary is not None else None
+            if failure is not None:
+                data = {"model_request_id": request.model_request_id, "request_sha256": request.context_sha256,
+                        "outcome": "model_error" if failure["terminal"] else "invalid", "raw": None,
+                        "finished_at": failure["finished_at"]}
+                self.evidence.save("result", request.model_request_id, data)
+        if data is None:
             raise D3RecoveryRequired("d8_revision_model_outcome_unknown")
         if (set(data) != {"model_request_id", "request_sha256", "outcome", "raw", "finished_at"}
                 or data["model_request_id"] != request.model_request_id
@@ -453,6 +461,10 @@ class ConclusionRevisions:
         return data
 
     async def _call(self, request, token):
+        if self.app.sessions is not None:
+            from agent_core.session_contracts import D8SessionChangeRequest
+            if isinstance(request, D8SessionChangeRequest):
+                self.app.sessions.freeze(request)
         saved = self.evidence.read("request", request.model_request_id)
         if saved is None:
             self.evidence.save("request", request.model_request_id, asdict(request))
@@ -489,6 +501,8 @@ class ConclusionRevisions:
                       "outcome": outcome, "raw": raw, "finished_at": self.app.clock()}
             self.evidence.save("result", request.model_request_id, result)
             result = self._known(request)
+        if self.app.output_boundary is not None and result["outcome"] != "stale":
+            self.app.output_boundary.terminal_check(request)
         if result["outcome"] == "invalid" and request.correction_of_model_request_id is None:
             self._actor(request.actor_intent_id)
             identity = self._id("correction/" + request.model_request_id)
@@ -665,7 +679,9 @@ class ConclusionRevisions:
     def reconcile(self):
         for call in self.store.list_d4_operations(self.state.task_run.task_run_id):
             raw = self.evidence.read("request", call.start.operation_id)
-            if raw is not None and self.evidence.read("result", call.start.operation_id) is not None:
+            if raw is not None and (self.evidence.read("result", call.start.operation_id) is not None
+                    or (self.app.output_boundary is not None
+                        and self.app.output_boundary.failure(D8ChangeRequest.from_dict(raw)) is not None)):
                 self._known(D8ChangeRequest.from_dict(raw))
 
     async def repair(self, actor_id, request_id, token):
@@ -673,6 +689,8 @@ class ConclusionRevisions:
         _uuid(request_id, "request_id")
         self.reconcile()
         self._actor(actor_id)
+        if self.app.sessions is not None and self.store.load_d4_operation(request_id) is None:
+            await self.app.sessions.before_decision(actor_id, (), token, restricted=True)
         prior = next((r for r in self.records() if r.proposal_request_id == request_id), None)
         if prior is None:
             correction = self._id("correction/" + request_id)
@@ -697,6 +715,8 @@ class ConclusionRevisions:
                                       tuple(selected), history_context=handoff_json(packet), prior_changes=self.prior_changes())
         if (request.actor_intent_id, request.task_run_id) != (actor_id, self.state.task_run.task_run_id):
             raise D3RecoveryRequired("d8_repair_request_owner_changed")
+        if self.app.sessions is not None:
+            request = self.app.sessions.wrap(request)
         final, action = await self._call(request, token)
         from agent_core.dual_llm_modeling import D8HistoryReadAction
         if isinstance(action, D8HistoryReadAction):

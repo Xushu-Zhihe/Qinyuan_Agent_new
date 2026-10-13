@@ -13,6 +13,7 @@ from agent_core.contracts import ModelBackend, TaskRequest
 from agent_core.conclusion_contracts import D8Conclusion
 from agent_core.handoff_contracts import D8HandoffVersion, D8CapacityVersion, D8TreeRecord
 from agent_core.conclusion_revision_contracts import D8RevisionRecord
+from agent_core.session_contracts import D8DecisionRecord
 from agent_core.handoff_storage import D8_CHANGES, D8_OPERATIONS
 from agent_core.v7.web_contracts import (
     D7WebExecutionRecord,
@@ -572,6 +573,7 @@ StateChange: TypeAlias = (
     | D8CapacityVersion
     | D8TreeRecord
     | D8RevisionRecord
+    | D8DecisionRecord
 )
 
 STATE_CHANGE_TYPES = (
@@ -592,6 +594,7 @@ STATE_CHANGE_TYPES = (
     D8CapacityVersion,
     D8TreeRecord,
     D8RevisionRecord,
+    D8DecisionRecord,
 )
 
 
@@ -927,6 +930,10 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
         "switch_d3_intent": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             dynamic_result_entity="running_intent",
+        ),
+        "abandon_d8_intent": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"abandoned"}),
         ),
         "complete_d3_turn": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,

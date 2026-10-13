@@ -223,6 +223,9 @@ class D8ChangeRequest:
                                        for i in value.get("prior_changes", ()))
         if value["candidate"] is not None:
             value["candidate"] = D8ConclusionChange.from_dict(value["candidate"])
+        if "session_id" in value:
+            from agent_core.session_contracts import D8SessionChangeRequest
+            return D8SessionChangeRequest(**value)
         return cls(**value)
 
 

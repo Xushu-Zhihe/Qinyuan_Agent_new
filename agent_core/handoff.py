@@ -389,6 +389,15 @@ class HandoffContext:
                 or call.start.role_config_ref != request.role_config_ref):
             raise D3RecoveryRequired("d8_call_binding_changed")
         if result is None:
+            failure = self.app.output_boundary.failure(request) if self.app.output_boundary is not None else None
+            if failure is not None:
+                result = {"model_request_id": request.model_request_id,
+                    "request_sha256": request.context_sha256,
+                    "outcome": "model_error" if failure["terminal"] else "invalid", "raw": None,
+                    "reason": "d8_output_contract_rejected", "rejected_candidate_indices": [],
+                    "finished_at": failure["finished_at"]}
+                self.evidence.save("result", request.model_request_id, result)
+        if result is None:
             raise D3RecoveryRequired("d8_summary_or_planning_outcome_unknown")
         if (result.get("model_request_id") != request.model_request_id
                 or result.get("request_sha256") != request.context_sha256
@@ -412,10 +421,15 @@ class HandoffContext:
     def reconcile(self):
         for operation in self.store.list_d4_operations(self.state.task_run.task_run_id):
             request = self.evidence.read("request", operation.start.operation_id)
-            if request is not None and self.evidence.read("result", operation.start.operation_id) is not None:
+            known_format = (self.app.output_boundary is not None
+                            and self.app.output_boundary.diagnostic(operation.start.operation_id) is not None)
+            if request is not None and (self.evidence.read("result", operation.start.operation_id) is not None or known_format):
                 self._known_call(D8HandoffRequest.from_dict(request))
 
     def _request(self, stage, turn_id, intent_id=None, support_fact_id=None):
+        suggestions = None
+        if stage == "tree_planning" and intent_id and self.app.sessions is not None:
+            suggestions = self.app.sessions.next_suggestions(intent_id)
         selected, omitted, packet = self.select(stage, turn_id, intent_id, support_fact_id)
         if stage == "tree_planning":
             packet["dependency_review"] = (
@@ -430,11 +444,17 @@ class HandoffContext:
         saved = self.evidence.read("request", request_id)
         if saved is not None:
             return D8HandoffRequest.from_dict(saved), omitted
-        return D8HandoffRequest(request_id, self.state.task_run.task_run_id, turn_id, intent_id,
+        request = D8HandoffRequest(request_id, self.state.task_run.task_run_id, turn_id, intent_id,
                                 stage, self.app.config.outer_role.role_config_ref,
                                 self.state.latest_checkpoint.sequence, version.version, version.capacity,
                                 self.app.redactor.redact(self.state.task_run.request.goal), selected,
-                                handoff_json(packet), support_fact_id), omitted
+                                handoff_json(packet), support_fact_id)
+        if suggestions is not None:
+            from dataclasses import fields
+            from agent_core.session_contracts import D8SuggestedPlanningRequest
+            request = D8SuggestedPlanningRequest(**{f.name: getattr(request, f.name) for f in fields(request)},
+                                                  suggestion_request_id=suggestions[0], inner_suggestions=suggestions[1])
+        return request, omitted
 
     async def call(self, request, token):
         current = request
@@ -451,6 +471,8 @@ class HandoffContext:
                 if not self.capacity_port.fits(current, policy):
                     self._pause("complete_model_request", [i.ref for i in current.history],
                                 policy.total_units, None)
+                if self.app.output_boundary is not None:
+                    self.app.output_boundary.prepare(current)
                 category = {"handoff_summary": "handoff_summary", "tree_planning": "planning", "intent_evaluation": "review"}[current.stage]
                 self.store.begin_d4_operation(D4OperationStart(
                     current.model_request_id, current.task_run_id, category, self.app.clock(),
@@ -485,6 +507,8 @@ class HandoffContext:
                           "finished_at": self.app.clock()}
                 self.evidence.save("result", current.model_request_id, result)
                 result = self._known_call(current)
+            if self.app.output_boundary is not None and result["outcome"] != "stale":
+                self.app.output_boundary.terminal_check(current)
             if result["outcome"] == "valid":
                 return current, self._parse(current, result["raw"])
             if result["outcome"] != "invalid" or attempt == 1:
@@ -629,9 +653,15 @@ class HandoffContext:
     def validate_mutation(self, mutation, state):
         from agent_core.handoff_storage import D8_CHANGES
         records = [c for c in mutation.state_changes if isinstance(c, D8_CHANGES)]
-        if len(records) != 1 or self.app.config.contract_version not in {3, 4}:
+        if len(records) != 1 or self.app.config.contract_version not in {3, 4, 5, 6}:
             raise D3RecoveryRequired("d8_handoff_mutation_not_enabled")
         record = records[0]
+        from agent_core.session_contracts import D8DecisionRecord
+        if isinstance(record, D8DecisionRecord):
+            if self.app.sessions is None:
+                raise D3RecoveryRequired("d8_session_not_enabled")
+            self.app.sessions.validate_record(record, state)
+            return
         from agent_core.conclusion_revision_contracts import D8RevisionRecord
         if isinstance(record, D8RevisionRecord):
             if self.app.revisions is None:
@@ -1004,6 +1034,8 @@ class HandoffContext:
         return result
 
     def freeze_execution_request(self, request):
+        if self.app.output_boundary is not None:
+            self.app.output_boundary.prepare(request)
         if not self.capacity_port.fits(request, self.app.config.handoff_config.inner_capacity):
             self._pause("complete_model_request", (), self.app.config.handoff_config.inner_capacity.total_units, None)
         data = {"task_run_id": request.task_run_id, "model_request_id": request.model_request_id,
@@ -1011,6 +1043,8 @@ class HandoffContext:
         self.evidence.save("execution-context", request.model_request_id, data)
 
     def check_role_request_capacity(self, request):
+        if self.app.output_boundary is not None:
+            self.app.output_boundary.prepare(request)
         role_ref = getattr(request, "role_config_ref", None)
         policy = (self.app.config.handoff_config.inner_capacity
                   if role_ref == self.app.config.inner_role.role_config_ref

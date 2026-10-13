@@ -375,9 +375,10 @@ class D3Control:
             for item in state.intents
             if item.turn_id == current.turn_id and item.status is IntentStatus.PENDING
         ]
-        if not siblings:
+        config = self.ledger.load_d3_run_config(state.task_run.task_run_id)
+        if not siblings and config.contract_version not in {5, 6}:
             raise D3RecoveryRequired("d3_no_sibling_candidate")
-        next_intent = min(siblings, key=lambda item: item.priority)
+        next_intent = min(siblings, key=lambda item: item.priority) if siblings else None
         changes: list[StateChange] = [
             UpsertIntent(
                 current.intent_id,
@@ -387,15 +388,11 @@ class D3Control:
                 current.intent_type,
                 IntentStatus.ABANDONED,
             ),
-            UpsertIntent(
-                next_intent.intent_id,
-                next_intent.turn_id,
-                next_intent.description,
-                next_intent.priority,
-                next_intent.intent_type,
-                IntentStatus.RUNNING,
-            ),
         ]
+        if next_intent is not None:
+            changes.append(UpsertIntent(next_intent.intent_id, next_intent.turn_id,
+                                       next_intent.description, next_intent.priority,
+                                       next_intent.intent_type, IntentStatus.RUNNING))
         outcomes = [
             D3Outcome(
                 "intent",
@@ -426,12 +423,12 @@ class D3Control:
                 )
         self._commit(
             f"switch/{review_id}",
-            "switch_d3_intent",
+            "switch_d3_intent" if next_intent is not None else "abandon_d8_intent",
             changes,
-            next_intent.intent_id,
+            next_intent.intent_id if next_intent is not None else "abandoned",
             D3CommitMetadata(outcomes=tuple(outcomes)),
         )
-        return next_intent.intent_id
+        return next_intent.intent_id if next_intent is not None else None
 
     def adjust_turn(
         self,

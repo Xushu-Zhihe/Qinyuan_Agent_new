@@ -893,11 +893,11 @@ class D3WorkspaceOperations:
             or review.paused_gate
             or review.intent_id != intent_id
             or review.turn_id != turn_id
-            or review.decision
-            != (
-                "switch_sibling_intent"
-                if reason == "sibling_switch"
-                else "adjust_turn_target"
+            or review.decision not in (
+                ({"switch_sibling_intent", "abandon_current_intent"}
+                 if self.ledger.load_d3_run_config(state.task_run.task_run_id).contract_version in {5, 6}
+                 else {"switch_sibling_intent"})
+                if reason == "sibling_switch" else {"adjust_turn_target"}
             )
         ):
             raise D3RecoveryRequired("d3_stop_review_or_owner_mismatch")

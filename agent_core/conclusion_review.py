@@ -26,6 +26,7 @@ class ConclusionReview:
         self.inner_model, self.outer_model = inner_model, outer_model
         self.redactor, self.clock, self.stopped = redactor, clock, stopped
         self.request_capacity_check = None
+        self.prepare_inner_request = None
 
     def _id(self, name):
         return stable_id(self.controller.control_state.task_run.task_run_id, f"d8/{name}")
@@ -114,6 +115,15 @@ class ConclusionReview:
         if record.start != expected or request.role_config_ref != role.role_config_ref:
             raise D3RecoveryRequired("d8_saved_request_binding_changed")
         if result is None:
+            boundary = getattr(self, "output_boundary", None)
+            failure = boundary.failure(request) if boundary is not None else None
+            if failure is not None:
+                result = {"model_request_id": request.model_request_id,
+                    "request_sha256": request.context_sha256,
+                    "outcome": "model_error" if failure["terminal"] else "invalid", "raw": None,
+                    "finished_at": failure["finished_at"]}
+                self.evidence.save_result(request.model_request_id, result)
+        if result is None:
             raise D3RecoveryRequired("d8_model_outcome_unknown")
         completion = self._completion(request, result)
         if record.completion is None:
@@ -128,7 +138,9 @@ class ConclusionReview:
         task_id = self.controller.control_state.task_run.task_run_id
         for record in self.store.list_d4_operations(task_id):
             request = self.evidence.read_request(record.start.operation_id)
-            if request is not None and self.evidence.read_result(request.model_request_id) is not None:
+            boundary = getattr(self, "output_boundary", None)
+            known_format = boundary is not None and boundary.diagnostic(record.start.operation_id) is not None
+            if request is not None and (self.evidence.read_result(request.model_request_id) is not None or known_format):
                 self._known(request)
         for record in self.store.list_d8_conclusions(task_id):
             for request_id in (record.proposal_request_id, record.review_request_id):
@@ -214,6 +226,9 @@ class ConclusionReview:
                       "raw": raw, "finished_at": self.clock()}
             self.evidence.save_result(request.model_request_id, result)
             self.store.complete_d4_operation(self._completion(request, result))
+        boundary = getattr(self, "output_boundary", None)
+        if boundary is not None and result["outcome"] != "stale":
+            boundary.terminal_check(request)
         if result["outcome"] == "invalid" and request.correction_of_model_request_id is None:
             self._scope(request.observation)
             correction_id = stable_id(request.task_run_id, f"d8/correction/{request.model_request_id}")
@@ -271,6 +286,8 @@ class ConclusionReview:
                 goal=self.controller.control_state.task_run.request.goal,
                 intent_description=next(i.description for i in self.controller.control_state.intents
                                         if i.intent_id == source.intent_id))
+            if self.prepare_inner_request is not None:
+                request = self.prepare_inner_request(request)
             proposal_id, candidate = await self._call(request, token)
             if isinstance(candidate, D8ReviewRequestAction):
                 return proposal_id, candidate

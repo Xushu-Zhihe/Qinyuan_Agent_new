@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 from agent_core.dual_llm_contracts import D3RecoveryRequired
 from agent_core.modeling import ModelError, ModelErrorKind
@@ -47,6 +47,7 @@ class ProcessRefinement:
         self.adapter = adapter
         self.config = config
         self.request_capacity_check = None
+        self.output_boundary = None
         self.clock = clock
         self.stopped = stopped
         self.redactor = redactor
@@ -221,6 +222,13 @@ class ProcessRefinement:
             return
         result = self.evidence.read_result(attempt.model_request_id)
         candidate = self.evidence.read_candidate(attempt.model_request_id)
+        if result is None and self.output_boundary is not None:
+            failure = self.output_boundary.failure(request)
+            if failure is not None:
+                self.evidence.save_result(attempt.model_request_id,
+                    "failed" if failure["terminal"] else "invalid", failure["finished_at"],
+                    "output_terminal_error" if failure["terminal"] else "output_format_invalid")
+                result = self.evidence.read_result(attempt.model_request_id)
         if result is None:
             if candidate is None:
                 self._seal(attempt)
@@ -247,6 +255,8 @@ class ProcessRefinement:
             self.store.complete_d4_operation(completion)
         elif operation.completion != completion:
             raise D3RecoveryRequired("d5_completion_evidence_changed")
+        if self.output_boundary is not None:
+            self.output_boundary.terminal_check(request)
         if not accepted or operation.application_ref is not None or self.stopped():
             return
         prior = self._prior(attempt.task_run_id)
@@ -290,6 +300,7 @@ class ProcessRefinement:
         )
         if existing is not None:
             self._finish_saved(existing)
+            self._maybe_correct(existing)
             return
         if self.stopped():
             return
@@ -308,6 +319,7 @@ class ProcessRefinement:
         sources = tuple(
             source
             for ref in review.source_ids
+            if not (self.config.contract_version in {5, 6} and ref.startswith("d8-decision:"))
             if (source := self._read_source(task_id, ref)) is not None
         )
         tried = {
@@ -362,6 +374,62 @@ class ProcessRefinement:
             self.store.begin_d5_attempt(attempt, start)
         except D4BudgetExhausted:
             return
+        self._run_request(request)
+        self._maybe_correct(attempt)
+
+    def _maybe_correct(self, root):
+        if self.output_boundary is None or self.store.d8_refinement_root(root.model_request_id) is not None:
+            return
+        request = self.evidence.read_request(root.model_request_id)
+        failure = self.output_boundary.failure(request)
+        result = self.evidence.read_result(root.model_request_id)
+        if (failure is None or failure["terminal"] is not None or result is None
+                or result["outcome"] != "invalid"):
+            return
+        identity = stable_id(root.task_run_id, "d8/refinement/correction/" + root.model_request_id)
+        existing = self.store.load_d5_attempt(identity)
+        if existing is not None:
+            self._finish_saved(existing)
+            return
+        if self.stopped() or self.controller.control_state.latest_checkpoint.sequence != root.base_checkpoint_sequence:
+            return
+        usage = self.store.d4_budget_usage(root.task_run_id)
+        budget = self.config.d4_budget
+        if usage.total_used >= budget.total or dict(usage.category_counts)["refinement"] >= budget.refinement:
+            return
+        if self.adapter.role_config != self.config.outer_role:
+            raise D3RecoveryRequired("d5_frozen_role_changed")
+        for source in root.sources:
+            if self._read_source(root.task_run_id, source.object_id, source.kind) != source:
+                # A business/source rejection is not a new format-correction opportunity.
+                return
+        saved = self.evidence.read_request(identity)
+        attempt = saved.attempt if saved is not None else replace(root, model_request_id=identity, started_at=self.clock())
+        correction = D5RefinementRequest(attempt, request.safe_sources, request.process_facts)
+        if saved is not None and saved != correction:
+            raise D3RecoveryRequired("d8_refinement_correction_request_changed")
+        self.evidence.save_request(correction)
+        self.request_capacity_check(correction)
+        start = D4OperationStart(identity, root.task_run_id, "refinement", attempt.started_at,
+            attempt.base_checkpoint_sequence, attempt.context_sha256, root.review_id,
+            budget.budget_policy_ref, "outer_planning", attempt.role_config_ref)
+        try:
+            self.store.begin_d8_refinement_correction(root.model_request_id, attempt, start)
+        except D4BudgetExhausted:
+            return
+        self._run_request(correction)
+
+    def resume_format_corrections(self):
+        """New dispatch is allowed only by the running application, never read reconciliation."""
+        if self.output_boundary is not None:
+            for root in self.store.list_d5_attempts(self.controller.control_state.task_run.task_run_id):
+                self._maybe_correct(root)
+
+    def _run_request(self, request):
+        attempt = request.attempt
+        sources = attempt.sources
+        task_id = attempt.task_run_id
+        state = self.controller.control_state
         finished = threading.Event()
         values = []
         stopped = threading.Event()

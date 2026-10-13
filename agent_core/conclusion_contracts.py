@@ -213,6 +213,9 @@ class D8ModelRequest:
         value["observation"] = D8Observation(**value["observation"])
         value["candidate"] = D8Candidate.from_dict(value["candidate"]) if value["candidate"] is not None else None
         value["feedback"] = tuple(D8Feedback(**item) for item in value["feedback"])
+        if "session_id" in value:
+            from agent_core.session_contracts import D8SessionConclusionRequest
+            return D8SessionConclusionRequest(**value)
         return cls(**value)
 
 

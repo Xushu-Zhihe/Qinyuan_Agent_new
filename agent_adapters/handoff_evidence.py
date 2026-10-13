@@ -8,7 +8,7 @@ import json
 
 
 class FileD8HandoffEvidence:
-    KINDS = {"request", "result", "handoff", "read-snapshot", "read-result", "execution-context", "pause"}
+    KINDS = {"request", "result", "handoff", "read-snapshot", "read-result", "execution-context", "pause", "decision"}
 
     def __init__(self, directory, *, create=True):
         self.records = T6CommandRecorder(directory, create=create)

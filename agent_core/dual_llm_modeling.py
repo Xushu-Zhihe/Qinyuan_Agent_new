@@ -6,7 +6,10 @@ import asyncio
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+
+if TYPE_CHECKING:
+    from agent_core.session_contracts import D8NextIntentSuggestion
 from uuid import UUID, uuid4
 
 from agent_core.actions import (
@@ -29,6 +32,7 @@ from agent_core.modeling import (
     CancellationToken,
     IntentCandidate,
     ModelError,
+    ModelErrorKind,
     ModelTransport,
 )
 from agent_core.turn_contracts import D1RoleConfig
@@ -159,6 +163,23 @@ class D3CandidateFlagAction:
 class D3ActionProposal:
     action: ProbeAction | CompleteIntentAction | D3CandidateFlagAction
     review_requested: bool
+
+
+@dataclass(frozen=True, slots=True)
+class D8CompleteProposal(D3ActionProposal):
+    next_intent_candidates: tuple[D8NextIntentSuggestion, ...]
+
+
+def parse_session_completion(raw, visible):
+    from agent_core.session_contracts import parse_next_intents
+    if not isinstance(raw, dict) or "next_intent_candidates" not in raw:
+        raise D3ProposalRejected("d8_next_intents_field_required", structural=True)
+    try:
+        suggestions = parse_next_intents(raw["next_intent_candidates"], visible)
+    except (TypeError, ValueError) as exc:
+        raise D3ProposalRejected("d8_next_intents_invalid", structural=True) from exc
+    base = parse_d3_action({k: v for k, v in raw.items() if k != "next_intent_candidates"}, "inner_complete")
+    return D8CompleteProposal(base.action, base.review_requested, suggestions)
 
 
 def _candidate_text(value: object, *, code: str, nonblank: bool) -> str:
@@ -396,6 +417,17 @@ class D8ExecutionModelRequest(D3ModelRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class D8SessionExecutionRequest(D8ExecutionModelRequest):
+    session_id: str = ""
+    session_context: str = ""
+
+    @property
+    def context_sha256(self):
+        return digest({"execution": super(D8SessionExecutionRequest, self).context_sha256,
+                       "session_id": self.session_id, "session_context": self.session_context})
+
+
+@dataclass(frozen=True, slots=True)
 class D8HistoryReadAction:
     kind: str
     value: object
@@ -484,11 +516,12 @@ class D3AuditedModel:
         self.clock = clock
         self.request_capacity_check = None
         self.change_response_sensitive = None
+        self.output_boundary = None
 
     def _parse(self, request: D3ModelRequest, raw: object):
         if request.stage == "outer_turn":
             return parse_d3_turn_proposal(raw)
-        if self.config.contract_version == 4:
+        if self.config.contract_version in {4, 5, 6}:
             from agent_core.conclusion_revision_contracts import D8ConclusionChange
             try:
                 change = D8ConclusionChange.parse_action(raw)
@@ -497,7 +530,7 @@ class D3AuditedModel:
             if change is not None:
                 return change
         if request.stage == "inner_plan":
-            if self.config.contract_version in {3, 4}:
+            if self.config.contract_version in {3, 4, 5, 6}:
                 try:
                     read = D8HistoryReadAction.parse(raw)
                 except (ValueError, TypeError) as exc:
@@ -505,9 +538,14 @@ class D3AuditedModel:
                 if read is not None:
                     return read
             return parse_d3_plan_proposal(raw)
+        if self.config.contract_version in {5, 6} and request.stage == "inner_complete":
+            from agent_core.sessions import IntentSessions
+            return parse_session_completion(raw, IntentSessions.visible(request))
         return parse_d3_action(raw, request.stage)
 
     def _check(self, request: D3ModelRequest) -> None:
+        if self.config.contract_version == 6 and self.output_boundary is None:
+            raise D3RecoveryRequired("d8_output_boundary_required")
         expected = (
             self.config.outer_role
             if request.stage == "outer_turn"
@@ -861,6 +899,19 @@ class D3AuditedModel:
         ):
             raise D3RecoveryRequired("d3_model_call_identity_changed")
         if evidence is None:
+            failure = self.output_boundary.failure(request) if self.output_boundary is not None else None
+            if failure is not None:
+                raw = None
+                outcome, reason = "invalid_structure", "d3_proposal_fields_invalid"
+                if failure["terminal"] is not None:
+                    error = ModelError(ModelErrorKind.INVALID_RESPONSE, "d8_" + failure["terminal"])
+                    raw, outcome, reason = error.to_dict(), "model_error", error.short_reason
+                evidence = D3ModelEvidence(request.model_request_id, request.task_run_id, request.stage,
+                    request.role_config_ref, request.resource_ref, request.base_checkpoint_sequence,
+                    request.context_sha256, request.correction_of_model_request_id, outcome,
+                    raw, reason, failure["finished_at"])
+                self.evidence.save(evidence)
+        if evidence is None:
             raise D3RecoveryRequired("d3_model_call_outcome_unknown")
         if (
             evidence.model_request_id != request.model_request_id
@@ -993,7 +1044,7 @@ class D3AuditedModel:
                     "accepted", "invalid_structure", "rejected", "model_error", "stale"
                 ] = "accepted"
                 reason = None
-                change_response = (self.config.contract_version == 4 and isinstance(raw, dict)
+                change_response = (self.config.contract_version in {4, 5, 6} and isinstance(raw, dict)
                                    and raw.get("kind") == "conclusion_change")
                 if change_response and self.change_response_sensitive is not None and self.change_response_sensitive(raw):
                     raw = None
@@ -1046,6 +1097,8 @@ class D3AuditedModel:
                     )
                 )
 
+            if self.output_boundary is not None and evidence.outcome != "stale":
+                self.output_boundary.terminal_check(current)
             rejection_code = evidence.reason
             if evidence.reason == "d8_change_sensitive_rejected":
                 raise D3ProposalRejected(evidence.reason, retryable=False, model_request_id=current.model_request_id)

@@ -147,7 +147,7 @@ from agent_core.operation_accounting import (
 from agent_core.process_facts import D5Attempt, D5ProcessFact
 from agent_core.conclusion_contracts import D8Conclusion
 from agent_core.handoff_storage import (
-    D8_HANDOFF_SCHEMA, D8_REVISION_SCHEMA, D8_CHANGES, D8_OPERATIONS,
+    D8_HANDOFF_SCHEMA, D8_REVISION_SCHEMA, D8_SESSION_SCHEMA, D8_CHANGES, D8_OPERATIONS,
     load_records, validate_handoff_mutation, save_handoff_mutation,
 )
 from agent_core.review_contracts import (
@@ -172,7 +172,25 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 25
+CURRENT_SCHEMA_VERSION = 27
+
+D8_OUTPUT_SCHEMA = """
+CREATE TABLE d8_refinement_corrections (
+    model_request_id TEXT PRIMARY KEY REFERENCES d4_operations(operation_id),
+    root_model_request_id TEXT NOT NULL UNIQUE REFERENCES d5_attempts(model_request_id),
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    attempt_json TEXT NOT NULL
+);
+CREATE TABLE d8_refinement_process_facts (
+    process_fact_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    version INTEGER NOT NULL CHECK (version > 0),
+    model_request_id TEXT NOT NULL UNIQUE REFERENCES d8_refinement_corrections(model_request_id),
+    metadata_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL,
+    UNIQUE(task_run_id, version)
+);
+"""
 
 MIGRATION_23 = """
 CREATE TABLE d8_conclusions (
@@ -1214,6 +1232,16 @@ class SqliteControlStore:
                     self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                                          (25, self._now()))
+            if version < 26:
+                for statement in _sql_statements(D8_SESSION_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                                         (26, self._now()))
+            if version < 27:
+                for statement in _sql_statements(D8_OUTPUT_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                                         (27, self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -3745,13 +3773,34 @@ class SqliteControlStore:
         row = self._connection.execute(
             "SELECT * FROM d5_attempts WHERE model_request_id = ?", (model_request_id,)
         ).fetchone()
+        correction = None
+        if row is None and self._schema_version >= 27:
+            row = self._connection.execute(
+                "SELECT * FROM d8_refinement_corrections WHERE model_request_id = ?", (model_request_id,)
+            ).fetchone()
+            if row is not None:
+                correction = row["root_model_request_id"]
         if row is None:
             return None
         attempt = D5Attempt.from_dict(json.loads(row["attempt_json"]))
-        if (attempt.model_request_id, attempt.task_run_id, attempt.review_id) != (
-            row["model_request_id"], row["task_run_id"], row["review_id"]
-        ):
+        if (attempt.model_request_id, attempt.task_run_id) != (row["model_request_id"], row["task_run_id"]):
             raise StorageError("D5 attempt ownership changed")
+        if correction is None:
+            if attempt.review_id != row["review_id"]:
+                raise StorageError("D5 attempt ownership changed")
+        else:
+            if self._connection.execute(
+                "SELECT 1 FROM d5_attempts WHERE model_request_id = ?", (correction,)
+            ).fetchone() is None:
+                raise StorageError("D8 refinement correction root unavailable")
+            root = self.load_d5_attempt(correction)
+            config = self.load_d3_run_config(attempt.task_run_id)
+            if (root is None or config is None or config.contract_version != 6
+                    or (root.task_run_id, root.review_id, root.sources, root.context_sha256,
+                        root.base_checkpoint_sequence, root.role_config_ref)
+                    != (attempt.task_run_id, attempt.review_id, attempt.sources, attempt.context_sha256,
+                        attempt.base_checkpoint_sequence, attempt.role_config_ref)):
+                raise StorageError("D8 refinement correction binding changed")
         operation = self.load_d4_operation(model_request_id)
         if operation is None:
             raise StorageError("D5 attempt has no D4 admission")
@@ -3766,16 +3815,17 @@ class SqliteControlStore:
             "SELECT model_request_id FROM d5_attempts WHERE task_run_id = ? ORDER BY rowid",
             (task_run_id,),
         ).fetchall()
+        if self._schema_version >= 27:
+            rows += self._connection.execute(
+                "SELECT model_request_id FROM d8_refinement_corrections WHERE task_run_id = ? ORDER BY rowid",
+                (task_run_id,),
+            ).fetchall()
         return tuple(row[0] for row in rows)
 
     def list_d5_attempts(self, task_run_id: str) -> tuple[D5Attempt, ...]:
         if self._schema_version < 15:
             return ()
-        rows = self._connection.execute(
-            "SELECT model_request_id FROM d5_attempts WHERE task_run_id = ? ORDER BY rowid",
-            (task_run_id,),
-        ).fetchall()
-        attempts = tuple(self.load_d5_attempt(row[0]) for row in rows)
+        attempts = tuple(self.load_d5_attempt(ref) for ref in self.list_d5_attempt_refs(task_run_id))
         if any(item is None or item.task_run_id != task_run_id for item in attempts):
             raise StorageError("D5 attempt ownership changed")
         return cast(tuple[D5Attempt, ...], attempts)
@@ -3821,6 +3871,54 @@ class SqliteControlStore:
             self._connection.rollback()
             raise
 
+    def d8_refinement_root(self, model_request_id: str) -> str | None:
+        if self._schema_version < 27:
+            return None
+        row = self._connection.execute(
+            "SELECT root_model_request_id FROM d8_refinement_corrections WHERE model_request_id = ?",
+            (model_request_id,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def begin_d8_refinement_correction(self, root_id: str, attempt: D5Attempt,
+                                     start: D4OperationStart) -> D5Attempt | None:
+        """Append one separately charged correction; retain the root's source dedup."""
+        from agent_core.turn_modeling import stable_id
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._validate_d5_attempt_start(attempt, start)
+            config = self.load_d3_run_config(attempt.task_run_id)
+            root = self.load_d5_attempt(root_id)
+            operation = self.load_d4_operation(root_id)
+            if (config is None or config.contract_version != 6 or root is None
+                    or self.d8_refinement_root(root_id) is not None
+                    or operation is None or operation.completion is None
+                    or operation.completion.result_kind != "failed"
+                    or operation.application_ref is not None
+                    or attempt.model_request_id != stable_id(attempt.task_run_id, "d8/refinement/correction/" + root_id)
+                    or (root.task_run_id, root.review_id, root.sources, root.context_sha256,
+                        root.base_checkpoint_sequence, root.role_config_ref)
+                    != (attempt.task_run_id, attempt.review_id, attempt.sources, attempt.context_sha256,
+                        attempt.base_checkpoint_sequence, attempt.role_config_ref)):
+                raise StorageError("D8 correction requires a bound completed failed root")
+            existing = self.load_d5_attempt(attempt.model_request_id)
+            if existing is not None:
+                if (existing != attempt or self.d8_refinement_root(attempt.model_request_id) != root_id
+                        or self.load_d4_operation(attempt.model_request_id).start != start):
+                    raise IdempotencyConflictError("D8 refinement correction changed")
+                self._connection.commit()
+                return existing
+            if self._begin_d4_operation(start) is not None:
+                raise StorageError("D8 correction cannot adopt a prior admission")
+            self._connection.execute("INSERT INTO d8_refinement_corrections VALUES (?, ?, ?, ?)",
+                                     (attempt.model_request_id, root_id, attempt.task_run_id,
+                                      canonical_json(asdict(attempt))))
+            self._connection.commit()
+            return None
+        except BaseException:
+            self._connection.rollback()
+            raise
+
     def list_process_facts(self, task_run_id: str) -> tuple[D5ProcessFact, ...]:
         if self._schema_version < 15:
             return ()
@@ -3828,6 +3926,12 @@ class SqliteControlStore:
             "SELECT * FROM process_facts WHERE task_run_id = ? ORDER BY version",
             (task_run_id,),
         ).fetchall()
+        if self._schema_version >= 27:
+            rows += self._connection.execute(
+                "SELECT * FROM d8_refinement_process_facts WHERE task_run_id = ? ORDER BY version",
+                (task_run_id,),
+            ).fetchall()
+            rows.sort(key=lambda row: row["version"])
         facts = []
         for row in rows:
             fact = D5ProcessFact.from_dict(json.loads(row["metadata_json"]))
@@ -3844,11 +3948,12 @@ class SqliteControlStore:
         """List owned summary keys without parsing row metadata."""
         if self._schema_version < 15:
             return ()
-        rows = self._connection.execute(
-            "SELECT process_fact_id FROM process_facts WHERE task_run_id = ? ORDER BY version",
-            (task_run_id,),
-        ).fetchall()
-        return tuple(row[0] for row in rows)
+        query = "SELECT process_fact_id, version FROM process_facts WHERE task_run_id = ?"
+        parameters = (task_run_id,)
+        if self._schema_version >= 27:
+            query += " UNION ALL SELECT process_fact_id, version FROM d8_refinement_process_facts WHERE task_run_id = ?"
+            parameters += (task_run_id,)
+        return tuple(row[0] for row in self._connection.execute(query + " ORDER BY version", parameters))
 
     def load_process_fact(self, process_fact_id: str) -> D5ProcessFact | None:
         """Read and verify one immutable metadata row independently."""
@@ -3857,6 +3962,10 @@ class SqliteControlStore:
         row = self._connection.execute(
             "SELECT * FROM process_facts WHERE process_fact_id = ?", (process_fact_id,),
         ).fetchone()
+        if row is None and self._schema_version >= 27:
+            row = self._connection.execute(
+                "SELECT * FROM d8_refinement_process_facts WHERE process_fact_id = ?", (process_fact_id,),
+            ).fetchone()
         if row is None:
             return None
         fact = D5ProcessFact.from_dict(json.loads(row["metadata_json"]))
@@ -3906,8 +4015,10 @@ class SqliteControlStore:
             return
         fact = mutation.state_changes[0]
         assert isinstance(fact, D5ProcessFact)
+        corrected = self.d8_refinement_root(fact.model_request_id) is not None
         self._connection.execute(
-            "INSERT INTO process_facts VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO d8_refinement_process_facts VALUES (?, ?, ?, ?, ?, ?)" if corrected
+            else "INSERT INTO process_facts VALUES (?, ?, ?, ?, ?, ?)",
             (fact.process_fact_id, fact.task_run_id, fact.version, fact.model_request_id,
              canonical_json(asdict(fact)), event_sequence),
         )
@@ -4351,6 +4462,9 @@ class SqliteControlStore:
     def list_d8_revisions(self, task_run_id):
         return load_records(self, "d8_conclusion_revisions", task_run_id)
 
+    def list_d8_decisions(self, task_run_id):
+        return load_records(self, "d8_decisions", task_run_id)
+
     def list_d8_capacities(self, task_run_id):
         return load_records(self, "d8_capacity_versions", task_run_id)
 
@@ -4403,7 +4517,7 @@ class SqliteControlStore:
             config = self.load_d3_run_config(start.task_run_id)
             task = self.load_task_run(start.task_run_id)
             latest = self._connection.execute("SELECT MAX(sequence) FROM checkpoints WHERE task_run_id=?", (start.task_run_id,)).fetchone()[0]
-            if (config is None or config.contract_version not in {3, 4} or task.status is not TaskRunStatus.RUNNING
+            if (config is None or config.contract_version not in {3, 4, 5, 6} or task.status is not TaskRunStatus.RUNNING
                     or latest != start.checkpoint_sequence or not task.started_at <= start.started_at < task.deadline_at
                     or self._now() >= task.deadline_at or self.list_d4_unresolved_operations(start.task_run_id)
                     or self._connection.execute("SELECT 1 FROM d4_audit_events WHERE task_run_id=? AND category='cancellation_requested'", (start.task_run_id,)).fetchone()):
@@ -4510,7 +4624,7 @@ class SqliteControlStore:
             "append_d8_conclusion",
             "finish_task_run", "register_d3_turn", "select_d3_intent",
             "apply_d3_review", "register_d3_plan", "replan_d3_plan",
-            "complete_d3_plan", "complete_d3_intent", "switch_d3_intent",
+            "complete_d3_plan", "complete_d3_intent", "switch_d3_intent", "abandon_d8_intent",
             "complete_d3_turn", "advance_d3_turn", "exhaust_d3_turn",
             "append_plan_validation_record", "create_execution", "start_execution",
             "complete_execution", "finish_d3_execution",
@@ -4726,6 +4840,8 @@ class SqliteControlStore:
             ("complete_d3_turn", "intent", "skipped"): "turn_goal_satisfied",
             ("switch_d3_intent", "intent", "abandoned"): "strategy_abandoned",
             ("switch_d3_intent", "plan", "superseded"): "sibling_switch",
+            ("abandon_d8_intent", "intent", "abandoned"): "strategy_abandoned",
+            ("abandon_d8_intent", "plan", "superseded"): "sibling_switch",
             ("advance_d3_turn", "turn", "superseded"): "turn_target_adjusted",
             ("advance_d3_turn", "intent", "abandoned"): "turn_target_adjusted",
             ("advance_d3_turn", "intent", "skipped"): "turn_target_adjusted",
@@ -4791,12 +4907,12 @@ class SqliteControlStore:
                 (IntentStatus.PENDING, IntentStatus.RUNNING): {"select_d3_intent", "switch_d3_intent"},
                 (IntentStatus.PENDING, IntentStatus.SKIPPED): {"complete_d3_turn", "advance_d3_turn"},
                 (IntentStatus.RUNNING, IntentStatus.SUCCEEDED): {"complete_d3_intent"},
-                (IntentStatus.RUNNING, IntentStatus.ABANDONED): {"switch_d3_intent", "advance_d3_turn"},
+                (IntentStatus.RUNNING, IntentStatus.ABANDONED): {"switch_d3_intent", "advance_d3_turn", "abandon_d8_intent"},
             },
             "plan": {
                 (PlanStatus.RUNNING, PlanStatus.COMPLETED): {"complete_d3_plan"},
                 (PlanStatus.RUNNING, PlanStatus.SUPERSEDED): {
-                    "replan_d3_plan", "switch_d3_intent", "advance_d3_turn",
+                    "replan_d3_plan", "switch_d3_intent", "advance_d3_turn", "abandon_d8_intent",
                 },
             },
         }
@@ -4814,7 +4930,7 @@ class SqliteControlStore:
                 ):
                     raise StorageError(f"D3 {kind} state transition is not admitted")
         config = self.load_d3_run_config(mutation.task_run_id)
-        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1 and config.contract_version not in {3, 4}:
+        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1 and config.contract_version not in {3, 4, 5, 6}:
             raise StorageError("D3 may run only one Turn")
         if sum(item.status is IntentStatus.RUNNING for item in after.intents) > 1:
             raise StorageError("D3 may run only one Intent")
@@ -4865,7 +4981,7 @@ class SqliteControlStore:
             }
             if set(status_changes) != expected or len(status_changes) != len(expected):
                 raise StorageError("D3 first selection must change only its Turn and Intent")
-        if mutation.operation == "switch_d3_intent":
+        if mutation.operation in {"switch_d3_intent", "abandon_d8_intent"}:
             old_active = [
                 item for item in before.intents if item.status is IntentStatus.RUNNING
             ]
@@ -4878,16 +4994,16 @@ class SqliteControlStore:
                 and item.status is IntentStatus.PENDING
             ]
             if (
-                len(old_active) != 1 or len(new_active) != 1
-                or not pending
-                or new_active[0].turn_id != old_active[0].turn_id
+                len(old_active) != 1
+                or mutation.operation == "abandon_d8_intent" and (config.contract_version not in {5, 6} or pending or new_active)
+                or mutation.operation == "switch_d3_intent" and (not pending or len(new_active) != 1)
+                or pending and new_active[0].turn_id != old_active[0].turn_id
                 or new_intents[old_active[0].intent_id].status is not IntentStatus.ABANDONED
-                or new_active[0].priority != min(item.priority for item in pending)
+                or pending and new_active[0].priority != min(item.priority for item in pending)
             ):
                 raise StorageError("D3 sibling switch must choose the highest-priority untried Intent")
             expected = {
                 ("intent", old_active[0].intent_id, IntentStatus.ABANDONED),
-                ("intent", new_active[0].intent_id, IntentStatus.RUNNING),
                 *(
                     ("plan", item.plan_id, PlanStatus.SUPERSEDED)
                     for item in before.plans
@@ -4895,6 +5011,8 @@ class SqliteControlStore:
                     and item.status is PlanStatus.RUNNING
                 ),
             }
+            if new_active:
+                expected.add(("intent", new_active[0].intent_id, IntentStatus.RUNNING))
             if set(status_changes) != expected or len(status_changes) != len(expected):
                 raise StorageError("D3 sibling switch must close old running Plans")
         if mutation.operation == "advance_d3_turn":

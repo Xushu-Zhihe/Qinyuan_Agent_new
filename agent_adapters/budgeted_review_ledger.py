@@ -49,6 +49,24 @@ class D4ReviewLedger(FileD2ReviewLedger):
         self.budget = config.d4_budget
         self.clock = clock
         self.request_capacity_check = None
+        self.output_boundary = None
+
+    def read_root(self, review_root_id):
+        root = super().read_root(review_root_id)
+        if (self.output_boundary is not None and root is not None
+                and root.get("last_outcome") == "started"):
+            value = root["last_request"]
+            request = D2ReviewRequest(**{**value, "source_versions": tuple(value["source_versions"])})
+            failure = self.output_boundary.failure(request)
+            if failure is not None:
+                terminal = failure["terminal"]
+                outcome = "provider_failure" if terminal else "invalid_response"
+                reason = "d8_" + terminal if terminal else "d8_output_format_invalid"
+                self.finish_attempt(request, outcome=outcome,
+                    response={"kind": outcome, "reason": reason, "provider_request_id": None},
+                    provider_request_id=None, reason=reason)
+                root = super().read_root(review_root_id)
+        return root
 
     @staticmethod
     def _items(root: dict[str, object] | None, key: str) -> tuple[dict, ...]:
@@ -304,6 +322,10 @@ class D4ReviewLedger(FileD2ReviewLedger):
                 self._drop_pending_request(request)
                 call = no_dispatch
                 request_payload = call.get("request")
+            if call.get("outcome") in {"started", "unknown"}:
+                if self.output_boundary is not None and call.get("outcome") == "started":
+                    root = self.read_root(request_payload["review_root_id"])
+                    call = next(i for i in self._items(root, "calls") if i["review_id"] == record.start.operation_id)
             if call.get("outcome") in {"started", "unknown"}:
                 if record.completion is not None:
                     raise D4RecoveryRequired("d4_review_outcome_changed")

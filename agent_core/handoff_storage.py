@@ -5,6 +5,7 @@ from dataclasses import asdict
 
 from agent_core.handoff_contracts import D8Capacity, D8CapacityVersion, D8HandoffVersion, D8TreeRecord
 from agent_core.conclusion_revision_contracts import D8RevisionRecord
+from agent_core.session_contracts import D8DecisionRecord
 
 D8_HANDOFF_SCHEMA = """
 CREATE TABLE d8_handoff_versions (
@@ -37,19 +38,29 @@ CREATE TABLE d8_conclusion_revisions (
  UNIQUE(task_run_id, sequence));
 """
 
-D8_CHANGES = (D8HandoffVersion, D8CapacityVersion, D8TreeRecord, D8RevisionRecord)
+D8_SESSION_SCHEMA = """
+CREATE TABLE d8_decisions (
+ record_id TEXT PRIMARY KEY, task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+ intent_id TEXT NOT NULL REFERENCES intents(intent_id), ordinal INTEGER NOT NULL,
+ root_request_id TEXT NOT NULL, metadata_json TEXT NOT NULL, event_sequence INTEGER NOT NULL,
+ UNIQUE(intent_id, ordinal), UNIQUE(task_run_id, root_request_id));
+"""
+
+D8_CHANGES = (D8HandoffVersion, D8CapacityVersion, D8TreeRecord, D8RevisionRecord, D8DecisionRecord)
 D8_OPERATIONS = {"append_d8_handoff", "append_d8_capacity", "register_d8_tree_turn",
                  "select_d8_tree_intent", "evaluate_d8_tree_intent", "exhaust_d8_expansion",
-                 "exhaust_d8_tree_turn", "append_d8_revision"}
+                 "exhaust_d8_tree_turn", "append_d8_revision", "append_d8_decision"}
 
 
 def load_records(store, table, task_id):
-    if store._schema_version < (25 if table == "d8_conclusion_revisions" else 24):
+    minimum = 26 if table == "d8_decisions" else 25 if table == "d8_conclusion_revisions" else 24
+    if store._schema_version < minimum:
         return ()
     rows = store._connection.execute(
         f"SELECT metadata_json FROM {table} WHERE task_run_id=? ORDER BY event_sequence", (task_id,))
     classes = {"d8_handoff_versions": D8HandoffVersion, "d8_capacity_versions": D8CapacityVersion,
-               "d8_tree_records": D8TreeRecord, "d8_conclusion_revisions": D8RevisionRecord}
+               "d8_tree_records": D8TreeRecord, "d8_conclusion_revisions": D8RevisionRecord,
+               "d8_decisions": D8DecisionRecord}
     result = []
     for row in rows:
         value = json.loads(row[0])
@@ -75,15 +86,25 @@ def validate_handoff_mutation(store, mutation):
             raise StorageError("D8-2 metadata requires its dedicated operation")
         return False
     config = store.load_d3_run_config(mutation.task_run_id)
-    if config is None or config.contract_version not in {3, 4} or len(records) != 1:
+    if config is None or config.contract_version not in {3, 4, 5, 6} or len(records) != 1:
         raise StorageError("D8-2 requires its explicit internal contract")
     record = records[0]
     if record.task_run_id != mutation.task_run_id:
         raise StorageError("D8-2 cross-task metadata rejected")
+    if isinstance(record, D8DecisionRecord):
+        prior = [i for i in store.list_d8_decisions(record.task_run_id) if i.intent_id == record.intent_id]
+        rows = store.load_control_state_rows(record.task_run_id)
+        owner = next((i for i in rows.intents if i.intent_id == record.intent_id), None)
+        if (config.contract_version not in {5, 6} or mutation.operation != "append_d8_decision"
+                or len(mutation.state_changes) != 1 or owner is None or owner.turn_id != record.turn_id
+                or record.ordinal != len(prior) + 1
+                or any(i.root_request_id == record.root_request_id for i in prior)):
+            raise StorageError("D8-4 decision ownership or append relation changed")
+        return True
     if any(not isinstance(c, (UpsertTurn, UpsertIntent, *D8_CHANGES)) for c in mutation.state_changes):
         raise StorageError("D8-2 transition cannot change other control objects")
     if isinstance(record, D8RevisionRecord):
-        if (config.contract_version != 4 or mutation.operation != "append_d8_revision"
+        if (config.contract_version not in {4, 5, 6} or mutation.operation != "append_d8_revision"
                 or len(mutation.state_changes) != 1
                 or record.sequence != len(store.list_d8_revisions(record.task_run_id)) + 1):
             raise StorageError("D8-3 revision requires its append-only contract")
@@ -246,3 +267,7 @@ def save_handoff_mutation(store, mutation, sequence):
                 if store.load_d3_operation(request_id) is not None:
                     store._connection.execute("UPDATE d3_operations SET application_ref=? WHERE operation_id=?",
                                               (record.record_id, request_id))
+        elif isinstance(record, D8DecisionRecord):
+            store._connection.execute("INSERT INTO d8_decisions VALUES (?,?,?,?,?,?,?)",
+                                      (record.record_id, record.task_run_id, record.intent_id,
+                                       record.ordinal, record.root_request_id, metadata, sequence))

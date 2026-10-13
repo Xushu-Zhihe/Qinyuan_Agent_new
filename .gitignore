@@ -41,6 +41,8 @@ tests
 !/tests/
 /tests/*
 !/tests/test_d8_revisions.py
+!/tests/test_d8_sessions.py
+!/tests/test_d8_output.py
 !/tests/test_t5_cli.py
 !/tests/test_t5_adapters.py
 !/tests/test_t5_recovery.py
@@ -117,3 +119,19 @@ Qinyuan_Agent_dual_llm_flow.svg
 TODO.md
 .uv-cache
 Plan
+
+# Local analysis and test caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+
+# Coverage reports
+/.coverage
+/.coverage.*
+/coverage.xml
+/htmlcov/
+
+# Local environment overrides
+.env.local
+.env.*.local
