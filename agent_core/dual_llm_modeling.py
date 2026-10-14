@@ -521,7 +521,7 @@ class D3AuditedModel:
     def _parse(self, request: D3ModelRequest, raw: object):
         if request.stage == "outer_turn":
             return parse_d3_turn_proposal(raw)
-        if self.config.contract_version in {4, 5, 6}:
+        if self.config.contract_version in {4, 5, 6, 7}:
             from agent_core.conclusion_revision_contracts import D8ConclusionChange
             try:
                 change = D8ConclusionChange.parse_action(raw)
@@ -530,7 +530,7 @@ class D3AuditedModel:
             if change is not None:
                 return change
         if request.stage == "inner_plan":
-            if self.config.contract_version in {3, 4, 5, 6}:
+            if self.config.contract_version in {3, 4, 5, 6, 7}:
                 try:
                     read = D8HistoryReadAction.parse(raw)
                 except (ValueError, TypeError) as exc:
@@ -538,13 +538,13 @@ class D3AuditedModel:
                 if read is not None:
                     return read
             return parse_d3_plan_proposal(raw)
-        if self.config.contract_version in {5, 6} and request.stage == "inner_complete":
+        if self.config.contract_version in {5, 6, 7} and request.stage == "inner_complete":
             from agent_core.sessions import IntentSessions
             return parse_session_completion(raw, IntentSessions.visible(request))
         return parse_d3_action(raw, request.stage)
 
     def _check(self, request: D3ModelRequest) -> None:
-        if self.config.contract_version == 6 and self.output_boundary is None:
+        if self.config.contract_version in {6, 7} and self.output_boundary is None:
             raise D3RecoveryRequired("d8_output_boundary_required")
         expected = (
             self.config.outer_role
@@ -1044,7 +1044,7 @@ class D3AuditedModel:
                     "accepted", "invalid_structure", "rejected", "model_error", "stale"
                 ] = "accepted"
                 reason = None
-                change_response = (self.config.contract_version in {4, 5, 6} and isinstance(raw, dict)
+                change_response = (self.config.contract_version in {4, 5, 6, 7} and isinstance(raw, dict)
                                    and raw.get("kind") == "conclusion_change")
                 if change_response and self.change_response_sensitive is not None and self.change_response_sensitive(raw):
                     raw = None

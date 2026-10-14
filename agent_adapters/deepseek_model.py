@@ -242,6 +242,7 @@ def build_payload(request, settings):
 def _http_worker(
     connection, settings, payload, timeout,
     max_response_bytes=MAX_RESPONSE_BYTES,
+    preserve_content=False,
 ):
     """Never print or transmit raw errors/credentials through the result channel."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -324,6 +325,19 @@ def _http_worker(
             return
         if message.get("refusal"):
             connection.send({"error": "refused", "reason": "provider_refused"})
+            return
+        if preserve_content:
+            finish = choice.get("finish_reason")
+            content = message.get("content")
+            if not isinstance(finish, str) or not finish:
+                connection.send({"error": "invalid_response", "reason": "provider_envelope_invalid"})
+                return
+            if not isinstance(content, str) and not (finish != "stop" and content is None):
+                connection.send({"error": "invalid_response", "reason": "provider_content_invalid"})
+                return
+            # Do not parse, repair, or persist content or reasoning here. D8 owns
+            # the strict content boundary and completion-reason handling.
+            connection.send({"payload": {"content": content or "", "finish_reason": finish}})
             return
         if choice.get("finish_reason") != "stop":
             _invalid_provider_payload(

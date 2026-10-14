@@ -109,6 +109,8 @@ tests
 !/tests/test_d6_transfer.py
 !/tests/test_d6_sensitive_evidence.py
 !/tests/test_d9_public.py
+!/tests/test_d9_models.py
+!/tests/test_d9_business_diagnostics.py
 Architecture.md
 interface.md
 protocol.md

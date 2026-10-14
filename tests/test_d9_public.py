@@ -87,11 +87,10 @@ def test_zero_input_is_unverified_and_cleaned(tmp_path, monkeypatch):
     assert result["run_exit_code"] == 4
 
 
-def test_real_is_rejected_without_creating_state(tmp_path, monkeypatch):
-    result, args = start(tmp_path, monkeypatch, request(tmp_path, mode="real"))
-    assert result["errors"] == [{"code": "capability_not_supported"}]
-    assert result["task_run_id"] is None and result["exit_code"] == 2
-    assert not args.state_dir.exists()
+def test_real_rejects_fake_configuration(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="invalid_d8_configuration"):
+        start(tmp_path, monkeypatch, request(tmp_path, mode="real"))
+    assert not (tmp_path / "state").exists()
 
 
 @pytest.mark.parametrize("field", ["mode", "d8_config", "dual_llm_config"])
@@ -117,7 +116,8 @@ def test_workbench_requires_mode_before_spawning(tmp_path, monkeypatch):
                         lambda *a, **k: pytest.fail("rejected mode spawned a process"))
     with pytest.raises(WorkbenchError, match="mode_required"):
         workbench.runner.start(challenge["id"])
-    with pytest.raises(WorkbenchError, match="capability_not_supported"):
+    monkeypatch.setattr("agent_adapters.workbench_runner.D7_ENV_FILE", tmp_path / "missing.env")
+    with pytest.raises(WorkbenchError, match="d8_model_configuration_unavailable"):
         workbench.runner.start(challenge["id"], mode="real")
     assert not list(workbench.root.glob("runs/*"))
 
@@ -139,7 +139,8 @@ def test_workbench_child_process_uses_d8_and_can_cancel(tmp_path):
 
 
 @pytest.mark.parametrize(("extra", "protocol", "profile", "mode"), [
-    ([], 3, "d8_v6", None),
+    ([], 3, "d8_v7", None),
+    (["--execution-profile", "d8_v6"], 3, "d8_v6", None),
     (["--execution-profile", "d7", "--d7-mode", "simulated"], 3, "d7", "simulated"),
     (["--protocol-version", "2"], 2, "d7", "simulated"),
 ])
@@ -264,11 +265,12 @@ def test_http_mode_contract_and_page_control(tmp_path):
             with urllib.request.urlopen(origin + "/api/health") as response:
                 health = json.load(response)["capabilities"]
             assert health["contract_version"] == 6
-            assert health["mode_selection_required"] and not health["real_supported"]
+            assert health["mode_selection_required"] and health["real_supported"]
+            assert health["real_sandbox_backend"] == "local_simulated"
             with urllib.request.urlopen(origin + "/") as response:
                 page = response.read().decode("utf-8")
             assert 'id="run-mode"' in page and '<option value="">' in page
-            for body, code in [({}, "mode_required"), ({"mode": "real"}, "capability_not_supported")]:
+            for body, code in [({}, "mode_required")]:
                 call = urllib.request.Request(origin + f"/api/challenges/{challenge['id']}/run",
                                               data=json.dumps(body).encode(),
                                               headers={"Content-Type": "application/json"})

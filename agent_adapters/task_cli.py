@@ -44,6 +44,12 @@ def _dispatch_v3_run_task(args, raw):
         request, _ = parse_request(raw)
     else:
         request = V3SimulationRequest.parse(raw)
+    d8_real = raw.get("execution_profile") in {"d8_v6", "d8_v7"} and raw.get("mode") == "real"
+    env_file = None
+    if d8_real:
+        from agent_adapters.d8_model import settings_from_file
+        if getattr(args, "fixture", None):
+            raise ValueError("fixture_forbidden_in_real_mode")
     state_dir = Path(args.state_dir).resolve()
     stager = D7RequestStager(state_dir, clock=time.time)
     stage = stager.stage(
@@ -136,6 +142,10 @@ def _dispatch_v3_run_task(args, raw):
             "task_run_id": None,
         }
 
+    if d8_real:
+        env_file = Path(args.env_file).resolve()
+        settings_from_file(request.outer_role, env_file)
+        settings_from_file(request.inner_role, env_file)
     task_id = str(uuid4())
     directory = run_path(state_dir, task_id)
     directory.mkdir(parents=True, exist_ok=False)
@@ -150,7 +160,7 @@ def _dispatch_v3_run_task(args, raw):
         "protocol_version": 3,
         "task_run_id": task_id,
         "request_id": request.request_id,
-        "mode": "simulated",
+        "mode": "real" if d8_real else "simulated",
         "request": raw,
         "source_root": str(directory.resolve()),
         "staged_attachment_paths": staged_paths,
@@ -165,8 +175,14 @@ def _dispatch_v3_run_task(args, raw):
         "ids": {"start": str(uuid4()), "cancel": str(uuid4())},
     }
     if "execution_profile" in raw:
-        declaration.update(execution_profile="d8_v6", contract_version=6)
+        declaration.update(execution_profile=raw["execution_profile"],
+                           contract_version=7 if raw["execution_profile"] == "d8_v7" else 6)
         declaration["capabilities"] = ["attachment_digest_only", "d8_simulation"]
+    if d8_real:
+        from agent_adapters.d8_simulation import real_declaration_binding
+        declaration.update(env_file=str(env_file), sandbox_backend="local_simulated")
+        declaration["capabilities"] = ["attachment_digest_only", "d8_real_models", "local_simulated_sandbox"]
+        immutable_write(directory / "d8-runtime.json", real_declaration_binding(declaration))
     immutable_write(directory / "run.json", declaration)
     receipt = stager.record_outcome(
         request.request_id,
@@ -178,7 +194,7 @@ def _dispatch_v3_run_task(args, raw):
             directory, declaration, operation="start", events=args.events
         )
     except Exception as exc:  # noqa: BLE001 -- sanitized persisted run boundary
-        error_code = ("d8_simulation_start_failed" if "execution_profile" in raw
+        error_code = ("d8_real_start_failed" if d8_real else "d8_simulation_start_failed" if "execution_profile" in raw
                       else "d7_simulation_start_failed")
         immutable_write(
             directory / ("dispatch-stop-" + str(uuid4()) + ".json"),
@@ -571,11 +587,6 @@ def dispatch_run_task(args):
                 parse_request(raw)
                 if raw["mode"] != args.mode:
                     raise ValueError("d8_mode_mismatch")
-                if raw["mode"] == "real":
-                    return {"protocol_version": 3, "execution_profile": "d8_v6",
-                            "contract_version": 6, "mode": "real", "task_run_id": None,
-                            "request_id": raw["request_id"],
-                            "errors": [{"code": "capability_not_supported"}], "exit_code": 2}
                 return _dispatch_v3_run_task(args, raw)
             if args.mode == "real":
                 return _dispatch_v3_real_run_task(args, raw)
@@ -803,7 +814,7 @@ def dispatch_v3_existing(args, directory: Path, declaration: dict):
             return operation_result(result)
         if operation == "cleanup" and result.get("cleanup_status") == "confirmed":
             return operation_result(result)
-        if declaration.get("mode") == "real":
+        if declaration.get("mode") == "real" and declaration.get("execution_profile") not in {"d8_v6", "d8_v7"}:
             if getattr(args, "authorization", None) or getattr(args, "fixture", None):
                 raise ValueError("v3_real_recovery_uses_persisted_configuration")
             try:

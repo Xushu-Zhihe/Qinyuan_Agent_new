@@ -4,4 +4,4 @@ from agent_adapters.handoff_evidence import FileD8HandoffEvidence
 
 
 class FileD8OutputEvidence(FileD8HandoffEvidence):
-    KINDS = {"contract", "diagnostic", "review-root"}
+    KINDS = {"contract", "diagnostic", "review-root", "business-diagnostic"}

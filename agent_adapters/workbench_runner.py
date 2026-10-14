@@ -148,13 +148,19 @@ class Runner:
             raise WorkbenchError("challenge_description_required_for_run", 409)
         attachments = challenge["attachments"]
         d7_model = None
-        if self.workbench.execution_profile == "d8_v6":
+        if self.workbench.execution_profile in {"d8_v6", "d8_v7"}:
             if mode not in {"simulated", "real"}:
                 raise WorkbenchError("mode_required", 409)
             if mode == "real":
-                raise WorkbenchError("capability_not_supported", 409)
+                from agent_adapters.d8_model import role_config, settings_from_file
+                try:
+                    prompt_version = 2 if self.workbench.execution_profile == "d8_v7" else 1
+                    settings_from_file(role_config("outer_planning", version=prompt_version), D7_ENV_FILE)
+                    settings_from_file(role_config("inner_action", version=prompt_version), D7_ENV_FILE)
+                except (TypeError, ValueError, OSError):
+                    raise WorkbenchError("d8_model_configuration_unavailable", 409) from None
         if self.workbench.protocol_version == 3:
-            if mode == "simulated" or self.workbench.d7_mode == "simulated":
+            if self.workbench.execution_profile in {"d8_v6", "d8_v7"} or mode == "simulated" or self.workbench.d7_mode == "simulated":
                 if challenge["endpoint"]:
                     raise WorkbenchError("v3_network_not_supported", 409)
             else:
@@ -178,7 +184,7 @@ class Runner:
     def start(self, challenge_id: str, *, mode=None):
         with self.workbench.lock:
             challenge = self.workbench.get(challenge_id)
-            if self.workbench.execution_profile == "d8_v6":
+            if self.workbench.execution_profile in {"d8_v6", "d8_v7"}:
                 if mode is not None and mode not in {"simulated", "real"}:
                     raise WorkbenchError("mode_required", 409)
                 if (mode is not None and self.workbench.d7_mode is not None
@@ -204,7 +210,7 @@ class Runner:
                     raise WorkbenchError("attachment_path_rejected", 409)
                 shutil.copyfile(source, target)
 
-            if self.workbench.protocol_version == 3 and mode == "simulated":
+            if self.workbench.protocol_version == 3 and (mode == "simulated" or self.workbench.execution_profile in {"d8_v6", "d8_v7"}):
                 # Temporary D7 simulation envelope.  It intentionally has no
                 # endpoint/network capability and uses deterministic local
                 # role snapshots; the child remains the sole scheduler.
@@ -250,15 +256,22 @@ class Runner:
                         },
                     },
                 }
-                if self.workbench.execution_profile == "d8_v6":
+                if self.workbench.execution_profile in {"d8_v6", "d8_v7"}:
                     from agent_adapters.d8_simulation import simulation_config
                     from agent_core.operation_accounting import D8HandoffBudgetPolicy
-                    request.update(execution_profile="d8_v6", mode=mode,
+                    request.update(execution_profile=self.workbench.execution_profile, mode=mode,
                                    d8_config=simulation_config())
                     request["dual_llm_config"]["d4_budget"] = asdict(D8HandoffBudgetPolicy())
                     for role, value in (("outer", role_outer), ("inner", role_inner)):
                         value["model"] = f"d8-simulated-{role}"
-                        value["prompt_template"] = f"d8-simulated-{role}-v1"
+                        value["prompt_template"] = f"d8-simulated-{role}-v{2 if self.workbench.execution_profile == 'd8_v7' else 1}"
+                    if mode == "real":
+                        from agent_adapters.d8_simulation import real_config
+                        from agent_adapters.d8_model import role_config
+                        request["d8_config"] = real_config()
+                        prompt_version = 2 if self.workbench.execution_profile == "d8_v7" else 1
+                        request["dual_llm_config"]["outer_role"] = asdict(role_config("outer_planning", version=prompt_version))
+                        request["dual_llm_config"]["inner_role"] = asdict(role_config("inner_action", version=prompt_version))
             elif self.workbench.protocol_version == 3:
                 origin = canonical_web_origin(challenge["endpoint"])
                 role_outer = {

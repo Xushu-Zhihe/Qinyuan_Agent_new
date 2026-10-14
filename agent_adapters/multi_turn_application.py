@@ -337,7 +337,7 @@ class D3Application:
             D5RedactingModel(
                 inner_model, self.redactor, enabled=config.d5_enabled,
                 configured=self._redaction_configured,
-                preserve_conclusion_change=config.contract_version in {4, 5, 6},
+                preserve_conclusion_change=config.contract_version in {4, 5, 6, 7},
             ),
             config,
             clock,
@@ -359,7 +359,7 @@ class D3Application:
         self.revisions = None
         self.sessions = None
         self._restricted_progress = False
-        if config.contract_version in {3, 4, 5, 6}:
+        if config.contract_version in {3, 4, 5, 6, 7}:
             from agent_core.handoff import HandoffContext
             from agent_adapters.handoff_evidence import FileD8HandoffEvidence
             if capacity_port is None:
@@ -377,11 +377,11 @@ class D3Application:
             self.review_ledger.request_capacity_check = self.handoff.check_role_request_capacity
             self.conclusions.request_capacity_check = self.handoff.check_role_request_capacity
             self.refinement.request_capacity_check = self.handoff.check_role_request_capacity
-            if config.contract_version in {4, 5, 6}:
+            if config.contract_version in {4, 5, 6, 7}:
                 from agent_core.conclusion_revisions import ConclusionRevisions
                 self.revisions = ConclusionRevisions(self, FileD8HandoffEvidence(directory / "d8-revisions"))
                 self.inner.change_response_sensitive = self.conclusions._sensitive
-            if config.contract_version in {5, 6}:
+            if config.contract_version in {5, 6, 7}:
                 from agent_core.sessions import IntentSessions
                 self.sessions = IntentSessions(self, FileD8HandoffEvidence(directory / "d8-sessions"))
                 self.inner.request_capacity_check = self.sessions.freeze
@@ -402,10 +402,15 @@ class D3Application:
         )
         self.review_call = _D3ReviewCall(self)
         self.output_boundary = None
-        if config.contract_version == 6:
+        self.business_diagnostics = None
+        if config.contract_version in {6, 7}:
             from agent_core.structured_output import StructuredOutput, StructuredModel
             from agent_adapters.output_evidence import FileD8OutputEvidence
             self.output_boundary = StructuredOutput(self, FileD8OutputEvidence(directory / "d8-output"))
+            if config.contract_version == 7:
+                from agent_core.business_diagnostics import BusinessDiagnostics
+                self.business_diagnostics = BusinessDiagnostics(
+                    config, self.output_boundary.evidence, self.handoff.evidence, self.store)
             adapters = (self.outer.adapter, self.inner.adapter, self.review_model,
                         self.conclusions.inner_model, self.conclusions.outer_model,
                         self.refinement.adapter, self.handoff.model.adapter)
@@ -544,6 +549,8 @@ class D3Application:
             return
         if self.output_boundary is not None:
             self.output_boundary.reconcile_formats()
+        if self.business_diagnostics is not None:
+            self.handoff.reconcile()
         task_run_id = self.state.task_run.task_run_id
         self.store.reconcile_d4_control_commit_audit(task_run_id)
         if self.conclusions is not None:
@@ -909,7 +916,7 @@ class D3Application:
         try:
             state = self.state
         except StorageError:
-            if self.config.contract_version not in {5, 6} or not recovery_required or self._bound_task_run_id is None:
+            if self.config.contract_version not in {5, 6, 7} or not recovery_required or self._bound_task_run_id is None:
                 raise
             state = self.store.load_control_state_rows(self._bound_task_run_id)
             if state is None or state.task_run.task_run_id != self._bound_task_run_id:

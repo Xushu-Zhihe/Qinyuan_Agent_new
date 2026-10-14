@@ -107,11 +107,11 @@ class D3EvidenceValidator:
             raise D3RecoveryRequired("d3_model_proposal_evidence_unavailable")
         if stage == "outer_turn":
             return parse_d3_turn_proposal(evidence.raw)
-        if config.contract_version in {4, 5, 6} and operation.application_ref is None:
+        if config.contract_version in {4, 5, 6, 7} and operation.application_ref is None:
             self.handoff.app.revisions.validate_frozen_execution(request_id)
         if stage == "inner_plan":
             return parse_d3_plan_proposal(evidence.raw)
-        if config.contract_version in {5, 6} and stage == "inner_complete":
+        if config.contract_version in {5, 6, 7} and stage == "inner_complete":
             from agent_core.dual_llm_modeling import parse_session_completion
             sessions = self.handoff.app.sessions
             snapshot = sessions.evidence.read("request", request_id)
@@ -124,7 +124,7 @@ class D3EvidenceValidator:
         base_id = stable_id(task_run_id, f"d3/action/{plan_id}/{stage}")
         correction_id = stable_id(task_run_id, f"d3/{base_id}/correction")
         config = self.ledger.load_d3_run_config(task_run_id)
-        if config is not None and config.contract_version in {4, 5, 6}:
+        if config is not None and config.contract_version in {4, 5, 6, 7}:
             operations = [r for r in self.ledger.list_d3_operations(task_run_id)
                           if r.start.resource_ref == f"{plan_id}:{stage}"
                           and (e := self.models.read(r.start.operation_id)) is not None
@@ -196,7 +196,7 @@ class D3EvidenceValidator:
         ):
             raise D3RecoveryRequired("d3_review_action_owner_changed")
         proposal = (self._known_model(task_run_id, request_id, stage)
-                    if config.contract_version in {5, 6} and stage == "inner_complete"
+                    if config.contract_version in {5, 6, 7} and stage == "inner_complete"
                     else parse_d3_action(evidence.raw, stage))
         if (
             not proposal.review_requested
@@ -220,7 +220,7 @@ class D3EvidenceValidator:
         fields["source_versions"] = tuple(fields["source_versions"])
         request = D2ReviewRequest(**fields)
         config = self.ledger.load_d3_run_config(task_run_id)
-        if config is not None and config.contract_version in {5, 6}:
+        if config is not None and config.contract_version in {5, 6, 7}:
             import json
             context = json.loads(request.context_summary)
             context.pop("checkpoint", None)
@@ -1010,7 +1010,7 @@ class D3EvidenceValidator:
         if output.decision == "switch_sibling_intent" and not any(
             item.turn_id == turn.turn_id and item.status is IntentStatus.PENDING
             for item in state.intents
-        ) and not (self.ledger.load_d3_run_config(mutation.task_run_id).contract_version in {5, 6}
+        ) and not (self.ledger.load_d3_run_config(mutation.task_run_id).contract_version in {5, 6, 7}
                    and getattr(getattr(output, "progress", None), "classification", None) == "repetitive"):
             raise ValueError("d3_no_sibling_candidate")
         if output.decision == "replan_current_intent":

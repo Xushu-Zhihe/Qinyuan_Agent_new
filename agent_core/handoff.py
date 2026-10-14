@@ -389,6 +389,10 @@ class HandoffContext:
                 or call.start.role_config_ref != request.role_config_ref):
             raise D3RecoveryRequired("d8_call_binding_changed")
         if result is None:
+            if self.app.business_diagnostics is not None and request.stage == "tree_planning":
+                # Reject ambiguous/corrupt diagnostic evidence before repairing
+                # any result file, including the older format-diagnostic path.
+                self.app.business_diagnostics.read(request.model_request_id, check_operation=True)
             failure = self.app.output_boundary.failure(request) if self.app.output_boundary is not None else None
             if failure is not None:
                 result = {"model_request_id": request.model_request_id,
@@ -397,6 +401,11 @@ class HandoffContext:
                     "reason": "d8_output_contract_rejected", "rejected_candidate_indices": [],
                     "finished_at": failure["finished_at"]}
                 self.evidence.save("result", request.model_request_id, result)
+            elif self.app.business_diagnostics is not None and request.stage == "tree_planning":
+                diagnostic = self.app.business_diagnostics.read(request.model_request_id, check_operation=True)
+                if diagnostic is not None:
+                    result = self.app.business_diagnostics.rejected_result(request, diagnostic)
+                    self.evidence.save("result", request.model_request_id, result)
         if result is None:
             raise D3RecoveryRequired("d8_summary_or_planning_outcome_unknown")
         if (result.get("model_request_id") != request.model_request_id
@@ -409,6 +418,8 @@ class HandoffContext:
                 raise D3RecoveryRequired("d8_saved_summary_not_safe")
         elif result["raw"] is not None:
             raise D3RecoveryRequired("d8_invalid_result_contains_text")
+        if self.app.business_diagnostics is not None and request.stage == "tree_planning":
+            self.app.business_diagnostics.verify_result(request, result)
         completion = D4OperationCompletion(request.model_request_id, result["finished_at"],
                                           "completed" if result["outcome"] == "valid" else "rejected",
                                           request.model_request_id, conclusion_digest(result))
@@ -423,7 +434,9 @@ class HandoffContext:
             request = self.evidence.read("request", operation.start.operation_id)
             known_format = (self.app.output_boundary is not None
                             and self.app.output_boundary.diagnostic(operation.start.operation_id) is not None)
-            if request is not None and (self.evidence.read("result", operation.start.operation_id) is not None or known_format):
+            known_business = (self.app.business_diagnostics is not None
+                              and self.app.business_diagnostics.read(operation.start.operation_id, check_operation=True) is not None)
+            if request is not None and (self.evidence.read("result", operation.start.operation_id) is not None or known_format or known_business):
                 self._known_call(D8HandoffRequest.from_dict(request))
 
     def reconcile_review_operation(self, operation: D4OperationRecord) -> bool:
@@ -501,6 +514,7 @@ class HandoffContext:
                     "outer_planning", current.role_config_ref))
                 raw = await self.model._invoke(current, min(180., self.state.task_run.deadline_at - self.app.clock()), token)
                 outcome, reason, rejected_indices = "valid", None, []
+                business_issues = None
                 if isinstance(raw, ModelError):
                     if raw.kind in {ModelErrorKind.TIMED_OUT, ModelErrorKind.CANCELLED}:
                         raise D3RecoveryRequired("d8_model_outcome_unknown")
@@ -513,18 +527,29 @@ class HandoffContext:
                         if isinstance(parsed, D8PlanningResult):
                             rejected_indices = list(parsed.rejected_indices)
                     except (ValueError, TypeError, KeyError) as exc:
-                        outcome, reason, raw = "invalid", "d8_output_contract_rejected", None
+                        outcome, reason = "invalid", "d8_output_contract_rejected"
                         if isinstance(exc, D8DependencyCandidatesRejected):
                             reason = "d8_all_dependency_candidates_rejected"
                             rejected_indices = list(exc.indices)
+                        if (self.app.business_diagnostics is not None and current.stage == "tree_planning"
+                                and self.app.output_boundary.diagnostic(current.model_request_id) is None):
+                            from agent_core.business_diagnostics import planning_issues
+                            business_issues = planning_issues(current, raw, self.app.config.authorization,
+                                lambda item: self.app.revisions is None or self.app.revisions.reliable(item))
+                        raw = None
                         # Do not persist invalid raw responses or exceptions containing text.
                 if (token.is_cancelled or self.app.clock() >= self.state.task_run.deadline_at
                         or self.state.latest_checkpoint.sequence != current.base_checkpoint_sequence):
                     outcome, raw = "stale", None
+                finished_at = self.app.clock()
                 result = {"model_request_id": current.model_request_id,
                           "request_sha256": current.context_sha256, "outcome": outcome,
                           "raw": raw, "reason": reason, "rejected_candidate_indices": rejected_indices,
-                          "finished_at": self.app.clock()}
+                          "finished_at": finished_at}
+                if business_issues is not None and outcome == "invalid":
+                    business = self.app.business_diagnostics.save(
+                        current, business_issues, reason, rejected_indices, finished_at)
+                    result = self.app.business_diagnostics.rejected_result(current, business)
                 self.evidence.save("result", current.model_request_id, result)
                 result = self._known_call(current)
             if self.app.output_boundary is not None and result["outcome"] != "stale":
@@ -673,7 +698,7 @@ class HandoffContext:
     def validate_mutation(self, mutation, state):
         from agent_core.handoff_storage import D8_CHANGES
         records = [c for c in mutation.state_changes if isinstance(c, D8_CHANGES)]
-        if len(records) != 1 or self.app.config.contract_version not in {3, 4, 5, 6}:
+        if len(records) != 1 or self.app.config.contract_version not in {3, 4, 5, 6, 7}:
             raise D3RecoveryRequired("d8_handoff_mutation_not_enabled")
         record = records[0]
         from agent_core.session_contracts import D8DecisionRecord

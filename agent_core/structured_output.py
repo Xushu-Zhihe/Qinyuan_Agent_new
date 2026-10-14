@@ -58,13 +58,7 @@ class StructuredOutput:
             role_ref = request.attempt.role_config_ref
         if isinstance(request, D2ReviewRequest):
             role_ref = self.app.config.outer_role.role_config_ref
-        error = None
-        if correction is not None:
-            diagnostic = self.diagnostic(correction)
-            # Semantic retry uses a fixed instruction; never echo a model/error string.
-            error = {"correction_of_model_request_id": correction,
-                     "reason": "output_format_invalid" if diagnostic is not None else "proposal_rejected",
-                     "issues": diagnostic["issues"] if diagnostic is not None else []}
+        error = self._error(correction)
         instruction = _instruction(correction is not None)
         safe = self.app.redactor.redact_model_input(request)
         shape = {"version": 1, "stage": stage, "schema": schema}
@@ -74,7 +68,7 @@ class StructuredOutput:
                   "context_sha256": request.context_sha256, "role_config_ref": request.role_config_ref,
                   "correction_of_model_request_id": request.correction_of_model_request_id}
                  if isinstance(request, D3ModelRequest) else None)
-        return envelope, {"contract_version": 6, "model_request_id": identity,
+        return envelope, {"contract_version": self.app.config.contract_version, "model_request_id": identity,
             "task_run_id": task, "role_config_ref": role_ref, "stage": stage,
             "root_request_id": root, "correction_of_model_request_id": correction,
             "source_request_sha256": digest(asdict(request)),
@@ -83,6 +77,20 @@ class StructuredOutput:
             "complete_input_utf8_bytes": len(handoff_json(envelope).encode("utf-8")),
             "complete_input_unicode_characters": len(handoff_json(envelope)),
             "input_tokens": None, "model_audit": audit}
+
+    def _error(self, correction):
+        if correction is None:
+            return None
+        diagnostic = self.diagnostic(correction)
+        error = {"correction_of_model_request_id": correction,
+                 "reason": "output_format_invalid" if diagnostic is not None else "proposal_rejected",
+                 "issues": diagnostic["issues"] if diagnostic is not None else []}
+        if self.app.business_diagnostics is not None:
+            business = self.app.business_diagnostics.read(correction)
+            if business is not None:
+                error.update(reason="output_business_invalid", issues=business["issues"],
+                             business_diagnostic_version=1, business_diagnostic_sha256=digest(business))
+        return error
 
     def prepare(self, request):
         envelope, record = self._contract(request)
@@ -105,12 +113,7 @@ class StructuredOutput:
         if saved["output_contract"] != {"version": 1, "stage": stage, "schema": schema}:
             raise D3RecoveryRequired("d8_output_schema_changed")
         correction = saved["correction_of_model_request_id"]
-        expected_error = None
-        if correction is not None:
-            failure = self.diagnostic(correction)
-            expected_error = {"correction_of_model_request_id": correction,
-                "reason": "output_format_invalid" if failure is not None else "proposal_rejected",
-                "issues": failure["issues"] if failure is not None else []}
+        expected_error = self._error(correction)
         if saved["instruction"] != _instruction(correction is not None) or saved["correction"] != expected_error:
             raise D3RecoveryRequired("d8_output_frozen_description_changed")
         # Model workers read frozen files only; SQLite belongs to the dispatch thread.
@@ -137,7 +140,7 @@ class StructuredOutput:
         if (contract is None or set(result) != {"contract_version", "task_run_id", "model_request_id",
                 "root_request_id", "correction_of_model_request_id", "stage", "contract_sha256",
                 "terminal", "issues", "output_measurement", "finished_at"}
-                or result.get("contract_version") != 6 or result.get("model_request_id") != identity
+                or result.get("contract_version") != self.app.config.contract_version or result.get("model_request_id") != identity
                 or result.get("contract_sha256") != digest(contract)
                 or result.get("task_run_id") != contract["task_run_id"]
                 or result.get("stage") != contract["stage"]
@@ -240,7 +243,7 @@ class StructuredOutput:
         if not issues:
             return raw
         contract = self.evidence.read("contract", identity)
-        diagnostic = {"contract_version": 6, "task_run_id": task,
+        diagnostic = {"contract_version": self.app.config.contract_version, "task_run_id": task,
             "model_request_id": identity, "root_request_id": contract["root_request_id"],
             "correction_of_model_request_id": contract["correction_of_model_request_id"],
             "stage": contract["stage"], "contract_sha256": digest(contract),

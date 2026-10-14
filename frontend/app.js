@@ -106,7 +106,7 @@ async function refreshRun(id, selection = runSelection) {
 async function startRun() {
   const id = state.selected; if (!id) return;
   const options = { method: "POST" };
-  if (state.executionProfile === "d8_v6") {
+  if (["d8_v6", "d8_v7"].includes(state.executionProfile)) {
     const mode = $("run-mode").value;
     if (!mode) { notify("请先选择运行模式"); return; }
     options.body = JSON.stringify({ mode });
@@ -160,7 +160,7 @@ function syncRoute() {
   if (route === "#new") { resetForm(); showView("detail", false); return; }
   showView(route === "#model" ? "model" : "tasks", false);
 }
-async function health() { try { const value = await request("/api/health"); state.executionProfile = value.capabilities?.execution_profile; $("run-mode-control").hidden = state.executionProfile !== "d8_v6"; if (state.executionProfile === "d8_v6") { $("run-mode").value = value.capabilities.d7_mode || ""; $("run-mode").disabled = !!value.capabilities.d7_mode; } $("service-status").textContent = value.status === "ready" ? "服务已连接" : "服务状态异常"; $("connection-text").textContent = "回环服务"; } catch (_) { $("service-status").textContent = "服务未连接"; $("connection-text").textContent = "未连接"; } }
+async function health() { try { const value = await request("/api/health"); state.executionProfile = value.capabilities?.execution_profile; $("run-mode-control").hidden = !["d8_v6", "d8_v7"].includes(state.executionProfile); if (["d8_v6", "d8_v7"].includes(state.executionProfile)) { $("run-mode").value = value.capabilities.d7_mode || ""; $("run-mode").disabled = !!value.capabilities.d7_mode; } $("service-status").textContent = value.status === "ready" ? "服务已连接" : "服务状态异常"; $("connection-text").textContent = "回环服务"; } catch (_) { $("service-status").textContent = "服务未连接"; $("connection-text").textContent = "未连接"; } }
 function toggleTaskSelection(taskId) {
   if (state.selectedTasks.has(taskId)) {
     state.selectedTasks.delete(taskId);

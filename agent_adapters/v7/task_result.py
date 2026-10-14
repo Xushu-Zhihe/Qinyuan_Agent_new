@@ -415,15 +415,18 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                 and "execution_profile" not in declaration):
             raise ValueError("d8_frozen_configuration_mismatch")
         d8_unresolved = False
+        business_rows = []
         if "execution_profile" in declaration:
             from agent_adapters.d8_simulation import parse_request
             _, expected = parse_request(declaration["request"])
-            if (expected is None or declaration["execution_profile"] != "d8_v6"
-                    or declaration.get("contract_version") != 6
-                    or declaration.get("mode") != "simulated"
+            if (expected is None or declaration["execution_profile"] != declaration["request"]["execution_profile"]
+                    or declaration.get("contract_version") != expected.contract_version
                     or declaration.get("mode") != declaration["request"]["mode"]
                     or declaration.get("d4_budget_policy") != asdict(expected.d4_budget)):
                 raise ValueError("d8_frozen_configuration_mismatch")
+            if declaration.get("mode") == "real":
+                from agent_adapters.d8_simulation import validate_real_declaration
+                validate_real_declaration(Path(directory), declaration)
             path = Path(directory) / "control.sqlite"
             if path.exists():
                 with SqliteControlStore.open_readonly(path) as store:
@@ -431,9 +434,22 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                     if config != expected:
                         raise ValueError("d8_frozen_configuration_mismatch")
                     d8_unresolved = bool(store.list_d4_unresolved_operations(declaration["task_run_id"]))
+                    if config.contract_version == 7:
+                        from agent_core.business_diagnostics import BusinessDiagnostics
+                        from agent_adapters.output_evidence import FileD8OutputEvidence
+                        from agent_adapters.handoff_evidence import FileD8HandoffEvidence
+                        diagnostics = BusinessDiagnostics(config,
+                            FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
+                            FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False), store)
+                        business_rows = diagnostics.projection(store.list_d4_operations(declaration["task_run_id"]))
         result = _snapshot_v3_task_result(Path(directory), declaration)
-        if declaration.get("execution_profile") == "d8_v6":
-            result.update(execution_profile="d8_v6", contract_version=6)
+        if declaration.get("execution_profile") in {"d8_v6", "d8_v7"}:
+            result.update(execution_profile=declaration["execution_profile"], contract_version=expected.contract_version)
+            if expected.contract_version == 7:
+                result["business_diagnostics"] = business_rows
+            if declaration.get("mode") == "real":
+                result.update(sandbox_backend="local_simulated", model_backend="deepseek",
+                              capacity_measurement="estimated_token_units")
             if d8_unresolved:
                 result["recovery"] = {"required": True, "reason": "operation_or_evidence_unknown"}
                 result["recovery_status"] = "required"

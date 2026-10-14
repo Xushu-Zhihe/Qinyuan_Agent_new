@@ -1,4 +1,4 @@
-"""Explicit public D8 simulation, using the existing core and local Sandbox."""
+"""Public D8 core assembly; model mode is separate from the local Sandbox."""
 
 import asyncio
 import json
@@ -32,25 +32,41 @@ def simulation_config():
     }
 
 
+def real_config():
+    from agent_adapters.d8_model import CAPACITY_POLICY, TRANSPORT
+    return {"handoff_config": asdict(D8HandoffConfig(
+                CAPACITY_POLICY, CAPACITY_POLICY,
+                D8Capacity(initial_history=32768, visible_history=131072))),
+            "d5_sensitive_requirements": [], "model_transport": dict(TRANSPORT),
+            "sandbox_backend": "local_simulated"}
+
+
 def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]:
     required = {"protocol_version", "request_id", "task_request", "authorization",
                 "dual_llm_config", "execution_profile", "mode", "d8_config"}
     if not isinstance(raw, dict) or set(raw) != required:
         raise ValueError("invalid_d8_request_fields")
-    if raw["execution_profile"] != "d8_v6":
+    if not isinstance(raw["execution_profile"], str) or raw["execution_profile"] not in {"d8_v6", "d8_v7"}:
         raise ValueError("unsupported_execution_profile")
+    version = 7 if raw["execution_profile"] == "d8_v7" else 6
     if type(raw["protocol_version"]) is not int or raw["protocol_version"] != 3:
         raise ValueError("unsupported_protocol_version")
     if not isinstance(raw["mode"], str) or raw["mode"] not in {"simulated", "real"}:
         raise ValueError("mode_required")
     extra = raw["d8_config"]
+    is_real = raw["mode"] == "real"
+    expected_fields = {"handoff_config", "d5_sensitive_requirements"}
+    if is_real:
+        expected_fields |= {"model_transport", "sandbox_backend"}
     if (not isinstance(extra, dict)
-            or set(extra) != {"handoff_config", "d5_sensitive_requirements"}
+            or set(extra) != expected_fields
             or extra["d5_sensitive_requirements"] != []):
-        raise ValueError("invalid_d8_simulation_configuration")
+        raise ValueError("invalid_d8_configuration")
+    if is_real and json.dumps(extra, sort_keys=True) != json.dumps(real_config(), sort_keys=True):
+        raise ValueError("d8_real_configuration_mismatch")
     handoff = D8HandoffConfig.from_dict(extra["handoff_config"])
     for policy in (handoff.outer_capacity, handoff.inner_capacity):
-        if policy.policy_name != "fake-json-v1" or policy.measurement_unit != "unicode_codepoints":
+        if not is_real and (policy.policy_name != "fake-json-v1" or policy.measurement_unit != "unicode_codepoints"):
             raise ValueError("unsupported_d8_simulation_capacity")
     dual = raw["dual_llm_config"]
     if not isinstance(dual, dict) or set(dual) != {"outer_role", "inner_role", "d4_budget"}:
@@ -61,6 +77,10 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
     legacy = {k: raw[k] for k in required - {"execution_profile", "mode", "d8_config"}}
     legacy["dual_llm_config"] = {**dual, "d4_budget": asdict(D4BudgetPolicy())}
     request = replace(V3SimulationRequest.parse(legacy), d4_budget=budget)
+    if is_real:
+        from agent_adapters.d8_model import validate_role
+        validate_role(request.outer_role, version=2 if version == 7 else 1)
+        validate_role(request.inner_role, version=2 if version == 7 else 1)
     if len(request.attachments) > 2:
         # The public staging envelope accepts up to sixteen attachments;
         # capability rejection and its receipt precede any runnable D3 config.
@@ -69,7 +89,7 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
         request.outer_role, request.inner_role,
         D3Authorization(request.authorization["authorization_id"],
                         tuple(request.authorization["attachment_indices"])),
-        request.outer_role.role_config_ref, contract_version=6,
+        request.outer_role.role_config_ref, contract_version=version,
         d4_budget=budget, d5_enabled=True, d5_sensitive_requirements=(),
         d8_enabled=True, handoff_config=handoff,
     )
@@ -146,6 +166,15 @@ class SimulationModel:
         raise ValueError("unsupported_d8_simulation_stage")
 
 
+class _LifecycleModel:
+    """Cancel/cleanup reconciles evidence and must never generate new output."""
+    def __init__(self, role):
+        self.role_config = role
+
+    def invoke(self, *args):
+        raise ValueError("d8_lifecycle_model_dispatch_forbidden")
+
+
 def run_simulated_task(directory, declaration, *, operation="start"):
     from agent_adapters.v7.task_result import snapshot_v3_task_result
     from agent_adapters.v7.request_staging import D7RequestStager
@@ -153,19 +182,27 @@ def run_simulated_task(directory, declaration, *, operation="start"):
     _, config = parse_request(declaration["request"])
     if config is None:
         raise ValueError("d8_attachment_capability_not_supported")
-    if (declaration.get("execution_profile") != "d8_v6"
-            or declaration.get("contract_version") != 6
-            or declaration.get("mode") != "simulated"
-            or declaration["request"]["mode"] != "simulated"
+    if (declaration.get("execution_profile") != declaration["request"]["execution_profile"]
+            or declaration.get("contract_version") != config.contract_version
+            or declaration.get("mode") != declaration["request"]["mode"]
             or declaration.get("d4_budget_policy") != asdict(config.d4_budget)):
         raise ValueError("d8_frozen_configuration_mismatch")
     sandbox = _LocalDigestSandbox(directory)
     outer, inner = SimulationModel(config.outer_role), SimulationModel(config.inner_role)
+    capacity = FakeUnicodeCapacity()
+    if declaration["mode"] == "real":
+        from agent_adapters.d8_model import D8DeepSeekModel, EstimatedCapacity, settings_from_file
+        validate_real_declaration(directory, declaration)
+        capacity = EstimatedCapacity(config.outer_role, config.inner_role)
+        outer, inner = _LifecycleModel(config.outer_role), _LifecycleModel(config.inner_role)
+        if operation in {"start", "resume"}:
+            outer = D8DeepSeekModel(config.outer_role, settings_from_file(config.outer_role, declaration["env_file"]))
+            inner = D8DeepSeekModel(config.inner_role, settings_from_file(config.inner_role, declaration["env_file"]))
     app = D3Application(
         directory, config=config, sandbox=sandbox, import_sandbox=sandbox,
         workspace_sandbox=sandbox, command_sandbox=sandbox, outer_model=outer,
         inner_model=inner, review_model=outer, refinement_model=outer,
-        fact_review_model=outer, handoff_model=outer, capacity_port=FakeUnicodeCapacity(),
+        fact_review_model=outer, handoff_model=outer, capacity_port=capacity,
         sensitive_config={}, clock=time.time,
     )
     task_id, token = declaration["task_run_id"], _Token(directory)
@@ -173,6 +210,9 @@ def run_simulated_task(directory, declaration, *, operation="start"):
     try:
         if operation == "start":
             app.start(_d3_request(declaration), directory, task_run_id=task_id)
+            if declaration["mode"] == "real":
+                outer.bind_runtime(token, app.state.task_run.deadline_at)
+                inner.bind_runtime(token, app.state.task_run.deadline_at)
             if not declaration.get("staged_attachment_paths"):
                 app.controller.conclude(TaskRunStatus.INCONCLUSIVE, str(uuid4()),
                                         reason="single_intent_slice_finished")
@@ -180,6 +220,12 @@ def run_simulated_task(directory, declaration, *, operation="start"):
             else:
                 report = asyncio.run(app.run(token))
         elif operation == "resume":
+            if declaration["mode"] == "real":
+                rows = app.store.load_control_state_rows(task_id)
+                if rows is None:
+                    raise ValueError("d8_runtime_state_unavailable")
+                outer.bind_runtime(token, rows.task_run.deadline_at)
+                inner.bind_runtime(token, rows.task_run.deadline_at)
             report = asyncio.run(app.resume(task_id, token))
         elif operation == "cancel":
             report = app.cancel(task_id)
@@ -206,3 +252,23 @@ def run_simulated_task(directory, declaration, *, operation="start"):
             # The confirmed public pause boundary retains the run and Sandbox;
             # close() itself intentionally requires terminal/feedback state.
             app.store.close()
+
+
+def real_declaration_binding(declaration):
+    return {"version": 1, "task_run_id": declaration["task_run_id"],
+            "request_id": declaration["request_id"], "mode": declaration["mode"],
+            "execution_profile": declaration["execution_profile"],
+            "contract_version": declaration["contract_version"],
+            "sandbox_backend": declaration["sandbox_backend"],
+            "env_file": declaration["env_file"],
+            "d8_config": declaration["request"]["d8_config"],
+            "role_config_refs": declaration["role_config_refs"]}
+
+
+def validate_real_declaration(directory, declaration):
+    from agent_adapters.run_files import immutable_read
+    path = directory / "d8-runtime.json"
+    if (path.is_symlink() or not path.is_file()
+            or declaration.get("sandbox_backend") != "local_simulated"
+            or immutable_read(path) != real_declaration_binding(declaration)):
+        raise ValueError("d8_real_frozen_configuration_mismatch")

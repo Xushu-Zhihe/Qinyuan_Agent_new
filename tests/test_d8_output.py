@@ -39,8 +39,8 @@ class EnvelopeModel:
         return self.transform(envelope, self.adapter.invoke(envelope.request, *args))
 
 
-@pytest.fixture
-def output_case(tmp_path):
+@pytest.fixture(params=(6, 7))
+def output_case(tmp_path, request):
     source = tmp_path / "input"
     source.mkdir()
     (source / "sample.txt").write_bytes(b"D8-5 authorized local observation")
@@ -48,7 +48,7 @@ def output_case(tmp_path):
     inner_role = D1RoleConfig("inner_action", "fake", "same-model", "inner-d8-5-v1")
     policy = D8CapacityPolicy("fake-json-v1", "unicode_codepoints", 262144, 8192)
     config = D3RunConfig(outer_role, inner_role, D3Authorization(str(uuid4()), (0,)),
-        outer_role.role_config_ref, contract_version=6, d4_budget=D8HandoffBudgetPolicy(),
+        outer_role.role_config_ref, contract_version=request.param, d4_budget=D8HandoffBudgetPolicy(),
         d5_enabled=True, d5_sensitive_requirements=(), d8_enabled=True,
         handoff_config=D8HandoffConfig(policy, policy))
     sandbox, clock, token = Sandbox(), Clock(), Token()
@@ -441,7 +441,8 @@ def test_semantic_retry_and_format_retry_share_one_opportunity(output_case):
     case.models["handoff"].transform = response
     assert run(case).stop_reason != "search_exhausted"
     assert len(case.models["handoff"].calls) == 2
-    assert case.models["handoff"].calls[1].correction["reason"] == "proposal_rejected"
+    expected = "output_business_invalid" if case.app.config.contract_version == 7 else "proposal_rejected"
+    assert case.models["handoff"].calls[1].correction["reason"] == expected
     assert not case.app.state.turns and not case.sandbox.command_calls
 
 

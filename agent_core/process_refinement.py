@@ -319,7 +319,7 @@ class ProcessRefinement:
         sources = tuple(
             source
             for ref in review.source_ids
-            if not (self.config.contract_version in {5, 6} and ref.startswith("d8-decision:"))
+            if not (self.config.contract_version in {5, 6, 7} and ref.startswith("d8-decision:"))
             if (source := self._read_source(task_id, ref)) is not None
         )
         tried = {
