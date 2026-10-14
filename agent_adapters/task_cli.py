@@ -39,7 +39,11 @@ def _dispatch_v3_run_task(args, raw):
     from agent_adapters.v7.request_contract import V3SimulationRequest
     from agent_adapters.v7.request_staging import D7RequestStager
 
-    request = V3SimulationRequest.parse(raw)
+    if "execution_profile" in raw:
+        from agent_adapters.d8_simulation import parse_request
+        request, _ = parse_request(raw)
+    else:
+        request = V3SimulationRequest.parse(raw)
     state_dir = Path(args.state_dir).resolve()
     stager = D7RequestStager(state_dir, clock=time.time)
     stage = stager.stage(
@@ -53,6 +57,8 @@ def _dispatch_v3_run_task(args, raw):
             "outer_role": request.outer_role.role_config_ref,
             "inner_role": request.inner_role.role_config_ref,
             "d4_budget": request.d4_budget.budget_policy_ref,
+            **({"execution_profile": raw["execution_profile"], "mode": raw["mode"],
+                "d8_config": raw["d8_config"]} if "execution_profile" in raw else {}),
         },
     )
     receipt = stage.receipt
@@ -158,6 +164,9 @@ def _dispatch_v3_run_task(args, raw):
         "d4_budget_policy": asdict(request.d4_budget),
         "ids": {"start": str(uuid4()), "cancel": str(uuid4())},
     }
+    if "execution_profile" in raw:
+        declaration.update(execution_profile="d8_v6", contract_version=6)
+        declaration["capabilities"] = ["attachment_digest_only", "d8_simulation"]
     immutable_write(directory / "run.json", declaration)
     receipt = stager.record_outcome(
         request.request_id,
@@ -169,14 +178,16 @@ def _dispatch_v3_run_task(args, raw):
             directory, declaration, operation="start", events=args.events
         )
     except Exception as exc:  # noqa: BLE001 -- sanitized persisted run boundary
+        error_code = ("d8_simulation_start_failed" if "execution_profile" in raw
+                      else "d7_simulation_start_failed")
         immutable_write(
             directory / ("dispatch-stop-" + str(uuid4()) + ".json"),
-            {"stop": "recovery_required", "reason": "d7_simulation_start_failed"},
+            {"stop": "recovery_required", "reason": error_code},
         )
         from agent_adapters.v7.task_result import snapshot_v3_task_result
 
         result = snapshot_v3_task_result(directory, declaration)
-        result.setdefault("errors", []).append({"code": "d7_simulation_start_failed"})
+        result.setdefault("errors", []).append({"code": error_code})
         result.setdefault("recovery", {"required": True, "reason": type(exc).__name__})
     result["request_id"] = request.request_id
     result["request_receipt"] = _safe_request_receipt(receipt)
@@ -555,6 +566,17 @@ def dispatch_run_task(args):
             # complete envelope follows the real v3 validation path below.
             if set(raw) == {"protocol_version"}:
                 raise ValueError("protocol_v3_not_supported")
+            if "execution_profile" in raw:
+                from agent_adapters.d8_simulation import parse_request
+                parse_request(raw)
+                if raw["mode"] != args.mode:
+                    raise ValueError("d8_mode_mismatch")
+                if raw["mode"] == "real":
+                    return {"protocol_version": 3, "execution_profile": "d8_v6",
+                            "contract_version": 6, "mode": "real", "task_run_id": None,
+                            "request_id": raw["request_id"],
+                            "errors": [{"code": "capability_not_supported"}], "exit_code": 2}
+                return _dispatch_v3_run_task(args, raw)
             if args.mode == "real":
                 return _dispatch_v3_real_run_task(args, raw)
             return _dispatch_v3_run_task(args, raw)

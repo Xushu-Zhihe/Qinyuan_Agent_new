@@ -327,6 +327,11 @@ def run_simulated_task(
     operation: str = "start",
 ) -> dict:
     """Run or recover one local simulated D3 TaskRun and return its projection."""
+    if "execution_profile" in declaration:
+        if declaration["execution_profile"] != "d8_v6":
+            raise ValueError("unsupported_execution_profile")
+        from agent_adapters.d8_simulation import run_simulated_task as run_d8
+        return run_d8(Path(directory), declaration, operation=operation)
     from agent_adapters.v7.task_result import snapshot_v3_task_result
 
     directory = Path(directory)

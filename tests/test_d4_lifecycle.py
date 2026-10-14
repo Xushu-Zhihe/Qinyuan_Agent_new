@@ -72,7 +72,9 @@ def test_d4_failed_terminal_reload_never_starts_cleanup(
     load_control_state = repository.load_control_state
 
     def fail_reload(_task_run_id):
-        raise RuntimeError("control snapshot is unavailable")
+        if app.store.load_task_run(_task_run_id).status.value == "cancelled":
+            raise RuntimeError("control snapshot is unavailable")
+        return load_control_state(_task_run_id)
 
     monkeypatch.setattr(repository, "load_control_state", fail_reload)
     with pytest.raises(CommittedStateReloadError) as raised:

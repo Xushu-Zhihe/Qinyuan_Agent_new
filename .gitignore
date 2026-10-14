@@ -108,6 +108,7 @@ tests
 !/tests/test_d6_windows_protection.py
 !/tests/test_d6_transfer.py
 !/tests/test_d6_sensitive_evidence.py
+!/tests/test_d9_public.py
 Architecture.md
 interface.md
 protocol.md

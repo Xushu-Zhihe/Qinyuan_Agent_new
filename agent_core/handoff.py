@@ -17,7 +17,7 @@ from agent_core.handoff_contracts import (
     D8ReadStart, D8SummaryCandidate, D8TreeRecord, checked_refs, handoff_json,
 )
 from agent_core.modeling import ModelError, ModelErrorKind
-from agent_core.operation_accounting import D4BudgetExhausted, D4OperationCompletion, D4OperationStart, _uuid
+from agent_core.operation_accounting import D4BudgetExhausted, D4OperationCompletion, D4OperationRecord, D4OperationStart, _uuid
 from agent_core.turn_modeling import stable_id, digest
 
 
@@ -425,6 +425,26 @@ class HandoffContext:
                             and self.app.output_boundary.diagnostic(operation.start.operation_id) is not None)
             if request is not None and (self.evidence.read("result", operation.start.operation_id) is not None or known_format):
                 self._known_call(D8HandoffRequest.from_dict(request))
+
+    def reconcile_review_operation(self, operation: D4OperationRecord) -> bool:
+        """Recognize only a bound local-goal review owned by this evidence port."""
+        raw = self.evidence.read("request", operation.start.operation_id)
+        if raw is None:
+            return False
+        request = D8HandoffRequest.from_dict(raw)
+        start = operation.start
+        if (request.stage != "intent_evaluation" or start.category != "review"
+                or request.model_request_id != start.operation_id
+                or request.task_run_id != self.state.task_run.task_run_id
+                or request.role_config_ref != self.app.config.outer_role.role_config_ref
+                or start.role != "outer_planning"
+                or start.resource_ref != (request.turn_id or request.task_run_id)
+                or start.budget_policy_ref != self.app.config.d4_budget.budget_policy_ref):
+            raise D3RecoveryRequired("d8_review_operation_binding_changed")
+        # Validates request digest/checkpoint, saved result and completion;
+        # an unknown result pauses rather than dispatching another model call.
+        self._known_call(request)
+        return True
 
     def _request(self, stage, turn_id, intent_id=None, support_fact_id=None):
         suggestions = None

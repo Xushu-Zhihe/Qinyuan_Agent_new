@@ -8,9 +8,9 @@ T6 继续以 CLI 验收，并补充手工测试步骤；本地工作台已接入
 
 T6-5 已接入独立的 `run-task` v2 CLI、模拟多轮链路和工作台真实模式。T6-6 已接通单一公网目标的隔离转发代码，真实 Docker/模型/目标网络由操作者手工验收。工作台只读取 CLI 持久化状态和有界证据，不拥有或改写 Agent 控制面。没有独立答案校验器时，候选 flag 仅保留为 pending，整体目标始终显示 `not_evaluated`。
 
-## 本地工作台（T6-5）
+## 本地工作台（D9-1）
 
-工作台是浏览器可用的本地题目管理和 Agent 运行界面。它支持多题目、0～16 个附件、可选远程目标白名单、归档/永久清理以及 DeepSeek/自定义 OpenAI Chat Completions 配置。API Key 只在服务进程内存中存在，服务重启后需重新填写。开始按钮会启动真实 `qinyuan-agent-new` 子进程，状态、事件、取消和最终 JSON 均来自该进程的持久化运行目录。
+工作台是浏览器可用的本地题目管理和 Agent 运行界面。2026-10-14 的默认入口采用公共 v3／内部契约6，使用确定性双角色模型和本地文件 Sandbox，实际调度、审核、会话及交接由 D8 核心执行。开始按钮启动本机 Agent CLI 子进程，状态、事件、取消和最终 JSON 来自持久化运行目录。完整标准见 [D9-1](Plan/D9_1_proposal.md)；真实模型／Docker 和实际解题留后续接入。
 
 ```powershell
 uv run python -m agent_adapters.workbench --port 4174 --data-dir workbench_data
@@ -24,7 +24,11 @@ Windows 可双击根目录 `start-workbench.cmd`，或在终端运行：
 .\start-workbench.cmd --port 4180
 ```
 
-脚本优先使用项目 `.venv` 的 Python，否则使用系统 Python；不会自动安装依赖。终端就是管理后端，保持窗口打开，按 `Ctrl+C` 关闭。启动后会打印 URL、数据目录及实际能力。开始 Agent 会启动 `run-task --mode real`，支持 0～16 个本地附件（运行时合计最多 64 MiB）；没有附件时必须填写公网目标。
+脚本优先使用项目 `.venv` 的 Python，否则使用系统 Python；不会自动安装依赖。终端就是管理后端，保持窗口打开，按 `Ctrl+C` 关闭。启动后打印 URL、数据目录及实际能力。
+
+默认启动后，在开始按钮旁明确选择“模拟”；也可用 `start-workbench.cmd --d7-mode simulated` 显式配置，无需 API Key 或 Docker。本轮新版“真实”在创建运行前明确拒绝。请求可暂存0～16项附件、合计最多64MiB；模拟执行支持1～2项且每项≤16MiB，0项为未评估终态并清理，超执行能力完整暂存后明确拒绝。内部搜索耗尽保持整体目标未评估，不生成假答案候选；可显式取消并清理。
+
+旧v2工作台使用 `start-workbench.cmd --protocol-version 2`；旧v3模拟使用 `--protocol-version 3 --execution-profile d7 --d7-mode simulated`。已有运行按原声明恢复，不因新默认升级。旧模型配置的Key只保留在服务内存；它不启用本轮尚未接入的新版真实链路。
 
 打开 [http://127.0.0.1:4174/](http://127.0.0.1:4174/)。点击题目进入独立的全宽详情视图，顶部查看已提交的 TaskRun、Turn 和 Intent 关系，下方查看短 Plan、Execution、Fact 和题目资料；可返回列表。解题图的连线只表示归属与轮次顺序，不表示跨 Intent 依赖。服务只绑定回环地址，网页只读投影 Agent 进度，不判断候选 flag 正确性，也不宣称整题成功。
 

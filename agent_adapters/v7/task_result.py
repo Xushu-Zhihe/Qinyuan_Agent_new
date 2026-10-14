@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import asdict
 
 from agent_adapters.run_files import immutable_read
 from agent_core.goal_feedback import project_candidate_feedback
@@ -410,7 +411,33 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
 def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
     """Return a safe result; unreadable state is represented as recovery required."""
     try:
-        return _snapshot_v3_task_result(Path(directory), declaration)
+        if ("execution_profile" in declaration.get("request", {})
+                and "execution_profile" not in declaration):
+            raise ValueError("d8_frozen_configuration_mismatch")
+        d8_unresolved = False
+        if "execution_profile" in declaration:
+            from agent_adapters.d8_simulation import parse_request
+            _, expected = parse_request(declaration["request"])
+            if (expected is None or declaration["execution_profile"] != "d8_v6"
+                    or declaration.get("contract_version") != 6
+                    or declaration.get("mode") != "simulated"
+                    or declaration.get("mode") != declaration["request"]["mode"]
+                    or declaration.get("d4_budget_policy") != asdict(expected.d4_budget)):
+                raise ValueError("d8_frozen_configuration_mismatch")
+            path = Path(directory) / "control.sqlite"
+            if path.exists():
+                with SqliteControlStore.open_readonly(path) as store:
+                    config = store.load_d3_run_config(declaration["task_run_id"])
+                    if config != expected:
+                        raise ValueError("d8_frozen_configuration_mismatch")
+                    d8_unresolved = bool(store.list_d4_unresolved_operations(declaration["task_run_id"]))
+        result = _snapshot_v3_task_result(Path(directory), declaration)
+        if declaration.get("execution_profile") == "d8_v6":
+            result.update(execution_profile="d8_v6", contract_version=6)
+            if d8_unresolved:
+                result["recovery"] = {"required": True, "reason": "operation_or_evidence_unknown"}
+                result["recovery_status"] = "required"
+        return result
     except Exception:  # noqa: BLE001 -- read-only result boundary
         task_id = declaration.get("task_run_id") if isinstance(declaration, dict) else None
         mode = declaration.get("mode") if isinstance(declaration, dict) else None

@@ -371,6 +371,7 @@ class D3Application:
                                                 configured=self._redaction_configured, redact_response=False),
                                config, clock), capacity_port)
             self.validator.handoff = self.handoff
+            self.review_ledger.handoff_review_reconciler = self.handoff.reconcile_review_operation
             self.inner.request_capacity_check = self.handoff.freeze_execution_request
             self.outer.request_capacity_check = self.handoff.check_role_request_capacity
             self.review_ledger.request_capacity_check = self.handoff.check_role_request_capacity

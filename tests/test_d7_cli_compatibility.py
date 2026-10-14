@@ -142,7 +142,7 @@ def test_v3_resume_routes_known_d3_operation_recovery_to_d3_reconciliation(
         "errors": [],
     }
     monkeypatch.setattr(
-        "agent_adapters.d7_task_result.snapshot_v3_task_result",
+        "agent_adapters.v7.task_result.snapshot_v3_task_result",
         lambda *_: projection,
     )
     calls = []
@@ -190,7 +190,7 @@ def test_v3_resume_does_not_dispatch_external_or_unclassified_recovery(
         "errors": [],
     }
     monkeypatch.setattr(
-        "agent_adapters.d7_task_result.snapshot_v3_task_result",
+        "agent_adapters.v7.task_result.snapshot_v3_task_result",
         lambda *_: projection,
     )
     monkeypatch.setattr(
@@ -289,7 +289,7 @@ def test_v3_resume_rechecks_external_ledgers_before_d3_reconciliation(
         **external_state,
     }
     monkeypatch.setattr(
-        "agent_adapters.d7_task_result.snapshot_v3_task_result",
+        "agent_adapters.v7.task_result.snapshot_v3_task_result",
         lambda *_: projection,
     )
     monkeypatch.setattr(
@@ -342,7 +342,7 @@ def test_v3_resume_allows_d3_reconciliation_after_unknown_feedback_is_resolved(
         }],
     }
     monkeypatch.setattr(
-        "agent_adapters.d7_task_result.snapshot_v3_task_result",
+        "agent_adapters.v7.task_result.snapshot_v3_task_result",
         lambda *_: projection,
     )
     calls = []
@@ -378,7 +378,7 @@ def test_v3_status_reports_successful_query_for_unresolved_recovery(
         "errors": [],
     }
     monkeypatch.setattr(
-        "agent_adapters.d7_task_result.snapshot_v3_task_result",
+        "agent_adapters.v7.task_result.snapshot_v3_task_result",
         lambda *_: projection,
     )
 

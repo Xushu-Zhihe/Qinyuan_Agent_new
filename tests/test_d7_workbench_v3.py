@@ -198,7 +198,7 @@ def test_v3_execution_endpoint_uses_only_the_safe_projection(tmp_path: Path):
     execution_id = str(uuid4())
     safe_execution = {"execution_id": execution_id, "plan_id": str(uuid4()),
                       "status": "succeeded", "step_index": 0}
-    with patch("agent_adapters.d7_task_result.snapshot_v3_task_result",
+    with patch("agent_adapters.v7.task_result.snapshot_v3_task_result",
                return_value={"executions": [safe_execution]}) as snapshot, patch(
         "agent_adapters.task_progress.execution_detail"
     ) as legacy:

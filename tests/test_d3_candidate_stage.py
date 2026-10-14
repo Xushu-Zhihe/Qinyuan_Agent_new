@@ -24,7 +24,7 @@ def test_completed_candidate_rejection_replays_without_model_or_candidate_io(
     tmp_path, monkeypatch, review_requested, expected_code, structural
 ):
     monkeypatch.setattr(
-        d7_candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection
+        candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection
     )
     app, token = make_case(tmp_path, 2)
     try:

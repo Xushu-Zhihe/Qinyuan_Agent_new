@@ -26,7 +26,8 @@ from agent_core.operation_accounting import (
     D4OperationStart,
     D4RecoveryRequired,
 )
-from agent_core.sqlite_control_store import SqliteControlStore
+from agent_core import sqlite_control_store
+from agent_core.sqlite_control_store import SqliteControlStore, CURRENT_SCHEMA_VERSION
 from agent_core.turn_modeling import digest, stable_id
 
 D4_BUDGET_MATRIX = {
@@ -39,6 +40,33 @@ D4_BUDGET_MATRIX = {
     "artifact_share": 4,
     "attachment_import": 2,
 }
+
+
+def _historical_database(path, version):
+    """Rebuild the two historical fixtures from their actual migration DDL."""
+    with sqlite3.connect(":memory:") as historical:
+        for number in range(1, version + 1):
+            historical.executescript(getattr(sqlite_control_store, f"MIGRATION_{number}"))
+            historical.execute(
+                "INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                (number, 0),
+            )
+        historical.execute("ATTACH DATABASE ? AS current", (str(path),))
+        tables = historical.execute(
+            "SELECT name FROM main.sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' AND name != 'schema_versions'"
+        ).fetchall()
+        for (table,) in tables:
+            columns = historical.execute(f'PRAGMA main.table_info("{table}")').fetchall()
+            names = ",".join(f'"{column[1]}"' for column in columns)
+            historical.execute(
+                f'INSERT INTO main."{table}" ({names}) '
+                f'SELECT {names} FROM current."{table}"'
+            )
+        historical.commit()
+        historical.execute("DETACH DATABASE current")
+        with sqlite3.connect(path) as destination:
+            historical.backup(destination)
 
 
 def _start(case, category, index, *, operation_id=None):
@@ -518,13 +546,7 @@ def test_schema14_readonly_keeps_unknown_refinement_unresolved(tmp_path):
     path = app.directory / "control.sqlite"
     app.store.close()
 
-    connection = sqlite3.connect(path)
-    connection.execute("DROP TABLE d5_attempts")
-    connection.execute("DROP TABLE process_facts")
-    connection.execute("ALTER TABLE d4_operations DROP COLUMN unknown_disposition_json")
-    connection.execute("DELETE FROM schema_versions WHERE version = 15")
-    connection.commit()
-    connection.close()
+    _historical_database(path, 14)
     before = path.read_bytes()
 
     with SqliteControlStore.open_readonly(path) as readonly:
@@ -540,7 +562,7 @@ def test_schema14_readonly_keeps_unknown_refinement_unresolved(tmp_path):
         version = upgraded._connection.execute(
             "SELECT MAX(version) FROM schema_versions"
         ).fetchone()[0]
-        assert version == 15
+        assert version == CURRENT_SCHEMA_VERSION
         assert tuple(
             item.start.operation_id
             for item in upgraded.list_d4_unresolved_operations(start.task_run_id)
@@ -632,13 +654,9 @@ def test_schema13_readonly_is_unchanged_and_upgrade_does_not_backfill_d4(
             source.task_run_id,
         ),
     )
-    connection.execute("DROP TABLE d5_attempts")
-    connection.execute("DROP TABLE process_facts")
-    connection.execute("DROP TABLE d4_audit_events")
-    connection.execute("DROP TABLE d4_operations")
-    connection.execute("DELETE FROM schema_versions WHERE version >= 14")
     connection.commit()
     connection.close()
+    _historical_database(path, 13)
     before = path.read_bytes()
 
     with SqliteControlStore.open_readonly(path) as readonly:
@@ -651,7 +669,7 @@ def test_schema13_readonly_is_unchanged_and_upgrade_does_not_backfill_d4(
         version = upgraded._connection.execute(
             "SELECT MAX(version) FROM schema_versions"
         ).fetchone()[0]
-        assert version == 15
+        assert version == CURRENT_SCHEMA_VERSION
         assert upgraded.list_d4_operations(source.task_run_id) == ()
         assert upgraded.load_d3_operation(d3_start.operation_id) is not None
     case[1].destroyed = True

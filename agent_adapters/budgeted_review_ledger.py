@@ -13,6 +13,7 @@ from agent_core.operation_accounting import (
     D4BudgetExhausted,
     D4OperationCompletion,
     D4OperationResult,
+    D4OperationRecord,
     D4OperationStart,
     D4RecoveryRequired,
 )
@@ -50,6 +51,7 @@ class D4ReviewLedger(FileD2ReviewLedger):
         self.clock = clock
         self.request_capacity_check = None
         self.output_boundary = None
+        self.handoff_review_reconciler: Callable[[D4OperationRecord], bool] | None = None
 
     def read_root(self, review_root_id):
         root = super().read_root(review_root_id)
@@ -262,6 +264,9 @@ class D4ReviewLedger(FileD2ReviewLedger):
     def reconcile_known_completions(self, task_run_id: str) -> None:
         for record in self.store.list_d4_operations(task_run_id):
             if record.start.category != "review":
+                continue
+            if (self.handoff_review_reconciler is not None
+                    and self.handoff_review_reconciler(record)):
                 continue
             call = None
             request_payload = None

@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from agent_adapters.run_files import immutable_read
+from agent_adapters.run_files import immutable_read, immutable_write
 from agent_adapters.workbench import Workbench, WorkbenchError
 from agent_adapters.workbench_runner import ActiveRun
 
@@ -151,7 +151,7 @@ def test_terminal_recovery_uses_explicit_cleanup_only_before_archive(tmp_path):
     directory = workbench.runner.root / run_id
     agent_directory = directory / "agent-state" / task_id
     agent_directory.mkdir(parents=True)
-    (agent_directory / "run.json").write_text("{}")
+    immutable_write(agent_directory / "run.json", {"protocol_version": 2, "task_run_id": task_id})
     workbench._insert_run(run_id, challenge_id, directory)
     result = {
         "protocol_version": 2, "task_run_id": task_id,
@@ -288,7 +288,7 @@ def test_paused_v2_can_cancel_through_cli_without_resuming_model(tmp_path):
     directory = workbench.runner.root / run_id
     agent_directory = directory / "agent-state" / task_id
     agent_directory.mkdir(parents=True)
-    (agent_directory / "run.json").write_text("{}")
+    immutable_write(agent_directory / "run.json", {"protocol_version": 2, "task_run_id": task_id})
     workbench._insert_run(run_id, challenge_id, directory)
     result = {"protocol_version": 2, "task_run_id": task_id,
               "task_run": {"status": "running"}, "recovery": {"required": False},
@@ -319,7 +319,7 @@ def test_recovery_required_v2_can_explicitly_end_and_cleanup(tmp_path, terminal_
     directory = workbench.runner.root / run_id
     agent_directory = directory / "agent-state" / task_id
     agent_directory.mkdir(parents=True)
-    (agent_directory / "run.json").write_text("{}", encoding="utf-8")
+    immutable_write(agent_directory / "run.json", {"protocol_version": 2, "task_run_id": task_id})
     workbench._insert_run(run_id, challenge_id, directory)
     result = {
         "protocol_version": 2, "task_run_id": task_id,
@@ -394,7 +394,7 @@ def test_historical_remote_cleanup_requires_explicit_network_cleanup(tmp_path):
     directory = workbench.runner.root / run_id
     agent_directory = directory / "agent-state" / task_id
     agent_directory.mkdir(parents=True)
-    (agent_directory / "run.json").write_text("{}", encoding="utf-8")
+    immutable_write(agent_directory / "run.json", {"protocol_version": 2, "task_run_id": task_id})
     workbench._insert_run(run_id, challenge_id, directory)
     old_result = {
         "protocol_version": 2, "task_run_id": task_id,

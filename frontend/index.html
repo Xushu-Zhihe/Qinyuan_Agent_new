@@ -35,7 +35,7 @@
           <section id="run-panel" class="run-panel" hidden aria-labelledby="run-title">
             <header class="run-header">
               <div><p class="eyebrow">TASK RUN</p><h2 id="run-title">解题过程</h2><p id="run-status" class="run-status" aria-live="polite">尚未运行</p></div>
-              <div class="run-actions"><button id="start-run" class="primary-button" type="button">开始 Agent</button><button id="cancel-run" class="danger-button" type="button" hidden>取消运行</button><button id="cleanup-run" class="secondary-button" type="button" hidden>重试资源清理</button></div>
+              <div class="run-actions"><label id="run-mode-control" hidden>运行模式 <select id="run-mode"><option value="">请选择运行模式</option><option value="simulated">模拟</option><option value="real">真实（尚未接入）</option></select></label><button id="start-run" class="primary-button" type="button">开始 Agent</button><button id="cancel-run" class="danger-button" type="button" hidden>取消运行</button><button id="cleanup-run" class="secondary-button" type="button" hidden>重试资源清理</button></div>
             </header>
             <div id="run-summary" class="run-summary"></div>
             <p id="run-read-error" class="run-read-error" role="status" hidden></p>

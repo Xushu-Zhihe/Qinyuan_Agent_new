@@ -90,6 +90,7 @@ class Workbench:
         *,
         protocol_version: int | None = None,
         d7_mode: str | None = None,
+        execution_profile: str = "d7",
     ):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -111,14 +112,19 @@ class Workbench:
         if protocol_version not in {2, 3}:
             raise ValueError("unsupported_workbench_protocol_version")
         explicit_d7_mode = d7_mode is not None
-        if d7_mode is None:
+        if execution_profile not in {"d7", "d8_v6"} or (
+            execution_profile == "d8_v6" and protocol_version != 3
+        ):
+            raise ValueError("unsupported_execution_profile")
+        if d7_mode is None and execution_profile == "d7":
             d7_mode = "simulated"
-        if d7_mode not in {"simulated", "real"} or (
+        if d7_mode not in {None, "simulated", "real"} or (
             explicit_d7_mode and protocol_version != 3
         ):
             raise ValueError("unsupported_d7_mode")
         self.protocol_version = protocol_version
         self.d7_mode = d7_mode
+        self.execution_profile = execution_profile
         with self._db() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS challenges (
@@ -565,7 +571,9 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["api", "health"] and self.command == "GET":
             self._send(HTTPStatus.OK, {"status": "ready", "agent_execution": "connected", "capabilities": {
                 "current_cli": (
-                    f"run-task-v3-{self.server.workbench.d7_mode}"
+                    "run-task-v3-d8"
+                    if self.server.workbench.execution_profile == "d8_v6"
+                    else f"run-task-v3-{self.server.workbench.d7_mode}"
                     if self.server.workbench.protocol_version == 3
                     else "t6_run_task_real"
                 ),
@@ -573,10 +581,16 @@ class Handler(BaseHTTPRequestHandler):
                 "d7_mode": self.server.workbench.d7_mode if self.server.workbench.protocol_version == 3 else None,
                 "t6_scheduler": self.server.workbench.protocol_version == 2,
                 "remote_network": (
+                    self.server.workbench.execution_profile != "d8_v6" and (
                     self.server.workbench.protocol_version == 2
                     or self.server.workbench.protocol_version == 3
                     and self.server.workbench.d7_mode == "real"
+                    )
                 ),
+                **({"execution_profile": "d8_v6", "contract_version": 6,
+                    "mode_selection_required": self.server.workbench.d7_mode is None,
+                    "real_supported": False}
+                   if self.server.workbench.execution_profile == "d8_v6" else {}),
             }})
             return
         if parts == ["api", "model"]:
@@ -621,7 +635,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[3] == "run":
                 if self.command == "POST":
-                    self._send(HTTPStatus.ACCEPTED, workbench.runner.start(challenge_id))
+                    if workbench.execution_profile == "d8_v6":
+                        body = self._json() if int(self.headers.get("Content-Length", "0")) else {}
+                        if not isinstance(body, dict) or set(body) - {"mode"}:
+                            raise WorkbenchError("invalid_run_request", 400)
+                        result = workbench.runner.start(challenge_id, mode=body.get("mode"))
+                    else:
+                        result = workbench.runner.start(challenge_id)
+                    self._send(HTTPStatus.ACCEPTED, result)
                 elif self.command == "GET":
                     self._send(HTTPStatus.OK, workbench.runner.status(challenge_id))
                 else:
@@ -710,14 +731,22 @@ def main(argv=None):
     parser.add_argument("--data-dir", type=Path, default=Path("workbench_data"))
     parser.add_argument("--protocol-version", type=int, choices=(2, 3), default=None)
     parser.add_argument("--d7-mode", choices=("simulated", "real"), default=None)
+    parser.add_argument("--execution-profile", choices=("d7", "d8_v6"), default=None)
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     try:
+        # Public launcher defaults to D8; explicit legacy protocol/profile
+        # selections and historical Python assembly retain their old behavior.
+        protocol = args.protocol_version
+        if protocol is None:
+            protocol = int(os.environ.get("QINYUAN_WORKBENCH_PROTOCOL_VERSION", "3"))
+        profile = args.execution_profile or ("d8_v6" if protocol == 3 else "d7")
         workbench = Workbench(
             args.data_dir,
-            protocol_version=args.protocol_version,
+            protocol_version=protocol,
             d7_mode=args.d7_mode,
+            execution_profile=profile,
         )
         server = WorkbenchServer(("127.0.0.1", args.port), workbench)
     except ValueError as exc:
@@ -736,7 +765,9 @@ def main(argv=None):
         print(f"Data: {workbench.root}", flush=True)
         print("Management API: ready (challenges, attachments, model settings)", flush=True)
         if workbench.protocol_version == 3:
-            if workbench.d7_mode == "real":
+            if workbench.execution_profile == "d8_v6":
+                print("Agent execution: protocol v3 / D8 contract 6 (simulation only; select mode explicitly)", flush=True)
+            elif workbench.d7_mode == "real":
                 print("Agent execution: run-task protocol v3 real (authorized single-origin Web)", flush=True)
             else:
                 print("Agent execution: run-task protocol v3 simulated (attachment_digest_only; no network)", flush=True)

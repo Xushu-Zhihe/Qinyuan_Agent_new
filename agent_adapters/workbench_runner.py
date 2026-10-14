@@ -135,7 +135,7 @@ class Runner:
         if declaration.get("protocol_version") == 3 and declaration.get("mode") == "real":
             command.extend(["--env-file", str(D7_ENV_FILE)])
 
-    def _preflight(self, challenge):
+    def _preflight(self, challenge, *, mode=None):
         if challenge["archived"]:
             raise WorkbenchError("challenge_archived", 409)
         if challenge["status"] in ACTIVE_RUN_STATUSES:
@@ -148,8 +148,13 @@ class Runner:
             raise WorkbenchError("challenge_description_required_for_run", 409)
         attachments = challenge["attachments"]
         d7_model = None
+        if self.workbench.execution_profile == "d8_v6":
+            if mode not in {"simulated", "real"}:
+                raise WorkbenchError("mode_required", 409)
+            if mode == "real":
+                raise WorkbenchError("capability_not_supported", 409)
         if self.workbench.protocol_version == 3:
-            if self.workbench.d7_mode == "simulated":
+            if mode == "simulated" or self.workbench.d7_mode == "simulated":
                 if challenge["endpoint"]:
                     raise WorkbenchError("v3_network_not_supported", 409)
             else:
@@ -170,10 +175,19 @@ class Runner:
             raise WorkbenchError("attachment_run_capacity_exceeded", 409)
         return d7_model
 
-    def start(self, challenge_id: str):
+    def start(self, challenge_id: str, *, mode=None):
         with self.workbench.lock:
             challenge = self.workbench.get(challenge_id)
-            d7_model = self._preflight(challenge)
+            if self.workbench.execution_profile == "d8_v6":
+                if mode is not None and mode not in {"simulated", "real"}:
+                    raise WorkbenchError("mode_required", 409)
+                if (mode is not None and self.workbench.d7_mode is not None
+                        and mode != self.workbench.d7_mode):
+                    raise WorkbenchError("mode_configuration_mismatch", 409)
+                mode = mode if mode is not None else self.workbench.d7_mode
+            else:
+                mode = self.workbench.d7_mode
+            d7_model = self._preflight(challenge, mode=mode)
             names = [self._safe_filename(item["name"]) for item in challenge["attachments"]]
             if len(set(names)) != len(names):
                 raise WorkbenchError("duplicate_attachment_names", 409)
@@ -190,7 +204,7 @@ class Runner:
                     raise WorkbenchError("attachment_path_rejected", 409)
                 shutil.copyfile(source, target)
 
-            if self.workbench.protocol_version == 3 and self.workbench.d7_mode == "simulated":
+            if self.workbench.protocol_version == 3 and mode == "simulated":
                 # Temporary D7 simulation envelope.  It intentionally has no
                 # endpoint/network capability and uses deterministic local
                 # role snapshots; the child remains the sole scheduler.
@@ -236,6 +250,15 @@ class Runner:
                         },
                     },
                 }
+                if self.workbench.execution_profile == "d8_v6":
+                    from agent_adapters.d8_simulation import simulation_config
+                    from agent_core.operation_accounting import D8HandoffBudgetPolicy
+                    request.update(execution_profile="d8_v6", mode=mode,
+                                   d8_config=simulation_config())
+                    request["dual_llm_config"]["d4_budget"] = asdict(D8HandoffBudgetPolicy())
+                    for role, value in (("outer", role_outer), ("inner", role_inner)):
+                        value["model"] = f"d8-simulated-{role}"
+                        value["prompt_template"] = f"d8-simulated-{role}-v1"
             elif self.workbench.protocol_version == 3:
                 origin = canonical_web_origin(challenge["endpoint"])
                 role_outer = {
@@ -321,7 +344,7 @@ class Runner:
                 "run-task",
                 "--mode",
                 (
-                    self.workbench.d7_mode
+                    mode
                     if self.workbench.protocol_version == 3
                     else "real"
                 ),
@@ -332,7 +355,7 @@ class Runner:
                 "--events",
                 str(events),
             ]
-            if self.workbench.protocol_version == 3 and self.workbench.d7_mode == "real":
+            if self.workbench.protocol_version == 3 and mode == "real":
                 command.extend(["--env-file", str(D7_ENV_FILE)])
             elif self.workbench.protocol_version == 2:
                 command.extend(["--env-file", str(directory / "unused.env")])
