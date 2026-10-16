@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from agent_core.control_store import TargetNetworkBinding
-from agent_core.d7_web_contracts import (
+from agent_core.v7.web_contracts import (
     D7_WEB_MAX_HEADER_BYTES,
     D7_WEB_MAX_HEADER_COUNT,
     D7_WEB_MAX_HEADER_VALUE_BYTES,

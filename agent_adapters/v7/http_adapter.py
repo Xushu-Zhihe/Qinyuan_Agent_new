@@ -943,3 +943,37 @@ class D7HttpAdapter:
         with self._lock:
             self._cookies.clear()
             self._closed = True
+
+    def export_cookie_session(self) -> dict:
+        """Program-only session data; callers must protect it before persistence."""
+        with self._lock:
+            if self._closed:
+                raise D7HttpError("d7_http_session_closed")
+            return {"task_run_id": self.task_run_id, "origin": self.origin.url,
+                    "cookies": [dict(vars(cookie), _rest=dict(cookie._rest))
+                                for cookie in self._cookies._jar]}
+
+    def restore_cookie_session(self, value: dict) -> None:
+        """Restore only the exact owner's protected snapshot, never model input."""
+        if (not isinstance(value, dict) or set(value) != {"task_run_id", "origin", "cookies"}
+                or value['task_run_id'] != self.task_run_id or value['origin'] != self.origin.url
+                or not isinstance(value['cookies'], list)):
+            raise D7HttpError('d20_http_cookie_owner_changed')
+        jar = http.cookiejar.CookieJar()
+        keys = {'version', 'name', 'value', 'port', 'port_specified', 'domain', 'domain_specified',
+                'domain_initial_dot', 'path', 'path_specified', 'secure', 'expires', 'discard',
+                'comment', 'comment_url', 'rfc2109', '_rest'}
+        for item in value['cookies']:
+            if (not isinstance(item, dict) or set(item) != keys or item['domain'] != self.origin.host
+                    or item['port'] is not None or item['port_specified'] is not False
+                    or not isinstance(item['path'], str) or not item['path'].startswith('/')
+                    or not isinstance(item['_rest'], dict)
+                    or not isinstance(item['name'], str) or not isinstance(item['value'], str)):
+                raise D7HttpError('d20_http_cookie_snapshot_invalid')
+            fields = dict(item)
+            fields['rest'] = fields.pop('_rest')
+            jar.set_cookie(http.cookiejar.Cookie(**fields))
+        with self._lock:
+            if self._closed:
+                raise D7HttpError('d7_http_session_closed')
+            self._cookies._jar = jar

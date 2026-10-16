@@ -51,6 +51,7 @@ class D4ReviewLedger(FileD2ReviewLedger):
         self.clock = clock
         self.request_capacity_check = None
         self.output_boundary = None
+        self.review_diagnostics = None
         self.handoff_review_reconciler: Callable[[D4OperationRecord], bool] | None = None
 
     def read_root(self, review_root_id):
@@ -59,6 +60,11 @@ class D4ReviewLedger(FileD2ReviewLedger):
                 and root.get("last_outcome") == "started"):
             value = root["last_request"]
             request = D2ReviewRequest(**{**value, "source_versions": tuple(value["source_versions"])})
+            if self.review_diagnostics is not None and self.review_diagnostics.supported(request):
+                known = self.review_diagnostics.known(request, repair=True)
+                if known is not None:
+                    self.finish_attempt(request, **self.review_diagnostics.call_values(known))
+                    return super().read_root(review_root_id)
             failure = self.output_boundary.failure(request)
             if failure is not None:
                 terminal = failure["terminal"]
@@ -110,8 +116,7 @@ class D4ReviewLedger(FileD2ReviewLedger):
             role_config_ref=self.config.outer_role.role_config_ref,
         )
 
-    @staticmethod
-    def _completion_values(call: dict) -> tuple[D4OperationResult, str]:
+    def _completion_values(self, call: dict) -> tuple[D4OperationResult, str]:
         outcome = call.get("outcome")
         if not isinstance(outcome, str):
             raise D4RecoveryRequired("d4_review_call_outcome_unknown")
@@ -128,6 +133,12 @@ class D4ReviewLedger(FileD2ReviewLedger):
             "provider_request_id": call.get("provider_request_id"),
             "reason": call.get("reason"),
         }
+        if self.review_diagnostics is not None:
+            value = call["request"]
+            request = D2ReviewRequest(**{**value, "source_versions": tuple(value["source_versions"])})
+            result = self.review_diagnostics.verify_call(request, call)
+            if result is not None:
+                evidence["review_result_sha256"] = digest(result)
         return result_kind, digest(evidence)
 
     def _save_pending_request(self, request: D2ReviewRequest) -> None:
@@ -226,6 +237,13 @@ class D4ReviewLedger(FileD2ReviewLedger):
         provider_request_id: str | None,
         reason: str | None = None,
     ) -> None:
+        if outcome != "unknown" and self.review_diagnostics is not None and self.review_diagnostics.supported(request):
+            result = self.review_diagnostics.known(request, repair=True)
+            if result is not None:
+                values = self.review_diagnostics.call_values(result)
+                if outcome != values["outcome"] and not (outcome == "provider_failure" and reason == "d3_review_provider_failure"):
+                    raise D4RecoveryRequired("d9_review_final_outcome_conflict")
+                outcome, response, provider_request_id, reason = values["outcome"], values["response"], values["provider_request_id"], values["reason"]
         super().finish_attempt(
             request,
             outcome=outcome,
@@ -346,6 +364,8 @@ class D4ReviewLedger(FileD2ReviewLedger):
                     "source_versions": tuple(request_payload["source_versions"]),
                 }
             )
+            if self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and self.review_diagnostics is not None and self.review_diagnostics.progress(request):
+                self.review_diagnostics.known(request, repair=True)
             self._repair_completion(request, call)
             if record.application_ref is None:
                 application = next(

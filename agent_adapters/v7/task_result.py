@@ -75,6 +75,11 @@ def _candidate_projection(
                 "feedback": feedback_projection,
             }
         )
+        config = store.load_d3_run_config(task_run_id)
+        if config is not None and config.contract_version in {19, 20, 21}:
+            projected[-1]['checkable_submission_ids'] = list(
+                state.conflict_operation_ids if state.state == 'conflict'
+                else state.unresolved_unknown_operation_ids if state.state == 'unknown' else ())
 
     if "conflict" in evaluations or "unknown" in evaluations:
         goal_evaluation = "unknown"
@@ -431,10 +436,14 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
             if path.exists():
                 with SqliteControlStore.open_readonly(path) as store:
                     config = store.load_d3_run_config(declaration["task_run_id"])
+                    from agent_core.http_contracts import is_http
+                    if is_http(config):
+                        from agent_adapters.http_capability import check_http_task
+                        d8_unresolved |= check_http_task(Path(directory), store, config)
                     if config != expected:
                         raise ValueError("d8_frozen_configuration_mismatch")
                     d8_unresolved = bool(store.list_d4_unresolved_operations(declaration["task_run_id"]))
-                    if config.contract_version == 7:
+                    if config.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
                         from agent_core.business_diagnostics import BusinessDiagnostics
                         from agent_adapters.output_evidence import FileD8OutputEvidence
                         from agent_adapters.handoff_evidence import FileD8HandoffEvidence
@@ -442,13 +451,72 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                             FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
                             FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False), store)
                         business_rows = diagnostics.projection(store.list_d4_operations(declaration["task_run_id"]))
+                    if config.contract_version in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                        from agent_core.fact_diagnostics import FactBusinessDiagnostics
+                        from agent_adapters.conclusion_evidence import FileD8Evidence
+                        facts = FactBusinessDiagnostics(config,
+                            FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
+                            FileD8Evidence(Path(directory) / "d8-conclusions", create=False), store)
+                        business_rows += facts.projection(store.list_d4_operations(declaration["task_run_id"]))
+                    if config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                        from agent_core.review_diagnostics import ReviewDiagnostics
+                        from agent_adapters.review_ledger import FileD2ReviewLedger
+                        reviews = ReviewDiagnostics(config,
+                            FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
+                            FileD2ReviewLedger(Path(directory) / "d3-reviews"), store, lambda: 0)
+                        business_rows += reviews.projection(store.list_d4_operations(declaration["task_run_id"]))
+                        d8_unresolved |= reviews.needs_repair
+                    if config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                        from types import SimpleNamespace
+                        from agent_core.fixed_probe import FixedProbeBindings
+                        from agent_adapters.model_evidence import FileD3ModelEvidence
+                        fixed = FixedProbeBindings(SimpleNamespace(config=config, store=store,
+                            output_boundary=SimpleNamespace(evidence=FileD8OutputEvidence(
+                                Path(directory) / "d8-output", create=False)),
+                            sessions=SimpleNamespace(evidence=FileD8HandoffEvidence(
+                                Path(directory) / "d8-sessions", create=False)),
+                            model_evidence=FileD3ModelEvidence(Path(directory) / "d3-models", create=False)))
+                        d8_unresolved |= fixed.check_task(declaration["task_run_id"])
+                    if config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and not is_http(config):
+                        from agent_core.planning_assertion import PlanningAssertionBindings
+                        from agent_adapters.attachment_import_recorder import FileAttachmentImportRecorder
+                        assemblies = PlanningAssertionBindings(config,
+                            FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
+                            FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False),
+                            FileD8Evidence(Path(directory) / "d8-conclusions", create=False), store,
+                            FileAttachmentImportRecorder(Path(directory) / "imports", read_only=True))
+                        d8_unresolved |= assemblies.check_task(declaration["task_run_id"])
+                    if config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+                        from agent_core.completion_evaluation import EvaluationBindings
+                        evaluations = EvaluationBindings(config,
+                            FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
+                            FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False), store)
+                        d8_unresolved |= evaluations.check_task(declaration["task_run_id"])
+                        business_rows.extend(evaluations.projection(store.list_d4_operations(declaration["task_run_id"])))
+                        from agent_core.completion_evaluation import check_candidate_task
+                        d8_unresolved |= check_candidate_task(config,
+                            FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
+                            FileD8HandoffEvidence(Path(directory) / "d8-sessions", create=False),
+                            FileD3ModelEvidence(Path(directory) / "d3-models", create=False),
+                            store, declaration["task_run_id"])
+                    if config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+                        from agent_core.selection_bindings import SelectionBindings
+                        from agent_adapters.process_fact_evidence import FileD5Evidence
+                        selections = SelectionBindings(SimpleNamespace(config=config, store=store,
+                            model_evidence=FileD3ModelEvidence(Path(directory) / 'd3-models', create=False),
+                            sessions=SimpleNamespace(evidence=FileD8HandoffEvidence(Path(directory) / 'd8-sessions', create=False)),
+                            handoff=SimpleNamespace(evidence=FileD8HandoffEvidence(Path(directory) / 'd8-handoff', create=False)),
+                            revisions=SimpleNamespace(evidence=FileD8HandoffEvidence(Path(directory) / 'd8-revisions', create=False)),
+                            refinement=SimpleNamespace(evidence=FileD5Evidence(Path(directory) / 'd5-process', create=False))),
+                            FileD8OutputEvidence(Path(directory) / 'd8-output', create=False))
+                        d8_unresolved |= selections.check_task(declaration['task_run_id'])
         result = _snapshot_v3_task_result(Path(directory), declaration)
-        if declaration.get("execution_profile") in {"d8_v6", "d8_v7"}:
+        if declaration.get("execution_profile") in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
             result.update(execution_profile=declaration["execution_profile"], contract_version=expected.contract_version)
-            if expected.contract_version == 7:
+            if expected.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
                 result["business_diagnostics"] = business_rows
             if declaration.get("mode") == "real":
-                result.update(sandbox_backend="local_simulated", model_backend="deepseek",
+                result.update(sandbox_backend=declaration["sandbox_backend"], model_backend="deepseek",
                               capacity_measurement="estimated_token_units")
             if d8_unresolved:
                 result["recovery"] = {"required": True, "reason": "operation_or_evidence_unknown"}

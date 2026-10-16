@@ -87,7 +87,15 @@ CLAIM = obj({"subject_ref": S, "observation_scope": S, "claim_key": text(128),
     optional=("conflicts_with",))
 
 
-def output_schema(request):
+def output_schema(request, *, contract_version=None):
+    stage, schema = _base_output_schema(request, contract_version=contract_version)
+    if contract_version in {15, 16, 17, 18, 19, 20, 21}:
+        from agent_core.governance_policy import patch_schema
+        schema = patch_schema(request, stage, schema)
+    return stage, schema
+
+
+def _base_output_schema(request, *, contract_version=None):
     """Enumerate the existing internal stages; unknown stages never fall back."""
     from agent_core.conclusion_revision_contracts import D8ChangeRequest
     from agent_core.process_facts import D5RefinementRequest
@@ -95,10 +103,23 @@ def output_schema(request):
     if isinstance(request, D5RefinementRequest):
         return "refinement", obj({"summary_text": text(2048), "claims": array(CLAIM, 0, 8)})
     if isinstance(request, D2ReviewRequest):
+        if (contract_version in {17, 18, 19, 20, 21} and request.review_scope != 'turn_end'
+                and json.loads(request.context_summary).get('d8_progress', {}).get('mode') != 'restricted_repair'):
+            from agent_core.execution_feasibility import policy
+            policy(request, required=True)
         fields = {"decision": S, "rationale": S, "source_ids": REFS,
                   "constraints": array(CONSTRAINT)}
         context = json.loads(request.context_summary)
         progress = isinstance(context, dict) and "d8_progress" in context
+        if contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and progress:
+            from agent_core.progress_policy import progress_schema, policy_for
+            if policy_for(request)['version'] != (2 if contract_version in {16, 17, 18, 19, 20, 21} else 1):
+                from agent_core.dual_llm_contracts import D3RecoveryRequired
+                raise D3RecoveryRequired('s6_review_text_policy_version_changed')
+            return "progress_review", progress_schema(request)
+        if contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and not progress:
+            from agent_core.review_policy import review_schema
+            return "review", review_schema(request)
         if progress:
             fields["progress"] = obj({"classification": S, "reason": text(512),
                                       "evidence_refs": array(S, 1, 8)})
@@ -110,6 +131,12 @@ def output_schema(request):
         return "change_review", obj({"decision": S, "reason": text(512),
                                        "goal_supported": NB, "scope_explanation": NS})
     if stage == "tree_planning":
+        if 'd20_http_policy' in json.loads(getattr(request, 'prior_summary', '{}')):
+            from agent_core.http_policy import schema
+            return stage, schema(request)
+        if contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.planning_assertion import planning_schema
+            return stage, planning_schema(request)
         return stage, {"anyOf": [tagged("candidates", {
             "turn_target": S, "completion_rule": RULE, "intents": array(INTENT, 1, 2)}),
             tagged("exhausted", {"reason": text(512), "evidence_refs": REFS})]}
@@ -118,28 +145,62 @@ def output_schema(request):
         return stage, obj({"turn_target": S, "completion_rule": RULE,
                            "intents": array(old_intent, 1, 2)})
     if stage == "inner_plan":
+        if getattr(getattr(getattr(request, 'context', None), 'turn_binding', None), 'kind', None) in {'http_origin','hybrid_origin'}:
+            from agent_core.http_policy import schema
+            return stage, {'anyOf': [schema(request), CHANGE, *READS]}
+        if contract_version in {17, 18, 19, 20, 21}:
+            from agent_core.execution_feasibility import KEY
+            if KEY not in json.loads(request.history_context):
+                from agent_core.dual_llm_contracts import D3RecoveryRequired
+                raise D3RecoveryRequired('d17_plan_execution_context_missing')
+        if contract_version in {16, 17, 18, 19, 20, 21}:
+            from agent_core.plan_policy import plan_schema
+            return stage, {"anyOf": [plan_schema(request), CHANGE, *READS]}
         return stage, {"anyOf": [obj({"template": S, "observation_mode": S,
                                       "source_proof_id": NS}), CHANGE, *READS]}
     if stage in {"inner_size", "inner_sha256"}:
+        if contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.fixed_probe import fixed_probe_schema
+            return stage, {"anyOf": [fixed_probe_schema(request), CHANGE]}
         return stage, {"anyOf": [obj({"action": PROBE, "review_requested": B}), CHANGE]}
     if stage == "inner_complete":
+        if contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.completion_evaluation import completion_schema
+            return stage, completion_schema(request)
         return stage, {"anyOf": [obj({"action": tagged("complete_intent", {
             "fact_ids": array(S, 1)}), "review_requested": B,
             "next_intent_candidates": array(SUGGESTION, 0, 2)}), CHANGE]}
     if stage == "inner_candidate":
+        if contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.completion_evaluation import candidate_schema
+            return stage, candidate_schema(request, allow_none=contract_version in {19, 20, 21})
         return stage, obj({"action": tagged("candidate_flag", {
             "value": S, "execution_id": S, "evidence_version": S, "source_ref": S}),
             "review_requested": B})
     if stage == "fact_proposal":
         assertion = obj({"rule_id": S, "rule_version": I,
                          "artifact_version_id": S, "observation_id": S})
+        if contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.planning_assertion import assertion_schema
+            assertion = assertion_schema()
+        if getattr(getattr(request, 'observation', None), 'rule_id', None) == 'http_response_observed':
+            assertion = obj({'rule_id': {'type':'string','const':'http_response_observed'}})
+        evidence_refs = array(S, 1, 8)
+        if contract_version in {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.conclusion_contracts import allowed_fact_evidence_refs
+            allowed = allowed_fact_evidence_refs(request.observation)
+            evidence_refs = {**array({"type": "string", "enum": list(allowed)}, len(allowed), len(allowed)),
+                             "uniqueItems": True}
         return stage, {"anyOf": [tagged("candidate", {
-            "content": text(256), "reason": text(512), "evidence_refs": array(S, 1, 8),
+            "content": text(256), "reason": text(512), "evidence_refs": evidence_refs,
             "assertion": {"anyOf": [N, assertion]}}),
             tagged("request_review", {"reason": text(512)})]}
     if stage == "fact_review":
         return stage, obj({"decision": S, "reason": text(512)})
     if stage == "intent_evaluation":
+        if contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.completion_evaluation import evaluation_schema
+            return stage, evaluation_schema(request)
         return stage, obj({"decision": S, "reason": text(512), "evidence_refs": REFS})
     if stage == "handoff_summary":
         return stage, obj({"turn_body": text(request.capacity.turn_body),
@@ -169,6 +230,13 @@ def json_type(value):
 def shape_issues(value, schema, path="$"):
     if "anyOf" in schema:
         branches = schema["anyOf"]
+        if isinstance(value, dict) and isinstance(value.get("progress"), dict):
+            classification = value["progress"].get("classification")
+            matched = [s for s in branches if s.get("properties", {}).get("progress", {}).get(
+                "properties", {}).get("classification", {}).get("const") == classification
+                and "const" in s.get("properties", {}).get("progress", {}).get("properties", {}).get("classification", {})]
+            if matched:
+                branches = matched
         if isinstance(value, dict) and isinstance(value.get("kind"), str):
             matched = [s for s in branches if s.get("properties", {}).get("kind", {}).get("const") == value["kind"]]
             if matched:
@@ -182,6 +250,8 @@ def shape_issues(value, schema, path="$"):
         return [D8FormatIssue("type_mismatch", path, "|".join(allowed), actual)]
     if "const" in schema and value != schema["const"]:
         return [D8FormatIssue("constant_mismatch", path, "fixed_value", actual)]
+    if "enum" in schema and value not in schema["enum"]:
+        return [D8FormatIssue("enum_mismatch", path, "allowed_choice", actual)]
     result = []
     if actual == "object":
         fields = schema["properties"]
@@ -198,6 +268,10 @@ def shape_issues(value, schema, path="$"):
             if key in value:
                 result += shape_issues(value[key], fields[key], path + "/" + key)
     elif actual == "array":
+        if "contains" in schema and not any(not shape_issues(v, schema["contains"], path) for v in value):
+            result.append(D8FormatIssue("array_required_item_missing", path, "required_current_reference", "missing"))
+        if schema.get("uniqueItems") and len({json.dumps(v, sort_keys=True) for v in value}) != len(value):
+            result.append(D8FormatIssue("array_duplicate", path, "unique_fields", "duplicate"))
         if len(value) < schema.get("minItems", 0):
             result.append(D8FormatIssue("array_too_short", path, "allowed_count", "array"))
         if "maxItems" in schema and len(value) > schema["maxItems"]:
@@ -208,6 +282,8 @@ def shape_issues(value, schema, path="$"):
             result += shape_issues(item, schema["items"], path + "/" + str(index))
     elif actual == "string" and len(value) > schema.get("maxLength", len(value)):
         result.append(D8FormatIssue("string_too_long", path, "allowed_length", "string"))
+    elif actual in {"integer", "number"} and (value < schema.get("minimum", value) or value > schema.get("maximum", value)):
+        result.append(D8FormatIssue("number_out_of_range", path, "allowed_range", actual))
     return result[:8]
 
 

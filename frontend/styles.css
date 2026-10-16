@@ -354,3 +354,9 @@
     font-size: 13px;
   }
 }
+
+/* Method choices are compact checkboxes, not full-width text fields. */
+#http-methods-control { margin: 0; padding: 12px 14px; border: 1px solid #ccd9d2; border-radius: 5px; }
+#http-methods-control label { display: inline-flex; align-items: center; gap: 7px; margin: 6px 20px 6px 0; }
+#http-methods-control input[type="checkbox"] { width: 16px; height: 16px; min-height: 0; margin: 0; padding: 0; flex: none; accent-color: #1b7c70; }
+#http-methods-control small { display: block; color: #71847d; }

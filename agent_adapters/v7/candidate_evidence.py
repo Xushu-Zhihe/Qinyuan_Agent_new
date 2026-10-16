@@ -23,7 +23,7 @@ from agent_adapters.windows_evidence_protection import (
     WindowsEvidenceProtectionError,
 )
 from agent_core.control_candidate import validate_control_ownership
-from agent_core.domain import ExecutionStatus, IntentStatus, PlanStatus, TurnStatus
+from agent_core.domain import ExecutionStatus, IntentStatus, PlanStatus
 from agent_core.goal_candidates import D7AnswerCandidate
 from agent_core.sqlite_control_store import SqliteControlStore
 
@@ -263,10 +263,11 @@ def _persisted_candidate(
             intents = {item.intent_id: item for item in state.intents}
             turn = turns.get(candidate.turn_id)
             intent = intents.get(candidate.intent_id)
+            from agent_core.candidate_policy import candidate_turn_ready
             if (
                 turn is None
                 or turn.task_run_id != task_run_id
-                or turn.status is not TurnStatus.COMPLETED
+                or not candidate_turn_ready(ledger.load_d3_run_config(task_run_id), turn)
                 or intent is None
                 or intent.turn_id != candidate.turn_id
                 or intent.status is not IntentStatus.SUCCEEDED

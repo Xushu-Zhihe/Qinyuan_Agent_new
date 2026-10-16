@@ -132,7 +132,8 @@ class Runner:
             or declaration.get("task_run_id") != agent_directory.name
         ):
             raise WorkbenchError("run_identity_unavailable", 409)
-        if declaration.get("protocol_version") == 3 and declaration.get("mode") == "real":
+        if (declaration.get("protocol_version") == 3 and declaration.get("mode") == "real"
+                and declaration.get('execution_profile') not in {'d8_v19', 'd8_v20', 'd8_v21'}):
             command.extend(["--env-file", str(D7_ENV_FILE)])
 
     def _preflight(self, challenge, *, mode=None):
@@ -148,21 +149,32 @@ class Runner:
             raise WorkbenchError("challenge_description_required_for_run", 409)
         attachments = challenge["attachments"]
         d7_model = None
-        if self.workbench.execution_profile in {"d8_v6", "d8_v7"}:
+        if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
             if mode not in {"simulated", "real"}:
                 raise WorkbenchError("mode_required", 409)
             if mode == "real":
                 from agent_adapters.d8_model import role_config, settings_from_file
                 try:
-                    prompt_version = 2 if self.workbench.execution_profile == "d8_v7" else 1
+                    prompt_version = int(self.workbench.execution_profile.removeprefix("d8_v")) - 5
                     settings_from_file(role_config("outer_planning", version=prompt_version), D7_ENV_FILE)
                     settings_from_file(role_config("inner_action", version=prompt_version), D7_ENV_FILE)
                 except (TypeError, ValueError, OSError):
                     raise WorkbenchError("d8_model_configuration_unavailable", 409) from None
         if self.workbench.protocol_version == 3:
-            if self.workbench.execution_profile in {"d8_v6", "d8_v7"} or mode == "simulated" or self.workbench.d7_mode == "simulated":
+            if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"} or mode == "simulated" or self.workbench.d7_mode == "simulated":
                 if challenge["endpoint"]:
-                    raise WorkbenchError("v3_network_not_supported", 409)
+                    if self.workbench.execution_profile not in {'d8_v20','d8_v21'}:
+                        raise WorkbenchError("v3_network_not_supported", 409)
+                    if mode != 'real':
+                        raise WorkbenchError('d20_http_requires_real_mode', 409)
+                    if attachments and self.workbench.execution_profile=='d8_v20':
+                        raise WorkbenchError('d20_http_attachments_unsupported', 409)
+                    from agent_adapters.workbench import http_methods
+                    http_methods(challenge.get('http_methods'))
+                    try:
+                        canonical_web_origin(challenge['endpoint'])
+                    except (TypeError, ValueError):
+                        raise WorkbenchError('d20_http_endpoint_invalid', 409) from None
             else:
                 if not challenge["endpoint"]:
                     raise WorkbenchError("d7_web_endpoint_required", 409)
@@ -184,7 +196,7 @@ class Runner:
     def start(self, challenge_id: str, *, mode=None):
         with self.workbench.lock:
             challenge = self.workbench.get(challenge_id)
-            if self.workbench.execution_profile in {"d8_v6", "d8_v7"}:
+            if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
                 if mode is not None and mode not in {"simulated", "real"}:
                     raise WorkbenchError("mode_required", 409)
                 if (mode is not None and self.workbench.d7_mode is not None
@@ -210,7 +222,7 @@ class Runner:
                     raise WorkbenchError("attachment_path_rejected", 409)
                 shutil.copyfile(source, target)
 
-            if self.workbench.protocol_version == 3 and (mode == "simulated" or self.workbench.execution_profile in {"d8_v6", "d8_v7"}):
+            if self.workbench.protocol_version == 3 and (mode == "simulated" or self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}):
                 # Temporary D7 simulation envelope.  It intentionally has no
                 # endpoint/network capability and uses deterministic local
                 # role snapshots; the child remains the sole scheduler.
@@ -256,7 +268,7 @@ class Runner:
                         },
                     },
                 }
-                if self.workbench.execution_profile in {"d8_v6", "d8_v7"}:
+                if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
                     from agent_adapters.d8_simulation import simulation_config
                     from agent_core.operation_accounting import D8HandoffBudgetPolicy
                     request.update(execution_profile=self.workbench.execution_profile, mode=mode,
@@ -264,12 +276,20 @@ class Runner:
                     request["dual_llm_config"]["d4_budget"] = asdict(D8HandoffBudgetPolicy())
                     for role, value in (("outer", role_outer), ("inner", role_inner)):
                         value["model"] = f"d8-simulated-{role}"
-                        value["prompt_template"] = f"d8-simulated-{role}-v{2 if self.workbench.execution_profile == 'd8_v7' else 1}"
+                        value["prompt_template"] = f"d8-simulated-{role}-v{int(self.workbench.execution_profile.removeprefix('d8_v')) - 5}"
                     if mode == "real":
                         from agent_adapters.d8_simulation import real_config
                         from agent_adapters.d8_model import role_config
-                        request["d8_config"] = real_config()
-                        prompt_version = 2 if self.workbench.execution_profile == "d8_v7" else 1
+                        is_http = self.workbench.execution_profile in {'d8_v20','d8_v21'} and bool(challenge['endpoint'])
+                        request["d8_config"] = real_config(contract_version=int(self.workbench.execution_profile.removeprefix("d8_v")),
+                            http=is_http, http_timeout_seconds=challenge['step_timeout_seconds'])
+                        if is_http:
+                            origin = canonical_web_origin(challenge['endpoint'])
+                            request['task_request']['target']['endpoints'] = [{'url': origin}]
+                            request['authorization'] = dict(authorization_id=str(uuid4()), allowed_origin=origin,
+                                allowed_methods=challenge['http_methods'], allowed_tool='d7_http_request',
+                                network_allowed=True, attachment_indices=list(range(len(names))) if self.workbench.execution_profile=='d8_v21' else [])
+                        prompt_version = int(self.workbench.execution_profile.removeprefix("d8_v")) - 5
                         request["dual_llm_config"]["outer_role"] = asdict(role_config("outer_planning", version=prompt_version))
                         request["dual_llm_config"]["inner_role"] = asdict(role_config("inner_action", version=prompt_version))
             elif self.workbench.protocol_version == 3:
@@ -506,6 +526,49 @@ class Runner:
         threading.Thread(target=self._watch, args=(run["run_id"],), daemon=True).start()
         return self.status(challenge_id)
 
+    def resume(self, challenge_id: str):
+        return self._d9_operation(challenge_id, 'resume')
+
+    def validation_check(self, challenge_id: str, selection: dict):
+        return self._d9_operation(challenge_id, 'validation-check', selection)
+
+    def _d9_operation(self, challenge_id, operation, selection=None):
+        """Only the CLI owns checks, continuation and persisted transitions."""
+        from agent_adapters.v7.task_result import snapshot_v3_task_result
+        from agent_adapters.validation_check import validate_selection
+        with self.workbench.lock, self._lock:
+            run = self._current(challenge_id)
+            if run is None or run['status'] not in {'paused', 'recovery_required', 'finished', 'cleanup_confirmed'}:
+                raise WorkbenchError('d9_operation_not_available', 409)
+            directory = Path(run['directory'])
+            agent_dir = self._find_agent_directory(directory)
+            if agent_dir is None or agent_dir.name != run['agent_task_run_id']:
+                raise WorkbenchError('run_identity_unavailable', 409)
+            declaration = immutable_read(agent_dir / 'run.json')
+            if (not isinstance(declaration, dict) or declaration.get('task_run_id') != agent_dir.name
+                    or (declaration.get('contract_version'), declaration.get('execution_profile')) not in {(19,'d8_v19'),(20,'d8_v20'),(21,'d8_v21')}):
+                raise WorkbenchError('d9_operation_profile_unsupported', 409)
+            result = snapshot_v3_task_result(agent_dir, declaration)
+            if operation == 'resume' and result.get('task_run', {}).get('status') != 'running':
+                raise WorkbenchError('d9_resume_requires_running_task', 409)
+            command = [sys.executable, '-m', 'agent', operation, '--task-run-id',
+                       agent_dir.name, '--state-dir', str(agent_dir.parent),
+                       '--events', str(directory / 'events.jsonl')]
+            if operation == 'validation-check':
+                selection = validate_selection(agent_dir.name, selection)
+                for key, value in selection.items():
+                    command.extend(['--' + key.replace('_', '-'), value])
+            try:
+                with (directory / 'agent.stdout.log').open('wb') as stdout, (directory / 'agent.stderr.log').open('wb') as stderr:
+                    process = subprocess.Popen(command, cwd=directory,
+                        env=self._subprocess_environment(3), stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+            except OSError as exc:
+                raise WorkbenchError('d9_operation_start_failed', 503) from exc
+            self._active[run['run_id']] = ActiveRun(run['run_id'], challenge_id, directory, process)
+            self.workbench._started_run(run['run_id'])
+        threading.Thread(target=self._watch, args=(run['run_id'],), daemon=True).start()
+        return self.status(challenge_id)
+
     def batch_cleanup(self, challenge_ids: list[str]):
         """Cleanup multiple challenges at once."""
         results = []
@@ -674,6 +737,29 @@ class Runner:
             }
         if stderr and not result.get("errors"):
             result["errors"] = [{"code": "agent_process_stderr"}]
+        known = self._current(active.challenge_id)
+        if (known and known['run_id'] == run_id and known.get('agent_task_run_id')
+                and (known.get('result') or {}).get('contract_version') in {19, 20, 21}
+                and (result.get('protocol_version') != 3 or result.get('contract_version') != (known.get('result') or {}).get('contract_version')
+                     or result.get('task_run_id') != known['agent_task_run_id'])):
+            expected = known['agent_task_run_id']
+            # Preserve the existing owner; stdout cannot select a replacement TaskRun.
+            try:
+                agent_dir = self._find_agent_directory(active.directory)
+                if agent_dir is None or agent_dir.name != expected:
+                    raise ValueError('d9_run_identity_unavailable')
+                declaration = immutable_read(agent_dir / 'run.json')
+                if (declaration.get('task_run_id') != expected
+                        or (declaration.get('contract_version'), declaration.get('execution_profile')) not in {(19,'d8_v19'),(20,'d8_v20'),(21,'d8_v21')}):
+                    raise ValueError('d9_run_identity_changed')
+                from agent_adapters.v7.task_result import snapshot_v3_task_result
+                result = snapshot_v3_task_result(agent_dir, declaration)
+            except (OSError, ValueError, TypeError, AttributeError):
+                result = {'protocol_version': 3, 'contract_version': (known.get('result') or {})['contract_version'], 'task_run_id': expected,
+                          'task_run': None, 'goal_evaluation': 'unknown', 'errors': []}
+            result.setdefault('errors', []).append({'code': 'd9_public_operation_result_unknown'})
+            result['recovery'] = {'required': True, 'reason': 'd9_public_operation_result_unknown'}
+            result['exit_code'] = 5
         agent_status = (result.get("task_run") or {}).get("status")
         exit_code = int(result.get("exit_code", 4))
         if result.get("protocol_version") == 3 and "run_exit_code" in result:
@@ -684,6 +770,9 @@ class Runner:
                 and (active.cleanup_only or exit_code in (4, 5)
                      or result.get("recovery", {}).get("required"))):
             status = "cleanup_confirmed"
+        elif (result.get('protocol_version') == 3 and result.get('contract_version') in {19, 20, 21}
+              and agent_status in {'running', 'awaiting_external_feedback'}):
+            status = 'recovery_required' if result.get('recovery', {}).get('required') else 'paused'
         elif exit_code == 2 and result.get("task_run_id") is None:
             status = "failed"
         elif (result.get("protocol_version") in {2, 3} and exit_code == 4

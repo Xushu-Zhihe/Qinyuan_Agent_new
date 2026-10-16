@@ -1,4 +1,4 @@
-"""Contract7 tree-planning rejection diagnostics, without rejected values."""
+"""Contracts7/8 tree-planning rejection diagnostics, without rejected values."""
 
 from dataclasses import asdict
 import math
@@ -110,7 +110,7 @@ def planning_issues(request, raw, authorization, reliable):
 
 class BusinessDiagnostics:
     def __init__(self, config, evidence, handoff_evidence, store):
-        if config.contract_version != 7:
+        if config.contract_version not in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
             raise ValueError("business_diagnostics_require_contract7")
         self.config, self.evidence, self.handoff, self.store = config, evidence, handoff_evidence, store
 
@@ -129,8 +129,8 @@ class BusinessDiagnostics:
             raise D3RecoveryRequired("d8_business_diagnostic_evidence_missing")
         request = D8HandoffRequest.from_dict(payload)
         if (type(record["diagnostic_version"]) is not int or record["diagnostic_version"] != 1
-                or type(record["contract_version"]) is not int or record["contract_version"] != 7
-                or contract["contract_version"] != 7 or request.stage != "tree_planning"
+                or type(record["contract_version"]) is not int or record["contract_version"] != self.config.contract_version
+                or contract["contract_version"] != self.config.contract_version or request.stage != "tree_planning"
                 or record["model_request_id"] != identity or request.model_request_id != identity
                 or record["task_run_id"] != request.task_run_id
                 or record["stage"] != request.stage or record["stage"] != contract["stage"]
@@ -160,7 +160,7 @@ class BusinessDiagnostics:
             root_payload = self.handoff.read("request", root)
             if (not isinstance(root_contract, dict) or not isinstance(root_payload, dict)
                     or root_contract.get("model_request_id") != root
-                    or root_contract.get("contract_version") != 7
+                    or root_contract.get("contract_version") != self.config.contract_version
                     or root_contract.get("correction_of_model_request_id") is not None
                     or root_payload.get("correction_of_model_request_id") is not None
                     or root_payload.get("task_run_id") != request.task_run_id
@@ -191,6 +191,8 @@ class BusinessDiagnostics:
             if not isinstance(value, dict) or value.get("code") not in allowed:
                 raise D3RecoveryRequired("d8_business_diagnostic_issues_invalid")
             code = value["code"]
+            if self.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and code in {"planning_target_invalid", "planning_target_mismatch"}:
+                raise D3RecoveryRequired("s2_planning_diagnostic_program_field")
             valid = ([issue(code, i) for i in range(2)] if code in CANDIDATE_ISSUES else [issue(code)])
             if value not in valid:
                 raise D3RecoveryRequired("d8_business_diagnostic_issues_invalid")
@@ -214,7 +216,7 @@ class BusinessDiagnostics:
 
     def save(self, request, issues, reason, indices, finished_at):
         contract = self.evidence.read("contract", request.model_request_id)
-        record = {"diagnostic_version": 1, "contract_version": 7,
+        record = {"diagnostic_version": 1, "contract_version": self.config.contract_version,
             "task_run_id": request.task_run_id, "model_request_id": request.model_request_id,
             "root_request_id": contract["root_request_id"],
             "correction_of_model_request_id": request.correction_of_model_request_id,

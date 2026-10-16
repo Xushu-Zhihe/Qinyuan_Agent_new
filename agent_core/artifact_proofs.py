@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent_core.http_contracts import plan_turn_binding
 import base64
 import hashlib
 import json
@@ -139,7 +140,7 @@ class D3ObservationProofVerifier:
 
     def _observation(self, binding: D3PlanBinding, observation_id: str, *, allow_inactive_plan: bool = False):
         state = self.ledger.load_control_state_rows(binding.task_run_id)
-        turn = self.ledger.load_d3_turn_binding(binding.turn_id)
+        turn = plan_turn_binding(self.ledger,binding)
         plan = (
             next(
                 (item for item in state.plans if item.plan_id == binding.plan_id), None

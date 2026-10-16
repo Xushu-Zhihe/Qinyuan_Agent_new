@@ -8,7 +8,7 @@ from dataclasses import asdict, replace
 
 from agent_core.conclusion_contracts import (
     D8Candidate, D8Conclusion, D8Feedback, D8InferenceView, D8ModelRequest, D8Observation,
-    D8ReviewDecision, D8ReviewRequestAction, conclusion_digest, parse_d8_proposal,
+    D8ReviewDecision, D8ReviewRequestAction, conclusion_digest, parse_d8_proposal, fact_evidence_matches,
 )
 from agent_core.runtime import TaskRunStatus
 from agent_core.domain import IntentStatus, PlanStatus, TurnStatus
@@ -27,11 +27,15 @@ class ConclusionReview:
         self.redactor, self.clock, self.stopped = redactor, clock, stopped
         self.request_capacity_check = None
         self.prepare_inner_request = None
+        self.business_diagnostics = None
 
     def _id(self, name):
         return stable_id(self.controller.control_state.task_run.task_run_id, f"d8/{name}")
 
     def observation(self, proof_id: str, *, historical: bool = False) -> D8Observation:
+        http = getattr(self, 'http', None)
+        if http is not None and http.result(proof_id) is not None:
+            return http.observation(proof_id, historical=historical)
         proof = self.proofs.proofs.read(proof_id)
         if proof is None:
             raise D3RecoveryRequired("d8_proof_missing")
@@ -41,15 +45,21 @@ class ConclusionReview:
         if checked.task_run_id != state.task_run.task_run_id:
             raise D3RecoveryRequired("d8_source_owner_mismatch")
         receipt = self.workspace.read_digest(proof.observation_id)
-        binding = self.store.load_d3_turn_binding(proof.turn_id)
+        binding = self.store.load_d3_plan_turn_binding(proof.plan_id)
         if receipt is None or binding is None:
             raise D3RecoveryRequired("d8_source_unavailable")
         version = conclusion_digest({"proof": asdict(checked), "receipt": asdict(receipt),
                                      "binding": asdict(binding)})
-        return D8Observation(proof.task_run_id, proof.turn_id, proof.intent_id,
+        source = D8Observation(proof.task_run_id, proof.turn_id, proof.intent_id,
                              proof.plan_id, proof.artifact_version_id, proof.observation_id,
                              proof.proof_id, proof.source_execution_id, proof.observed_sha256,
                              binding.expected_byte_size, receipt.completed_at, version)
+        if self.config.contract_version in {16, 17, 18, 19, 20, 21}:
+            from agent_core.conclusion_contracts import D16Observation
+            return D16Observation(**asdict(source), expected_sha256=binding.expected_sha256,
+                digest_matches_expected=proof.observed_sha256 == binding.expected_sha256,
+                rule_binding_sha256=proof.rule_binding_sha256)
+        return source
 
     def _scope(self, source: D8Observation) -> None:
         state = self.controller.control_state
@@ -82,7 +92,17 @@ class ConclusionReview:
             raise D3RecoveryRequired("d8_saved_result_invalid") from exc
 
     def _checked_completion(self, request, result):
-        if (set(result) != {"model_request_id", "request_sha256", "outcome", "raw", "finished_at"}
+        fields = {"model_request_id", "request_sha256", "outcome", "raw", "finished_at"}
+        bindings = getattr(self, "assembly_bindings", None)
+        if bindings is not None and request.stage == "fact_proposal":
+            bindings.verify_result(request, result)
+            if "assembly_sha256" in result:
+                fields.add("assembly_sha256")
+        if self.business_diagnostics is not None and request.stage == "fact_proposal":
+            self.business_diagnostics.verify_result(request, result)
+            if "business_diagnostic_sha256" in result:
+                fields.add("business_diagnostic_sha256")
+        if (set(result) != fields
                 or result["request_sha256"] != request.context_sha256
                 or result["model_request_id"] != request.model_request_id
                 or result["outcome"] not in {"valid", "invalid", "sensitive_rejected", "model_error", "stale"}):
@@ -98,6 +118,11 @@ class ConclusionReview:
                                      request.model_request_id, conclusion_digest(result))
 
     def _known(self, request, *, repair=True):
+        if self.config.contract_version in {16, 17, 18, 19, 20, 21} and request.observation.rule_id!='http_response_observed':
+            from agent_core.conclusion_contracts import D16Observation
+            if (not isinstance(request.observation, D16Observation)
+                    or request.observation != self.observation(request.observation.proof_id, historical=True)):
+                raise D3RecoveryRequired('s6_fact_source_projection_changed')
         record = self.store.load_d4_operation(request.model_request_id)
         result = self.evidence.read_result(request.model_request_id)
         if record is None:
@@ -115,8 +140,23 @@ class ConclusionReview:
         if record.start != expected or request.role_config_ref != role.role_config_ref:
             raise D3RecoveryRequired("d8_saved_request_binding_changed")
         if result is None:
+            bindings = getattr(self, "assembly_bindings", None)
+            if bindings is not None and request.stage == "fact_proposal":
+                known = bindings.known_result(request)
+                if known is not None:
+                    self._parse(request, known["raw"])
+                    if self._sensitive(known["raw"]):
+                        raise D3RecoveryRequired("s2_saved_fact_not_safe")
+                    self.evidence.save_result(request.model_request_id, known)
+                    result = known
+        if result is None:
+            business = (self.business_diagnostics.read(request.model_request_id, check_operation=True)
+                        if self.business_diagnostics is not None and request.stage == "fact_proposal" else None)
+            if business is not None:
+                result = self.business_diagnostics.rejected_result(request, business)
+                self.evidence.save_result(request.model_request_id, result)
             boundary = getattr(self, "output_boundary", None)
-            failure = boundary.failure(request) if boundary is not None else None
+            failure = boundary.failure(request) if boundary is not None and result is None else None
             if failure is not None:
                 result = {"model_request_id": request.model_request_id,
                     "request_sha256": request.context_sha256,
@@ -140,7 +180,13 @@ class ConclusionReview:
             request = self.evidence.read_request(record.start.operation_id)
             boundary = getattr(self, "output_boundary", None)
             known_format = boundary is not None and boundary.diagnostic(record.start.operation_id) is not None
-            if request is not None and (self.evidence.read_result(request.model_request_id) is not None or known_format):
+            known_business = (request is not None and request.stage == "fact_proposal"
+                and self.business_diagnostics is not None
+                and self.business_diagnostics.read(request.model_request_id, check_operation=True) is not None)
+            bindings = getattr(self, "assembly_bindings", None)
+            known_assembly = (request is not None and request.stage == "fact_proposal" and bindings is not None
+                              and bindings.known_result(request) is not None)
+            if request is not None and (self.evidence.read_result(request.model_request_id) is not None or known_format or known_business or known_assembly):
                 self._known(request)
         for record in self.store.list_d8_conclusions(task_id):
             for request_id in (record.proposal_request_id, record.review_request_id):
@@ -209,7 +255,14 @@ class ConclusionReview:
                 "inner_action" if request.stage == "fact_proposal" else "outer_planning",
                 request.role_config_ref))
             raw = await self._invoke(request, token)
+            wire = raw
+            bindings = getattr(self, "assembly_bindings", None)
+            if (bindings is not None and request.stage == "fact_proposal"
+                    and raw is not None and not isinstance(raw, ModelError)):
+                from agent_core.planning_assertion import materialize
+                raw = materialize(request, raw)
             outcome = "valid"
+            issues = None
             if isinstance(raw, ModelError):
                 outcome, raw = "model_error", None
             elif self._sensitive(raw):
@@ -218,12 +271,22 @@ class ConclusionReview:
                 try:
                     self._parse(request, raw)
                 except (ValueError, TypeError, KeyError):
+                    if self.business_diagnostics is not None and request.stage == "fact_proposal":
+                        boundary = getattr(self, "output_boundary", None)
+                        if boundary is None or boundary.diagnostic(request.model_request_id) is None:
+                            from agent_core.fact_diagnostics import proposal_issues
+                            issues = proposal_issues(raw)
                     outcome, raw = "invalid", None
             if self.stopped() or token.is_cancelled:
                 outcome, raw = "stale", None
             result = {"model_request_id": request.model_request_id,
                       "request_sha256": request.context_sha256, "outcome": outcome,
                       "raw": raw, "finished_at": self.clock()}
+            if outcome == "invalid" and issues is not None:
+                business = self.business_diagnostics.save(request, issues, result["finished_at"])
+                result = self.business_diagnostics.rejected_result(request, business)
+            if bindings is not None and request.stage == "fact_proposal" and outcome == "valid":
+                result = bindings.save(request, wire, result)
             self.evidence.save_result(request.model_request_id, result)
             self.store.complete_d4_operation(self._completion(request, result))
         boundary = getattr(self, "output_boundary", None)
@@ -266,7 +329,9 @@ class ConclusionReview:
             return "rejected" if decision.decision == "reject" else "insufficient"
         if candidate.assertion is None:
             return "reviewed_inference"
-        if (candidate.assertion.artifact_version_id != source.artifact_version_id
+        if (candidate.assertion.rule_id != source.rule_id
+                or candidate.assertion.rule_version != source.rule_version
+                or candidate.assertion.artifact_version_id != source.artifact_version_id
                 or candidate.assertion.observation_id != source.observation_id):
             return "rejected"
         return "verified_fact"
@@ -291,7 +356,7 @@ class ConclusionReview:
             proposal_id, candidate = await self._call(request, token)
             if isinstance(candidate, D8ReviewRequestAction):
                 return proposal_id, candidate
-            if set(candidate.evidence_refs) != {source.proof_id}:
+            if not fact_evidence_matches(candidate, source):
                 raise D3RecoveryRequired("d8_candidate_source_not_in_context")
             review_id = self._id(f"review/{proposal_id}")
             review = self.evidence.read_request(review_id) or D8ModelRequest(
@@ -327,7 +392,7 @@ class ConclusionReview:
                 or record.source_version_sha256 != source.source_version_sha256
                 or record.candidate_sha256 != conclusion_digest(asdict(candidate))
                 or record.outcome != self._outcome(candidate, source, decision)
-                or set(candidate.evidence_refs) != {source.proof_id}):
+                or not fact_evidence_matches(candidate, source)):
             raise D3RecoveryRequired("d8_approval_binding_changed")
         self._scope(source)
         if (proposal.base_checkpoint_sequence > state.latest_checkpoint.sequence
@@ -383,7 +448,7 @@ class ConclusionReview:
                         or record.candidate_sha256 != conclusion_digest(asdict(request.candidate))
                         or record.source_version_sha256 != source.source_version_sha256
                         or request.candidate.assertion is not None
-                        or set(request.candidate.evidence_refs) != {source.proof_id}
+                        or not fact_evidence_matches(request.candidate, source)
                         or D8ReviewDecision.from_dict(known["raw"]).decision != "accept"):
                     raise D3RecoveryRequired("d8_inference_binding_changed")
                 result.append(D8InferenceView(record, "available", scope_status, request.candidate, source))

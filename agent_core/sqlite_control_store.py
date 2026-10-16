@@ -2070,7 +2070,22 @@ class SqliteControlStore:
         row = self._connection.execute(
             "SELECT binding_json FROM d3_turn_bindings WHERE turn_id = ?", (turn_id,)
         ).fetchone()
-        return None if row is None else D3TurnBinding(**json.loads(row["binding_json"]))
+        from agent_core.http_contracts import turn_binding_from_dict
+        return None if row is None else turn_binding_from_dict(json.loads(row["binding_json"]))
+
+    def load_d3_plan_turn_binding(self, plan_id: str):
+        from agent_core.hybrid_contracts import HybridTurnBinding,AttachmentPlanBinding,attachment_binding
+        binding=self.load_d3_plan_binding(plan_id)
+        if binding is None:return None
+        turn=self.load_d3_turn_binding(binding.turn_id)
+        if isinstance(binding,AttachmentPlanBinding):
+            selected=attachment_binding(turn,binding.attachment_index)
+            if binding.rule_binding_sha256!=digest(asdict(selected)):
+                raise StorageError('d21_attachment_rule_binding_changed')
+            return selected
+        if isinstance(turn,HybridTurnBinding) and isinstance(binding,D3PlanBinding):
+            raise StorageError('d21_attachment_plan_selection_missing')
+        return turn
 
     def load_d3_intent_binding(self, intent_id: str) -> D3IntentBinding | None:
         if self._schema_version < 13:
@@ -2086,7 +2101,8 @@ class SqliteControlStore:
         row = self._connection.execute(
             "SELECT binding_json FROM d3_plan_bindings WHERE plan_id = ?", (plan_id,)
         ).fetchone()
-        return None if row is None else D3PlanBinding(**json.loads(row["binding_json"]))
+        from agent_core.http_contracts import plan_binding_from_dict
+        return None if row is None else plan_binding_from_dict(json.loads(row["binding_json"]))
 
     def load_d3_plan_result(self, plan_id: str) -> D3PlanResult | None:
         if self._schema_version < 13:
@@ -3795,7 +3811,7 @@ class SqliteControlStore:
                 raise StorageError("D8 refinement correction root unavailable")
             root = self.load_d5_attempt(correction)
             config = self.load_d3_run_config(attempt.task_run_id)
-            if (root is None or config is None or config.contract_version not in {6, 7}
+            if (root is None or config is None or config.contract_version not in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
                     or (root.task_run_id, root.review_id, root.sources, root.context_sha256,
                         root.base_checkpoint_sequence, root.role_config_ref)
                     != (attempt.task_run_id, attempt.review_id, attempt.sources, attempt.context_sha256,
@@ -3890,7 +3906,7 @@ class SqliteControlStore:
             config = self.load_d3_run_config(attempt.task_run_id)
             root = self.load_d5_attempt(root_id)
             operation = self.load_d4_operation(root_id)
-            if (config is None or config.contract_version not in {6, 7} or root is None
+            if (config is None or config.contract_version not in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or root is None
                     or self.d8_refinement_root(root_id) is not None
                     or operation is None or operation.completion is None
                     or operation.completion.result_kind != "failed"
@@ -4103,10 +4119,11 @@ class SqliteControlStore:
             intents = {item.intent_id: item for item in state.intents}
             turn = turns.get(candidate.turn_id)
             intent = intents.get(candidate.intent_id)
+            from agent_core.candidate_policy import candidate_turn_ready
             if (
                 turn is None
                 or turn.task_run_id != mutation.task_run_id
-                or turn.status is not TurnStatus.COMPLETED
+                or not candidate_turn_ready(d3_config, turn)
                 or intent is None
                 or intent.turn_id != candidate.turn_id
                 or intent.status is not IntentStatus.SUCCEEDED
@@ -4517,7 +4534,7 @@ class SqliteControlStore:
             config = self.load_d3_run_config(start.task_run_id)
             task = self.load_task_run(start.task_run_id)
             latest = self._connection.execute("SELECT MAX(sequence) FROM checkpoints WHERE task_run_id=?", (start.task_run_id,)).fetchone()[0]
-            if (config is None or config.contract_version not in {3, 4, 5, 6, 7} or task.status is not TaskRunStatus.RUNNING
+            if (config is None or config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or task.status is not TaskRunStatus.RUNNING
                     or latest != start.checkpoint_sequence or not task.started_at <= start.started_at < task.deadline_at
                     or self._now() >= task.deadline_at or self.list_d4_unresolved_operations(start.task_run_id)
                     or self._connection.execute("SELECT 1 FROM d4_audit_events WHERE task_run_id=? AND category='cancellation_requested'", (start.task_run_id,)).fetchone()):
@@ -4602,11 +4619,13 @@ class SqliteControlStore:
             if metadata != D3CommitMetadata(config=metadata.config):
                 raise StorageError("D3 start may only save its frozen configuration")
             attachments = mutation.request.target.attachments
-            if (
-                mutation.request.target.endpoints
-                or len(attachments) != len(metadata.config.authorization.attachment_indices)
-                or any(item.kind != "local_path" for item in attachments)
-                or len(mutation.state_changes) != 1
+            from agent_core.http_validation import valid_target
+            from agent_core.http_contracts import is_http
+            target_valid = (valid_target(metadata.config, mutation.request) if is_http(metadata.config) else
+                not mutation.request.target.endpoints
+                and len(attachments) == len(metadata.config.authorization.attachment_indices)
+                and all(item.kind == 'local_path' for item in attachments))
+            if (not target_valid or len(mutation.state_changes) != 1
                 or not isinstance(mutation.state_changes[0], UpsertTaskRun)
             ):
                 raise StorageError("D3 requires frozen local attachments without network")
@@ -4668,6 +4687,9 @@ class SqliteControlStore:
             accepted_feedback or accepted_check or preserved_achieved_feedback
         ):
             raise StorageError("D3 has no whole-task success evaluator")
+        from agent_core.http_validation import validate_mutation as validate_http_mutation
+        if validate_http_mutation(self, mutation, config):
+            return
         turn_changes = [change for change in mutation.state_changes if isinstance(change, UpsertTurn)]
         intent_changes = [change for change in mutation.state_changes if isinstance(change, UpsertIntent)]
         plan_changes = [change for change in mutation.state_changes if isinstance(change, UpsertPlan)]
@@ -4930,7 +4952,7 @@ class SqliteControlStore:
                 ):
                     raise StorageError(f"D3 {kind} state transition is not admitted")
         config = self.load_d3_run_config(mutation.task_run_id)
-        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1 and config.contract_version not in {3, 4, 5, 6, 7}:
+        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1 and config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
             raise StorageError("D3 may run only one Turn")
         if sum(item.status is IntentStatus.RUNNING for item in after.intents) > 1:
             raise StorageError("D3 may run only one Intent")
@@ -4995,7 +5017,7 @@ class SqliteControlStore:
             ]
             if (
                 len(old_active) != 1
-                or mutation.operation == "abandon_d8_intent" and (config.contract_version not in {5, 6, 7} or pending or new_active)
+                or mutation.operation == "abandon_d8_intent" and (config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or pending or new_active)
                 or mutation.operation == "switch_d3_intent" and (not pending or len(new_active) != 1)
                 or pending and new_active[0].turn_id != old_active[0].turn_id
                 or new_intents[old_active[0].intent_id].status is not IntentStatus.ABANDONED

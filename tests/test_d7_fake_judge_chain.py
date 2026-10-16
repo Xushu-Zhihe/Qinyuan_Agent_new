@@ -42,7 +42,7 @@ def test_fake_judge_rejection_automatically_executes_second_turn_and_accepts(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setattr(
-        d7_candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
+        candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
     )
     app, token = make_case(tmp_path, 2)
     candidates = []
@@ -115,7 +115,7 @@ def test_reopened_application_replays_rejected_feedback_and_continues(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setattr(
-        d7_candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
+        candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
     )
     app, token = make_case(tmp_path, 2)
     reopened = None
@@ -198,7 +198,7 @@ def test_reopened_application_replays_rejected_feedback_and_continues(
 
 def test_unknown_feedback_does_not_register_or_run_a_turn(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        d7_candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
+        candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
     )
     app, token = make_case(tmp_path, 2)
     try:
@@ -238,7 +238,7 @@ def test_unknown_feedback_does_not_register_or_run_a_turn(tmp_path, monkeypatch)
 
 def test_opposite_feedback_conflict_does_not_reopen_or_continue(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        d7_candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
+        candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
     )
     app, token = make_case(tmp_path, 2)
     try:
@@ -294,7 +294,7 @@ def test_conflict_after_rejection_blocks_continuation_dispatch(
     tmp_path, monkeypatch, injection_point,
 ):
     monkeypatch.setattr(
-        d7_candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
+        candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
     )
     app, token = make_case(tmp_path, 2)
     try:
@@ -368,7 +368,7 @@ def test_cancel_while_waiting_for_external_feedback_cleans_sandbox(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setattr(
-        d7_candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
+        candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection,
     )
     app, token = make_case(tmp_path, 2)
     try:

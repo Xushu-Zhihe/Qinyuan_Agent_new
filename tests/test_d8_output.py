@@ -36,10 +36,27 @@ class EnvelopeModel:
     def invoke(self, envelope, *args):
         assert isinstance(envelope, D8OutputRequest)
         self.calls.append(envelope)
-        return self.transform(envelope, self.adapter.invoke(envelope.request, *args))
+        raw = self.adapter.invoke(envelope.request, *args)
+        from agent_core.fixed_probe import FixedProbeContext, fixed_probe_policy
+        if (isinstance(getattr(envelope.request, "context", None), FixedProbeContext)
+                and isinstance(raw, dict) and isinstance(raw.get("action"), dict)
+                and raw["action"].get("kind") == "probe"):
+            raw = {"action": {"kind": "fixed_probe", "operation": fixed_probe_policy(envelope.request)["operation"],
+                              "timeout_seconds": raw["action"]["timeout_seconds"]},
+                   "review_requested": raw["review_requested"]}
+        if envelope.output_contract['stage'] == 'tree_planning' and isinstance(raw, dict) and raw.get('kind') == 'candidates' and (
+                'turn_target' not in envelope.output_contract['schema']['anyOf'][0]['properties']):
+            raw.pop('turn_target')
+            raw['completion_rule'].pop('version')
+        if envelope.output_contract['stage'] == 'fact_proposal' and isinstance(raw, dict) and raw.get('assertion') is not None and (
+                set(envelope.output_contract['schema']['anyOf'][0]['properties']['assertion']['anyOf'][1]['properties']) == {'rule_id'}):
+            raw['assertion'] = {'rule_id': raw['assertion']['rule_id']}
+        if envelope.output_contract['stage'] == 'progress_review' and 'anyOf' in envelope.output_contract['schema'] and isinstance(raw, dict):
+            raw['constraints'] = [{k: v for k, v in c.items() if k != 'scope_id'} for c in raw['constraints']]
+        return self.transform(envelope, raw)
 
 
-@pytest.fixture(params=(6, 7))
+@pytest.fixture(params=(6, 7, 8, 9, 10, 11, 12, 13, 14))
 def output_case(tmp_path, request):
     source = tmp_path / "input"
     source.mkdir()
@@ -436,12 +453,14 @@ def test_semantic_retry_and_format_retry_share_one_opportunity(output_case):
     case = output_case
     def response(e, raw):
         if initial_planning(e):
+            if case.app.config.contract_version in {12, 13, 14} and e.correction is None:
+                return {**raw, 'intents': [{**raw['intents'][0], 'description': ' '}]}
             return {**raw, "turn_target": "Different goal"} if e.correction is None else {**raw, "intents": {}}
         return raw
     case.models["handoff"].transform = response
     assert run(case).stop_reason != "search_exhausted"
     assert len(case.models["handoff"].calls) == 2
-    expected = "output_business_invalid" if case.app.config.contract_version == 7 else "proposal_rejected"
+    expected = "output_business_invalid" if case.app.config.contract_version in {7, 8, 9, 10, 11, 12, 13, 14} else "proposal_rejected"
     assert case.models["handoff"].calls[1].correction["reason"] == expected
     assert not case.app.state.turns and not case.sandbox.command_calls
 

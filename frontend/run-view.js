@@ -8,6 +8,7 @@ const RunView = (() => {
   let current = null;
   let filter = null;
   let cache = new Map();
+  const validationQueries = new Map();
   let generation = 0;
   let activeTab = "detail";
   let graphZoom = null;
@@ -20,7 +21,7 @@ const RunView = (() => {
   function detail(key, title) { const el = node("details", undefined, "run-event"); el.dataset.key = key; el.append(node("summary", title)); return el; }
   function badge(status) { const el = node("span", label(status), "run-badge"); if (Object.hasOwn(labels, status)) el.dataset.status = status; return el; }
   function metric(title, value) { const el = node("div", undefined, "run-metric"); el.append(node("span", title), node("strong", value)); return el; }
-  function reset() { generation += 1; current = null; filter = null; cache = new Map(); graphZoom = null; setTab("detail"); get("run-read-error").hidden = true; }
+  function reset() { generation += 1; current = null; filter = null; cache = new Map(); validationQueries.clear(); graphZoom = null; setTab("detail"); get("run-read-error").hidden = true; }
   function render(data) {
     if (current?.run?.run_id !== data.run?.run_id) { generation += 1; cache.clear(); filter = null; }
     current = data;
@@ -28,7 +29,8 @@ const RunView = (() => {
     const progress = data.progress || run?.result || {};
     const live = ["starting", "running", "cancelling", "cleaning"].includes(run?.status);
     get("run-dashboard").hidden = !run; get("run-raw").hidden = !run;
-    get("run-status").textContent = run ? `${label(run.status)} · ${progress.mode === "simulated" ? "本地模拟 · " : ""}${progress.task_run_id || run.agent_task_run_id || run.run_id}` : "保存题目后，可开始运行。";
+    const backend = progress.mode === "simulated" ? "本地模拟 · " : progress.sandbox_backend === "docker" ? "Docker · " : progress.sandbox_backend === "local_simulated" ? "真实模型／本地模拟 Sandbox · " : "";
+    get("run-status").textContent = run ? `${label(run.status)} · ${backend}${progress.task_run_id || run.agent_task_run_id || run.run_id}` : "保存题目后，可开始运行。";
     const executions = progress.executions || [];
     const activeExecution = executions.find((item) => ["pending", "running"].includes(item.status));
     const activeIntent = (progress.turns || []).flatMap((turn) => turn.intents).find((item) => item.status === "running");
@@ -266,7 +268,24 @@ const RunView = (() => {
       for (const candidate of progress.answer_candidates || []) {
         const item = node("article", undefined, "run-candidate");
         item.append(node("strong", label(candidate.validation_state)), node("p", `候选 ${candidate.candidate_id}\n证据版本 ${candidate.evidence_version}\nExecution ${candidate.execution_id}`, "run-ref"));
+        if ([19, 20].includes(progress.contract_version) && candidate.validation_state === 'pending') item.append(node('p', '等待可信验证反馈；候选尚未被确认。', 'run-meta'));
         for (const feedback of candidate.feedback || []) item.append(node("p", `${progress.mode === "simulated" ? "模拟反馈" : "反馈"}：${label(feedback.verdict)} · ${feedback.operation_id}`, "run-ref"));
+        if ([19, 20].includes(progress.contract_version) && !live && candidate.checkable_submission_ids?.length) {
+          const submission = candidate.checkable_submission_ids[0];
+          const pending = (progress.external_validation_checks || []).find((check) => check.candidate_id === candidate.candidate_id && check.evidence_version === candidate.evidence_version && check.submission_operation_id === submission && check.status === "started");
+          const key = `${progress.task_run_id}/${candidate.candidate_id}/${candidate.evidence_version}/${submission}`;
+          const cached = validationQueries.get(key);
+          if ((progress.external_validation_checks || []).some((check) => check.query_id === cached && check.status === "completed")) validationQueries.delete(key);
+          const button = node("button", pending ? "继续核查原请求" : "核查反馈", "secondary-button");
+          button.type = "button";
+          button.addEventListener("click", () => {
+            button.disabled = true;
+            const query = pending?.query_id || validationQueries.get(key) || crypto.randomUUID();
+            validationQueries.set(key, query);
+            window.dispatchEvent(new CustomEvent("d9-validation-check", { detail: { challengeId: current.challengeId, selection: { candidate_id: candidate.candidate_id, evidence_version: candidate.evidence_version, submission_operation_id: submission, query_id: query } } }));
+          });
+          item.append(button);
+        }
         candidates.append(item);
       }
     } else {

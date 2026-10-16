@@ -303,7 +303,7 @@ class ControlStateRepository:
         ]
         if len(running_turns) > 1:
             config = self._store.load_d3_run_config(rows.task_run.task_run_id)
-            if config is None or config.contract_version not in {3, 4, 5, 6, 7}:
+            if config is None or config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
                 raise StorageError("control state contains multiple running Turns")
             leaf = max((turns[i] for i in running_turns), key=lambda t: t.sequence)
             chain = set()
@@ -494,6 +494,11 @@ class ControlStateRepository:
                     expected_content = d3_fact_content(proof.proof_id)
                     if config is not None and config.d8_enabled:
                         expected_content = d8_fact_content(proof.artifact_version_id, proof.observed_sha256, proof.proof_id)
+                        if getattr(proof, 'rule_id', None) == 'http_response_observed':
+                            from agent_core.http_contracts import is_http
+                            if not is_http(config):
+                                raise StorageError('HTTP proof requires its frozen contract20 authorization')
+                            expected_content = proof.fact_content()
                         approvals = (*self._store.list_d8_conclusions(task_run_id), *d8_pending)
                         if not any(r.outcome == "verified_fact" and r.fact_id == fact.fact_id
                                    and r.plan_id == source_plan.plan_id for r in approvals):

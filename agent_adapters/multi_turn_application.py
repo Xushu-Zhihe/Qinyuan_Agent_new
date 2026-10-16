@@ -217,6 +217,8 @@ class D3Application:
         capacity_port=None,
         d6_artifact_store: CrossTaskRunArtifactStore | None = None,
         d6_artifact_transfer: D6ArtifactTransfer | None = None,
+        target_network_adapter=None,
+        http_sandbox=None,
     ) -> None:
         self.directory = directory
         self.config = config
@@ -291,6 +293,7 @@ class D3Application:
             attachment_imports=self.imports,
             d3_evidence_validator=self.validator,
             process_fact_validator=self._validate_process_fact,
+            target_network_adapter=target_network_adapter,
         )
         self.refinement = (
             ProcessRefinement(
@@ -337,7 +340,7 @@ class D3Application:
             D5RedactingModel(
                 inner_model, self.redactor, enabled=config.d5_enabled,
                 configured=self._redaction_configured,
-                preserve_conclusion_change=config.contract_version in {4, 5, 6, 7},
+                preserve_conclusion_change=config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21},
             ),
             config,
             clock,
@@ -359,7 +362,7 @@ class D3Application:
         self.revisions = None
         self.sessions = None
         self._restricted_progress = False
-        if config.contract_version in {3, 4, 5, 6, 7}:
+        if config.contract_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
             from agent_core.handoff import HandoffContext
             from agent_adapters.handoff_evidence import FileD8HandoffEvidence
             if capacity_port is None:
@@ -377,17 +380,18 @@ class D3Application:
             self.review_ledger.request_capacity_check = self.handoff.check_role_request_capacity
             self.conclusions.request_capacity_check = self.handoff.check_role_request_capacity
             self.refinement.request_capacity_check = self.handoff.check_role_request_capacity
-            if config.contract_version in {4, 5, 6, 7}:
+            if config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
                 from agent_core.conclusion_revisions import ConclusionRevisions
                 self.revisions = ConclusionRevisions(self, FileD8HandoffEvidence(directory / "d8-revisions"))
                 self.inner.change_response_sensitive = self.conclusions._sensitive
-            if config.contract_version in {5, 6, 7}:
+            if config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
                 from agent_core.sessions import IntentSessions
                 self.sessions = IntentSessions(self, FileD8HandoffEvidence(directory / "d8-sessions"))
                 self.inner.request_capacity_check = self.sessions.freeze
                 self.conclusions.prepare_inner_request = self.sessions.wrap
                 self.conclusions.request_capacity_check = self.sessions.freeze
         self.command_sandbox = command_sandbox
+        self.http_sandbox = http_sandbox if http_sandbox is not None else command_sandbox
         self.review_coordinator = D2ReviewCoordinator(
             self.review_ledger,
             apply=cast(
@@ -403,14 +407,35 @@ class D3Application:
         self.review_call = _D3ReviewCall(self)
         self.output_boundary = None
         self.business_diagnostics = None
-        if config.contract_version in {6, 7}:
+        self.fact_business_diagnostics = None
+        self.review_diagnostics = None
+        self.evaluation_bindings = None
+        self.selection_bindings = None
+        if config.contract_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
             from agent_core.structured_output import StructuredOutput, StructuredModel
             from agent_adapters.output_evidence import FileD8OutputEvidence
             self.output_boundary = StructuredOutput(self, FileD8OutputEvidence(directory / "d8-output"))
-            if config.contract_version == 7:
+            if config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+                from agent_core.selection_bindings import SelectionBindings
+                self.selection_bindings = SelectionBindings(self, self.output_boundary.evidence)
+            if config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+                from agent_core.completion_evaluation import EvaluationBindings
+                self.evaluation_bindings = EvaluationBindings(config, self.output_boundary.evidence,
+                                                              self.handoff.evidence, self.store)
+            if config.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
                 from agent_core.business_diagnostics import BusinessDiagnostics
                 self.business_diagnostics = BusinessDiagnostics(
                     config, self.output_boundary.evidence, self.handoff.evidence, self.store)
+            if config.contract_version in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                from agent_core.fact_diagnostics import FactBusinessDiagnostics
+                self.fact_business_diagnostics = FactBusinessDiagnostics(
+                    config, self.output_boundary.evidence, self.conclusions.evidence, self.store)
+                self.conclusions.business_diagnostics = self.fact_business_diagnostics
+            if config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                from agent_core.review_diagnostics import ReviewDiagnostics
+                self.review_diagnostics = ReviewDiagnostics(config, self.output_boundary.evidence,
+                                                           self.review_ledger, self.store, clock)
+                self.review_ledger.review_diagnostics = self.review_diagnostics
             adapters = (self.outer.adapter, self.inner.adapter, self.review_model,
                         self.conclusions.inner_model, self.conclusions.outer_model,
                         self.refinement.adapter, self.handoff.model.adapter)
@@ -422,6 +447,43 @@ class D3Application:
             self.conclusions.output_boundary = self.output_boundary
             self.refinement.output_boundary = self.output_boundary
             self.review_ledger.output_boundary = self.output_boundary
+        self.answers = None
+        if config.contract_version in {19, 20, 21}:
+            from agent_core.answer_candidates import AnswerCandidates
+            from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
+            self.answers = AnswerCandidates(self, lambda: D7CandidateEvidenceService(
+                self.directory, self.state.task_run.task_run_id, trusted_adapter_ids=('d7_candidate_stage',)))
+        self.fixed_probe_bindings = None
+        if config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.fixed_probe import FixedProbeBindings
+            self.fixed_probe_bindings = FixedProbeBindings(self)
+        self.planning_assertion_bindings = None
+        if config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.planning_assertion import PlanningAssertionBindings
+            self.planning_assertion_bindings = PlanningAssertionBindings(config, self.output_boundary.evidence,
+                self.handoff.evidence, self.conclusions.evidence, self.store, self.imports)
+            self.conclusions.assembly_bindings = self.planning_assertion_bindings
+        self.web = None
+        from agent_core.http_contracts import is_http
+        if is_http(config):
+            from agent_adapters.http_capability import HttpCapability
+            self.web = HttpCapability(self)
+            self.conclusions.http = self.web
+            self.conclusions.assembly_bindings = None
+            self.conclusions.business_diagnostics = None
+            self.planning_assertion_bindings = None
+            self.business_diagnostics = None
+            self.fact_business_diagnostics = None
+            self.proofs = self.web
+            self.validator.proofs = self.web
+            self.validator.http = self.web
+            repository = self.controller._persistent.repository
+            repository._execution_evidence = self.web
+            repository._d3_observation_proofs = self.web
+            for model in (outer_model, inner_model, review_model, fact_review_model, handoff_model):
+                if model is not None:
+                    model.context_loader = self.web.model_context
+            capacity_port.context_loader = self.web.model_context
 
     @property
     def state(self):
@@ -547,8 +609,12 @@ class D3Application:
         """Repair SQLite operation completions from already-persisted evidence only."""
         if self.config.d4_budget is None:
             return
+        if self.web is not None:
+            self.web.reconcile()
         if self.output_boundary is not None:
             self.output_boundary.reconcile_formats()
+        if self.fixed_probe_bindings is not None:
+            self.fixed_probe_bindings.reconcile()
         if self.business_diagnostics is not None:
             self.handoff.reconcile()
         task_run_id = self.state.task_run.task_run_id
@@ -916,7 +982,7 @@ class D3Application:
         try:
             state = self.state
         except StorageError:
-            if self.config.contract_version not in {5, 6, 7} or not recovery_required or self._bound_task_run_id is None:
+            if self.config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or not recovery_required or self._bound_task_run_id is None:
                 raise
             state = self.store.load_control_state_rows(self._bound_task_run_id)
             if state is None or state.task_run.task_run_id != self._bound_task_run_id:
@@ -1065,6 +1131,17 @@ class D3Application:
             if self.config.d5_enabled and not self._redaction_configured:
                 return self.result("d5_redaction_configuration_unavailable", recovery_required=True)
             self.store.reconcile_d4_control_commit_audit(task_run_id)
+            if (self.answers is not None and not token.is_cancelled
+                    and self.state.task_run.status in {TaskRunStatus.RUNNING, TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK}
+                    and self.clock() < self.state.task_run.deadline_at):
+                try:
+                    await self.answers.reconcile_known(token)
+                except (D3RecoveryRequired, D3ProposalRejected) as exc:
+                    return self.result(str(exc), recovery_required=True)
+                except (StorageError, OSError):
+                    return self.result('d9_candidate_persistence_recovery_required', recovery_required=True)
+                if self.state.task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK:
+                    return self.result('d9_awaiting_external_feedback')
             if self.state.task_run.status is not TaskRunStatus.RUNNING:
                 terminal_result = self.result("task_run_already_terminal")
                 return replace(
@@ -1553,6 +1630,8 @@ class D3Application:
             return candidate
 
     async def _import_all(self, token: CancellationToken):
+        if self.web is not None and not self.config.authorization.attachment_indices:
+            return ()
         task = self.state.task_run
         receipts = []
         for index in self.config.authorization.attachment_indices:
@@ -1744,6 +1823,10 @@ class D3Application:
         return request_id, proposal
 
     def _source(self, reference: str) -> object:
+        if self.web is not None:
+            source = self.web.source(reference)
+            if source is not None:
+                return source
         if reference.startswith("d8-decision:") and self.sessions is not None:
             record = next((r for r in self.sessions.records() if r.record_id == reference[12:]), None)
             if record is None:
@@ -1883,6 +1966,12 @@ class D3Application:
         progress = None
         if self.sessions is not None and scope != "turn_end" and self.sessions.due(intent_id):
             progress = self.sessions.review_context(intent_id, mode="restricted_repair" if self._restricted_progress else "ordinary")
+            if self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                rows = self.sessions.records(intent_id)
+                if (not rows or not progress["recent"] or progress["decision_count"] != len(rows)
+                        or progress["recent"][-1]["ref"] != "d8-decision:" + rows[-1].record_id
+                        or progress["recent"][-1]["ordinal"] != rows[-1].ordinal):
+                    raise D3RecoveryRequired("s3_latest_decision_unavailable")
             source_ids = tuple(dict.fromkeys((*source_ids, *(r["ref"] for r in progress["recent"]))))
         if binding is None or not source_ids:
             raise D3RecoveryRequired("d3_review_binding_or_sources_missing")
@@ -1925,6 +2014,34 @@ class D3Application:
         if self.config.d5_enabled:
             context["source_summaries"] = self.redactor.redact_value(context["source_summaries"])
             context["turn_target"] = self.redactor.redact(context["turn_target"])
+        if self.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and (progress is None or self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21}):
+            from agent_core.review_policy import ACTION_KINDS, MAX_ACTION_TIMEOUT, stage_decisions, unavailable_decisions
+            from agent_core.review_contracts import D2AllowedActionKinds
+            actions, timeout = set(ACTION_KINDS), MAX_ACTION_TIMEOUT
+            for application in self.store.list_d3_review_applications(state.task_run.task_run_id):
+                for item in application.output_constraints:
+                    if not (item.scope_kind == "turn" and item.scope_id == turn_id
+                            or item.scope_kind == "intent" and item.scope_id == intent_id):
+                        continue
+                    if isinstance(item, D2AllowedActionKinds):
+                        actions &= set(item.allowed_action_kinds)
+                    else:
+                        timeout = min(timeout, item.max_action_timeout_seconds)
+            if not actions and (progress is None or progress["mode"] == "ordinary"):
+                raise D3RecoveryRequired("constraint_action_intersection_empty")
+            unavailable = unavailable_decisions(state, turn_id, intent_id, self.config.max_turns)
+            decisions = [d for d in stage_decisions(scope) if d not in unavailable]
+            context["review_policy"] = {"version": 1, "review_scope": scope,
+                "scope_bindings": {"intent": intent_id, "turn": turn_id}, "allowed_decisions": decisions,
+                "allowed_action_kinds": [a for a in ACTION_KINDS if a in actions], "max_action_timeout_seconds": timeout}
+            if progress is not None:
+                from agent_core.progress_policy import freeze_policy
+                context["progress_policy"] = freeze_policy(self, context, turn_id, intent_id, scope, actions, timeout)
+                context.pop("review_policy")
+        if (self.config.contract_version in {17, 18, 19, 20, 21} and scope != 'turn_end'
+                and (progress is None or progress['mode'] != 'restricted_repair')):
+            from agent_core.execution_feasibility import KEY, freeze
+            context[KEY] = freeze(self, turn_id, intent_id)
         summary = {**context, "checkpoint": state.latest_checkpoint.sequence}
         from agent_core.control_store import canonical_json
 
@@ -1965,25 +2082,12 @@ class D3Application:
     def _parse_review(self, raw, request: D2ReviewRequest) -> D3ReviewOutput:
         output = parse_d3_review_output(raw, request)
         state = self.state
-        if output.decision == "switch_sibling_intent" and not any(
-            item.turn_id == request.turn_id and item.status is IntentStatus.PENDING
-            for item in state.intents
-        ) and not (self.sessions is not None
+        from agent_core.review_policy import unavailable_decisions
+        reason = unavailable_decisions(state, request.turn_id, request.intent_id, self.config.max_turns).get(output.decision)
+        if reason is not None and not (output.decision == "switch_sibling_intent" and self.sessions is not None
+                   and self.config.contract_version != 13
                    and getattr(getattr(output, "progress", None), "classification", None) == "repetitive"):
-            raise ValueError("d3_no_sibling_candidate")
-        if (
-            output.decision == "replan_current_intent"
-            and not 1
-            <= sum(item.intent_id == request.intent_id for item in state.plans)
-            < 2
-        ):
-            raise ValueError("d3_replan_not_available")
-        if (
-            output.decision == "adjust_turn_target"
-            and self.config.max_turns is not None
-            and len(state.turns) >= self.config.max_turns
-        ):
-            raise ValueError("d3_turn_limit_reached")
+            raise ValueError(reason)
         return output
 
     def _review_committed(self, request: D2ReviewRequest) -> bool:
@@ -2173,6 +2277,8 @@ class D3Application:
         *,
         review_id: str | None = None,
     ) -> None:
+        if self.web is not None:
+            return await self.web.new_plan(intent_id, token, review_id=review_id)
         if self.sessions is not None:
             receipts = await self._import_all(token)
             if await self.sessions.before_decision(intent_id, receipts, token):
@@ -2257,6 +2363,13 @@ class D3Application:
                     raise D3ProposalRejected("d8_history_read_action_rejected") from exc
                 return
             live_context = _current.context
+            if self.config.contract_version in {16, 17, 18, 19, 20, 21}:
+                from agent_core.plan_policy import validate as validate_plan
+                validate_plan(_current, proposal)
+                if self.config.contract_version in {17, 18, 19, 20, 21}:
+                    from agent_core.execution_feasibility import verify_plan
+                    verify_plan(self, _current, proposal, self.state)
+                return
             if (
                 ordinal == 1
                 and proposal.template != "size_then_sha256"
@@ -2346,6 +2459,8 @@ class D3Application:
                 if item.turn_id == turn.turn_id and item.status is IntentStatus.PENDING
             ]
             if not siblings and self.sessions is None:
+                raise D3RecoveryRequired("d3_no_sibling_candidate")
+            if not siblings and self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and output.decision == "switch_sibling_intent":
                 raise D3RecoveryRequired("d3_no_sibling_candidate")
             if siblings:
                 next_intent = min(siblings, key=lambda item: item.priority)
@@ -2460,11 +2575,20 @@ class D3Application:
         conditions = (
             () if is_size else (FileSha256(step_index, path, turn.expected_sha256),)
         )
+        def fixed_context(context):
+            if self.config.contract_version not in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                return context
+            from dataclasses import fields
+            from agent_core.fixed_probe import FixedProbeContext
+            self.validator._allowed(plan_binding.task_run_id, turn.turn_id, plan_binding.intent_id, "probe", 1)
+            _, maximum = self.validator.action_limits(plan_binding.task_run_id, turn.turn_id, plan_binding.intent_id)
+            return FixedProbeContext(**{f.name: getattr(context, f.name) for f in fields(context)},
+                                     fixed_path=path, max_timeout_seconds=maximum)
         shared_artifacts = await self._shared_context(plan_binding.intent_id, token)
         request = self._model_request(
             stage,
             f"{plan_binding.plan_id}:{stage}",
-            D3ActionContext(
+            fixed_context(D3ActionContext(
                 next(
                     item.turn_target
                     for item in self.state.turns
@@ -2477,7 +2601,7 @@ class D3Application:
                 path.rsplit("/", 1)[0],
                 (),
                 shared_artifacts,
-            ),
+            )),
             f"action/{plan_binding.plan_id}/{stage}",
         )
 
@@ -2511,7 +2635,7 @@ class D3Application:
                 or current_plan.status is not PlanStatus.RUNNING
             ):
                 raise D3RecoveryRequired("d3_action_proposal_scope_expired")
-            turn_binding = self.store.load_d3_turn_binding(live_turn.turn_id)
+            turn_binding = self.store.load_d3_plan_turn_binding(plan_binding.plan_id)
             if turn_binding is None or turn_binding != turn:
                 raise D3RecoveryRequired("d3_action_turn_binding_changed")
             fresh = D3ActionContext(
@@ -2527,7 +2651,7 @@ class D3Application:
             return replace(
                 request,
                 base_checkpoint_sequence=self.state.latest_checkpoint.sequence,
-                context=fresh,
+                context=fixed_context(fresh),
             )
 
         def validate(_current: D3ModelRequest, candidate) -> None:
@@ -2731,11 +2855,13 @@ class D3Application:
                     return True
                 continue
             if result.outcome == "verified_fact":
-                receipt = self.workspace_evidence.read_digest(proof.observation_id)
+                source = self.conclusions.observation(proof.proof_id)
+                evidence_sha = (source.source_version_sha256 if self.web is not None
+                    else digest(asdict(self.workspace_evidence.read_digest(proof.observation_id))))
                 observed = D3PlanResult(binding.task_run_id, binding.plan_id, "satisfied",
                                         binding.artifact_version_id, proof.observation_id,
-                                        proof.proof_id, digest(asdict(receipt)), result.fact_id)
-                content = self.conclusions.observation(proof.proof_id).fact_content()
+                                        proof.proof_id, evidence_sha, result.fact_id)
+                content = source.fact_content()
                 self.control.complete_plan(binding, observed, proof.source_execution_id,
                                            conclusion=result, content=content)
                 return False
@@ -2745,11 +2871,13 @@ class D3Application:
             )
 
     async def _run_plan(self, plan_binding, receipts, token: CancellationToken) -> bool:
+        if getattr(plan_binding,'kind',None)=='http_request':
+            return await self.web.run_plan(plan_binding, token)
         if self.conclusions is not None and plan_binding.observation_mode == "new_observation":
             proof = self.proof_store.read(self._id(f"proof/{plan_binding.plan_id}"))
             if proof is not None:
                 return await self._review_d8_observation(plan_binding, proof, receipts, token)
-        turn = self.store.load_d3_turn_binding(plan_binding.turn_id)
+        turn = self.store.load_d3_plan_turn_binding(plan_binding.plan_id)
         if turn is None:
             raise D3RecoveryRequired("d3_plan_turn_missing")
         if plan_binding.observation_mode == "reuse_saved_proof":
@@ -2796,7 +2924,7 @@ class D3Application:
         plan = [item for item in self.state.plans if item.intent_id == intent_id][-1]
         binding = self.store.load_d3_plan_binding(plan.plan_id)
         result = self.store.load_d3_plan_result(plan.plan_id)
-        turn = self.store.load_d3_turn_binding(intent.turn_id)
+        turn = self.store.load_d3_plan_turn_binding(plan.plan_id)
         if (
             binding is None
             or result is None
@@ -2806,7 +2934,7 @@ class D3Application:
         ):
             raise D3RecoveryRequired("d3_completion_support_unavailable")
         fact_id = result.supporting_fact_id
-        if self.conclusions is not None and binding.observation_mode == "new_observation":
+        if getattr(binding,'kind',None)!='http_request' and self.conclusions is not None and binding.observation_mode == "new_observation":
             action_id, action = self.validator._known_action(binding.task_run_id, binding.plan_id, "inner_sha256")
             if action.review_requested:
                 step_index = 1 if binding.template == "size_then_sha256" else 0
@@ -2864,7 +2992,7 @@ class D3Application:
             )
             if live_turn is None:
                 raise D3RecoveryRequired("d3_completion_turn_missing")
-            turn_binding = self.store.load_d3_turn_binding(live_turn.turn_id)
+            turn_binding = self.store.load_d3_plan_turn_binding(binding.plan_id)
             if turn_binding is None or turn_binding != turn:
                 raise D3RecoveryRequired("d3_completion_turn_binding_changed")
             fresh = D3ActionContext(
@@ -3005,6 +3133,10 @@ class D3Application:
             raise D3RecoveryRequired("d3_tail_review_not_read_only")
 
     async def _run_tree(self, token: CancellationToken) -> D3Result:
+        if self.answers is not None and not token.is_cancelled:
+            await self.answers.reconcile_known(token)
+            if self.state.task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK:
+                return self.result('d9_awaiting_external_feedback')
         if self.revisions is not None:
             self.revisions.reconcile()
             await self.revisions.refresh_summaries(token)
@@ -3039,6 +3171,10 @@ class D3Application:
                                    and not any(t.triggering_intent_id == i.intent_id for t in self.state.turns)
                                    and not any(r.kind == "expansion_exhausted" and r.intent_id == i.intent_id for r in records)), None)
                 if unfinished is not None:
+                    if self.answers is not None and await self.answers.after_success(unfinished, token):
+                        return self.result('d9_awaiting_external_feedback'
+                            if self.state.task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
+                            else 'd9_candidate_registration_stopped')
                     await self.handoff.plan_expansion(turn.turn_id, unfinished.intent_id, receipts, token)
                     continue
                 pending = [i for i in self.state.intents if i.turn_id == turn.turn_id and i.status is IntentStatus.PENDING]
@@ -3055,8 +3191,9 @@ class D3Application:
             plans = [p for p in self.state.plans if p.intent_id == current.intent_id]
             if not plans:
                 turn_binding = self.store.load_d3_turn_binding(turn.turn_id)
-                review_id, output = self._review(turn.turn_id, current.intent_id, "turn_start", None,
-                                                 (turn_binding.import_id, turn_binding.proposal_request_id))
+                sources = ((turn_binding.authorization_id, turn_binding.proposal_request_id) if self.web is not None
+                           else (turn_binding.import_id, turn_binding.proposal_request_id))
+                review_id, output = self._review(turn.turn_id, current.intent_id, "turn_start", None, sources)
                 if await self._route(review_id, output, current.intent_id, receipts, token):
                     continue
                 await self._new_plan(current.intent_id, token)

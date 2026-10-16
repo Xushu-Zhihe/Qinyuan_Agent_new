@@ -44,7 +44,7 @@ def _dispatch_v3_run_task(args, raw):
         request, _ = parse_request(raw)
     else:
         request = V3SimulationRequest.parse(raw)
-    d8_real = raw.get("execution_profile") in {"d8_v6", "d8_v7"} and raw.get("mode") == "real"
+    d8_real = raw.get("execution_profile") in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"} and raw.get("mode") == "real"
     env_file = None
     if d8_real:
         from agent_adapters.d8_model import settings_from_file
@@ -176,12 +176,17 @@ def _dispatch_v3_run_task(args, raw):
     }
     if "execution_profile" in raw:
         declaration.update(execution_profile=raw["execution_profile"],
-                           contract_version=7 if raw["execution_profile"] == "d8_v7" else 6)
+                           contract_version=int(raw["execution_profile"].removeprefix("d8_v")))
         declaration["capabilities"] = ["attachment_digest_only", "d8_simulation"]
     if d8_real:
         from agent_adapters.d8_simulation import real_declaration_binding
-        declaration.update(env_file=str(env_file), sandbox_backend="local_simulated")
-        declaration["capabilities"] = ["attachment_digest_only", "d8_real_models", "local_simulated_sandbox"]
+        backend = raw["d8_config"]["sandbox_backend"]
+        declaration.update(env_file=str(env_file), sandbox_backend=backend)
+        declaration["capabilities"] = ["attachment_digest_only", "d8_real_models",
+                                       "docker_task_run_sandbox" if backend == "docker" else "local_simulated_sandbox"]
+        if raw.get('execution_profile') == 'd8_v20' and raw['task_request']['target'].get('endpoints'):
+            declaration['capabilities'] = ['d8_http', 'd8_real_models', 'docker_task_run_sandbox',
+                                           'task_run_origin_bound_target_network']
         immutable_write(directory / "d8-runtime.json", real_declaration_binding(declaration))
     immutable_write(directory / "run.json", declaration)
     receipt = stager.record_outcome(
@@ -359,6 +364,7 @@ def _run_v3_simulated_operation(
         declaration["task_run_id"],
         append_existing=operation != "start",
     )
+    exporter.start_monitoring()
     try:
         result = run_simulated_task(directory, declaration, operation=operation)
     except BaseException:
@@ -424,6 +430,7 @@ def _run_v3_web_operation(
             declaration["task_run_id"],
             append_existing=operation != "start",
         )
+        exporter.start_monitoring()
     try:
         result = run_d7_web_task(
             directory, declaration, operation=operation, settings=settings
@@ -779,6 +786,15 @@ def dispatch_v3_existing(args, directory: Path, declaration: dict):
                 "next_sequence": events[-1]["sequence"] if events else args.after_sequence,
                 "exit_code": 0}
     result = snapshot_v3_task_result(directory, declaration)
+    if args.command == 'validation-check':
+        from agent_adapters.validation_check import dispatch_check
+        selection = {key: getattr(args, key) for key in
+                     ('candidate_id', 'evidence_version', 'submission_operation_id', 'query_id')}
+        try:
+            return dispatch_check(directory, declaration, selection, events=getattr(args, 'events', None))
+        except ValueError:
+            result.setdefault('errors', []).append({'code': 'd9_validation_check_rejected'})
+            return operation_result(result, exit_code=2)
     if args.command == "status":
         return operation_result(result)
     if args.command in {"cancel", "resume", "cleanup"}:
@@ -814,7 +830,7 @@ def dispatch_v3_existing(args, directory: Path, declaration: dict):
             return operation_result(result)
         if operation == "cleanup" and result.get("cleanup_status") == "confirmed":
             return operation_result(result)
-        if declaration.get("mode") == "real" and declaration.get("execution_profile") not in {"d8_v6", "d8_v7"}:
+        if declaration.get("mode") == "real" and declaration.get("execution_profile") not in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
             if getattr(args, "authorization", None) or getattr(args, "fixture", None):
                 raise ValueError("v3_real_recovery_uses_persisted_configuration")
             try:

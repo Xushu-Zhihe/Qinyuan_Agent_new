@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from agent_core.runtime import TaskRunStatus
 
 _WITHHELD = "[WITHHELD]"
 _UUID = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12, 13, 14, 15}$"
 )
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _EVENT_DETAIL_KEYS = {
@@ -314,9 +315,27 @@ class EventExporter:
         self.sequence = 0
         self.done = False
         self.closed = False
+        self._tick_lock = threading.RLock()
+        self._monitor_stop = threading.Event()
+        self._monitor = None
+
+    def start_monitoring(self):
+        """Drain acknowledgements while a synchronous public application runs."""
+        if self._monitor is not None or self.closed:
+            raise ValueError("event_export_monitor_already_started")
+        def monitor():
+            while not self._monitor_stop.is_set() and not self.done and not self.error:
+                self.tick()
+                self._monitor_stop.wait(0.01)
+        self._monitor = threading.Thread(target=monitor, daemon=True, name="event-export-monitor")
+        self._monitor.start()
 
     def tick(self):
-        if self.error or self.done:
+        with self._tick_lock:
+            self._tick()
+
+    def _tick(self):
+        if self.error or self.done or self.closed:
             return
         try:
             while self.pipe.poll():
@@ -343,6 +362,13 @@ class EventExporter:
             self.close()
 
     def close(self):
+        self._monitor_stop.set()
+        with self._tick_lock:
+            self._close()
+        if self._monitor is not None and self._monitor is not threading.current_thread():
+            self._monitor.join(0.1)
+
+    def _close(self):
         if self.closed:
             return
         self.closed = True

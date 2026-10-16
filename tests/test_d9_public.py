@@ -139,7 +139,8 @@ def test_workbench_child_process_uses_d8_and_can_cancel(tmp_path):
 
 
 @pytest.mark.parametrize(("extra", "protocol", "profile", "mode"), [
-    ([], 3, "d8_v7", None),
+    ([], 3, "d8_v20", None),
+    (["--execution-profile", "d8_v7"], 3, "d8_v7", None),
     (["--execution-profile", "d8_v6"], 3, "d8_v6", None),
     (["--execution-profile", "d7", "--d7-mode", "simulated"], 3, "d7", "simulated"),
     (["--protocol-version", "2"], 2, "d7", "simulated"),

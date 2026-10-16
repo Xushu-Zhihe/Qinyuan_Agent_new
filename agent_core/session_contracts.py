@@ -61,6 +61,13 @@ class D8ProgressReviewOutput(D3ReviewOutput):
 
 
 def parse_progress_review(raw, request):
+    if "progress_policy" in json.loads(request.context_summary):
+        from agent_core.progress_policy import parse_bound
+        return parse_bound(raw, request)
+    return _parse_progress_review_legacy(raw, request)
+
+
+def _parse_progress_review_legacy(raw, request):
     if isinstance(raw, D8ProgressReviewOutput):
         raw = asdict(raw)
     if not isinstance(raw, dict) or set(raw) != {
@@ -79,7 +86,9 @@ def parse_progress_review(raw, request):
             raise ValueError("d8_repair_progress_cannot_change_constraints")
     if p["classification"] not in allowed or raw["decision"] not in allowed[p["classification"]]:
         raise ValueError("d8_progress_decision_mismatch")
-    if not isinstance(p["reason"], str) or not p["reason"].strip() or len(p["reason"]) > 512:
+    unbounded = json.loads(request.context_summary).get('progress_policy', {}).get('version') == 2
+    if (not isinstance(p["reason"], str) or not p["reason"].strip()
+            or ("\x00" in p["reason"] if unbounded else len(p["reason"]) > 512)):
         raise ValueError("d8_progress_reason_invalid")
     refs = checked_refs(p["evidence_refs"], set(request.source_versions))
     if not refs or len(refs) > 8:

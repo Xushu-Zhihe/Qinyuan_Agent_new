@@ -196,6 +196,11 @@ class IntentSessions:
                 cited = {s[12:] for s in application.source_ids if s.startswith("d8-decision:")}
                 rows = [r for r in self.records(intent_id) if r.record_id in cited]
                 watermark = max((r.ordinal for r in rows), default=0)
+                if self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                    from agent_core.progress_policy import policy_for
+                    from agent_core.review_contracts import D2ReviewRequest
+                    request = D2ReviewRequest(**{**call["request"], "source_versions": tuple(call["request"]["source_versions"])})
+                    watermark = policy_for(request)["decision_watermark"]
                 if (watermark < 4 or context["d8_progress"] != self.review_context(intent_id, watermark,
                                                         mode=context["d8_progress"].get("mode", "ordinary"))):
                     raise D3RecoveryRequired("d8_progress_applied_window_changed")

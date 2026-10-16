@@ -41,7 +41,7 @@ class D8Assertion:
     observation_id: str
 
     def __post_init__(self) -> None:
-        if self.rule_id != "attachment_copy_sha256" or type(self.rule_version) is not int or self.rule_version != 1:
+        if self.rule_id not in {"attachment_copy_sha256", "http_response_observed"} or type(self.rule_version) is not int or self.rule_version != 1:
             raise ValueError("d8_assertion_rule_unsupported")
         _uuid(self.artifact_version_id, "artifact_version_id")
         _uuid(self.observation_id, "observation_id")
@@ -150,6 +150,35 @@ class D8Observation:
 
 
 @dataclass(frozen=True, slots=True)
+class D16Observation(D8Observation):
+    """Program-verified comparison; outer acceptance remains an independent gate."""
+    expected_sha256: str = ''
+    digest_matches_expected: bool = True
+    rule_binding_sha256: str = ''
+    source_version_kind: str = 'proof_receipt_turn_binding_sha256'
+
+    def __post_init__(self):
+        super(D16Observation, self).__post_init__()
+        _sha(self.expected_sha256, 'expected_sha256')
+        _sha(self.rule_binding_sha256, 'rule_binding_sha256')
+        if (type(self.digest_matches_expected) is not bool or not self.digest_matches_expected
+                or self.observed_sha256 != self.expected_sha256
+                or self.source_version_kind != 'proof_receipt_turn_binding_sha256'):
+            raise ValueError('s6_observation_comparison_invalid')
+
+
+def allowed_fact_evidence_refs(observation: D8Observation) -> tuple[str, ...]:
+    """Registered proof citations; object identifiers are not proof references."""
+    if not isinstance(observation, D8Observation):
+        raise ValueError("d8_fact_observation_required")
+    return (observation.proof_id,)
+
+
+def fact_evidence_matches(candidate: D8Candidate, observation: D8Observation) -> bool:
+    return set(candidate.evidence_refs) == set(allowed_fact_evidence_refs(observation))
+
+
+@dataclass(frozen=True, slots=True)
 class D8Feedback:
     record_id: str
     outcome: str
@@ -210,7 +239,11 @@ class D8ModelRequest:
     @classmethod
     def from_dict(cls, raw: dict) -> D8ModelRequest:
         value = dict(raw)
-        value["observation"] = D8Observation(**value["observation"])
+        observation = value['observation']
+        from agent_core.http_contracts import HttpObservation
+        cls_observation = HttpObservation if observation.get('rule_id') == 'http_response_observed' else D16Observation if any(key in observation for key in (
+            'expected_sha256', 'digest_matches_expected', 'rule_binding_sha256', 'source_version_kind')) else D8Observation
+        value["observation"] = cls_observation(**observation)
         value["candidate"] = D8Candidate.from_dict(value["candidate"]) if value["candidate"] is not None else None
         value["feedback"] = tuple(D8Feedback(**item) for item in value["feedback"])
         if "session_id" in value:

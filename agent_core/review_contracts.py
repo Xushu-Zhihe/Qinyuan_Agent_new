@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from agent_core.review_policy import ACTION_KINDS, MAX_ACTION_TIMEOUT
+
 import hashlib
 import json
 from dataclasses import asdict, dataclass
@@ -77,7 +79,7 @@ class D2AllowedActionKinds:
         ):
             raise ValueError("allowed_action_kinds must be a non-empty set")
         if any(
-            item not in {"probe", "complete_intent"}
+            item not in set(ACTION_KINDS)
             for item in self.allowed_action_kinds
         ):
             raise ValueError("unsupported allowed action kind")
@@ -95,7 +97,7 @@ class D2MaxActionTimeout:
         if self.scope_kind not in {"intent", "turn"}:
             raise ValueError("invalid constraint scope")
         _finite_int(
-            self.max_action_timeout_seconds, "max_action_timeout_seconds", 1, 300
+            self.max_action_timeout_seconds, "max_action_timeout_seconds", 1, MAX_ACTION_TIMEOUT
         )
 
 
@@ -299,7 +301,7 @@ def parse_d2_output(raw: object, request: D2ReviewRequest) -> D2ReviewOutput:
                 raise ValueError("review_constraint_fields_invalid")
             values = item["allowed_action_kinds"]
             if not isinstance(values, list) or any(
-                value not in {"probe", "complete_intent"} for value in values
+                value not in set(ACTION_KINDS) for value in values
             ):
                 raise ValueError("review_allowed_actions_invalid")
             parsed.append(

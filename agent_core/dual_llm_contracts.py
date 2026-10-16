@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from agent_core.review_policy import REVIEW_DECISIONS, stage_decisions
+
 import math
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Literal
 from uuid import UUID
 
 from agent_core.execution_authorization import D6Authorization
+from agent_core.v7.web_contracts import D7WebAuthorization
 from agent_core.operation_accounting import D4BudgetPolicy, D8BudgetPolicy, D8HandoffBudgetPolicy
 from agent_core.handoff_contracts import D8HandoffConfig
 from agent_core.review_contracts import (
@@ -90,6 +93,12 @@ def d3_payload(value: object) -> dict[str, object]:
     payload = (
         asdict(value) if is_dataclass(value) and not isinstance(value, type) else {}
     )
+    if isinstance(value, D3RunConfig) and value.web_authorization is None:
+        payload.pop('web_authorization', None)
+        payload.pop('http_timeout_seconds', None)
+    elif isinstance(value, D3CommitMetadata) and value.config is not None and value.config.web_authorization is None:
+        payload['config'].pop('web_authorization', None)
+        payload['config'].pop('http_timeout_seconds', None)
     if isinstance(value, D3RunConfig) and value.handoff_config is None:
         payload.pop("handoff_config")
     elif isinstance(value, D3CommitMetadata) and value.config is not None and value.config.handoff_config is None:
@@ -159,8 +168,20 @@ class D3RunConfig:
     d6_authorization: D6Authorization | None = None
     d8_enabled: bool = False
     handoff_config: D8HandoffConfig | None = None
+    web_authorization: D7WebAuthorization | None = None
+    http_timeout_seconds: int | None = None
 
     def __post_init__(self) -> None:
+        if self.web_authorization is not None and (
+                self.contract_version not in {20,21} or not isinstance(self.web_authorization, D7WebAuthorization)
+                or self.contract_version==20 and self.authorization.attachment_indices
+                or self.authorization.authorization_id!=self.web_authorization.authorization_id
+                or self.d6_authorization is not None):
+            raise ValueError('d20_http_authorization_invalid')
+        if ((self.web_authorization is None and self.http_timeout_seconds is not None)
+                or self.web_authorization is not None and (type(self.http_timeout_seconds) is not int
+                    or not 1 <= self.http_timeout_seconds <= 300)):
+            raise ValueError('d20_http_timeout_invalid')
         if (
             not isinstance(self.outer_role, D1RoleConfig)
             or self.outer_role.role != "outer_planning"
@@ -220,7 +241,7 @@ class D3RunConfig:
         if (
             self.chain_id != "dual_llm_d3"
             or type(self.contract_version) is not int
-            or self.contract_version not in {1, 2, 3, 4, 5, 6, 7}
+            or self.contract_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
         ):
             raise ValueError("unsupported D3 chain contract")
         if self.contract_version == 2 and (
@@ -231,11 +252,11 @@ class D3RunConfig:
             raise ValueError("D8 enablement must be explicit boolean")
         if self.d8_enabled:
             if (not isinstance(self.d4_budget, D8BudgetPolicy)
-                    or not self.d5_enabled or self.contract_version not in {1, 3, 4, 5, 6, 7}):
+                    or not self.d5_enabled or self.contract_version not in {1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}):
                 raise ValueError("D8 requires its internal chain, budget and D5 redaction")
         elif isinstance(self.d4_budget, D8BudgetPolicy):
             raise ValueError("D8 budget requires explicit D8 enablement")
-        if self.contract_version in {3, 4, 5, 6, 7}:
+        if self.contract_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
             if (not self.d8_enabled or not isinstance(self.d4_budget, D8HandoffBudgetPolicy)
                     or not isinstance(self.handoff_config, D8HandoffConfig)):
                 raise ValueError("D8-2 requires its explicit handoff configuration and budget")
@@ -262,7 +283,7 @@ class D3RunConfig:
             fields | {"d4_budget", "d5_enabled"},
             fields | {"d4_budget", "d5_enabled", "d5_sensitive_requirements"},
         )
-        if set(value) - {"d6_authorization", "d8_enabled", "handoff_config"} not in allowed:
+        if set(value) - {"d6_authorization", "d8_enabled", "handoff_config", "web_authorization", "http_timeout_seconds"} not in allowed:
             raise ValueError("invalid D3RunConfig fields")
         budget = value.get("d4_budget")
         if budget is not None and not isinstance(budget, dict):
@@ -294,7 +315,7 @@ class D3RunConfig:
             value["review_role_ref"],  # type: ignore[arg-type]
             value["chain_id"],  # type: ignore[arg-type]
             value["contract_version"],  # type: ignore[arg-type]
-            (D8HandoffBudgetPolicy.from_dict(budget) if value.get("contract_version") in {3, 4, 5, 6, 7}
+            (D8HandoffBudgetPolicy.from_dict(budget) if value.get("contract_version") in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
              else D8BudgetPolicy.from_dict(budget) if value.get("d8_enabled") is True
              else D4BudgetPolicy.from_dict(budget)) if budget is not None else None,
             value.get("d5_enabled", False),  # type: ignore[arg-type]
@@ -305,6 +326,8 @@ class D3RunConfig:
             if value.get("d6_authorization") is not None else None,
             value.get("d8_enabled", False),  # type: ignore[arg-type]
             D8HandoffConfig.from_dict(value["handoff_config"]) if "handoff_config" in value else None,
+            D7WebAuthorization.from_dict(value['web_authorization']) if value.get('web_authorization') is not None else None,
+            value.get('http_timeout_seconds'),
         )
 
 
@@ -588,20 +611,14 @@ def parse_d3_review_output(raw: object, request: D2ReviewRequest) -> D3ReviewOut
     }:
         raise ValueError("d3_review_output_fields_invalid")
     decision = raw["decision"]
-    if decision not in {
-        "continue_current_intent",
-        "switch_sibling_intent",
-        "replan_current_intent",
-        "adjust_turn_target",
-        "acknowledge_turn_end",
-    }:
+    if decision not in REVIEW_DECISIONS:
         raise ValueError("d3_review_decision_invalid")
     if request.review_scope == "turn_end":
-        if decision != "acknowledge_turn_end":
+        if decision not in stage_decisions(request.review_scope):
             raise ValueError("d3_tail_decision_invalid")
         checked = parse_d2_output(raw, request)
     else:
-        if decision == "acknowledge_turn_end":
+        if decision not in stage_decisions(request.review_scope):
             raise ValueError("d3_nonterminal_acknowledgement_invalid")
         checked = parse_d2_output(
             {**raw, "decision": "continue_current_intent"}, request
@@ -697,6 +714,7 @@ class D3CommitMetadata:
     outcomes: tuple[D3Outcome, ...] = ()
 
     def __post_init__(self) -> None:
+        from agent_core.http_contracts import HttpTurnBinding, HttpPlanBinding
         if not any(
             (
                 self.config is not None,
@@ -711,7 +729,7 @@ class D3CommitMetadata:
         if self.config is not None and not isinstance(self.config, D3RunConfig):
             raise TypeError("invalid D3 run configuration")
         if self.turn_binding is not None and not isinstance(
-            self.turn_binding, D3TurnBinding
+            self.turn_binding, (D3TurnBinding, HttpTurnBinding)
         ):
             raise TypeError("invalid D3 Turn binding")
         if not isinstance(self.intent_bindings, tuple) or any(
@@ -723,7 +741,7 @@ class D3CommitMetadata:
         ):
             raise ValueError("duplicate D3 Intent binding")
         if self.plan_binding is not None and not isinstance(
-            self.plan_binding, D3PlanBinding
+            self.plan_binding, (D3PlanBinding, HttpPlanBinding)
         ):
             raise TypeError("invalid D3 Plan binding")
         if self.plan_result is not None and not isinstance(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from agent_core.review_policy import ACTION_KINDS, MAX_ACTION_TIMEOUT
+
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Literal, NoReturn, cast
@@ -181,8 +183,8 @@ class D2ReviewCoordinator:
     ) -> None:
         if not set(output.source_ids).issubset(request.source_versions):
             raise ValueError("review_source_not_in_current_snapshot")
-        actions = {"probe", "complete_intent"}
-        timeout = 300
+        actions = set(ACTION_KINDS)
+        timeout = MAX_ACTION_TIMEOUT
         for item in self._constraints(
             request.task_run_id, request.turn_id, request.intent_id
         ):
@@ -393,7 +395,7 @@ class D2ReviewCoordinator:
         live_intent_ids: tuple[str, ...] | None = None,
     ) -> None:
         """Check all run restrictions bound to the still-live target scope."""
-        if action_kind not in {"probe", "complete_intent"}:
+        if action_kind not in set(ACTION_KINDS):
             raise D2ReviewPaused("action_kind_not_authorized")
         if action_kind == "probe" and (
             type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 300
@@ -410,7 +412,7 @@ class D2ReviewCoordinator:
             )
         if turn_id is None or intent_id is None:
             raise ValueError("current_review_scope_required")
-        allowed = {"probe", "complete_intent"}
+        allowed = set(ACTION_KINDS)
         upper = 300
         for item in self._constraints(
             task_run_id,

@@ -20,7 +20,7 @@ from agent_core.runtime import TaskRunStatus
 
 def _make_run(tmp_path, monkeypatch, candidate_value):
     monkeypatch.setattr(
-        d7_candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection
+        candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection
     )
     app, token = make_case(tmp_path, 2)
     app.inner.adapter.adapter.candidate_values = [candidate_value]

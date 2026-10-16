@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
@@ -124,6 +125,12 @@ class D3PlanProposal:
 
 
 def parse_d3_plan_proposal(raw: object) -> D3PlanProposal:
+    if isinstance(raw, dict) and raw.get('kind') == 'attachment_observation':
+        from agent_core.hybrid_contracts import AttachmentPlanProposal
+        return AttachmentPlanProposal(**raw)
+    if isinstance(raw, dict) and raw.get('kind') == 'http_request_saved':
+        from agent_core.http_contracts import HttpPlanProposal
+        return HttpPlanProposal(**raw)
     value = _fields(raw, {"template", "observation_mode", "source_proof_id"})
     template, mode, proof_id = (
         value["template"],
@@ -359,9 +366,10 @@ class D3CandidateContext:
     plan_result: D3PlanResult
 
     def __post_init__(self) -> None:
-        if not isinstance(self.turn_binding, D3TurnBinding):
+        from agent_core.http_contracts import HttpTurnBinding, HttpPlanBinding
+        if not isinstance(self.turn_binding, (D3TurnBinding, HttpTurnBinding)):
             raise ValueError("D3 candidate requires a typed Turn binding")
-        if not isinstance(self.plan_binding, D3PlanBinding):
+        if not isinstance(self.plan_binding, (D3PlanBinding, HttpPlanBinding)):
             raise ValueError("D3 candidate requires a typed Plan binding")
         if not isinstance(self.plan_result, D3PlanResult):
             raise ValueError("D3 candidate requires a typed Plan result")
@@ -519,9 +527,11 @@ class D3AuditedModel:
         self.output_boundary = None
 
     def _parse(self, request: D3ModelRequest, raw: object):
+        if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21} and request.stage in {'inner_plan', 'inner_size', 'inner_sha256', 'inner_complete'}:
+            self.output_boundary.app.selection_bindings.verify(request, raw)
         if request.stage == "outer_turn":
             return parse_d3_turn_proposal(raw)
-        if self.config.contract_version in {4, 5, 6, 7}:
+        if self.config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
             from agent_core.conclusion_revision_contracts import D8ConclusionChange
             try:
                 change = D8ConclusionChange.parse_action(raw)
@@ -530,7 +540,7 @@ class D3AuditedModel:
             if change is not None:
                 return change
         if request.stage == "inner_plan":
-            if self.config.contract_version in {3, 4, 5, 6, 7}:
+            if self.config.contract_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
                 try:
                     read = D8HistoryReadAction.parse(raw)
                 except (ValueError, TypeError) as exc:
@@ -538,13 +548,18 @@ class D3AuditedModel:
                 if read is not None:
                     return read
             return parse_d3_plan_proposal(raw)
-        if self.config.contract_version in {5, 6, 7} and request.stage == "inner_complete":
+        if self.config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and request.stage == "inner_complete":
             from agent_core.sessions import IntentSessions
             return parse_session_completion(raw, IntentSessions.visible(request))
+        if self.config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and request.stage in {"inner_size", "inner_sha256"}:
+            if raw is None:
+                raise D3ProposalRejected("d3_action_structure_invalid", structural=True)
+            return self.output_boundary.app.fixed_probe_bindings.proposal(
+                request.model_request_id, request=request, wire=raw, check_operation=False)
         return parse_d3_action(raw, request.stage)
 
     def _check(self, request: D3ModelRequest) -> None:
-        if self.config.contract_version in {6, 7} and self.output_boundary is None:
+        if self.config.contract_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and self.output_boundary is None:
             raise D3RecoveryRequired("d8_output_boundary_required")
         expected = (
             self.config.outer_role
@@ -594,6 +609,12 @@ class D3AuditedModel:
         self._check(request)
 
         context = request.context
+        if self.config.contract_version in {19, 20, 21} and self.evidence.read(request.model_request_id) is not None:
+            evidence, record = self._saved(request)
+            if evidence.outcome == "accepted" and evidence.raw == {"action": {"kind": "no_candidate"}}:
+                if protected.load_pending_for_request(request.model_request_id) is not None:
+                    raise D3RecoveryRequired("d9_candidate_result_conflict")
+                return request.model_request_id, None
         expected_start = D3OperationStart(
             request.model_request_id,
             request.task_run_id,
@@ -646,6 +667,19 @@ class D3AuditedModel:
                 token,
             )
             try:
+                if self.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+                    from agent_core.completion_evaluation import materialize_candidate
+                    raw = materialize_candidate(request, raw, allow_none=self.config.contract_version in {19, 20, 21})
+                if self.config.contract_version in {19, 20, 21} and raw == {"action": {"kind": "no_candidate"}}:
+                    evidence = D3ModelEvidence(request.model_request_id, request.task_run_id,
+                        request.stage, request.role_config_ref, request.resource_ref,
+                        request.base_checkpoint_sequence, request.context_sha256,
+                        request.correction_of_model_request_id, "accepted", raw, None, self.clock())
+                    checksum = self.evidence.save(evidence)
+                    self.ledger.complete_d3_operation(D3OperationCompletion(
+                        request.model_request_id, evidence.finished_at, "completed",
+                        request.model_request_id, checksum))
+                    return request.model_request_id, None
                 proposal = parse_d3_action(raw, "inner_candidate")
                 action = proposal.action
                 if not isinstance(action, D3CandidateFlagAction):
@@ -706,11 +740,17 @@ class D3AuditedModel:
                 evidence_version=context.plan_result.evidence_sha256,
                 source_ref=context.plan_binding.artifact_version_id,
             )
+            if self.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+                from agent_core.completion_evaluation import candidate_binding
+                body = action.value.encode("utf-8")
+                binding = candidate_binding(self.output_boundary.evidence, request, candidate,
+                                            hashlib.sha256(body).hexdigest(), len(body))
+                self.output_boundary.evidence.save("candidate-binding", request.model_request_id, binding)
             metadata = protected.save_pending(
                 candidate, action.value, request.model_request_id
             )
             pending = (candidate, metadata)
-            safe_raw = self._candidate_safe_raw(candidate, metadata)
+            safe_raw = self._candidate_safe_raw(candidate, metadata, request)
             evidence = D3ModelEvidence(
                 request.model_request_id,
                 request.task_run_id,
@@ -739,7 +779,7 @@ class D3AuditedModel:
         elif record.completion is None:
             candidate, metadata = pending
             self._validate_pending_candidate(request, candidate, metadata)
-            safe_raw = self._candidate_safe_raw(candidate, metadata)
+            safe_raw = self._candidate_safe_raw(candidate, metadata, request)
             evidence = D3ModelEvidence(
                 request.model_request_id,
                 request.task_run_id,
@@ -822,15 +862,14 @@ class D3AuditedModel:
             or evidence.correction_of_model_request_id
             != request.correction_of_model_request_id
             or record.completion.result_kind != "completed"
-            or evidence.raw != self._candidate_safe_raw(candidate, metadata)
+            or evidence.raw != self._candidate_safe_raw(candidate, metadata, request)
             or record.completion.evidence_ref != request.model_request_id
             or record.completion.evidence_sha256 != digest(asdict(evidence))
         ):
             raise D3RecoveryRequired("d3_candidate_completion_evidence_changed")
         return request.model_request_id, candidate
 
-    @staticmethod
-    def _candidate_safe_raw(candidate: object, metadata: Mapping[str, object]):
+    def _candidate_safe_raw(self, candidate: object, metadata: Mapping[str, object], request):
         if not isinstance(metadata, Mapping):
             raise D3RecoveryRequired("d3_candidate_protected_metadata_invalid")
         body_sha256 = metadata.get("body_sha256")
@@ -843,13 +882,18 @@ class D3AuditedModel:
             or byte_size <= 0
         ):
             raise D3RecoveryRequired("d3_candidate_protected_metadata_invalid")
-        return {
+        safe = {
             "candidate_id": getattr(candidate, "candidate_id", None),
             "evidence_version": getattr(candidate, "evidence_version", None),
             "execution_id": getattr(candidate, "execution_id", None),
             "body_sha256": body_sha256,
             "byte_size": byte_size,
         }
+        if self.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.completion_evaluation import verify_candidate_binding
+            safe["candidate_binding_sha256"] = verify_candidate_binding(
+                self.output_boundary.evidence, request, candidate, metadata)
+        return safe
 
     @staticmethod
     def _validate_pending_candidate(
@@ -880,6 +924,8 @@ class D3AuditedModel:
     def _saved(
         self, request: D3ModelRequest
     ) -> tuple[D3ModelEvidence | None, object | None]:
+        if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            self.output_boundary.app.selection_bindings.repair_request(request)
         record = self.ledger.load_d3_operation(request.model_request_id)
         evidence = self.evidence.read(request.model_request_id)
         if record is None:
@@ -899,6 +945,9 @@ class D3AuditedModel:
         ):
             raise D3RecoveryRequired("d3_model_call_identity_changed")
         if evidence is None:
+            if (self.config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and request.stage in {"inner_size", "inner_sha256"}
+                    and self.output_boundary.evidence.read("fixed-probe-binding", request.model_request_id) is not None):
+                evidence = self.output_boundary.app.fixed_probe_bindings.known(request.model_request_id, repair=True)
             failure = self.output_boundary.failure(request) if self.output_boundary is not None else None
             if failure is not None:
                 raw = None
@@ -1044,7 +1093,7 @@ class D3AuditedModel:
                     "accepted", "invalid_structure", "rejected", "model_error", "stale"
                 ] = "accepted"
                 reason = None
-                change_response = (self.config.contract_version in {4, 5, 6, 7} and isinstance(raw, dict)
+                change_response = (self.config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and isinstance(raw, dict)
                                    and raw.get("kind") == "conclusion_change")
                 if change_response and self.change_response_sensitive is not None and self.change_response_sensitive(raw):
                     raw = None
@@ -1072,6 +1121,11 @@ class D3AuditedModel:
                     != current.base_checkpoint_sequence
                 ):
                     outcome, reason = "stale", "d3_model_response_stale"
+                finished_at = self.clock()
+                if (self.config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and current.stage in {"inner_size", "inner_sha256"}
+                        and isinstance(raw, dict) and "action" in raw):
+                    _, binding = self.output_boundary.app.fixed_probe_bindings.read(current.model_request_id)
+                    finished_at = binding["finished_at"]
                 evidence = D3ModelEvidence(
                     current.model_request_id,
                     current.task_run_id,
@@ -1084,7 +1138,7 @@ class D3AuditedModel:
                     outcome,
                     raw,
                     reason,
-                    self.clock(),
+                    finished_at,
                 )
                 checksum = self.evidence.save(evidence)
                 self.ledger.complete_d3_operation(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent_core.http_contracts import plan_turn_binding
 import asyncio
 import base64
 import time
@@ -77,7 +78,7 @@ class D3FixedCommandPolicy(SandboxCommandPolicy):
     def authorize(self, request, authorization, state, *, now, step_limit_seconds):
         if (
             self.ledger.load_d3_run_config(self.turn.task_run_id) != self.config
-            or self.ledger.load_d3_turn_binding(self.turn.turn_id) != self.turn
+            or plan_turn_binding(self.ledger,self.plan) != self.turn
             or self.ledger.load_d3_plan_binding(self.plan.plan_id) != self.plan
             or self.config.authorization.authorization_id
             != authorization.authorization_id

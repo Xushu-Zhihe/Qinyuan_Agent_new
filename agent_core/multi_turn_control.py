@@ -168,6 +168,9 @@ class D3Control:
         state = self.state
         intent = next(item for item in state.intents if item.intent_id == intent_id)
         turn = self.ledger.load_d3_turn_binding(intent.turn_id)
+        from agent_core.hybrid_contracts import AttachmentPlanProposal,AttachmentPlanBinding,attachment_binding
+        hybrid=isinstance(proposal,AttachmentPlanProposal)
+        if hybrid:turn=attachment_binding(turn,proposal.attachment_index)
         if turn is None:
             raise D3RecoveryRequired("d3_plan_turn_binding_missing")
         previous = [item for item in state.plans if item.intent_id == intent_id]
@@ -196,6 +199,8 @@ class D3Control:
             proposal.source_proof_id,
             source_fact_id,
         )
+        if hybrid:
+            binding=AttachmentPlanBinding(**asdict(binding),attachment_index=proposal.attachment_index)
         new_plan = UpsertPlan(plan_id, intent_id, steps, PlanStatus.RUNNING)
         if previous and previous[-1].status is PlanStatus.RUNNING:
             if review_id is None:
@@ -376,7 +381,7 @@ class D3Control:
             if item.turn_id == current.turn_id and item.status is IntentStatus.PENDING
         ]
         config = self.ledger.load_d3_run_config(state.task_run.task_run_id)
-        if not siblings and config.contract_version not in {5, 6, 7}:
+        if not siblings and config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
             raise D3RecoveryRequired("d3_no_sibling_candidate")
         next_intent = min(siblings, key=lambda item: item.priority) if siblings else None
         changes: list[StateChange] = [

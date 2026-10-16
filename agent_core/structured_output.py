@@ -1,10 +1,11 @@
 """D8-5 frozen output instructions and safe, immutable format diagnostics."""
 
 from dataclasses import asdict
+import json
 import math
 import re
 from agent_core.dual_llm_contracts import D3RecoveryRequired
-from agent_core.output_contracts import D8OutputRequest, decode_response, output_schema
+from agent_core.output_contracts import D8OutputRequest, D8FormatIssue, decode_response, output_schema
 from agent_core.handoff_contracts import handoff_json
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.review_contracts import D2ReviewRequest, D2ModelFailure, D2ModelResponse
@@ -51,7 +52,7 @@ class StructuredOutput:
     def _contract(self, request):
         from agent_core.dual_llm_modeling import D3ModelRequest
         task, identity = self.identity(request)
-        stage, schema = output_schema(request)
+        stage, schema = output_schema(request, contract_version=self.app.config.contract_version)
         root, correction = self._correction(request, identity)
         role_ref = getattr(request, "role_config_ref", None)
         if isinstance(request, D5RefinementRequest):
@@ -85,11 +86,37 @@ class StructuredOutput:
         error = {"correction_of_model_request_id": correction,
                  "reason": "output_format_invalid" if diagnostic is not None else "proposal_rejected",
                  "issues": diagnostic["issues"] if diagnostic is not None else []}
-        if self.app.business_diagnostics is not None:
-            business = self.app.business_diagnostics.read(correction)
+        contract = self.evidence.read("contract", correction)
+        diagnostics = (getattr(self.app, "evaluation_bindings", None)
+                       if contract is not None and contract["stage"] == "intent_evaluation" and self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}
+                       else getattr(self.app, "review_diagnostics", None) if contract is not None and (
+                          contract["stage"] == "review" or self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and contract["stage"] == "progress_review")
+                       else getattr(self.app, "fact_business_diagnostics", None)
+                       if contract is not None and contract["stage"] == "fact_proposal"
+                       else self.app.business_diagnostics)
+        if diagnostics is not None:
+            business = diagnostics.read(correction)
             if business is not None:
                 error.update(reason="output_business_invalid", issues=business["issues"],
                              business_diagnostic_version=1, business_diagnostic_sha256=digest(business))
+        if self.app.config.contract_version in {17, 18, 19, 20, 21} and contract is not None and contract['stage'] in {'review', 'progress_review'}:
+            from agent_core.execution_feasibility import KEY
+            snapshot = self.evidence.read('review-request', correction)
+            if not isinstance(snapshot, dict) or digest(snapshot) != contract['source_request_sha256']:
+                raise D3RecoveryRequired('d17_review_correction_request_changed')
+            if snapshot['review_scope'] != 'turn_end':
+                context = json.loads(snapshot['context_summary'])
+                if KEY in context:
+                    error[KEY] = context[KEY]
+        if self.app.config.contract_version in {16, 17, 18, 19, 20, 21} and contract is not None and contract['stage'] == 'inner_plan':
+            from agent_core.plan_policy import policy_for as plan_policy
+            snapshot = self.app.sessions.evidence.read('request', correction)
+            if not isinstance(snapshot, dict) or digest(snapshot['request']) != contract['source_request_sha256']:
+                raise D3RecoveryRequired('s6_plan_correction_request_changed')
+            if getattr(self.app, 'web', None) is not None:
+                error['http_request_policy'] = self.app.web.policy()
+            else:
+                error['allowed_plan_choices'] = plan_policy(snapshot['request'])['allowed_choices']
         return error
 
     def prepare(self, request):
@@ -103,13 +130,18 @@ class StructuredOutput:
         if not self.app.handoff.capacity_port.fits(envelope, policy):
             raise D3RecoveryRequired("d8_output_complete_request_capacity_paused")
         self.evidence.save("contract", record["model_request_id"], record)
+        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            self.app.selection_bindings.freeze(envelope.request, record)
+        if (self.app.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and isinstance(request, D2ReviewRequest)
+                and (record["stage"] == "review" or self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and record["stage"] == "progress_review")):
+            self.evidence.save("review-request", request.review_id, asdict(request))
 
     def envelope(self, safe_request):
         task, identity = self.identity(safe_request)
         saved = self.evidence.read("contract", identity)
         if saved is None or saved["task_run_id"] != task or saved["safe_request_sha256"] != digest(asdict(safe_request)):
             raise D3RecoveryRequired("d8_output_request_not_frozen")
-        stage, schema = output_schema(safe_request)
+        stage, schema = output_schema(safe_request, contract_version=self.app.config.contract_version)
         if saved["output_contract"] != {"version": 1, "stage": stage, "schema": schema}:
             raise D3RecoveryRequired("d8_output_schema_changed")
         correction = saved["correction_of_model_request_id"]
@@ -167,6 +199,12 @@ class StructuredOutput:
                   "missing", "unknown", "invalid", "duplicate", "incomplete", "oversized", "too_deep",
                   "fixed_value", "allowed_shape", "declared_field", "allowed_count", "allowed_length",
                   "finite_json", "unique_fields", "valid_json", "complete_response", "bounded_response"}
+        if self.app.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            codes |= {"enum_mismatch", "array_duplicate", "number_out_of_range"}
+            labels |= {"allowed_choice", "allowed_range"}
+        if self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            codes.add("array_required_item_missing")
+            labels.add("required_current_reference")
         for issue in result["issues"]:
             if (not isinstance(issue, dict) or set(issue) != {"code", "path", "expected", "actual"}
                     or issue["code"] not in codes or not isinstance(issue["path"], str)
@@ -240,8 +278,45 @@ class StructuredOutput:
             response = response.response
         envelope = self.envelope(request)
         raw, issues, terminal, units = decode_response(response, envelope.output_contract["schema"])
+        if not issues and self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            from agent_core.selection_bindings import STAGES
+            from agent_core.governance_policy import requires_binding, MixedClaimSources
+            stage = envelope.output_contract['stage']
+            if stage in STAGES and requires_binding(stage, raw):
+                if self.app.conclusions._sensitive(raw):
+                    return ModelError(ModelErrorKind.INVALID_RESPONSE, 's5_sensitive_output_rejected')
+                try:
+                    return self.app.selection_bindings.normalize(request, raw, self.app.clock)
+                except MixedClaimSources:
+                    # Preserve D5's no-retry business rejection; do not create a format diagnostic.
+                    return None
+                except (ValueError, TypeError, KeyError):
+                    if stage == 'refinement':
+                        # Native D5 candidate rejection cannot create a format retry.
+                        return None
+                    issues = [D8FormatIssue('json_value_invalid', '$', 'allowed_shape', 'invalid')]
         if not issues:
-            return raw
+            http = getattr(self.app, 'web', None)
+            if (http is not None and envelope.output_contract['stage'] == 'inner_plan'
+                    and raw.get('kind') == 'http_request'):
+                try:
+                    return http.normalize_plan(request, raw)
+                except (ValueError, TypeError, KeyError):
+                    issues = [D8FormatIssue('json_value_invalid', '$', 'allowed_shape', 'invalid')]
+            if (http is not None and envelope.output_contract['stage'] == 'fact_proposal'
+                    and raw.get('kind') == 'candidate' and raw.get('assertion') is not None):
+                raw['assertion'].update(rule_version=1,
+                    artifact_version_id=request.observation.artifact_version_id,
+                    observation_id=request.observation.observation_id)
+            if (self.app.config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and envelope.output_contract["stage"] in {"inner_size", "inner_sha256"}
+                    and raw.get("kind") != "conclusion_change"):
+                return self.app.fixed_probe_bindings.normalize(request, raw)
+            if (self.app.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and isinstance(request, D2ReviewRequest)
+                    and (envelope.output_contract["stage"] == "review"
+                         or self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and envelope.output_contract["stage"] == "progress_review")):
+                return self.app.review_diagnostics.normalize(request, raw)
+            if not issues:
+                return raw
         contract = self.evidence.read("contract", identity)
         diagnostic = {"contract_version": self.app.config.contract_version, "task_run_id": task,
             "model_request_id": identity, "root_request_id": contract["root_request_id"],

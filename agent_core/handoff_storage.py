@@ -7,6 +7,13 @@ from agent_core.handoff_contracts import D8Capacity, D8CapacityVersion, D8Handof
 from agent_core.conclusion_revision_contracts import D8RevisionRecord
 from agent_core.session_contracts import D8DecisionRecord
 
+
+def _turn_authorized(config, binding):
+    from agent_core.http_validation import valid_turn
+    if getattr(binding, 'kind', None) in {'http_origin','hybrid_origin'}:
+        return valid_turn(config, binding)
+    return binding.attachment_index in config.authorization.attachment_indices
+
 D8_HANDOFF_SCHEMA = """
 CREATE TABLE d8_handoff_versions (
  record_id TEXT PRIMARY KEY, task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
@@ -86,7 +93,7 @@ def validate_handoff_mutation(store, mutation):
             raise StorageError("D8-2 metadata requires its dedicated operation")
         return False
     config = store.load_d3_run_config(mutation.task_run_id)
-    if config is None or config.contract_version not in {3, 4, 5, 6, 7} or len(records) != 1:
+    if config is None or config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or len(records) != 1:
         raise StorageError("D8-2 requires its explicit internal contract")
     record = records[0]
     if record.task_run_id != mutation.task_run_id:
@@ -95,7 +102,7 @@ def validate_handoff_mutation(store, mutation):
         prior = [i for i in store.list_d8_decisions(record.task_run_id) if i.intent_id == record.intent_id]
         rows = store.load_control_state_rows(record.task_run_id)
         owner = next((i for i in rows.intents if i.intent_id == record.intent_id), None)
-        if (config.contract_version not in {5, 6, 7} or mutation.operation != "append_d8_decision"
+        if (config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or mutation.operation != "append_d8_decision"
                 or len(mutation.state_changes) != 1 or owner is None or owner.turn_id != record.turn_id
                 or record.ordinal != len(prior) + 1
                 or any(i.root_request_id == record.root_request_id for i in prior)):
@@ -104,7 +111,7 @@ def validate_handoff_mutation(store, mutation):
     if any(not isinstance(c, (UpsertTurn, UpsertIntent, *D8_CHANGES)) for c in mutation.state_changes):
         raise StorageError("D8-2 transition cannot change other control objects")
     if isinstance(record, D8RevisionRecord):
-        if (config.contract_version not in {4, 5, 6, 7} or mutation.operation != "append_d8_revision"
+        if (config.contract_version not in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or mutation.operation != "append_d8_revision"
                 or len(mutation.state_changes) != 1
                 or record.sequence != len(store.list_d8_revisions(record.task_run_id)) + 1):
             raise StorageError("D8-3 revision requires its append-only contract")
@@ -188,7 +195,7 @@ def validate_handoff_mutation(store, mutation):
                 or metadata.turn_binding.turn_id != record.turn_id
                 or metadata.turn_binding.proposal_request_id != record.model_request_id
                 or metadata.turn_binding.task_run_id != record.task_run_id
-                or metadata.turn_binding.attachment_index not in config.authorization.attachment_indices
+                or not _turn_authorized(config, metadata.turn_binding)
                 or {i.intent_id for i in metadata.intent_bindings} != set(turns[0].intent_ids)
                 or any(i.task_run_id != record.task_run_id or i.turn_id != record.turn_id
                        or i.work_directory != f"/workspace/work/intents/{i.intent_id}" for i in metadata.intent_bindings)

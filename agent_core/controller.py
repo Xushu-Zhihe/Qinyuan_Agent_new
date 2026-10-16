@@ -508,10 +508,13 @@ class TaskRunController(LegacyTaskRunController):
                 raise TaskRequestError("D1 requires exactly one local attachment without network")
         if d3_config is not None:
             attachments = request.target.attachments
+            from agent_core.http_validation import valid_target
+            http_target = valid_target(d3_config, request)
             if (
                 not isinstance(d3_config, D3RunConfig)
                 or d1_config is not None or d2_config is not None
-                or request.target.endpoints or self._target_network is not None
+                or (not http_target and (request.target.endpoints or self._target_network is not None))
+                or (http_target and self._target_network is None)
                 or len(attachments) != len(d3_config.authorization.attachment_indices)
                 or any(item.kind != "local_path" for item in attachments)
             ):

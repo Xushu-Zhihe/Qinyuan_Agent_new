@@ -85,7 +85,7 @@ def parser():
     directory = candidate.add_mutually_exclusive_group(required=True)
     directory.add_argument("--state-dir")
     directory.add_argument("--run-dir")
-    for command in ("resume", "cancel", "cleanup", "status", "replay"):
+    for command in ("resume", "cancel", "cleanup", "status", "replay", "validation-check"):
         item = commands.add_parser(command)
         if command == "status":
             selector = item.add_mutually_exclusive_group(required=True)
@@ -105,6 +105,10 @@ def parser():
             item.add_argument("--events")
         elif command in {"cancel", "cleanup"}:
             item.add_argument("--events")
+        elif command == 'validation-check':
+            for field in ('candidate-id', 'evidence-version', 'submission-operation-id', 'query-id'):
+                item.add_argument('--' + field, required=True)
+            item.add_argument('--events')
         if command == "replay":
             item.add_argument("--after-sequence", type=int, default=0)
             item.add_argument("--limit", type=int, default=128)
@@ -855,6 +859,8 @@ def dispatch(args):
     protocol_version = _persisted_protocol_version(declaration)
     if declaration.get("task_run_id") != args.task_run_id:
         raise ValueError("run_identity_mismatch")
+    if args.command == 'validation-check' and protocol_version != 3:
+        raise ValueError('d9_validation_check_profile_unsupported')
     if protocol_version == 2:
         from agent_adapters.task_cli import dispatch_existing
 

@@ -32,13 +32,24 @@ def simulation_config():
     }
 
 
-def real_config():
+def real_config(*, contract_version=6, http=False, http_timeout_seconds=60):
     from agent_adapters.d8_model import CAPACITY_POLICY, TRANSPORT
-    return {"handoff_config": asdict(D8HandoffConfig(
+    result = {"handoff_config": asdict(D8HandoffConfig(
                 CAPACITY_POLICY, CAPACITY_POLICY,
                 D8Capacity(initial_history=32768, visible_history=131072))),
             "d5_sensitive_requirements": [], "model_transport": dict(TRANSPORT),
             "sandbox_backend": "local_simulated"}
+    if contract_version in {18, 19, 20, 21}:
+        from agent_adapters.d8_docker import sandbox_config
+        result.update(sandbox_backend="docker", sandbox_config=sandbox_config())
+    if http:
+        if contract_version not in {20,21}:
+            raise ValueError('d20_http_requires_contract20')
+        result['http_profile'] = 'qinyuan.d7.taskrun-forwarder.v1'
+        if type(http_timeout_seconds) is not int or not 1 <= http_timeout_seconds <= 300:
+            raise ValueError('d20_http_timeout_invalid')
+        result['http_timeout_seconds'] = http_timeout_seconds
+    return result
 
 
 def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]:
@@ -46,9 +57,22 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
                 "dual_llm_config", "execution_profile", "mode", "d8_config"}
     if not isinstance(raw, dict) or set(raw) != required:
         raise ValueError("invalid_d8_request_fields")
-    if not isinstance(raw["execution_profile"], str) or raw["execution_profile"] not in {"d8_v6", "d8_v7"}:
+    if not isinstance(raw["execution_profile"], str) or raw["execution_profile"] not in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
         raise ValueError("unsupported_execution_profile")
-    version = 7 if raw["execution_profile"] == "d8_v7" else 6
+    version = int(raw["execution_profile"].removeprefix("d8_v"))
+    endpoints = raw.get('task_request', {}).get('target', {}).get('endpoints', [])
+    http = bool(endpoints) and version in {20,21}
+    web_authorization = None
+    if http:
+        from agent_core.v7.web_contracts import D7WebAuthorization, canonical_web_origin
+        if (raw.get('mode') != 'real' or not isinstance(endpoints, list) or len(endpoints) != 1
+                or not isinstance(endpoints[0], dict) or set(endpoints[0]) != {'url'}
+                or version==20 and raw['task_request']['target'].get('attachments', [])):
+            raise ValueError('d20_http_requires_real_one_origin_without_attachments')
+        web_authorization = D7WebAuthorization.from_dict(
+            raw['authorization']|{'attachment_indices':[]} if version==21 else raw['authorization'])
+        if web_authorization.allowed_origin != canonical_web_origin(endpoints[0]['url']):
+            raise ValueError('d20_http_endpoint_authorization_mismatch')
     if type(raw["protocol_version"]) is not int or raw["protocol_version"] != 3:
         raise ValueError("unsupported_protocol_version")
     if not isinstance(raw["mode"], str) or raw["mode"] not in {"simulated", "real"}:
@@ -58,11 +82,17 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
     expected_fields = {"handoff_config", "d5_sensitive_requirements"}
     if is_real:
         expected_fields |= {"model_transport", "sandbox_backend"}
+        if version in {18, 19, 20, 21}:
+            expected_fields.add("sandbox_config")
+        if http:
+            expected_fields.add('http_profile')
+            expected_fields.add('http_timeout_seconds')
     if (not isinstance(extra, dict)
             or set(extra) != expected_fields
             or extra["d5_sensitive_requirements"] != []):
         raise ValueError("invalid_d8_configuration")
-    if is_real and json.dumps(extra, sort_keys=True) != json.dumps(real_config(), sort_keys=True):
+    if is_real and json.dumps(extra, sort_keys=True) != json.dumps(real_config(contract_version=version, http=http,
+            http_timeout_seconds=extra.get('http_timeout_seconds',60)), sort_keys=True):
         raise ValueError("d8_real_configuration_mismatch")
     handoff = D8HandoffConfig.from_dict(extra["handoff_config"])
     for policy in (handoff.outer_capacity, handoff.inner_capacity):
@@ -76,11 +106,21 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
     # changing its frozen 48-call budget contract or the caller's request.
     legacy = {k: raw[k] for k in required - {"execution_profile", "mode", "d8_config"}}
     legacy["dual_llm_config"] = {**dual, "d4_budget": asdict(D4BudgetPolicy())}
+    if http:
+        legacy['task_request'] = {**raw['task_request'], 'target': {
+            **raw['task_request']['target'], 'endpoints': []}}
+        legacy['authorization'] = dict(authorization_id=web_authorization.authorization_id,
+            attachment_indices=raw['authorization']['attachment_indices'] if version==21 else [],
+            allowed_tool='d3_fixed_readonly', network_allowed=False)
     request = replace(V3SimulationRequest.parse(legacy), d4_budget=budget)
+    if http:
+        task_request = {**raw['task_request'], 'target': {**raw['task_request']['target'],
+            'endpoints': [{'url': web_authorization.allowed_origin}]}}
+        request = replace(request, task_request=task_request)
     if is_real:
         from agent_adapters.d8_model import validate_role
-        validate_role(request.outer_role, version=2 if version == 7 else 1)
-        validate_role(request.inner_role, version=2 if version == 7 else 1)
+        validate_role(request.outer_role, version=version - 5)
+        validate_role(request.inner_role, version=version - 5)
     if len(request.attachments) > 2:
         # The public staging envelope accepts up to sixteen attachments;
         # capability rejection and its receipt precede any runnable D3 config.
@@ -92,8 +132,10 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
         request.outer_role.role_config_ref, contract_version=version,
         d4_budget=budget, d5_enabled=True, d5_sensitive_requirements=(),
         d8_enabled=True, handoff_config=handoff,
+        web_authorization=web_authorization,
+        http_timeout_seconds=extra['http_timeout_seconds'] if http else None,
     )
-    return request, config
+    return (replace(request, authorization=raw['authorization']) if http else request), config
 
 
 class SimulationModel:
@@ -127,11 +169,17 @@ class SimulationModel:
             if request.turn_id is not None:
                 return {"kind": "exhausted", "reason": "No further simulation branch is proposed.",
                         "evidence_refs": [request.history[0].ref] if request.history else []}
-            return {"kind": "candidates", "turn_target": request.goal,
+            result = {"kind": "candidates", "turn_target": request.goal,
                     "completion_rule": {"rule_id": "attachment_copy_sha256", "version": 1,
                                         "parameters": {"attachment_index": 0}},
                     "intents": [{"description": "Observe the authorized local copy digest",
                                  "intent_type": "file_sha256", "dependency_refs": []}]}
+            if "turn_target" not in envelope.output_contract["schema"]["anyOf"][0]["properties"]:
+                from agent_core.planning_assertion import planning_policy
+                result.pop("turn_target")
+                result["completion_rule"].pop("version")
+                result["completion_rule"]["parameters"]["attachment_index"] = planning_policy(request)["attachment_indices"][0]
+            return result
         if stage == "handoff_summary":
             return {"turn_body": "Simulation observation progress; inspect labelled sources.",
                     "global_body": "Bounded simulation; the final goal remains unverified.",
@@ -142,12 +190,16 @@ class SimulationModel:
                     "evidence_refs": [ref]}
         if stage == "fact_proposal":
             observation = request.observation
-            return {"kind": "candidate", "content": "The observed copy digest matches the frozen import.",
+            result = {"kind": "candidate", "content": "The observed copy digest matches the frozen import.",
                     "reason": "Only this saved copy version is covered.",
                     "evidence_refs": [observation.proof_id],
                     "assertion": {"rule_id": "attachment_copy_sha256", "rule_version": 1,
                                   "artifact_version_id": observation.artifact_version_id,
                                   "observation_id": observation.observation_id}}
+            assertion = envelope.output_contract["schema"]["anyOf"][0]["properties"]["assertion"]["anyOf"][1]
+            if set(assertion["properties"]) == {"rule_id"}:
+                result["assertion"] = {"rule_id": observation.rule_id}
+            return result
         if stage == "fact_review":
             return {"decision": "accept", "reason": "Supported within the fixed observation scope."}
         context = request.context
@@ -157,7 +209,15 @@ class SimulationModel:
         if stage == "inner_complete":
             return {"action": action_payload(CompleteIntentAction(context.supporting_fact_ids)),
                     "review_requested": False, "next_intent_candidates": []}
+        if stage == "inner_candidate" and "anyOf" in envelope.output_contract['schema']['properties']['action']:
+            return {"action": {"kind": "no_candidate"}}
         if stage in {"inner_size", "inner_sha256"}:
+            if envelope.output_contract["schema"]["anyOf"][0]["properties"]["action"]["properties"]["kind"].get("const") == "fixed_probe":
+                from agent_core.fixed_probe import fixed_probe_policy
+                policy = fixed_probe_policy(request)
+                return {"action": {"kind": "fixed_probe", "operation": policy["operation"],
+                                   "timeout_seconds": min(60, policy["max_timeout_seconds"])},
+                        "review_requested": False}
             conditions = () if stage == "inner_size" else (FileSha256(
                 context.step_index, context.fixed_script.rsplit(" ", 1)[-1],
                 context.turn_binding.expected_sha256),)
@@ -175,7 +235,7 @@ class _LifecycleModel:
         raise ValueError("d8_lifecycle_model_dispatch_forbidden")
 
 
-def run_simulated_task(directory, declaration, *, operation="start"):
+def run_simulated_task(directory, declaration, *, operation="start", validation_selection=None, validation_checker=None):
     from agent_adapters.v7.task_result import snapshot_v3_task_result
     from agent_adapters.v7.request_staging import D7RequestStager
 
@@ -187,7 +247,14 @@ def run_simulated_task(directory, declaration, *, operation="start"):
             or declaration.get("mode") != declaration["request"]["mode"]
             or declaration.get("d4_budget_policy") != asdict(config.d4_budget)):
         raise ValueError("d8_frozen_configuration_mismatch")
-    sandbox = _LocalDigestSandbox(directory)
+    if config.contract_version in {18, 19, 20, 21} and declaration["mode"] == "real" and operation in {"cancel", "cleanup"}:
+        previous = snapshot_v3_task_result(directory, declaration)
+        terminal = previous.get("task_run", {}).get("status") in {item.value for item in TERMINAL_STATUSES}
+        if terminal and (operation == "cancel" or previous.get("cleanup_status") == "confirmed"):
+            return previous
+    sandbox = _LocalDigestSandbox(directory) if not (declaration["mode"] == "real" and config.contract_version in {18, 19, 20, 21}) else None
+    resources = None
+    target_network = None
     outer, inner = SimulationModel(config.outer_role), SimulationModel(config.inner_role)
     capacity = FakeUnicodeCapacity()
     if declaration["mode"] == "real":
@@ -198,22 +265,38 @@ def run_simulated_task(directory, declaration, *, operation="start"):
         if operation in {"start", "resume"}:
             outer = D8DeepSeekModel(config.outer_role, settings_from_file(config.outer_role, declaration["env_file"]))
             inner = D8DeepSeekModel(config.inner_role, settings_from_file(config.inner_role, declaration["env_file"]))
-    app = D3Application(
-        directory, config=config, sandbox=sandbox, import_sandbox=sandbox,
-        workspace_sandbox=sandbox, command_sandbox=sandbox, outer_model=outer,
-        inner_model=inner, review_model=outer, refinement_model=outer,
-        fact_review_model=outer, handoff_model=outer, capacity_port=capacity,
-        sensitive_config={}, clock=time.time,
-    )
+        if config.contract_version in {18, 19, 20, 21}:
+            from agent_adapters.d8_docker import connect
+            from agent_adapters.application import RecordedSandbox
+            resources, sandbox = connect(declaration["request"]["d8_config"]["sandbox_config"], directory)
+            if config.web_authorization is not None:
+                from agent_adapters.target_network_cleanup import RecordedTargetNetwork
+                from Sandbox.target_network import T6TargetNetwork
+                target_network = RecordedTargetNetwork(T6TargetNetwork(resources._runtime), directory)
+    try:
+        app = D3Application(
+            directory, config=config, sandbox=RecordedSandbox(resources, directory) if resources else sandbox,
+            import_sandbox=sandbox, workspace_sandbox=sandbox,
+            command_sandbox=sandbox, http_sandbox=resources if config.web_authorization is not None else None, outer_model=outer,
+            inner_model=inner, review_model=outer, refinement_model=outer,
+            fact_review_model=outer, handoff_model=outer, capacity_port=capacity,
+            sensitive_config={}, clock=time.time,
+            target_network_adapter=target_network,
+        )
+    except BaseException:
+        if resources is not None:
+            resources.close()
+        raise
     task_id, token = declaration["task_run_id"], _Token(directory)
     report = None
+    check_record = None
     try:
         if operation == "start":
             app.start(_d3_request(declaration), directory, task_run_id=task_id)
             if declaration["mode"] == "real":
                 outer.bind_runtime(token, app.state.task_run.deadline_at)
                 inner.bind_runtime(token, app.state.task_run.deadline_at)
-            if not declaration.get("staged_attachment_paths"):
+            if not declaration.get("staged_attachment_paths") and config.web_authorization is None:
                 app.controller.conclude(TaskRunStatus.INCONCLUSIVE, str(uuid4()),
                                         reason="single_intent_slice_finished")
                 app.controller.cleanup_sandbox()
@@ -231,9 +314,22 @@ def run_simulated_task(directory, declaration, *, operation="start"):
             report = app.cancel(task_id)
         elif operation == "cleanup":
             report = app.resume_cleanup(task_id)
+        elif operation == 'validation-check' and config.contract_version in {19, 20, 21}:
+            from agent_adapters.run_files import run_lock
+            with run_lock(directory):
+                app.controller.attach(task_id)
+                app._bound_task_run_id = task_id
+                if app.store.load_d3_run_config(task_id) != config:
+                    raise ValueError('d3_frozen_run_configuration_changed')
+                if token.is_cancelled:
+                    raise ValueError('d9_validation_check_cancelled')
+                check_record = app.answers.check(validation_selection, validation_checker)
         else:
             raise ValueError("unsupported_v3_operation")
         result = snapshot_v3_task_result(directory, declaration)
+        if check_record is not None:
+            result['validation_check'] = {'state': check_record.result.verdict,
+                                         'query_id': check_record.request.query_id}
         if report is not None and report.recovery_required:
             result["recovery"] = {"required": True, "reason": "operation_or_evidence_unknown"}
             result["recovery_status"] = "required"
@@ -245,13 +341,18 @@ def run_simulated_task(directory, declaration, *, operation="start"):
                 declaration["request_id"], task_id, directory)
         return result
     finally:
-        state = app.controller._persistent_state
-        if state is not None and state.task_run.status in TERMINAL_STATUSES:
-            app.close()
-        else:
-            # The confirmed public pause boundary retains the run and Sandbox;
-            # close() itself intentionally requires terminal/feedback state.
-            app.store.close()
+        if app.web is not None:
+            app.web.close()
+        try:
+            state = app.controller._persistent_state
+            if state is not None and state.task_run.status in TERMINAL_STATUSES:
+                app.close()
+            else:
+                # Paused real runs retain the container, not the SDK handles.
+                app.store.close()
+        finally:
+            if resources is not None:
+                resources.close()
 
 
 def real_declaration_binding(declaration):
@@ -269,6 +370,7 @@ def validate_real_declaration(directory, declaration):
     from agent_adapters.run_files import immutable_read
     path = directory / "d8-runtime.json"
     if (path.is_symlink() or not path.is_file()
-            or declaration.get("sandbox_backend") != "local_simulated"
+            or declaration.get("sandbox_backend") != ("docker" if declaration.get("contract_version") in {18, 19, 20, 21} else "local_simulated")
+            or declaration.get("sandbox_backend") != declaration["request"]["d8_config"]["sandbox_backend"]
             or immutable_read(path) != real_declaration_binding(declaration)):
         raise ValueError("d8_real_frozen_configuration_mismatch")
