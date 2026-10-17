@@ -41,7 +41,7 @@ def issue(code, index=None):
     return {"code": code, "path": path, "expected": expected, "actual": actual}
 
 
-def planning_issues(request, raw, authorization, reliable):
+def planning_issues(request, raw, authorization, reliable, *, maximum=2):
     """Explain an actual rejection; this function never grants acceptance."""
     issues = []
     add = lambda code, index=None: issues.append(issue(code, index))
@@ -83,7 +83,7 @@ def planning_issues(request, raw, authorization, reliable):
         elif params["attachment_index"] not in authorization.attachment_indices:
             add("planning_attachment_unauthorized")
     candidates = raw.get("intents")
-    if not isinstance(candidates, list) or not 1 <= len(candidates) <= 2:
+    if not isinstance(candidates, list) or not candidates or maximum is not None and len(candidates) > maximum:
         add("planning_intent_count_invalid")
     else:
         for index, candidate in enumerate(candidates):
@@ -110,7 +110,7 @@ def planning_issues(request, raw, authorization, reliable):
 
 class BusinessDiagnostics:
     def __init__(self, config, evidence, handoff_evidence, store):
-        if config.contract_version not in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config.contract_version not in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             raise ValueError("business_diagnostics_require_contract7")
         self.config, self.evidence, self.handoff, self.store = config, evidence, handoff_evidence, store
 
@@ -191,14 +191,20 @@ class BusinessDiagnostics:
             if not isinstance(value, dict) or value.get("code") not in allowed:
                 raise D3RecoveryRequired("d8_business_diagnostic_issues_invalid")
             code = value["code"]
-            if self.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and code in {"planning_target_invalid", "planning_target_mismatch"}:
+            if self.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and code in {"planning_target_invalid", "planning_target_mismatch"}:
                 raise D3RecoveryRequired("s2_planning_diagnostic_program_field")
-            valid = ([issue(code, i) for i in range(2)] if code in CANDIDATE_ISSUES else [issue(code)])
-            if value not in valid:
+            if self.config.contract_version == 22 and code in CANDIDATE_ISSUES:
+                parts = value.get('path', '').split('/')
+                index = int(parts[2]) if len(parts) == 4 and parts[2].isdigit() else -1
+                valid = index >= 0 and value == issue(code, index)
+            else:
+                valid = value in ([issue(code, i) for i in range(2)] if code in CANDIDATE_ISSUES else [issue(code)])
+            if not valid:
                 raise D3RecoveryRequired("d8_business_diagnostic_issues_invalid")
         indices = record["rejected_candidate_indices"]
         if (record["rejection_reason"] not in {"d8_output_contract_rejected", "d8_all_dependency_candidates_rejected"}
-                or not isinstance(indices, list) or any(type(i) is not int or i not in {0, 1} for i in indices)
+                or not isinstance(indices, list) or any(type(i) is not int or i < 0
+                    or self.config.contract_version != 22 and i not in {0, 1} for i in indices)
                 or len(indices) != len(set(indices))):
             raise D3RecoveryRequired("d8_business_diagnostic_result_invalid")
         if check_operation:

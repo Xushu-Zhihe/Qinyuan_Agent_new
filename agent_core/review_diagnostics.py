@@ -19,7 +19,7 @@ def completion_evidence(call, result=None):
 
 class ReviewDiagnostics:
     def __init__(self, config, output, ledger, store, clock):
-        if config.contract_version not in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config.contract_version not in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             raise ValueError("review_diagnostics_require_contract9")
         self.config, self.output, self.ledger, self.store, self.clock = config, output, ledger, store, clock
         self.needs_repair = False
@@ -28,7 +28,7 @@ class ReviewDiagnostics:
         return policy_for(request) is not None
 
     def progress(self, request):
-        return self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and "d8_progress" in json.loads(request.context_summary)
+        return self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and "d8_progress" in json.loads(request.context_summary)
 
     def supported(self, request):
         return self.progress(request) or self.ordinary(request)
@@ -52,7 +52,7 @@ class ReviewDiagnostics:
         return business_issues(wire, request)
 
     def _reason_fields(self, wire):
-        if self.config.contract_version not in {16, 17, 18, 19, 20, 21}:
+        if self.config.contract_version not in {16, 17, 18, 19, 20, 21, 22}:
             return {}
         lengths = {'rationale': len(wire['rationale'])}
         if 'progress' in wire:
@@ -134,7 +134,7 @@ class ReviewDiagnostics:
             catalog, make_issue = ISSUES, issue
             if self.progress(request):
                 from agent_core.progress_policy import ISSUES as catalog, issue as make_issue
-                if self.config.contract_version in {16, 17, 18, 19, 20, 21}:
+                if self.config.contract_version in {16, 17, 18, 19, 20, 21, 22}:
                     from functools import partial
                     make_issue = partial(make_issue, unbounded=True)
             if (not isinstance(issues, list) or not 1 <= len(issues) <= 8
@@ -304,11 +304,11 @@ class ReviewDiagnostics:
                     raise D3RecoveryRequired("d9_review_request_missing")
                 contract = self.output.read("contract", identity)
                 if contract is not None and (contract.get("stage") == "review"
-                        or self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and contract.get("stage") == "progress_review"):
+                        or self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and contract.get("stage") == "progress_review"):
                     raise D3RecoveryRequired("d9_review_request_missing")
                 diagnostic = self.output.read("business-diagnostic", identity)
                 if diagnostic is not None and (diagnostic.get("stage") == "review"
-                        or self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and diagnostic.get("stage") == "progress_review"):
+                        or self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and diagnostic.get("stage") == "progress_review"):
                     raise D3RecoveryRequired("d9_review_request_missing")
                 for root in self.ledger.list_roots(op.start.task_run_id):
                     for call in root.get("calls", []):

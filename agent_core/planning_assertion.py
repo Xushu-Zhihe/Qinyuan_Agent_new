@@ -51,10 +51,11 @@ def freeze_planning_policy(app):
 
 def planning_schema(request):
     from agent_core.output_contracts import tagged, obj, array, INTENT, REFS, text
+    from agent_core.intent_planning import candidate_limit
     policy = planning_policy(request)
     rule = obj({"rule_id": {"type": "string", "enum": [policy["rule_id"]]},
                 "parameters": obj({"attachment_index": {"type": "integer", "enum": policy["attachment_indices"]}})})
-    return {"anyOf": [tagged("candidates", {"completion_rule": rule, "intents": array(INTENT, 1, 2)}),
+    return {"anyOf": [tagged("candidates", {"completion_rule": rule, "intents": array(INTENT, 1, candidate_limit(request))}),
                       tagged("exhausted", {"reason": text(512), "evidence_refs": REFS})]}
 
 
@@ -82,7 +83,7 @@ def materialize(request, wire):
 
 class PlanningAssertionBindings:
     def __init__(self, config, output, handoff, conclusions, store, imports):
-        if config.contract_version not in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config.contract_version not in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             raise ValueError("s2_bindings_require_contract12")
         self.config, self.output, self.handoff = config, output, handoff
         self.conclusions, self.store, self.imports = conclusions, store, imports
@@ -207,7 +208,8 @@ class PlanningAssertionBindings:
             raise D3RecoveryRequired("s2_binding_invalid")
         canonical = materialize(request, record.get("wire_response"))
         indices = record.get("rejected_candidate_indices")
-        if (not isinstance(indices, list) or any(type(i) is not int or i not in {0, 1} for i in indices)
+        if (not isinstance(indices, list) or any(type(i) is not int or i < 0
+                or self.config.contract_version != 22 and i not in {0, 1} for i in indices)
                 or len(indices) != len(set(indices))
                 or request.stage == "fact_proposal" and indices):
             raise D3RecoveryRequired("s2_binding_indices_invalid")
@@ -250,7 +252,8 @@ class PlanningAssertionBindings:
                             checked_refs(candidate["dependency_refs"], {i.ref for i in request.history})
                             kept.append({k: candidate[k] for k in ("description", "intent_type")})
                     parse_d3_turn_proposal({"turn_target": raw["turn_target"],
-                                           "completion_rule": raw["completion_rule"], "intents": kept})
+                                           "completion_rule": raw["completion_rule"], "intents": kept},
+                                          maximum=None if self.config.contract_version == 22 else 2)
             except (ValueError, TypeError, KeyError) as exc:
                 raise D3RecoveryRequired("s2_saved_planning_business_invalid") from exc
         return record

@@ -896,7 +896,7 @@ class D3WorkspaceOperations:
             or review.turn_id != turn_id
             or review.decision not in (
                 ({"switch_sibling_intent", "abandon_current_intent"}
-                 if self.ledger.load_d3_run_config(state.task_run.task_run_id).contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+                 if self.ledger.load_d3_run_config(state.task_run.task_run_id).contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}
                  else {"switch_sibling_intent"})
                 if reason == "sibling_switch" else {"adjust_turn_target"}
             )

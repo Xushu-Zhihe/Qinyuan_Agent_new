@@ -262,7 +262,15 @@ def _d3_request(declaration: dict) -> TaskRequest:
     raw = declaration["request"]["task_request"]
     rewritten = dict(raw)
     target = dict(raw["target"])
-    if declaration.get('execution_profile') == 'd8_v20' and target.get('endpoints'):
+    if declaration.get('execution_profile') in {'d8_v15', 'd8_v16', 'd8_v17', 'd8_v18', 'd8_v19', 'd8_v20', 'd8_v21'} and target.get('endpoints'):
+        # Rewrite attachments to use staged paths
+        staged = declaration.get("staged_attachment_paths", [])
+        if staged:
+            target["attachments"] = [
+                {"kind": "local_path", "path": item} for item in staged
+            ]
+            rewritten["target"] = target
+            return TaskRequest.from_dict(rewritten)
         return TaskRequest.from_dict(raw)
     staged = declaration.get("staged_attachment_paths", [])
     target["attachments"] = [
@@ -330,7 +338,7 @@ def run_simulated_task(
 ) -> dict:
     """Run or recover one local simulated D3 TaskRun and return its projection."""
     if "execution_profile" in declaration:
-        if declaration["execution_profile"] not in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
+        if declaration["execution_profile"] not in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
             raise ValueError("unsupported_execution_profile")
         from agent_adapters.d8_simulation import run_simulated_task as run_d8
         return run_d8(Path(directory), declaration, operation=operation)

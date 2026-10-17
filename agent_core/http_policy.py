@@ -23,9 +23,10 @@ def policy(request):
 
 def schema(request):
     from agent_core.output_contracts import tagged,array,INTENT,REFS,text,S
+    from agent_core.intent_planning import candidate_limit
     if request.stage=='tree_planning':
         policy(request)
-        return {'anyOf':[tagged('candidates',{'intents':array(INTENT,1,2)}),
+        return {'anyOf':[tagged('candidates',{'intents':array(INTENT,1,candidate_limit(request))}),
             tagged('exhausted',{'reason':text(512),'evidence_refs':REFS})]}
     if request.stage=='inner_plan':
         authorization=json.loads(request.history_context)['d20_http_policy']
@@ -55,13 +56,16 @@ def attachment_choices(context):
 
 def planning(request,raw,revisions):
     from agent_core.handoff import D8PlanningResult,D8DependencyCandidatesRejected
+    from agent_core.intent_planning import candidate_limit
     if not isinstance(raw,dict):raise ValueError('d20_http_planning_invalid')
     if raw.get('kind')=='exhausted':
         if set(raw)!={'kind','reason','evidence_refs'} or not isinstance(raw['reason'],str) or not raw['reason'].strip():
             raise ValueError('d20_http_exhaustion_invalid')
         checked_refs(raw['evidence_refs'],{i.ref for i in request.history})
         return D8PlanningResult(None,(),(),raw['reason'])
-    if set(raw)!={'kind','intents'} or raw['kind']!='candidates' or not isinstance(raw['intents'],list) or not 1<=len(raw['intents'])<=2:
+    maximum=candidate_limit(request)
+    if (set(raw)!={'kind','intents'} or raw['kind']!='candidates' or not isinstance(raw['intents'],list)
+            or not raw['intents'] or maximum is not None and len(raw['intents'])>maximum):
         raise ValueError('d20_http_planning_invalid')
     available={i.ref for i in request.history}
     kept,deps,rejected=[],[],[]

@@ -381,7 +381,7 @@ class D3Control:
             if item.turn_id == current.turn_id and item.status is IntentStatus.PENDING
         ]
         config = self.ledger.load_d3_run_config(state.task_run.task_run_id)
-        if not siblings and config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if not siblings and config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             raise D3RecoveryRequired("d3_no_sibling_candidate")
         next_intent = min(siblings, key=lambda item: item.priority) if siblings else None
         changes: list[StateChange] = [

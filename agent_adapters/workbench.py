@@ -120,8 +120,8 @@ class Workbench:
         if protocol_version not in {2, 3}:
             raise ValueError("unsupported_workbench_protocol_version")
         explicit_d7_mode = d7_mode is not None
-        if execution_profile not in {"d7", "d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"} or (
-            execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"} and protocol_version != 3
+        if execution_profile not in {"d7", "d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} or (
+            execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} and protocol_version != 3
         ):
             raise ValueError("unsupported_execution_profile")
         if d7_mode is None and execution_profile == "d7":
@@ -205,7 +205,7 @@ class Workbench:
             raise WorkbenchError("challenge_not_found", HTTPStatus.NOT_FOUND)
         result = dict(row)
         methods = result.pop('http_methods_json')
-        if self.execution_profile in {'d8_v20','d8_v21'}:
+        if self.execution_profile in {'d8_v20','d8_v21','d8_v22'}:
             result['http_methods'] = http_methods(json.loads(methods))
         result["archived"] = bool(result["archived"])
         result["attachments"] = [dict(item) for item in db.execute(
@@ -330,7 +330,7 @@ class Workbench:
     def create(self, value):
         title, category, description, target, deadline, step_timeout = challenge_fields(value)
         methods = http_methods(value.get('http_methods', ['GET', 'HEAD', 'OPTIONS']))
-        if 'http_methods' in value and self.execution_profile not in {'d8_v20','d8_v21'}:
+        if 'http_methods' in value and self.execution_profile not in {'d8_v20','d8_v21','d8_v22'}:
             raise WorkbenchError('http_methods_profile_unsupported')
         challenge_id, timestamp = str(uuid4()), now()
         with self.lock, self._db() as db:
@@ -338,7 +338,7 @@ class Workbench:
                 "INSERT INTO challenges(id,title,category,description,endpoint,deadline_minutes,step_timeout_seconds,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (challenge_id, title, category, description, target, deadline, step_timeout, timestamp, timestamp),
             )
-            if self.execution_profile in {'d8_v20','d8_v21'}:
+            if self.execution_profile in {'d8_v20','d8_v21','d8_v22'}:
                 db.execute('UPDATE challenges SET http_methods_json=? WHERE id=?', (json.dumps(methods), challenge_id))
             return self._get(db, challenge_id)
 
@@ -347,7 +347,7 @@ class Workbench:
         with self.lock, self._db() as db:
             current = self._get(db, challenge_id)
             methods = http_methods(value.get('http_methods', current.get('http_methods', ['GET', 'HEAD', 'OPTIONS'])))
-            if 'http_methods' in value and self.execution_profile not in {'d8_v20','d8_v21'}:
+            if 'http_methods' in value and self.execution_profile not in {'d8_v20','d8_v21','d8_v22'}:
                 raise WorkbenchError('http_methods_profile_unsupported')
             if current["status"] != "draft" or current["archived"]:
                 raise WorkbenchError("challenge_not_editable", HTTPStatus.CONFLICT)
@@ -355,7 +355,7 @@ class Workbench:
                 "UPDATE challenges SET title=?,category=?,description=?,endpoint=?,deadline_minutes=?,step_timeout_seconds=?,updated_at=? WHERE id=?",
                 (title, category, description, target, deadline, step_timeout, now(), challenge_id),
             )
-            if self.execution_profile in {'d8_v20','d8_v21'}:
+            if self.execution_profile in {'d8_v20','d8_v21','d8_v22'}:
                 db.execute('UPDATE challenges SET http_methods_json=? WHERE id=?', (json.dumps(methods), challenge_id))
             return self._get(db, challenge_id)
 
@@ -595,7 +595,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, {"status": "ready", "agent_execution": "connected", "capabilities": {
                 "current_cli": (
                     "run-task-v3-d8"
-                    if self.server.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}
+                    if self.server.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}
                     else f"run-task-v3-{self.server.workbench.d7_mode}"
                     if self.server.workbench.protocol_version == 3
                     else "t6_run_task_real"
@@ -604,8 +604,8 @@ class Handler(BaseHTTPRequestHandler):
                 "d7_mode": self.server.workbench.d7_mode if self.server.workbench.protocol_version == 3 else None,
                 "t6_scheduler": self.server.workbench.protocol_version == 2,
                 "remote_network": (
-                    self.server.workbench.execution_profile in {'d8_v20','d8_v21'} or
-                    self.server.workbench.execution_profile not in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"} and (
+                    self.server.workbench.execution_profile in {'d8_v20','d8_v21','d8_v22'} or
+                    self.server.workbench.execution_profile not in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} and (
                     self.server.workbench.protocol_version == 2
                     or self.server.workbench.protocol_version == 3
                     and self.server.workbench.d7_mode == "real"
@@ -615,8 +615,8 @@ class Handler(BaseHTTPRequestHandler):
                     "contract_version": int(self.server.workbench.execution_profile.removeprefix("d8_v")),
                     "mode_selection_required": self.server.workbench.d7_mode is None,
                     "real_supported": True, "real_model": "deepseek-flash",
-                    "real_sandbox_backend": "docker" if self.server.workbench.execution_profile in {"d8_v18", "d8_v19", "d8_v20", "d8_v21"} else "local_simulated"}
-                   if self.server.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"} else {}),
+                    "real_sandbox_backend": "docker" if self.server.workbench.execution_profile in {"d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} else "local_simulated"}
+                   if self.server.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} else {}),
             }})
             return
         if parts == ["api", "model"]:
@@ -645,7 +645,7 @@ class Handler(BaseHTTPRequestHandler):
                 challenge_ids = self._json().get("challenge_ids", [])
                 if not isinstance(challenge_ids, list) or len(challenge_ids) > 50:
                     raise WorkbenchError("invalid_batch_cleanup_request")
-                results = workbench.runner.batch_cleanup(challenge_ids)
+                results = workbench.runner.batch_force_delete(challenge_ids)
                 self._send(HTTPStatus.OK, {"results": results})
                 return
             # Regular challenge routes
@@ -661,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[3] == "run":
                 if self.command == "POST":
-                    if workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
+                    if workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
                         body = self._json() if int(self.headers.get("Content-Length", "0")) else {}
                         if not isinstance(body, dict) or set(body) - {"mode"}:
                             raise WorkbenchError("invalid_run_request", 400)
@@ -778,7 +778,7 @@ def main(argv=None):
     parser.add_argument("--data-dir", type=Path, default=Path("workbench_data"))
     parser.add_argument("--protocol-version", type=int, choices=(2, 3), default=None)
     parser.add_argument("--d7-mode", choices=("simulated", "real"), default=None)
-    parser.add_argument("--execution-profile", choices=("d7", "d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"), default=None)
+    parser.add_argument("--execution-profile", choices=("d7", "d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"), default=None)
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
@@ -788,7 +788,7 @@ def main(argv=None):
         protocol = args.protocol_version
         if protocol is None:
             protocol = int(os.environ.get("QINYUAN_WORKBENCH_PROTOCOL_VERSION", "3"))
-        profile = args.execution_profile or ("d8_v21" if protocol == 3 else "d7")
+        profile = args.execution_profile or ("d8_v22" if protocol == 3 else "d7")
         workbench = Workbench(
             args.data_dir,
             protocol_version=protocol,
@@ -812,7 +812,7 @@ def main(argv=None):
         print(f"Data: {workbench.root}", flush=True)
         print("Management API: ready (challenges, attachments, model settings)", flush=True)
         if workbench.protocol_version == 3:
-            if workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
+            if workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
                 print(f"Agent execution: protocol v3 / D8 contract {int(workbench.execution_profile.removeprefix('d8_v'))} (select model mode explicitly; local simulated Sandbox)", flush=True)
             elif workbench.d7_mode == "real":
                 print("Agent execution: run-task protocol v3 real (authorized single-origin Web)", flush=True)

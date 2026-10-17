@@ -88,9 +88,9 @@ class StructuredOutput:
                  "issues": diagnostic["issues"] if diagnostic is not None else []}
         contract = self.evidence.read("contract", correction)
         diagnostics = (getattr(self.app, "evaluation_bindings", None)
-                       if contract is not None and contract["stage"] == "intent_evaluation" and self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}
+                       if contract is not None and contract["stage"] == "intent_evaluation" and self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}
                        else getattr(self.app, "review_diagnostics", None) if contract is not None and (
-                          contract["stage"] == "review" or self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and contract["stage"] == "progress_review")
+                          contract["stage"] == "review" or self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and contract["stage"] == "progress_review")
                        else getattr(self.app, "fact_business_diagnostics", None)
                        if contract is not None and contract["stage"] == "fact_proposal"
                        else self.app.business_diagnostics)
@@ -99,7 +99,7 @@ class StructuredOutput:
             if business is not None:
                 error.update(reason="output_business_invalid", issues=business["issues"],
                              business_diagnostic_version=1, business_diagnostic_sha256=digest(business))
-        if self.app.config.contract_version in {17, 18, 19, 20, 21} and contract is not None and contract['stage'] in {'review', 'progress_review'}:
+        if self.app.config.contract_version in {17, 18, 19, 20, 21, 22} and contract is not None and contract['stage'] in {'review', 'progress_review'}:
             from agent_core.execution_feasibility import KEY
             snapshot = self.evidence.read('review-request', correction)
             if not isinstance(snapshot, dict) or digest(snapshot) != contract['source_request_sha256']:
@@ -108,7 +108,7 @@ class StructuredOutput:
                 context = json.loads(snapshot['context_summary'])
                 if KEY in context:
                     error[KEY] = context[KEY]
-        if self.app.config.contract_version in {16, 17, 18, 19, 20, 21} and contract is not None and contract['stage'] == 'inner_plan':
+        if self.app.config.contract_version in {16, 17, 18, 19, 20, 21, 22} and contract is not None and contract['stage'] == 'inner_plan':
             from agent_core.plan_policy import policy_for as plan_policy
             snapshot = self.app.sessions.evidence.read('request', correction)
             if not isinstance(snapshot, dict) or digest(snapshot['request']) != contract['source_request_sha256']:
@@ -130,10 +130,10 @@ class StructuredOutput:
         if not self.app.handoff.capacity_port.fits(envelope, policy):
             raise D3RecoveryRequired("d8_output_complete_request_capacity_paused")
         self.evidence.save("contract", record["model_request_id"], record)
-        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.app.selection_bindings.freeze(envelope.request, record)
-        if (self.app.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and isinstance(request, D2ReviewRequest)
-                and (record["stage"] == "review" or self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and record["stage"] == "progress_review")):
+        if (self.app.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and isinstance(request, D2ReviewRequest)
+                and (record["stage"] == "review" or self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and record["stage"] == "progress_review")):
             self.evidence.save("review-request", request.review_id, asdict(request))
 
     def envelope(self, safe_request):
@@ -199,10 +199,10 @@ class StructuredOutput:
                   "missing", "unknown", "invalid", "duplicate", "incomplete", "oversized", "too_deep",
                   "fixed_value", "allowed_shape", "declared_field", "allowed_count", "allowed_length",
                   "finite_json", "unique_fields", "valid_json", "complete_response", "bounded_response"}
-        if self.app.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if self.app.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             codes |= {"enum_mismatch", "array_duplicate", "number_out_of_range"}
             labels |= {"allowed_choice", "allowed_range"}
-        if self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             codes.add("array_required_item_missing")
             labels.add("required_current_reference")
         for issue in result["issues"]:
@@ -278,7 +278,7 @@ class StructuredOutput:
             response = response.response
         envelope = self.envelope(request)
         raw, issues, terminal, units = decode_response(response, envelope.output_contract["schema"])
-        if not issues and self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+        if not issues and self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.selection_bindings import STAGES
             from agent_core.governance_policy import requires_binding, MixedClaimSources
             stage = envelope.output_contract['stage']
@@ -308,13 +308,19 @@ class StructuredOutput:
                 raw['assertion'].update(rule_version=1,
                     artifact_version_id=request.observation.artifact_version_id,
                     observation_id=request.observation.observation_id)
-            if (self.app.config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and envelope.output_contract["stage"] in {"inner_size", "inner_sha256"}
+            if (self.app.config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and envelope.output_contract["stage"] in {"inner_size", "inner_sha256"}
                     and raw.get("kind") != "conclusion_change"):
                 return self.app.fixed_probe_bindings.normalize(request, raw)
-            if (self.app.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and isinstance(request, D2ReviewRequest)
+            if (self.app.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and isinstance(request, D2ReviewRequest)
                     and (envelope.output_contract["stage"] == "review"
-                         or self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and envelope.output_contract["stage"] == "progress_review")):
-                return self.app.review_diagnostics.normalize(request, raw)
+                         or self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and envelope.output_contract["stage"] == "progress_review")):
+                # envelope() has checked the safe request; business binding uses the
+                # frozen original, whose JSON text can differ after redaction.
+                original = self.app.review_diagnostics._request(identity)
+                contract = self.evidence.read("contract", identity)
+                if contract["source_request_sha256"] != digest(asdict(original)):
+                    raise D3RecoveryRequired("d9_review_contract_binding_changed")
+                return self.app.review_diagnostics.normalize(original, raw)
             if not issues:
                 return raw
         contract = self.evidence.read("contract", identity)
@@ -343,6 +349,9 @@ class StructuredModel:
         return self.adapter.role_config
 
     def invoke(self, request, *args):
-        envelope = self.boundary.envelope(request)
+        from agent_core.model_call_phase import model_call_phase
+        with model_call_phase("request_assembly"):
+            envelope = self.boundary.envelope(request)
         response = self.adapter.invoke(envelope, *args)
-        return self.boundary.normalize(request, response)
+        with model_call_phase("response_processing"):
+            return self.boundary.normalize(request, response)

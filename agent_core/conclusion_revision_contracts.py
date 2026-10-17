@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 
 from agent_core.conclusion_contracts import _bounded, _fields, conclusion_digest
 from agent_core.handoff_contracts import D8HistoryItem
-from agent_core.operation_accounting import _sha, _uuid
+from agent_core.operation_accounting import _sha, _text, _uuid
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +43,7 @@ class D8ConclusionChange:
             raise ValueError("d8_revision_targets_invalid")
         _bounded(self.reason, "reason", 512)
         if self.content is not None:
-            _bounded(self.content, "content", 256)
+            _text(self.content, "content")
         if self.replacement_ref is not None:
             _bounded(self.replacement_ref, "replacement_ref", 256)
         if (not isinstance(self.evidence_refs, tuple) or len(self.evidence_refs) > 8

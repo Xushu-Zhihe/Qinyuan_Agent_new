@@ -54,7 +54,7 @@ class ConclusionReview:
                              proof.plan_id, proof.artifact_version_id, proof.observation_id,
                              proof.proof_id, proof.source_execution_id, proof.observed_sha256,
                              binding.expected_byte_size, receipt.completed_at, version)
-        if self.config.contract_version in {16, 17, 18, 19, 20, 21}:
+        if self.config.contract_version in {16, 17, 18, 19, 20, 21, 22}:
             from agent_core.conclusion_contracts import D16Observation
             return D16Observation(**asdict(source), expected_sha256=binding.expected_sha256,
                 digest_matches_expected=proof.observed_sha256 == binding.expected_sha256,
@@ -118,7 +118,7 @@ class ConclusionReview:
                                      request.model_request_id, conclusion_digest(result))
 
     def _known(self, request, *, repair=True):
-        if self.config.contract_version in {16, 17, 18, 19, 20, 21} and request.observation.rule_id!='http_response_observed':
+        if self.config.contract_version in {16, 17, 18, 19, 20, 21, 22} and request.observation.rule_id!='http_response_observed':
             from agent_core.conclusion_contracts import D16Observation
             if (not isinstance(request.observation, D16Observation)
                     or request.observation != self.observation(request.observation.proof_id, historical=True)):

@@ -172,7 +172,9 @@ class _D3ReviewCall:
 
         def invoke() -> None:
             try:
-                values.append((True, application.review_model.invoke(request)))
+                from agent_core.model_call_phase import model_call_phase
+                with model_call_phase("review_adapter"):
+                    values.append((True, application.review_model.invoke(request)))
             except BaseException as exc:
                 values.append((False, exc))
             finally:
@@ -188,6 +190,12 @@ class _D3ReviewCall:
             if application._dispatch_stopped() or time.monotonic() >= limit:
                 return D2ModelFailure("unknown", "d3_review_call_outcome_unknown")
         succeeded, value = values[0]
+        if application.output_boundary is not None and (not succeeded or isinstance(value, D2ModelFailure)):
+            try:
+                application.output_boundary.evidence.save_review_failure(
+                    request, **({"failure": value} if succeeded else {"error": value}))
+            except Exception as exc:
+                raise D3RecoveryRequired("d8_review_diagnostic_write_failed") from (value if not succeeded else exc)
         if not succeeded:
             if isinstance(value, (TimeoutError, ConnectionError)):
                 return D2ModelFailure("unknown", "d3_review_call_outcome_unknown")
@@ -340,7 +348,7 @@ class D3Application:
             D5RedactingModel(
                 inner_model, self.redactor, enabled=config.d5_enabled,
                 configured=self._redaction_configured,
-                preserve_conclusion_change=config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21},
+                preserve_conclusion_change=config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22},
             ),
             config,
             clock,
@@ -362,7 +370,7 @@ class D3Application:
         self.revisions = None
         self.sessions = None
         self._restricted_progress = False
-        if config.contract_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config.contract_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.handoff import HandoffContext
             from agent_adapters.handoff_evidence import FileD8HandoffEvidence
             if capacity_port is None:
@@ -380,11 +388,11 @@ class D3Application:
             self.review_ledger.request_capacity_check = self.handoff.check_role_request_capacity
             self.conclusions.request_capacity_check = self.handoff.check_role_request_capacity
             self.refinement.request_capacity_check = self.handoff.check_role_request_capacity
-            if config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            if config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.conclusion_revisions import ConclusionRevisions
                 self.revisions = ConclusionRevisions(self, FileD8HandoffEvidence(directory / "d8-revisions"))
                 self.inner.change_response_sensitive = self.conclusions._sensitive
-            if config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            if config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.sessions import IntentSessions
                 self.sessions = IntentSessions(self, FileD8HandoffEvidence(directory / "d8-sessions"))
                 self.inner.request_capacity_check = self.sessions.freeze
@@ -411,27 +419,27 @@ class D3Application:
         self.review_diagnostics = None
         self.evaluation_bindings = None
         self.selection_bindings = None
-        if config.contract_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config.contract_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.structured_output import StructuredOutput, StructuredModel
             from agent_adapters.output_evidence import FileD8OutputEvidence
             self.output_boundary = StructuredOutput(self, FileD8OutputEvidence(directory / "d8-output"))
-            if config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            if config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.selection_bindings import SelectionBindings
                 self.selection_bindings = SelectionBindings(self, self.output_boundary.evidence)
-            if config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+            if config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.completion_evaluation import EvaluationBindings
                 self.evaluation_bindings = EvaluationBindings(config, self.output_boundary.evidence,
                                                               self.handoff.evidence, self.store)
-            if config.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            if config.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.business_diagnostics import BusinessDiagnostics
                 self.business_diagnostics = BusinessDiagnostics(
                     config, self.output_boundary.evidence, self.handoff.evidence, self.store)
-            if config.contract_version in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            if config.contract_version in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.fact_diagnostics import FactBusinessDiagnostics
                 self.fact_business_diagnostics = FactBusinessDiagnostics(
                     config, self.output_boundary.evidence, self.conclusions.evidence, self.store)
                 self.conclusions.business_diagnostics = self.fact_business_diagnostics
-            if config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            if config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.review_diagnostics import ReviewDiagnostics
                 self.review_diagnostics = ReviewDiagnostics(config, self.output_boundary.evidence,
                                                            self.review_ledger, self.store, clock)
@@ -448,17 +456,17 @@ class D3Application:
             self.refinement.output_boundary = self.output_boundary
             self.review_ledger.output_boundary = self.output_boundary
         self.answers = None
-        if config.contract_version in {19, 20, 21}:
+        if config.contract_version in {19, 20, 21, 22}:
             from agent_core.answer_candidates import AnswerCandidates
             from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
             self.answers = AnswerCandidates(self, lambda: D7CandidateEvidenceService(
                 self.directory, self.state.task_run.task_run_id, trusted_adapter_ids=('d7_candidate_stage',)))
         self.fixed_probe_bindings = None
-        if config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.fixed_probe import FixedProbeBindings
             self.fixed_probe_bindings = FixedProbeBindings(self)
         self.planning_assertion_bindings = None
-        if config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.planning_assertion import PlanningAssertionBindings
             self.planning_assertion_bindings = PlanningAssertionBindings(config, self.output_boundary.evidence,
                 self.handoff.evidence, self.conclusions.evidence, self.store, self.imports)
@@ -982,7 +990,7 @@ class D3Application:
         try:
             state = self.state
         except StorageError:
-            if self.config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or not recovery_required or self._bound_task_run_id is None:
+            if self.config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} or not recovery_required or self._bound_task_run_id is None:
                 raise
             state = self.store.load_control_state_rows(self._bound_task_run_id)
             if state is None or state.task_run.task_run_id != self._bound_task_run_id:
@@ -1966,7 +1974,7 @@ class D3Application:
         progress = None
         if self.sessions is not None and scope != "turn_end" and self.sessions.due(intent_id):
             progress = self.sessions.review_context(intent_id, mode="restricted_repair" if self._restricted_progress else "ordinary")
-            if self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            if self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 rows = self.sessions.records(intent_id)
                 if (not rows or not progress["recent"] or progress["decision_count"] != len(rows)
                         or progress["recent"][-1]["ref"] != "d8-decision:" + rows[-1].record_id
@@ -2014,7 +2022,7 @@ class D3Application:
         if self.config.d5_enabled:
             context["source_summaries"] = self.redactor.redact_value(context["source_summaries"])
             context["turn_target"] = self.redactor.redact(context["turn_target"])
-        if self.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and (progress is None or self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21}):
+        if self.config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and (progress is None or self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}):
             from agent_core.review_policy import ACTION_KINDS, MAX_ACTION_TIMEOUT, stage_decisions, unavailable_decisions
             from agent_core.review_contracts import D2AllowedActionKinds
             actions, timeout = set(ACTION_KINDS), MAX_ACTION_TIMEOUT
@@ -2038,7 +2046,7 @@ class D3Application:
                 from agent_core.progress_policy import freeze_policy
                 context["progress_policy"] = freeze_policy(self, context, turn_id, intent_id, scope, actions, timeout)
                 context.pop("review_policy")
-        if (self.config.contract_version in {17, 18, 19, 20, 21} and scope != 'turn_end'
+        if (self.config.contract_version in {17, 18, 19, 20, 21, 22} and scope != 'turn_end'
                 and (progress is None or progress['mode'] != 'restricted_repair')):
             from agent_core.execution_feasibility import KEY, freeze
             context[KEY] = freeze(self, turn_id, intent_id)
@@ -2363,10 +2371,10 @@ class D3Application:
                     raise D3ProposalRejected("d8_history_read_action_rejected") from exc
                 return
             live_context = _current.context
-            if self.config.contract_version in {16, 17, 18, 19, 20, 21}:
+            if self.config.contract_version in {16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.plan_policy import validate as validate_plan
                 validate_plan(_current, proposal)
-                if self.config.contract_version in {17, 18, 19, 20, 21}:
+                if self.config.contract_version in {17, 18, 19, 20, 21, 22}:
                     from agent_core.execution_feasibility import verify_plan
                     verify_plan(self, _current, proposal, self.state)
                 return
@@ -2460,7 +2468,7 @@ class D3Application:
             ]
             if not siblings and self.sessions is None:
                 raise D3RecoveryRequired("d3_no_sibling_candidate")
-            if not siblings and self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and output.decision == "switch_sibling_intent":
+            if not siblings and self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and output.decision == "switch_sibling_intent":
                 raise D3RecoveryRequired("d3_no_sibling_candidate")
             if siblings:
                 next_intent = min(siblings, key=lambda item: item.priority)
@@ -2576,7 +2584,7 @@ class D3Application:
             () if is_size else (FileSha256(step_index, path, turn.expected_sha256),)
         )
         def fixed_context(context):
-            if self.config.contract_version not in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            if self.config.contract_version not in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 return context
             from dataclasses import fields
             from agent_core.fixed_probe import FixedProbeContext

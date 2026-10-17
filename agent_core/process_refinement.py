@@ -203,7 +203,7 @@ class ProcessRefinement:
                 != source
             ):
                 raise D3RecoveryRequired("d5_summary_source_changed")
-        if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+        if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.output_boundary.app.selection_bindings.verify(request, asdict(candidate))
         self._validate_candidate(candidate, attempt)
         expected = derive_d5_conflicts(
@@ -222,7 +222,7 @@ class ProcessRefinement:
         if self.store.is_unknown_refinement_sealed(attempt.model_request_id):
             self._seal(attempt)
             return
-        if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+        if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.output_boundary.app.selection_bindings.repair_request(request)
         result = self.evidence.read_result(attempt.model_request_id)
         candidate = self.evidence.read_candidate(attempt.model_request_id)
@@ -237,7 +237,7 @@ class ProcessRefinement:
             if candidate is None:
                 self._seal(attempt)
                 return
-            if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                 self.output_boundary.app.selection_bindings.verify(request, asdict(candidate))
             self._validate_candidate(candidate, attempt)
             self._result(attempt, "accepted", "candidate_accepted")
@@ -249,7 +249,7 @@ class ProcessRefinement:
         if accepted:
             if candidate is None:
                 raise D3RecoveryRequired("d5_accepted_candidate_missing")
-            if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                 self.output_boundary.app.selection_bindings.verify(request, asdict(candidate))
             self._validate_candidate(candidate, attempt)
         completion = D4OperationCompletion(
@@ -327,7 +327,7 @@ class ProcessRefinement:
         sources = tuple(
             source
             for ref in review.source_ids
-            if not (self.config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and ref.startswith("d8-decision:"))
+            if not (self.config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and ref.startswith("d8-decision:"))
             if (source := self._read_source(task_id, ref)) is not None
         )
         tried = {

@@ -61,7 +61,7 @@ RULE = obj({"rule_id": S, "version": I, "parameters": obj({"attachment_index": I
 INTENT = obj({"description": S, "intent_type": NS, "dependency_refs": REFS})
 CHANGE = tagged("conclusion_change", {
     "operation": S, "targets": array(obj({"root_id": S, "version": I, "ref": S}), 1, 2),
-    "replacement_ref": NS, "content": {"type": ["string", "null"], "maxLength": 256},
+    "replacement_ref": NS, "content": {"type": ["string", "null"]},
     "evidence_refs": array(S, 0, 8), "reason": text(512), "resolution": NS,
     "relation_kind": NS, "relation_owner_id": NS})
 READS = [tagged("history_query", {"query": obj({k: NS for k in (
@@ -89,7 +89,7 @@ CLAIM = obj({"subject_ref": S, "observation_scope": S, "claim_key": text(128),
 
 def output_schema(request, *, contract_version=None):
     stage, schema = _base_output_schema(request, contract_version=contract_version)
-    if contract_version in {15, 16, 17, 18, 19, 20, 21}:
+    if contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
         from agent_core.governance_policy import patch_schema
         schema = patch_schema(request, stage, schema)
     return stage, schema
@@ -103,7 +103,7 @@ def _base_output_schema(request, *, contract_version=None):
     if isinstance(request, D5RefinementRequest):
         return "refinement", obj({"summary_text": text(2048), "claims": array(CLAIM, 0, 8)})
     if isinstance(request, D2ReviewRequest):
-        if (contract_version in {17, 18, 19, 20, 21} and request.review_scope != 'turn_end'
+        if (contract_version in {17, 18, 19, 20, 21, 22} and request.review_scope != 'turn_end'
                 and json.loads(request.context_summary).get('d8_progress', {}).get('mode') != 'restricted_repair'):
             from agent_core.execution_feasibility import policy
             policy(request, required=True)
@@ -111,13 +111,13 @@ def _base_output_schema(request, *, contract_version=None):
                   "constraints": array(CONSTRAINT)}
         context = json.loads(request.context_summary)
         progress = isinstance(context, dict) and "d8_progress" in context
-        if contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and progress:
+        if contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and progress:
             from agent_core.progress_policy import progress_schema, policy_for
-            if policy_for(request)['version'] != (2 if contract_version in {16, 17, 18, 19, 20, 21} else 1):
+            if policy_for(request)['version'] != (2 if contract_version in {16, 17, 18, 19, 20, 21, 22} else 1):
                 from agent_core.dual_llm_contracts import D3RecoveryRequired
                 raise D3RecoveryRequired('s6_review_text_policy_version_changed')
             return "progress_review", progress_schema(request)
-        if contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and not progress:
+        if contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and not progress:
             from agent_core.review_policy import review_schema
             return "review", review_schema(request)
         if progress:
@@ -134,7 +134,7 @@ def _base_output_schema(request, *, contract_version=None):
         if 'd20_http_policy' in json.loads(getattr(request, 'prior_summary', '{}')):
             from agent_core.http_policy import schema
             return stage, schema(request)
-        if contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.planning_assertion import planning_schema
             return stage, planning_schema(request)
         return stage, {"anyOf": [tagged("candidates", {
@@ -143,65 +143,65 @@ def _base_output_schema(request, *, contract_version=None):
     if stage == "outer_turn":
         old_intent = obj({"description": S, "intent_type": NS})
         return stage, obj({"turn_target": S, "completion_rule": RULE,
-                           "intents": array(old_intent, 1, 2)})
+                           "intents": array(old_intent, 1, None if contract_version == 22 else 2)})
     if stage == "inner_plan":
         if getattr(getattr(getattr(request, 'context', None), 'turn_binding', None), 'kind', None) in {'http_origin','hybrid_origin'}:
             from agent_core.http_policy import schema
             return stage, {'anyOf': [schema(request), CHANGE, *READS]}
-        if contract_version in {17, 18, 19, 20, 21}:
+        if contract_version in {17, 18, 19, 20, 21, 22}:
             from agent_core.execution_feasibility import KEY
             if KEY not in json.loads(request.history_context):
                 from agent_core.dual_llm_contracts import D3RecoveryRequired
                 raise D3RecoveryRequired('d17_plan_execution_context_missing')
-        if contract_version in {16, 17, 18, 19, 20, 21}:
+        if contract_version in {16, 17, 18, 19, 20, 21, 22}:
             from agent_core.plan_policy import plan_schema
             return stage, {"anyOf": [plan_schema(request), CHANGE, *READS]}
         return stage, {"anyOf": [obj({"template": S, "observation_mode": S,
                                       "source_proof_id": NS}), CHANGE, *READS]}
     if stage in {"inner_size", "inner_sha256"}:
-        if contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.fixed_probe import fixed_probe_schema
             return stage, {"anyOf": [fixed_probe_schema(request), CHANGE]}
         return stage, {"anyOf": [obj({"action": PROBE, "review_requested": B}), CHANGE]}
     if stage == "inner_complete":
-        if contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+        if contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.completion_evaluation import completion_schema
-            return stage, completion_schema(request)
+            return stage, completion_schema(request, maximum=None if contract_version == 22 else 2)
         return stage, {"anyOf": [obj({"action": tagged("complete_intent", {
             "fact_ids": array(S, 1)}), "review_requested": B,
             "next_intent_candidates": array(SUGGESTION, 0, 2)}), CHANGE]}
     if stage == "inner_candidate":
-        if contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+        if contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.completion_evaluation import candidate_schema
-            return stage, candidate_schema(request, allow_none=contract_version in {19, 20, 21})
+            return stage, candidate_schema(request, allow_none=contract_version in {19, 20, 21, 22})
         return stage, obj({"action": tagged("candidate_flag", {
             "value": S, "execution_id": S, "evidence_version": S, "source_ref": S}),
             "review_requested": B})
     if stage == "fact_proposal":
         assertion = obj({"rule_id": S, "rule_version": I,
                          "artifact_version_id": S, "observation_id": S})
-        if contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.planning_assertion import assertion_schema
             assertion = assertion_schema()
         if getattr(getattr(request, 'observation', None), 'rule_id', None) == 'http_response_observed':
             assertion = obj({'rule_id': {'type':'string','const':'http_response_observed'}})
         evidence_refs = array(S, 1, 8)
-        if contract_version in {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if contract_version in {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.conclusion_contracts import allowed_fact_evidence_refs
             allowed = allowed_fact_evidence_refs(request.observation)
             evidence_refs = {**array({"type": "string", "enum": list(allowed)}, len(allowed), len(allowed)),
                              "uniqueItems": True}
         return stage, {"anyOf": [tagged("candidate", {
-            "content": text(256), "reason": text(512), "evidence_refs": evidence_refs,
+            "content": text(), "reason": text(512), "evidence_refs": evidence_refs,
             "assertion": {"anyOf": [N, assertion]}}),
             tagged("request_review", {"reason": text(512)})]}
     if stage == "fact_review":
         return stage, obj({"decision": S, "reason": text(512)})
     if stage == "intent_evaluation":
-        if contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+        if contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.completion_evaluation import evaluation_schema
             return stage, evaluation_schema(request)
-        return stage, obj({"decision": S, "reason": text(512), "evidence_refs": REFS})
+        return stage, obj({"decision": S, "reason": text(), "evidence_refs": REFS})
     if stage == "handoff_summary":
         return stage, obj({"turn_body": text(request.capacity.turn_body),
             "global_body": text(request.capacity.global_body), "ordered_refs": REFS,

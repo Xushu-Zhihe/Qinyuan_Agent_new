@@ -13,6 +13,7 @@ ISSUES = {
     "fact_shape_invalid": ("$", "declared_fields", "invalid"),
     "fact_kind_invalid": ("$/kind", "candidate_or_request_review", "invalid"),
     "fact_content_invalid": ("$/content", "nonempty_text_without_nul", "invalid"),
+    # Retained for reading historical diagnostics; new candidate content has no field limit.
     "fact_content_too_long": ("$/content", "at_most_256_unicode_characters", "over_limit"),
     "fact_reason_invalid": ("$/reason", "nonempty_text_without_nul", "invalid"),
     "fact_reason_too_long": ("$/reason", "at_most_512_unicode_characters", "over_limit"),
@@ -38,11 +39,11 @@ def proposal_issues(raw):
     result = []
     if not isinstance(raw, dict):
         return [issue("fact_shape_invalid")]
-    def text(name, maximum):
+    def text(name, maximum=None):
         value = raw.get(name)
         if not isinstance(value, str) or not value.strip() or "\x00" in value:
             result.append(issue(f"fact_{name}_invalid"))
-        elif len(value) > maximum:
+        elif maximum is not None and len(value) > maximum:
             result.append(issue(f"fact_{name}_too_long"))
     def uuid_valid(value):
         try:
@@ -59,7 +60,7 @@ def proposal_issues(raw):
             result.append(issue("fact_kind_invalid"))
         if set(raw) != {"kind", "content", "reason", "evidence_refs", "assertion"}:
             result.append(issue("fact_shape_invalid"))
-        text("content", 256)
+        text("content")
         refs = raw.get("evidence_refs")
         if not isinstance(refs, (list, tuple)) or not 1 <= len(refs) <= 8:
             result.append(issue("fact_evidence_count_invalid"))
@@ -86,7 +87,7 @@ def proposal_issues(raw):
 
 class FactBusinessDiagnostics:
     def __init__(self, config, output_evidence, conclusion_evidence, store):
-        if config.contract_version not in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config.contract_version not in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             raise ValueError("fact_diagnostics_require_contract8")
         self.config, self.output, self.conclusions, self.store = config, output_evidence, conclusion_evidence, store
 
@@ -121,7 +122,7 @@ class FactBusinessDiagnostics:
                 or contract.get("correction_of_model_request_id") != request.correction_of_model_request_id):
             raise D3RecoveryRequired("d8_fact_diagnostic_binding_changed")
         issues, finished = record.get("issues"), record.get("finished_at")
-        if self.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and isinstance(issues, list) and any(
+        if self.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and isinstance(issues, list) and any(
                 isinstance(value, dict) and value.get("code") in {"fact_assertion_version_unsupported",
                 "fact_assertion_artifact_uuid_invalid", "fact_assertion_observation_uuid_invalid"} for value in issues):
             raise D3RecoveryRequired("s2_fact_diagnostic_program_field")

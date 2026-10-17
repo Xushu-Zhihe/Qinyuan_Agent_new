@@ -60,7 +60,7 @@ class SelectionBindings:
         record = self.output.read('selection-request', identity)
         contract = self.output.read('contract', identity)
         if (not isinstance(record, dict) or not isinstance(contract, dict)
-                or self.app.config.contract_version not in {15, 16, 17, 18, 19, 20, 21} or contract.get('contract_version') != self.app.config.contract_version
+                or self.app.config.contract_version not in {15, 16, 17, 18, 19, 20, 21, 22} or contract.get('contract_version') != self.app.config.contract_version
                 or contract.get('model_request_id') != identity or contract.get('stage') not in STAGES
                 or set(record) != {'binding_version', 'contract_version', 'task_run_id', 'model_request_id',
                     'contract_sha256', 'request', 'selection_context_sha256'}

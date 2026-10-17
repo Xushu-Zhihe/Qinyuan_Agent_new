@@ -123,8 +123,8 @@ class D8SuggestedPlanningRequest(D8HandoffRequest):
     inner_suggestions_identity: str = "inner_candidates_require_outer_review_not_registered"
 
 
-def parse_next_intents(raw, visible):
-    if not isinstance(raw, list) or len(raw) > 2:
+def parse_next_intents(raw, visible, *, maximum=2):
+    if not isinstance(raw, list) or maximum is not None and len(raw) > maximum:
         raise ValueError("d8_next_intents_array_required")
     result = []
     for item in raw:

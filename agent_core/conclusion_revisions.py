@@ -411,7 +411,7 @@ class ConclusionRevisions:
         return action
 
     def _known(self, request, *, repair=True):
-        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21} and repair:
+        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22} and repair:
             self.app.selection_bindings.repair_request(request)
         call = self.store.load_d4_operation(request.model_request_id)
         data = self.evidence.read("result", request.model_request_id)
@@ -446,7 +446,7 @@ class ConclusionRevisions:
                 or data["outcome"] not in {"valid", "invalid", "sensitive_rejected", "model_error", "stale"}):
             raise D3RecoveryRequired("d8_revision_result_binding_changed")
         if data["outcome"] == "valid":
-            if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                 self.app.selection_bindings.verify(request, data['raw'])
             self._parse(request, data["raw"])
             if self.app.conclusions._sensitive(data["raw"]):
@@ -491,7 +491,7 @@ class ConclusionRevisions:
             raw = await self.app.conclusions._invoke(request, token)
             outcome = "valid"
             if isinstance(raw, ModelError):
-                if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21} and raw.kind in {ModelErrorKind.TIMED_OUT, ModelErrorKind.CANCELLED}:
+                if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22} and raw.kind in {ModelErrorKind.TIMED_OUT, ModelErrorKind.CANCELLED}:
                     raise D3RecoveryRequired('d8_revision_model_outcome_unknown')
                 outcome, raw = "model_error", None
             elif self.app.conclusions._sensitive(raw):
@@ -565,7 +565,7 @@ class ConclusionRevisions:
                 raise D3RecoveryRequired("d8_revision_replay_changed")
             await self.refresh_summaries(token)
             return existing
-        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.app.selection_bindings.check_relation(proposal_id, action)
         self.validate_action(action, visible)
         identity = self._id("review/" + proposal_id)
@@ -580,7 +580,7 @@ class ConclusionRevisions:
         if request.candidate != action:
             raise D3RecoveryRequired("d8_revision_candidate_changed")
         final, decision = await self._call(request, token)
-        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.app.selection_bindings.check_relation(proposal_id, action)
         self.validate_action(action, final.history)
         if final.base_checkpoint_sequence != self.state.latest_checkpoint.sequence:
@@ -690,7 +690,7 @@ class ConclusionRevisions:
         for call in self.store.list_d4_operations(self.state.task_run.task_run_id):
             raw = self.evidence.read("request", call.start.operation_id)
             if raw is not None and (self.evidence.read("result", call.start.operation_id) is not None
-                    or (self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}
+                    or (self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}
                         and self.app.output_boundary.evidence.read('selection-binding', call.start.operation_id) is not None)
                     or (self.app.output_boundary is not None
                         and self.app.output_boundary.failure(D8ChangeRequest.from_dict(raw)) is not None)):
@@ -719,7 +719,7 @@ class ConclusionRevisions:
             actor = self._actor(actor_id)
             selected, _, packet = self.app.handoff.select("conclusion_repair", actor.turn_id, actor_id)
             packet["retrieved"] = self.app.handoff.retrieved_for(actor_id)
-            if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.governance_policy import freeze_policy
                 packet['s5_policy'] = freeze_policy(self.app, packet)
             capacity = self.app.handoff.capacity().capacity

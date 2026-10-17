@@ -99,7 +99,7 @@ def change_schema(ctx):
         count = 2 if operation in {'report_conflict', 'resolve_conflict'} else 1
         fields = {'operation': {'type': 'string', 'const': operation},
                   'targets': {**array(choice(allowed), count, count), 'uniqueItems': True},
-                  'replacement_ref': NS, 'content': {'type': ['string', 'null'], 'maxLength': 256},
+                  'replacement_ref': NS, 'content': {'type': ['string', 'null']},
                   'evidence_refs': {**array(choice(ctx['refs']), 0, 8), 'uniqueItems': True},
                   'reason': text(512), 'resolution': {'type': 'null'}, 'relation_ref': {'type': 'null'}}
         if operation == 'resolve_conflict':

@@ -109,21 +109,22 @@ class D3EvidenceValidator:
         ):
             raise D3RecoveryRequired("d3_model_proposal_evidence_unavailable")
         if stage == "outer_turn":
-            return parse_d3_turn_proposal(evidence.raw)
-        if config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            return parse_d3_turn_proposal(evidence.raw, maximum=None if config.contract_version == 22 else 2)
+        if config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.handoff.app.selection_bindings.verify_identity(request_id, evidence.raw)
-        if config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and operation.application_ref is None:
+        if config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and operation.application_ref is None:
             self.handoff.app.revisions.validate_frozen_execution(request_id)
         if stage == "inner_plan":
             return parse_d3_plan_proposal(evidence.raw)
-        if config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and stage == "inner_complete":
+        if config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and stage == "inner_complete":
             from agent_core.dual_llm_modeling import parse_session_completion
             sessions = self.handoff.app.sessions
             snapshot = sessions.evidence.read("request", request_id)
             if snapshot is None:
                 raise D3RecoveryRequired("d8_completion_snapshot_missing")
-            return parse_session_completion(evidence.raw, sessions.visible(snapshot["request"]["session_context"]))
-        if config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and stage in {"inner_size", "inner_sha256"}:
+            return parse_session_completion(evidence.raw, sessions.visible(snapshot["request"]["session_context"]),
+                                            maximum=None if config.contract_version == 22 else 2)
+        if config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and stage in {"inner_size", "inner_sha256"}:
             return self.handoff.app.fixed_probe_bindings.proposal(request_id)
         return parse_d3_action(evidence.raw, stage)
 
@@ -131,7 +132,7 @@ class D3EvidenceValidator:
         base_id = stable_id(task_run_id, f"d3/action/{plan_id}/{stage}")
         correction_id = stable_id(task_run_id, f"d3/{base_id}/correction")
         config = self.ledger.load_d3_run_config(task_run_id)
-        if config is not None and config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config is not None and config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             operations = [r for r in self.ledger.list_d3_operations(task_run_id)
                           if r.start.resource_ref == f"{plan_id}:{stage}"
                           and (e := self.models.read(r.start.operation_id)) is not None
@@ -203,8 +204,8 @@ class D3EvidenceValidator:
         ):
             raise D3RecoveryRequired("d3_review_action_owner_changed")
         proposal = (self._known_model(task_run_id, request_id, stage)
-                    if config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and stage == "inner_complete"
-                    or config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and stage in {"inner_size", "inner_sha256"}
+                    if config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and stage == "inner_complete"
+                    or config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and stage in {"inner_size", "inner_sha256"}
                     else parse_d3_action(evidence.raw, stage))
         if (
             not proposal.review_requested
@@ -228,16 +229,16 @@ class D3EvidenceValidator:
         fields["source_versions"] = tuple(fields["source_versions"])
         request = D2ReviewRequest(**fields)
         config = self.ledger.load_d3_run_config(task_run_id)
-        if config is not None and config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config is not None and config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.review_policy import policy_for
-            if policy_for(request) is not None or config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and "d8_progress" in json.loads(request.context_summary):
+            if policy_for(request) is not None or config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and "d8_progress" in json.loads(request.context_summary):
                 from agent_core.review_diagnostics import ReviewDiagnostics
                 from agent_adapters.output_evidence import FileD8OutputEvidence
                 manager = ReviewDiagnostics(config, FileD8OutputEvidence(self.reviews.directory.parent / "d8-output", create=False),
                                             self.reviews, self.ledger, lambda: 0)
                 manager.verify_call(request, call)
                 manager.known(request)
-        if config is not None and config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if config is not None and config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             context = json.loads(request.context_summary)
             context.pop("checkpoint", None)
             if digest(context) != request.context_version:
@@ -482,7 +483,7 @@ class D3EvidenceValidator:
         proposal = self._known_model(
             mutation.task_run_id, binding.proposal_request_id, "inner_plan"
         )
-        if self.ledger.load_d3_run_config(mutation.task_run_id).contract_version in {17, 18, 19, 20, 21}:
+        if self.ledger.load_d3_run_config(mutation.task_run_id).contract_version in {17, 18, 19, 20, 21, 22}:
             from types import SimpleNamespace
             from agent_core.execution_feasibility import verify_plan
             saved = self.handoff.evidence.read('execution-context', binding.proposal_request_id)
@@ -989,7 +990,7 @@ class D3EvidenceValidator:
         ):
             raise D3RecoveryRequired("d3_review_application_context_changed")
         summary = json.loads(request.context_summary)
-        if self.ledger.load_d3_run_config(mutation.task_run_id).contract_version in {17, 18, 19, 20, 21}:
+        if self.ledger.load_d3_run_config(mutation.task_run_id).contract_version in {17, 18, 19, 20, 21, 22}:
             from agent_core.execution_feasibility import verify_review
             verify_review(self.handoff.app, request, call['response'], state)
         versions = summary.get("source_versions", {})
@@ -1040,8 +1041,8 @@ class D3EvidenceValidator:
         if output.decision == "switch_sibling_intent" and not any(
             item.turn_id == turn.turn_id and item.status is IntentStatus.PENDING
             for item in state.intents
-        ) and not (self.ledger.load_d3_run_config(mutation.task_run_id).contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
-                   and self.ledger.load_d3_run_config(mutation.task_run_id).contract_version not in {13, 14, 15, 16, 17, 18, 19, 20, 21}
+        ) and not (self.ledger.load_d3_run_config(mutation.task_run_id).contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}
+                   and self.ledger.load_d3_run_config(mutation.task_run_id).contract_version not in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}
                    and getattr(getattr(output, "progress", None), "classification", None) == "repetitive"):
             raise ValueError("d3_no_sibling_candidate")
         if output.decision == "replan_current_intent":

@@ -122,7 +122,7 @@ class HandoffContext:
             plan = plans[execution.plan_id]
             intent = intents[plan.intent_id]
             binding = self.store.load_d3_plan_binding(plan.plan_id)
-            if self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+            if self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.completion_evaluation import execution_projection
                 content, version = execution_projection(self.app, execution, binding)
                 add(execution.execution_id, "progress", intent.turn_id, intent.intent_id,
@@ -193,7 +193,7 @@ class HandoffContext:
                     "process_fact_model_summary_not_verified", status, bool(record.conflicts))
                 if any(p.get("applicability") == "historical" for p in projections):
                     items[-1] = replace(items[-1], scope="historical")
-        if self.app.config.contract_version in {19, 20, 21}:
+        if self.app.config.contract_version in {19, 20, 21, 22}:
             for candidate, feedback, projection in self.app.answers.feedback_history():
                 add(feedback.operation_id, 'progress', candidate.turn_id, candidate.intent_id,
                     candidate.source_ref, handoff_json({'kind': 'answer_feedback',
@@ -230,7 +230,12 @@ class HandoffContext:
 
     def select(self, phase, turn_id=None, intent_id=None, support_fact_id=None):
         items, required = self.history(), set()
-        if self.app.config.contract_version in {19, 20, 21} and phase == 'tree_planning' and intent_id:
+        active = []
+        if self.app.config.contract_version == 22 and phase == 'tree_planning':
+            active = [i for i in self.state.intents if i.status.value in {'pending', 'running'}]
+            active_ids = {i.intent_id for i in active}
+            required.update(i.ref for i in items if i.record_type == 'intent' and i.record_id in active_ids)
+        if self.app.config.contract_version in {19, 20, 21, 22} and phase == 'tree_planning' and intent_id:
             required.update(i.ref for i in items if i.intent_id == intent_id
                 and i.identity == 'trusted_final_answer_feedback_not_local_goal_verdict')
         evaluation = None
@@ -272,7 +277,7 @@ class HandoffContext:
             if support_fact_id not in by_id:
                 raise D3RecoveryRequired("d8_support_fact_missing")
             required.add(by_id[support_fact_id].ref)
-        if self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21} and phase == "intent_evaluation":
+        if self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22} and phase == "intent_evaluation":
             # These observations are evidence, never a program-generated semantic decision.
             from agent_core.completion_evaluation import freeze_evaluation_policy
             policy = freeze_evaluation_policy(self.app, intent_id, support_fact_id, items)
@@ -345,6 +350,12 @@ class HandoffContext:
             if evaluation is not None:
                 result['s4_evaluation_policy'] = {**evaluation,
                     'history_sha256': digest([asdict(i) for i in chosen])}
+            if self.app.config.contract_version == 22:
+                result['intent_planning'] = {'version': 1, 'directions_are_solution_chains': True}
+                if phase == 'tree_planning':
+                    result['active_intent_frontier'] = [
+                        {'intent_id': i.intent_id, 'turn_id': i.turn_id, 'status': i.status.value,
+                         'ref': by_id[i.intent_id].ref} for i in active]
             return result
         limit = min(version.capacity.initial_history, version.capacity.visible_history)
         blocking_kind = "initial_history" if version.capacity.initial_history <= version.capacity.visible_history else "visible_history"
@@ -363,14 +374,14 @@ class HandoffContext:
         refs = {i.ref for i in request.history}
         if request.stage == "handoff_summary":
             candidate = D8SummaryCandidate.parse(raw, refs, request.capacity)
-            if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                 self.app.selection_bindings.verify(request, raw)
             return candidate
         if request.stage == "intent_evaluation":
             value = _fields(raw, {"decision", "reason", "evidence_refs"})
             if (value["decision"] not in {"succeeded", "failed", "inconclusive"}
                     or not isinstance(value["reason"], str) or not value["reason"].strip()
-                    or len(value["reason"]) > 512):
+                    or "\x00" in value["reason"]):
                 raise ValueError("d8_evaluation_invalid")
             cited = checked_refs(value["evidence_refs"], refs)
             support = next((i.ref for i in request.history if i.record_id == request.support_fact_id), None)
@@ -388,7 +399,8 @@ class HandoffContext:
         value = _fields(raw, {"kind", "turn_target", "completion_rule", "intents"})
         if value["kind"] != "candidates" or value["turn_target"] != request.goal:
             raise ValueError("d8_planning_target_or_kind_invalid")
-        if not isinstance(value["intents"], list) or not 1 <= len(value["intents"]) <= 2:
+        if (not isinstance(value["intents"], list) or not value["intents"]
+                or self.app.config.contract_version != 22 and len(value["intents"]) > 2):
             raise ValueError("d8_planning_candidates_required_not_exhausted")
         kept, dependencies, rejected = [], [], []
         for index, candidate in enumerate(value["intents"]):
@@ -407,13 +419,14 @@ class HandoffContext:
         if not kept:
             raise D8DependencyCandidatesRejected(rejected)
         parsed = parse_d3_turn_proposal({"turn_target": value["turn_target"],
-                                        "completion_rule": value["completion_rule"], "intents": kept})
+                                        "completion_rule": value["completion_rule"], "intents": kept},
+                                       maximum=None if self.app.config.contract_version == 22 else 2)
         if parsed.attachment_index not in self.app.config.authorization.attachment_indices:
             raise ValueError("d8_planning_attachment_unauthorized")
         return D8PlanningResult(parsed, tuple(dependencies), tuple(rejected))
 
     def _known_call(self, request):
-        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+        if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.app.selection_bindings.repair_request(request)
         call = self.store.load_d4_operation(request.model_request_id)
         result = self.evidence.read("result", request.model_request_id)
@@ -471,7 +484,7 @@ class HandoffContext:
             raise D3RecoveryRequired("d8_saved_result_binding_changed")
         if result["outcome"] == "valid":
             parsed = self._parse(request, result["raw"])
-            if self.app.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and request.stage == "tree_planning" and (
+            if self.app.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and request.stage == "tree_planning" and (
                     result.get("rejected_candidate_indices") != list(parsed.rejected_indices)):
                 raise D3RecoveryRequired("s2_planning_rejection_indices_changed")
             if self.app.conclusions._sensitive(result["raw"]):
@@ -510,7 +523,7 @@ class HandoffContext:
             known_evaluation = (request is not None and request.get('stage') == 'intent_evaluation'
                                 and evaluations is not None
                                 and evaluations.known_result(D8HandoffRequest.from_dict(request)) is not None)
-            known_selection = (self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}
+            known_selection = (self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}
                 and self.app.output_boundary.evidence.read('selection-binding', operation.start.operation_id) is not None)
             if request is not None and (self.evidence.read("result", operation.start.operation_id) is not None or known_format or known_business or known_assembly or known_evaluation or known_selection):
                 self._known_call(D8HandoffRequest.from_dict(request))
@@ -540,7 +553,7 @@ class HandoffContext:
         if stage == "tree_planning" and intent_id and self.app.sessions is not None:
             suggestions = self.app.sessions.next_suggestions(intent_id)
         selected, omitted, packet = self.select(stage, turn_id, intent_id, support_fact_id)
-        if self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21} and stage == "intent_evaluation":
+        if self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22} and stage == "intent_evaluation":
             from agent_core.completion_evaluation import freeze_evaluation_policy
             packet["s4_evaluation_policy"] = freeze_evaluation_policy(
                 self.app, intent_id, support_fact_id, selected)
@@ -552,7 +565,7 @@ class HandoffContext:
         if stage == "tree_planning":
             if self.app.web is not None:
                 packet['d20_http_policy'] = self.app.web.policy()
-            elif self.app.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            elif self.app.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.planning_assertion import freeze_planning_policy
                 packet["s2_planning_policy"] = freeze_planning_policy(self.app)
             packet["dependency_review"] = (
@@ -631,7 +644,8 @@ class HandoffContext:
                                 and self.app.output_boundary.diagnostic(current.model_request_id) is None):
                             from agent_core.business_diagnostics import planning_issues
                             business_issues = planning_issues(current, raw, self.app.config.authorization,
-                                lambda item: self.app.revisions is None or self.app.revisions.reliable(item))
+                                lambda item: self.app.revisions is None or self.app.revisions.reliable(item),
+                                maximum=None if self.app.config.contract_version == 22 else 2)
                         raw = None
                         # Do not persist invalid raw responses or exceptions containing text.
                 if (token.is_cancelled or self.app.clock() >= self.state.task_run.deadline_at
@@ -805,7 +819,7 @@ class HandoffContext:
     def validate_mutation(self, mutation, state):
         from agent_core.handoff_storage import D8_CHANGES
         records = [c for c in mutation.state_changes if isinstance(c, D8_CHANGES)]
-        if len(records) != 1 or self.app.config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if len(records) != 1 or self.app.config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             raise D3RecoveryRequired("d8_handoff_mutation_not_enabled")
         record = records[0]
         from agent_core.session_contracts import D8DecisionRecord
@@ -1157,10 +1171,10 @@ class HandoffContext:
             packet["retrieved"] = self.retrieved_for(intent_id)
             if self.app.web is not None:
                 packet['d20_http_policy'] = self.app.web.policy()
-            if self.app.config.contract_version in {17, 18, 19, 20, 21} and request.stage == 'inner_plan':
+            if self.app.config.contract_version in {17, 18, 19, 20, 21, 22} and request.stage == 'inner_plan':
                 from agent_core.execution_feasibility import KEY, freeze
                 packet[KEY] = freeze(self.app, turn_id, intent_id)
-            if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+            if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.governance_policy import freeze_policy
                 packet['s5_policy'] = freeze_policy(self.app, packet)
             version = self.capacity()

@@ -3811,7 +3811,7 @@ class SqliteControlStore:
                 raise StorageError("D8 refinement correction root unavailable")
             root = self.load_d5_attempt(correction)
             config = self.load_d3_run_config(attempt.task_run_id)
-            if (root is None or config is None or config.contract_version not in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+            if (root is None or config is None or config.contract_version not in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}
                     or (root.task_run_id, root.review_id, root.sources, root.context_sha256,
                         root.base_checkpoint_sequence, root.role_config_ref)
                     != (attempt.task_run_id, attempt.review_id, attempt.sources, attempt.context_sha256,
@@ -3906,7 +3906,7 @@ class SqliteControlStore:
             config = self.load_d3_run_config(attempt.task_run_id)
             root = self.load_d5_attempt(root_id)
             operation = self.load_d4_operation(root_id)
-            if (config is None or config.contract_version not in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or root is None
+            if (config is None or config.contract_version not in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} or root is None
                     or self.d8_refinement_root(root_id) is not None
                     or operation is None or operation.completion is None
                     or operation.completion.result_kind != "failed"
@@ -4534,7 +4534,7 @@ class SqliteControlStore:
             config = self.load_d3_run_config(start.task_run_id)
             task = self.load_task_run(start.task_run_id)
             latest = self._connection.execute("SELECT MAX(sequence) FROM checkpoints WHERE task_run_id=?", (start.task_run_id,)).fetchone()[0]
-            if (config is None or config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or task.status is not TaskRunStatus.RUNNING
+            if (config is None or config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} or task.status is not TaskRunStatus.RUNNING
                     or latest != start.checkpoint_sequence or not task.started_at <= start.started_at < task.deadline_at
                     or self._now() >= task.deadline_at or self.list_d4_unresolved_operations(start.task_run_id)
                     or self._connection.execute("SELECT 1 FROM d4_audit_events WHERE task_run_id=? AND category='cancellation_requested'", (start.task_run_id,)).fetchone()):
@@ -4716,7 +4716,7 @@ class SqliteControlStore:
                 binding.task_run_id != mutation.task_run_id
                 or binding.turn_id != turn.turn_id
                 or binding.attachment_index not in config.authorization.attachment_indices
-                or not 1 <= len(children) <= 2
+                or not children or config.contract_version != 22 and len(children) > 2
                 or tuple(item.intent_id for item in children) != turn.intent_ids
                 or tuple(item.priority for item in children) != tuple(range(1, len(children) + 1))
                 or turn.status is not TurnStatus.PENDING
@@ -4952,7 +4952,7 @@ class SqliteControlStore:
                 ):
                     raise StorageError(f"D3 {kind} state transition is not admitted")
         config = self.load_d3_run_config(mutation.task_run_id)
-        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1 and config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+        if sum(item.status is TurnStatus.RUNNING for item in after.turns) > 1 and config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
             raise StorageError("D3 may run only one Turn")
         if sum(item.status is IntentStatus.RUNNING for item in after.intents) > 1:
             raise StorageError("D3 may run only one Intent")
@@ -5017,7 +5017,7 @@ class SqliteControlStore:
             ]
             if (
                 len(old_active) != 1
-                or mutation.operation == "abandon_d8_intent" and (config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21} or pending or new_active)
+                or mutation.operation == "abandon_d8_intent" and (config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} or pending or new_active)
                 or mutation.operation == "switch_d3_intent" and (not pending or len(new_active) != 1)
                 or pending and new_active[0].turn_id != old_active[0].turn_id
                 or new_intents[old_active[0].intent_id].status is not IntentStatus.ABANDONED

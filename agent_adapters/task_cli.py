@@ -44,7 +44,7 @@ def _dispatch_v3_run_task(args, raw):
         request, _ = parse_request(raw)
     else:
         request = V3SimulationRequest.parse(raw)
-    d8_real = raw.get("execution_profile") in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"} and raw.get("mode") == "real"
+    d8_real = raw.get("execution_profile") in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} and raw.get("mode") == "real"
     env_file = None
     if d8_real:
         from agent_adapters.d8_model import settings_from_file
@@ -199,17 +199,35 @@ def _dispatch_v3_run_task(args, raw):
             directory, declaration, operation="start", events=args.events
         )
     except Exception as exc:  # noqa: BLE001 -- sanitized persisted run boundary
-        error_code = ("d8_real_start_failed" if d8_real else "d8_simulation_start_failed" if "execution_profile" in raw
-                      else "d7_simulation_start_failed")
+        from agent_adapters.output_evidence import safe_failure_details
+        from agent_core.sqlite_control_store import SqliteControlStore
+
+        started = None
+        try:
+            database = directory / "control.sqlite"
+            if database.is_file():
+                with SqliteControlStore.open_readonly(database) as store:
+                    started = store.load_task_run(task_id) is not None
+            else:
+                started = False
+        except Exception:
+            pass  # Unknown state must not be reported as a confirmed startup failure.
+        phase = "execution" if started is True else "start" if started is False else "dispatch"
+        prefix = ("d8_real" if d8_real else "d8_simulation" if "execution_profile" in raw
+                  else "d7_simulation")
+        error_code = f"{prefix}_{phase}_failed"
+        failure = {"code": error_code, "phase": phase, **safe_failure_details(exc)}
         immutable_write(
             directory / ("dispatch-stop-" + str(uuid4()) + ".json"),
-            {"stop": "recovery_required", "reason": error_code},
+            {"stop": "recovery_required", "reason": error_code, "diagnostic": failure},
         )
         from agent_adapters.v7.task_result import snapshot_v3_task_result
 
         result = snapshot_v3_task_result(directory, declaration)
-        result.setdefault("errors", []).append({"code": error_code})
-        result.setdefault("recovery", {"required": True, "reason": type(exc).__name__})
+        result.setdefault("errors", []).append(failure)
+        if not result.get("recovery", {}).get("required"):
+            result["recovery"] = {"required": True, "reason": error_code}
+        result["recovery_status"] = "required"
     result["request_id"] = request.request_id
     result["request_receipt"] = _safe_request_receipt(receipt)
     result["exit_code"] = _v3_run_operation_exit(result)
@@ -830,7 +848,7 @@ def dispatch_v3_existing(args, directory: Path, declaration: dict):
             return operation_result(result)
         if operation == "cleanup" and result.get("cleanup_status") == "confirmed":
             return operation_result(result)
-        if declaration.get("mode") == "real" and declaration.get("execution_profile") not in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
+        if declaration.get("mode") == "real" and declaration.get("execution_profile") not in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
             if getattr(args, "authorization", None) or getattr(args, "fixture", None):
                 raise ValueError("v3_real_recovery_uses_persisted_configuration")
             try:

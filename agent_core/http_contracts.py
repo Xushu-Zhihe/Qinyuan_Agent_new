@@ -150,7 +150,7 @@ class HttpRunConfig(D7WebRunConfig):
         _uuid(self.request_id,'request_id')
         if (self.endpoint != canonical_web_origin(self.endpoint)
                 or self.endpoint != self.authorization.allowed_origin
-                or self.outer_role.prompt_template not in {'qinyuan.d8.outer.v15','qinyuan.d8.outer.v16'}
+                or self.outer_role.prompt_template not in {'qinyuan.d8.outer.v15','qinyuan.d8.outer.v16','qinyuan.d8.outer.v17'}
                 or self.inner_role.prompt_template != self.outer_role.prompt_template.replace('outer','inner')
                 or not isinstance(self.d4_budget,D8HandoffBudgetPolicy)
                 or self.schema_version != 1):
@@ -161,4 +161,4 @@ class HttpRunConfig(D7WebRunConfig):
 
 
 def is_http(config):
-    return config is not None and config.contract_version in {20,21} and config.web_authorization is not None
+    return config is not None and config.contract_version in {20,21,22} and config.web_authorization is not None

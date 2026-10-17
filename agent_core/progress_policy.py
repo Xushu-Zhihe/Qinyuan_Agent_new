@@ -31,7 +31,7 @@ def freeze_policy(app, context, turn_id, intent_id, scope, actions, timeout):
     unavailable = unavailable_decisions(app.state, turn_id, intent_id, app.config.max_turns)
     sibling, replan = "switch_sibling_intent" not in unavailable, "replan_current_intent" not in unavailable
     mode = progress["mode"]
-    return {"version": 2 if app.config.contract_version in {16, 17, 18, 19, 20, 21} else 1,
+    return {"version": 2 if app.config.contract_version in {16, 17, 18, 19, 20, 21, 22} else 1,
             "review_scope": scope, "scope_bindings": {"intent": intent_id, "turn": turn_id},
             "mode": mode, "decision_watermark": progress["decision_count"],
             "window_sha256": digest(progress), "required_latest_decision_ref": latest,

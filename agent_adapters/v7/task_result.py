@@ -76,7 +76,7 @@ def _candidate_projection(
             }
         )
         config = store.load_d3_run_config(task_run_id)
-        if config is not None and config.contract_version in {19, 20, 21}:
+        if config is not None and config.contract_version in {19, 20, 21, 22}:
             projected[-1]['checkable_submission_ids'] = list(
                 state.conflict_operation_ids if state.state == 'conflict'
                 else state.unresolved_unknown_operation_ids if state.state == 'unknown' else ())
@@ -140,7 +140,15 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
     if not isinstance(task_id, str) or declaration.get("protocol_version") != 3:
         raise ValueError("invalid_v3_run_declaration")
     result = _empty_result(task_id, mode if isinstance(mode, str) else "unknown", error="", recovery=False)
-    database = directory / "control.sqlite"
+
+    # Try to find the database in agent-state directory first (correct location)
+    agent_dirs = list((directory / "agent-state").glob("*/control.sqlite"))
+    if agent_dirs:
+        database = agent_dirs[0]
+    else:
+        # Fallback to old location
+        database = directory / "control.sqlite"
+
     if not database.is_file() or database.is_symlink():
         failure_path = directory / "start-failure.json"
         if failure_path.is_file() and not failure_path.is_symlink():
@@ -226,6 +234,7 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
             {
                 "fact_id": fact.fact_id,
                 "turn_id": fact.turn_id,
+                "content": fact.content,
                 "source_execution_id": fact.source_ref,
                 "status": fact.status.value,
                 "verification_ref": fact.verification_ref,
@@ -421,8 +430,13 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
             raise ValueError("d8_frozen_configuration_mismatch")
         d8_unresolved = False
         business_rows = []
+        http_diagnostics = []
+        model_format_diagnostics = []
+        review_call_diagnostics = []
+        known_model_failure = None
         if "execution_profile" in declaration:
             from agent_adapters.d8_simulation import parse_request
+            from agent_core.http_contracts import is_http
             _, expected = parse_request(declaration["request"])
             if (expected is None or declaration["execution_profile"] != declaration["request"]["execution_profile"]
                     or declaration.get("contract_version") != expected.contract_version
@@ -436,14 +450,40 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
             if path.exists():
                 with SqliteControlStore.open_readonly(path) as store:
                     config = store.load_d3_run_config(declaration["task_run_id"])
-                    from agent_core.http_contracts import is_http
-                    if is_http(config):
-                        from agent_adapters.http_capability import check_http_task
-                        d8_unresolved |= check_http_task(Path(directory), store, config)
                     if config != expected:
                         raise ValueError("d8_frozen_configuration_mismatch")
                     d8_unresolved = bool(store.list_d4_unresolved_operations(declaration["task_run_id"]))
-                    if config.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                    if config.contract_version >= 6:
+                        from types import SimpleNamespace
+                        from agent_core.structured_output import StructuredOutput
+                        from agent_adapters.output_evidence import FileD8OutputEvidence
+                        output = FileD8OutputEvidence(Path(directory) / "d8-output", create=False)
+                        boundary = StructuredOutput(SimpleNamespace(config=config), output)
+                        operations = store.list_d4_operations(declaration["task_run_id"])
+                        review_call_diagnostics = output.review_failures(operations)
+                        for operation in operations:
+                            diagnostic = boundary.diagnostic(operation.start.operation_id)
+                            if diagnostic is not None:
+                                if diagnostic["task_run_id"] != declaration["task_run_id"]:
+                                    raise ValueError("d8_output_diagnostic_binding_changed")
+                                model_format_diagnostics.append(diagnostic)
+                        latest = max(operations, key=lambda op: op.start.started_at, default=None)
+                        if latest is not None and latest.completion is not None and latest.completion.result_kind in {"rejected", "failed"}:
+                            diagnostic = next((row for row in model_format_diagnostics
+                                               if row["model_request_id"] == latest.start.operation_id), None)
+                            if diagnostic is not None:
+                                known_model_failure = "d8_model_format_rejected"
+                                if (diagnostic["stage"] == "intent_evaluation" and any(
+                                        issue["code"] == "string_too_long" and issue["path"] == "$/reason"
+                                        for issue in diagnostic["issues"])):
+                                    known_model_failure = "d8_intent_evaluation_reason_too_long"
+                            elif latest.start.category == "review" and latest.start.resource_ref == latest.start.operation_id:
+                                known_model_failure = "d8_review_call_failed"
+                    if is_http(config):
+                        from agent_adapters.http_capability import check_http_task
+                        d8_unresolved |= check_http_task(Path(directory), store, config,
+                                                        diagnostics=http_diagnostics)
+                    if config.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                         from agent_core.business_diagnostics import BusinessDiagnostics
                         from agent_adapters.output_evidence import FileD8OutputEvidence
                         from agent_adapters.handoff_evidence import FileD8HandoffEvidence
@@ -451,14 +491,14 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                             FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
                             FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False), store)
                         business_rows = diagnostics.projection(store.list_d4_operations(declaration["task_run_id"]))
-                    if config.contract_version in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                    if config.contract_version in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                         from agent_core.fact_diagnostics import FactBusinessDiagnostics
                         from agent_adapters.conclusion_evidence import FileD8Evidence
                         facts = FactBusinessDiagnostics(config,
                             FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
                             FileD8Evidence(Path(directory) / "d8-conclusions", create=False), store)
                         business_rows += facts.projection(store.list_d4_operations(declaration["task_run_id"]))
-                    if config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                    if config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                         from agent_core.review_diagnostics import ReviewDiagnostics
                         from agent_adapters.review_ledger import FileD2ReviewLedger
                         reviews = ReviewDiagnostics(config,
@@ -466,7 +506,7 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                             FileD2ReviewLedger(Path(directory) / "d3-reviews"), store, lambda: 0)
                         business_rows += reviews.projection(store.list_d4_operations(declaration["task_run_id"]))
                         d8_unresolved |= reviews.needs_repair
-                    if config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                    if config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                         from types import SimpleNamespace
                         from agent_core.fixed_probe import FixedProbeBindings
                         from agent_adapters.model_evidence import FileD3ModelEvidence
@@ -477,7 +517,7 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                                 Path(directory) / "d8-sessions", create=False)),
                             model_evidence=FileD3ModelEvidence(Path(directory) / "d3-models", create=False)))
                         d8_unresolved |= fixed.check_task(declaration["task_run_id"])
-                    if config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21} and not is_http(config):
+                    if config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and not is_http(config):
                         from agent_core.planning_assertion import PlanningAssertionBindings
                         from agent_adapters.attachment_import_recorder import FileAttachmentImportRecorder
                         assemblies = PlanningAssertionBindings(config,
@@ -486,7 +526,7 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                             FileD8Evidence(Path(directory) / "d8-conclusions", create=False), store,
                             FileAttachmentImportRecorder(Path(directory) / "imports", read_only=True))
                         d8_unresolved |= assemblies.check_task(declaration["task_run_id"])
-                    if config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21}:
+                    if config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
                         from agent_core.completion_evaluation import EvaluationBindings
                         evaluations = EvaluationBindings(config,
                             FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
@@ -499,7 +539,7 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                             FileD8HandoffEvidence(Path(directory) / "d8-sessions", create=False),
                             FileD3ModelEvidence(Path(directory) / "d3-models", create=False),
                             store, declaration["task_run_id"])
-                    if config.contract_version in {15, 16, 17, 18, 19, 20, 21}:
+                    if config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                         from agent_core.selection_bindings import SelectionBindings
                         from agent_adapters.process_fact_evidence import FileD5Evidence
                         selections = SelectionBindings(SimpleNamespace(config=config, store=store,
@@ -511,26 +551,42 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                             FileD8OutputEvidence(Path(directory) / 'd8-output', create=False))
                         d8_unresolved |= selections.check_task(declaration['task_run_id'])
         result = _snapshot_v3_task_result(Path(directory), declaration)
-        if declaration.get("execution_profile") in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
+        if declaration.get("execution_profile") in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
             result.update(execution_profile=declaration["execution_profile"], contract_version=expected.contract_version)
-            if expected.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            if expected.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 result["business_diagnostics"] = business_rows
             if declaration.get("mode") == "real":
                 result.update(sandbox_backend=declaration["sandbox_backend"], model_backend="deepseek",
                               capacity_measurement="estimated_token_units")
+            if is_http(expected):
+                result['http_diagnostics'] = http_diagnostics
+            if expected.contract_version >= 6:
+                result["model_format_diagnostics"] = model_format_diagnostics
+                result["review_call_diagnostics"] = review_call_diagnostics
             if d8_unresolved:
                 result["recovery"] = {"required": True, "reason": "operation_or_evidence_unknown"}
                 result["recovery_status"] = "required"
+            elif known_model_failure is not None and (result.get("task_run") or {}).get("status") == "running":
+                result["recovery"] = {"required": True, "reason": known_model_failure}
+                result["recovery_status"] = "required"
+            elif ((result.get("task_run") or {}).get("status") == "running"
+                    and any(intent.get("status") == "inconclusive"
+                            for turn in result.get("turns", []) for intent in turn.get("intents", []))):
+                result["recovery"] = {"required": True, "reason": "d8_local_goal_inconclusive"}
+                result["recovery_status"] = "required"
         return result
-    except Exception:  # noqa: BLE001 -- read-only result boundary
+    except Exception as exc:  # noqa: BLE001 -- read-only result boundary
+        from agent_adapters.output_evidence import safe_failure_details
         task_id = declaration.get("task_run_id") if isinstance(declaration, dict) else None
         mode = declaration.get("mode") if isinstance(declaration, dict) else None
-        return _empty_result(
+        result = _empty_result(
             task_id if isinstance(task_id, str) else "unknown",
             mode if isinstance(mode, str) else "unknown",
             error="state_read_failed",
             recovery=True,
         )
+        result["errors"][0].update(phase="state_read", **safe_failure_details(exc))
+        return result
 
 
 __all__ = ["snapshot_v3_task_result"]

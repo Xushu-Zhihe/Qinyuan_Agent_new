@@ -256,11 +256,24 @@ const RunView = (() => {
     else if (current.run?.status === "recovery_required" || progress.recovery?.required) stop.append(node("strong", "需要显式恢复 · 未自动重新执行"));
     else stop.append(node("strong", label(current.run?.status)));
     if (!live && progress.stop) stop.append(node("p", `${progress.stop.reason || progress.stop.kind || "调度已停止"}`, "run-condition"), code("停止记录", JSON.stringify(progress.stop, null, 2)));
-    if (!live && progress.recovery?.required) stop.append(node("p", progress.recovery.reason, "run-condition"));
+    const recoveryMessages = {
+      d8_local_goal_inconclusive: "当前 Intent 的完成证据不足，已暂停；不是操作结果未知。",
+      d8_intent_evaluation_reason_too_long: "局部目标审核 reason 超过当次请求的长度上限，已暂停。",
+      d8_model_format_rejected: "模型输出格式被确定拒绝，已暂停；详见格式诊断。",
+      d8_review_call_failed: "审核调用失败，已暂停；不是操作结果未知。",
+    };
+    if (!live && progress.recovery?.required) stop.append(node("p", recoveryMessages[progress.recovery.reason] || progress.recovery.reason, "run-condition"));
+    if (progress.review_call_diagnostics?.length) stop.append(code("审核调用诊断", JSON.stringify(progress.review_call_diagnostics, null, 2)));
+    if (progress.model_format_diagnostics?.length) stop.append(code("模型格式诊断（含已纠正的历史记录）", JSON.stringify(progress.model_format_diagnostics, null, 2)));
     if (!live) stop.append(node("p", `清理：${progress.cleanup?.status || "未确认"}`, "run-meta"));
     for (const error of [...(progress.errors || []), ...(current.run?.result?.errors || [])]) stop.append(node("p", error.code || error.category, "run-read-error"));
     const facts = get("run-facts"); facts.replaceChildren();
-    for (const fact of progress.verified_facts || []) { const item = node("article", undefined, "run-fact"); item.append(node("p", progress.protocol_version === 3 ? `验证状态：${label(fact.status)}` : fact.content), node("p", `Fact ${fact.fact_id}\nExecution ${fact.source_execution_id || fact.source_ref}`, "run-ref")); facts.append(item); }
+    for (const fact of progress.verified_facts || []) {
+      const item = node("article", undefined, "run-fact");
+      if (progress.protocol_version === 3) item.append(node("p", `验证状态：${label(fact.status)}`));
+      item.append(node("p", fact.content || "正文暂不可用，请刷新运行状态。"), node("p", `Fact ${fact.fact_id}\nExecution ${fact.source_execution_id || fact.source_ref}`, "run-ref"));
+      facts.append(item);
+    }
     if (!facts.children.length) empty(facts, "尚无已验证观察。原始输出不会自动成为 Fact。");
     const candidates = get("run-candidates"); candidates.replaceChildren();
     get("run-candidate-heading").textContent = progress.protocol_version === 3 ? "答案候选 · Candidates" : "待验证候选 · Pending";

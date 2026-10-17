@@ -10,14 +10,14 @@ from agent_core.turn_modeling import digest
 from agent_core.operation_accounting import D4OperationStart, D4OperationCompletion
 
 
-def completion_schema(request):
+def completion_schema(request, *, maximum=2):
     from agent_core.output_contracts import obj, tagged, array, B, SUGGESTION, CHANGE
     allowed = list(request.context.supporting_fact_ids)
     if len(allowed) != 1 or len(set(allowed)) != 1:
         raise D3RecoveryRequired("s4_completion_support_unavailable")
     return {"anyOf": [obj({"action": tagged("complete_intent", {
         "fact_ids": {**array({"type": "string", "enum": allowed}, 1, 1), "uniqueItems": True}}),
-        "review_requested": B, "next_intent_candidates": array(SUGGESTION, 0, 2)}), CHANGE]}
+        "review_requested": B, "next_intent_candidates": array(SUGGESTION, 0, maximum)}), CHANGE]}
 
 
 def execution_projection(app, execution, binding):
@@ -141,7 +141,7 @@ def evaluation_schema(request):
     from agent_core.output_contracts import obj, array, text
     policy = evaluation_policy(request)
     refs = [i.ref for i in request.history if i.source_status == "available" and not i.conflict]
-    fields = {"reason": text(512), "evidence_refs": {**array({"type": "string", "enum": refs}, 1),
+    fields = {"reason": text(), "evidence_refs": {**array({"type": "string", "enum": refs}, 1),
                                                         "uniqueItems": True}}
     return {"anyOf": [obj({"decision": {"type": "string", "const": decision},
         **fields, "evidence_refs": {**fields["evidence_refs"], **(
@@ -183,7 +183,7 @@ def candidate_binding(output, request, candidate, body_sha256, byte_size):
             or any(c not in '0123456789abcdef' for c in body_sha256)
             or type(byte_size) is not int or not 1 <= byte_size <= 16 * 1024
             or request.correction_of_model_request_id is not None or not isinstance(contract, dict)
-            or contract.get("contract_version") not in {14, 15, 16, 17, 18, 19, 20, 21}
+            or contract.get("contract_version") not in {14, 15, 16, 17, 18, 19, 20, 21, 22}
             or contract.get("source_request_sha256") != digest(asdict(request))
             or contract.get("model_request_id") != request.model_request_id
             or contract.get("root_request_id") != request.model_request_id
@@ -223,7 +223,7 @@ def check_candidate_task(config, output, sessions, models, store, task):
             raise D3RecoveryRequired('s4_candidate_contract_changed')
         record = output.read("candidate-binding", identity)
         native = models.read(identity)
-        if (config.contract_version in {19, 20, 21} and native is not None and native.outcome == 'accepted'
+        if (config.contract_version in {19, 20, 21, 22} and native is not None and native.outcome == 'accepted'
                 and native.raw == {'action': {'kind': 'no_candidate'}}):
             if record is not None:
                 raise D3RecoveryRequired('d9_candidate_result_conflict')
@@ -246,7 +246,7 @@ def check_candidate_task(config, output, sessions, models, store, task):
             context["turn_binding"] = turn_binding_from_dict(context["turn_binding"])
             context["plan_binding"] = plan_binding_from_dict(context["plan_binding"])
             context["plan_result"] = D3PlanResult(**context["plan_result"])
-            if config.contract_version in {19, 20, 21}:
+            if config.contract_version in {19, 20, 21, 22}:
                 from agent_core.answer_candidates import AnswerCandidateContext
                 value["context"] = AnswerCandidateContext(**context)
             else:
@@ -272,7 +272,7 @@ def check_candidate_task(config, output, sessions, models, store, task):
                 or op.start.resource_ref != request.resource_ref):
             raise D3RecoveryRequired("s4_candidate_source_changed")
         checksum = verify_candidate_binding(output, request, candidate, record)
-        if config.contract_version in {19, 20, 21}:
+        if config.contract_version in {19, 20, 21, 22}:
             decision = output.read('answer-decision', identity)
             expected = {'version': 1, 'task_run_id': task, 'intent_id': candidate.intent_id,
                         'model_request_id': identity, 'request_sha256': digest(asdict(request)),
@@ -323,7 +323,7 @@ class EvaluationBindings:
         contract = self.output.read("contract", request.model_request_id)
         root = request.correction_of_model_request_id or request.model_request_id
         if (self._request(request.model_request_id) != request
-                or not isinstance(contract, dict) or self.config.contract_version not in {14, 15, 16, 17, 18, 19, 20, 21}
+                or not isinstance(contract, dict) or self.config.contract_version not in {14, 15, 16, 17, 18, 19, 20, 21, 22}
                 or contract.get("contract_version") != self.config.contract_version
                 or contract.get("model_request_id") != request.model_request_id
                 or contract.get("task_run_id") != request.task_run_id

@@ -303,7 +303,7 @@ class ControlStateRepository:
         ]
         if len(running_turns) > 1:
             config = self._store.load_d3_run_config(rows.task_run.task_run_id)
-            if config is None or config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}:
+            if config is None or config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 raise StorageError("control state contains multiple running Turns")
             leaf = max((turns[i] for i in running_turns), key=lambda t: t.sequence)
             chain = set()

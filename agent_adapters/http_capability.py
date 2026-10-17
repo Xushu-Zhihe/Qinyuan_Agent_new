@@ -10,6 +10,7 @@ from uuid import UUID
 
 from agent_adapters.v7.http_adapter import D7HttpAdapter,D7HttpRequest,D7HttpResponseEvidenceService,D7HttpPolicy,D7HttpError
 from agent_adapters.v7.sandbox_transport import D7SandboxHttpTransport
+from agent_adapters.output_evidence import safe_failure_details, SAFE_EXCEPTION_TYPES, SAFE_HTTP_ERROR_CODES
 from agent_core.control_store import UpsertPlan,UpsertExecution,UpsertFact,PlanValidationRecordDraft,AppendPlanValidationRecord
 from agent_core.domain import PlanStep,PlanStatus,ExecutionStatus,ExecutionEvidence,PlanValidationStatus
 from agent_core.dual_llm_contracts import D3CommitMetadata,D3RecoveryRequired
@@ -52,13 +53,13 @@ class HttpCapability:
         auth=self.app.config.web_authorization
         value=dict(endpoint=auth.allowed_origin,allowed_methods=list(auth.allowed_methods),
                    authorization_sha256=digest(asdict(auth)))
-        if self.app.config.contract_version==21:
+        if self.app.config.contract_version in {21,22}:
             value['attachment_indices']=list(self.app.config.authorization.attachment_indices)
         return value
 
     def turn_binding(self,turn_id,request_id):
         auth=self.app.config.web_authorization
-        if self.app.config.contract_version==21 and self.app.config.authorization.attachment_indices:
+        if self.app.config.contract_version in {21,22} and self.app.config.authorization.attachment_indices:
             from agent_core.hybrid_contracts import HybridTurnBinding
             from agent_core.dual_llm_contracts import D3TurnBinding
             from agent_core.planning_assertion import freeze_planning_policy
@@ -391,13 +392,28 @@ class HttpCapability:
                 'tool_dispatch',app.clock(),app.state.latest_checkpoint.sequence,binding.request_sha256,
                 binding.plan_id,app.config.d4_budget.budget_policy_ref))
             self.http.timeout_seconds=timeout
-            response=await self.dispatch(binding,timeout,token)
-            value=dict(task_run_id=self.task.task_run_id,plan_id=binding.plan_id,execution_id=binding.execution_id,
-                request_sha256=binding.request_sha256,method=self.read_request(binding).method,status=response.status,
-                body_evidence_id=response.body_evidence_id,body_sha256=response.body_sha256,
-                body_bytes=response.body_bytes,finished_at=app.clock(),effective_timeout_seconds=timeout)
-            value.update(self.save_cookies(binding.execution_id,previous,response))
-            self.evidence.save('http-result',binding.execution_id,value)
+            phase='http_dispatch'
+            try:
+                response=await self.dispatch(binding,timeout,token)
+                phase='response_metadata'
+                value=dict(task_run_id=self.task.task_run_id,plan_id=binding.plan_id,execution_id=binding.execution_id,
+                    request_sha256=binding.request_sha256,method=self.read_request(binding).method,status=response.status,
+                    body_evidence_id=response.body_evidence_id,body_sha256=response.body_sha256,
+                    body_bytes=response.body_bytes,finished_at=app.clock(),effective_timeout_seconds=timeout)
+                phase='cookie_snapshot'
+                value.update(self.save_cookies(binding.execution_id,previous,response))
+                phase='response_save'
+                self.evidence.save('http-result',binding.execution_id,value)
+            except Exception as exc:
+                # A diagnostic is not a completion receipt. Preserve the unknown operation.
+                try:
+                    self.evidence.save('http-failure',binding.execution_id,dict(
+                        diagnostic_version=1,task_run_id=binding.task_run_id,plan_id=binding.plan_id,
+                        execution_id=binding.execution_id,request_sha256=binding.request_sha256,
+                        phase=phase,**safe_failure_details(exc)))
+                except Exception:
+                    raise D3RecoveryRequired('d20_http_failure_diagnostic_write_failed') from exc
+                raise
         if operation is None or operation.completion is None:
             self.store.complete_d4_operation(D4OperationCompletion(binding.execution_id,value['finished_at'],
                 'completed',binding.execution_id,digest(value)))
@@ -424,7 +440,7 @@ class HttpCapability:
             if token.is_cancelled or self.app.clock()>=self.task.deadline_at:
                 self.app._check_dispatch(allow_admitted_operation_id=binding.execution_id)
             if time.monotonic()>=expires:
-                raise D3RecoveryRequired('d20_http_outcome_unknown')
+                raise D3RecoveryRequired('d20_http_outcome_unknown') from TimeoutError()
             await asyncio.sleep(.025)
         self.app._check_dispatch(allow_admitted_operation_id=binding.execution_id)
         ok,value=result[0]
@@ -473,7 +489,7 @@ class HttpCapability:
         selected=attachment_binding(context.turn_binding,binding.attachment_index)
         prior=[p for p in state.plans if p.intent_id==binding.intent_id]
         intent=next((i for i in state.intents if i.intent_id==binding.intent_id),None)
-        if (self.app.config.contract_version!=21 or not isinstance(binding,AttachmentPlanBinding)
+        if (self.app.config.contract_version not in {21,22} or not isinstance(binding,AttachmentPlanBinding)
                 or not isinstance(proposal,AttachmentPlanProposal) or frozen is None or contract is None
                 or digest(frozen['request']['context'])!=digest(asdict(context))
                 or digest(frozen['request'])!=contract['source_request_sha256']
@@ -644,17 +660,34 @@ def readonly_capability(directory,store,config):
     return capability
 
 
-def check_http_task(directory,store,config):
+def check_http_task(directory,store,config,*,diagnostics=None):
     capability=readonly_capability(directory,store,config)
     needs_repair=False
     for plan in capability.app.state.plans:
         binding=store.load_d3_plan_binding(plan.plan_id)
         if not isinstance(binding,HttpPlanBinding):
-            if config.contract_version==21 and getattr(binding,'kind',None)=='attachment_observation':
+            if config.contract_version in {21,22} and getattr(binding,'kind',None)=='attachment_observation':
                 store.load_d3_plan_turn_binding(plan.plan_id)
                 continue
             raise D3RecoveryRequired('d20_http_plan_type_changed')
         capability.read_request(binding)
+        failure=capability.evidence.read('http-failure',binding.execution_id)
+        if failure is not None:
+            fields={'diagnostic_version','task_run_id','plan_id','execution_id','request_sha256',
+                    'phase','exception_types','error_codes'}
+            if (not isinstance(failure,dict) or set(failure)!=fields
+                    or type(failure['diagnostic_version']) is not int or failure['diagnostic_version']!=1
+                    or failure['task_run_id']!=binding.task_run_id or failure['plan_id']!=binding.plan_id
+                    or failure['execution_id']!=binding.execution_id
+                    or failure['request_sha256']!=binding.request_sha256
+                    or failure['phase'] not in ('http_dispatch','response_metadata','cookie_snapshot','response_save')
+                    or not isinstance(failure['exception_types'],list)
+                    or not 1<=len(failure['exception_types'])<=6
+                    or any(not isinstance(v,str) or v not in SAFE_EXCEPTION_TYPES for v in failure['exception_types'])
+                    or not isinstance(failure['error_codes'],list) or len(failure['error_codes'])>6
+                    or any(not isinstance(v,str) or v not in SAFE_HTTP_ERROR_CODES for v in failure['error_codes'])):
+                raise D3RecoveryRequired('d20_http_failure_diagnostic_invalid')
+            if diagnostics is not None:diagnostics.append(failure)
         value=capability.result(binding.execution_id)
         op=store.load_d4_operation(binding.execution_id)
         execution=next((e for e in capability.app.state.executions if e.execution_id==binding.execution_id),None)
@@ -666,5 +699,7 @@ def check_http_task(directory,store,config):
                 capability.observation(execution.execution_id,historical=True)
         elif execution is not None and execution.status is ExecutionStatus.SUCCEEDED:
             raise D3RecoveryRequired('d20_http_execution_result_missing')
+        elif op is not None and op.completion is None:
+            needs_repair=True
     capability.cookie_history()
     return needs_repair

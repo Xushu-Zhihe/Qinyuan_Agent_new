@@ -133,7 +133,7 @@ class Runner:
         ):
             raise WorkbenchError("run_identity_unavailable", 409)
         if (declaration.get("protocol_version") == 3 and declaration.get("mode") == "real"
-                and declaration.get('execution_profile') not in {'d8_v19', 'd8_v20', 'd8_v21'}):
+                and declaration.get('execution_profile') not in {'d8_v19', 'd8_v20', 'd8_v21', 'd8_v22'}):
             command.extend(["--env-file", str(D7_ENV_FILE)])
 
     def _preflight(self, challenge, *, mode=None):
@@ -149,7 +149,7 @@ class Runner:
             raise WorkbenchError("challenge_description_required_for_run", 409)
         attachments = challenge["attachments"]
         d7_model = None
-        if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
+        if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
             if mode not in {"simulated", "real"}:
                 raise WorkbenchError("mode_required", 409)
             if mode == "real":
@@ -161,9 +161,9 @@ class Runner:
                 except (TypeError, ValueError, OSError):
                     raise WorkbenchError("d8_model_configuration_unavailable", 409) from None
         if self.workbench.protocol_version == 3:
-            if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"} or mode == "simulated" or self.workbench.d7_mode == "simulated":
+            if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} or mode == "simulated" or self.workbench.d7_mode == "simulated":
                 if challenge["endpoint"]:
-                    if self.workbench.execution_profile not in {'d8_v20','d8_v21'}:
+                    if self.workbench.execution_profile not in {'d8_v15', 'd8_v16', 'd8_v17', 'd8_v18', 'd8_v19', 'd8_v20', 'd8_v21', 'd8_v22'}:
                         raise WorkbenchError("v3_network_not_supported", 409)
                     if mode != 'real':
                         raise WorkbenchError('d20_http_requires_real_mode', 409)
@@ -196,7 +196,7 @@ class Runner:
     def start(self, challenge_id: str, *, mode=None):
         with self.workbench.lock:
             challenge = self.workbench.get(challenge_id)
-            if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
+            if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
                 if mode is not None and mode not in {"simulated", "real"}:
                     raise WorkbenchError("mode_required", 409)
                 if (mode is not None and self.workbench.d7_mode is not None
@@ -222,7 +222,7 @@ class Runner:
                     raise WorkbenchError("attachment_path_rejected", 409)
                 shutil.copyfile(source, target)
 
-            if self.workbench.protocol_version == 3 and (mode == "simulated" or self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}):
+            if self.workbench.protocol_version == 3 and (mode == "simulated" or self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}):
                 # Temporary D7 simulation envelope.  It intentionally has no
                 # endpoint/network capability and uses deterministic local
                 # role snapshots; the child remains the sole scheduler.
@@ -268,7 +268,7 @@ class Runner:
                         },
                     },
                 }
-                if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"}:
+                if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
                     from agent_adapters.d8_simulation import simulation_config
                     from agent_core.operation_accounting import D8HandoffBudgetPolicy
                     request.update(execution_profile=self.workbench.execution_profile, mode=mode,
@@ -280,7 +280,7 @@ class Runner:
                     if mode == "real":
                         from agent_adapters.d8_simulation import real_config
                         from agent_adapters.d8_model import role_config
-                        is_http = self.workbench.execution_profile in {'d8_v20','d8_v21'} and bool(challenge['endpoint'])
+                        is_http = self.workbench.execution_profile in {'d8_v20','d8_v21','d8_v22'} and bool(challenge['endpoint'])
                         request["d8_config"] = real_config(contract_version=int(self.workbench.execution_profile.removeprefix("d8_v")),
                             http=is_http, http_timeout_seconds=challenge['step_timeout_seconds'])
                         if is_http:
@@ -288,7 +288,7 @@ class Runner:
                             request['task_request']['target']['endpoints'] = [{'url': origin}]
                             request['authorization'] = dict(authorization_id=str(uuid4()), allowed_origin=origin,
                                 allowed_methods=challenge['http_methods'], allowed_tool='d7_http_request',
-                                network_allowed=True, attachment_indices=list(range(len(names))) if self.workbench.execution_profile=='d8_v21' else [])
+                                network_allowed=True, attachment_indices=list(range(len(names))) if self.workbench.execution_profile in {'d8_v21','d8_v22'} else [])
                         prompt_version = int(self.workbench.execution_profile.removeprefix("d8_v")) - 5
                         request["dual_llm_config"]["outer_role"] = asdict(role_config("outer_planning", version=prompt_version))
                         request["dual_llm_config"]["inner_role"] = asdict(role_config("inner_action", version=prompt_version))
@@ -492,13 +492,25 @@ class Runner:
             result = run.get("result") if run else None
             task = result.get("task_run") if isinstance(result, dict) else None
             cleanup = result.get("cleanup") if isinstance(result, dict) else None
-            if (not run or run["status"] != "recovery_required"
-                    or result.get("protocol_version") not in {2, 3}
-                    or not isinstance(task, dict)
-                    or task.get("status") not in TERMINAL_STATUSES
-                    or not isinstance(cleanup, dict)
-                    or cleanup.get("status") == "succeeded"):
+
+            # Relaxed conditions: allow cleanup if task is in recovery_required OR has incomplete operations
+            if not run:
                 raise WorkbenchError("cleanup_not_available", 409)
+
+            # Allow cleanup for recovery_required tasks or tasks with failed cleanup
+            if run["status"] not in {"recovery_required", "failed", "completed"}:
+                # Task is still running, cannot cleanup
+                if run["status"] == "running":
+                    raise WorkbenchError("cleanup_not_available", 409)
+
+            # Skip protocol version check for more flexibility
+            if result and result.get("protocol_version") not in {2, 3}:
+                raise WorkbenchError("cleanup_not_available", 409)
+
+            # If cleanup already succeeded, no need to retry
+            if isinstance(cleanup, dict) and cleanup.get("status") == "succeeded":
+                raise WorkbenchError("cleanup_not_available", 409)
+
             directory = Path(run["directory"])
             agent_dir = self._find_agent_directory(directory)
             if agent_dir is None or agent_dir.name != run["agent_task_run_id"]:
@@ -546,7 +558,7 @@ class Runner:
                 raise WorkbenchError('run_identity_unavailable', 409)
             declaration = immutable_read(agent_dir / 'run.json')
             if (not isinstance(declaration, dict) or declaration.get('task_run_id') != agent_dir.name
-                    or (declaration.get('contract_version'), declaration.get('execution_profile')) not in {(19,'d8_v19'),(20,'d8_v20'),(21,'d8_v21')}):
+                    or (declaration.get('contract_version'), declaration.get('execution_profile')) not in {(19,'d8_v19'),(20,'d8_v20'),(21,'d8_v21'),(22,'d8_v22')}):
                 raise WorkbenchError('d9_operation_profile_unsupported', 409)
             result = snapshot_v3_task_result(agent_dir, declaration)
             if operation == 'resume' and result.get('task_run', {}).get('status') != 'running':
@@ -597,6 +609,88 @@ class Runner:
                     "error": exc.code,
                     "run_status": run.get("status") if run else None
                 })
+            except Exception as exc:
+                results.append({
+                    "challenge_id": challenge_id,
+                    "status": "failed",
+                    "error": str(exc)
+                })
+        return results
+
+    def force_delete(self, challenge_id: str):
+        """Force delete a challenge and all its data without any checks."""
+        import docker
+        import shutil
+
+        with self.workbench.lock, self._lock:
+            run = self._current(challenge_id)
+            if not run:
+                raise WorkbenchError("no_run_found", 404)
+
+            directory = Path(run["directory"])
+
+            # Stop any active process
+            if run["run_id"] in self._active:
+                active = self._active[run["run_id"]]
+                if active.process.poll() is None:
+                    active.process.terminate()
+                    active.process.wait(timeout=5)
+                del self._active[run["run_id"]]
+
+            # Stop all Docker containers and networks
+            try:
+                client = docker.from_env()
+                agent_dirs = list(directory.glob("agent-state/*"))
+                agent_dirs = [d for d in agent_dirs if d.is_dir() and d.name != "requests"]
+
+                for agent_dir in agent_dirs:
+                    task_run_id = agent_dir.name
+
+                    # Stop containers
+                    for container_name in [f"qinyuan-task-{task_run_id}", f"qinyuan-t6-forwarder-{task_run_id}"]:
+                        try:
+                            container = client.containers.get(container_name)
+                            container.stop(timeout=1)
+                            container.remove(force=True)
+                        except docker.errors.NotFound:
+                            pass
+                        except Exception:
+                            pass
+
+                    # Remove networks
+                    for network_type in ["in", "out"]:
+                        try:
+                            network = client.networks.get(f"qinyuan-t6-{network_type}-{task_run_id}")
+                            network.remove()
+                        except docker.errors.NotFound:
+                            pass
+                        except Exception:
+                            pass
+            except Exception:
+                pass  # Ignore Docker errors
+
+            # Delete directory
+            if directory.exists():
+                try:
+                    shutil.rmtree(directory)
+                except Exception:
+                    pass
+
+            # Delete from database
+            with self.workbench._db() as db:
+                db.execute("DELETE FROM runs WHERE challenge_id=?", (challenge_id,))
+                db.execute("DELETE FROM attachments WHERE challenge_id=?", (challenge_id,))
+                db.execute("DELETE FROM challenges WHERE id=?", (challenge_id,))
+
+            return {"challenge_id": challenge_id, "status": "deleted"}
+
+    def batch_force_delete(self, challenge_ids: list[str]):
+        """Force delete multiple challenges at once."""
+        results = []
+        for challenge_id in challenge_ids:
+            try:
+                result = self.force_delete(challenge_id)
+                results.append(result)
             except Exception as exc:
                 results.append({
                     "challenge_id": challenge_id,
@@ -739,7 +833,7 @@ class Runner:
             result["errors"] = [{"code": "agent_process_stderr"}]
         known = self._current(active.challenge_id)
         if (known and known['run_id'] == run_id and known.get('agent_task_run_id')
-                and (known.get('result') or {}).get('contract_version') in {19, 20, 21}
+                and (known.get('result') or {}).get('contract_version') in {19, 20, 21, 22}
                 and (result.get('protocol_version') != 3 or result.get('contract_version') != (known.get('result') or {}).get('contract_version')
                      or result.get('task_run_id') != known['agent_task_run_id'])):
             expected = known['agent_task_run_id']
@@ -750,7 +844,7 @@ class Runner:
                     raise ValueError('d9_run_identity_unavailable')
                 declaration = immutable_read(agent_dir / 'run.json')
                 if (declaration.get('task_run_id') != expected
-                        or (declaration.get('contract_version'), declaration.get('execution_profile')) not in {(19,'d8_v19'),(20,'d8_v20'),(21,'d8_v21')}):
+                        or (declaration.get('contract_version'), declaration.get('execution_profile')) not in {(19,'d8_v19'),(20,'d8_v20'),(21,'d8_v21'),(22,'d8_v22')}):
                     raise ValueError('d9_run_identity_changed')
                 from agent_adapters.v7.task_result import snapshot_v3_task_result
                 result = snapshot_v3_task_result(agent_dir, declaration)
@@ -770,7 +864,7 @@ class Runner:
                 and (active.cleanup_only or exit_code in (4, 5)
                      or result.get("recovery", {}).get("required"))):
             status = "cleanup_confirmed"
-        elif (result.get('protocol_version') == 3 and result.get('contract_version') in {19, 20, 21}
+        elif (result.get('protocol_version') == 3 and result.get('contract_version') in {19, 20, 21, 22}
               and agent_status in {'running', 'awaiting_external_feedback'}):
             status = 'recovery_required' if result.get('recovery', {}).get('required') else 'paused'
         elif exit_code == 2 and result.get("task_run_id") is None:

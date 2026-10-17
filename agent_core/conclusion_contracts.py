@@ -55,7 +55,7 @@ class D8Candidate:
     assertion: D8Assertion | None
 
     def __post_init__(self) -> None:
-        _bounded(self.content, "content", 256)
+        _text(self.content, "content")
         _bounded(self.reason, "reason", 512)
         if not isinstance(self.evidence_refs, tuple) or not 1 <= len(self.evidence_refs) <= 8:
             raise ValueError("d8_candidate_sources_invalid")
@@ -190,7 +190,7 @@ class D8Feedback:
         if self.outcome not in {"verified_fact", "reviewed_inference", "rejected", "insufficient"}:
             raise ValueError("d8_feedback_outcome_invalid")
         _bounded(self.reason, "reason", 512)
-        _bounded(self.content, "content", 256)
+        _text(self.content, "content")
 
 
 @dataclass(frozen=True, slots=True)

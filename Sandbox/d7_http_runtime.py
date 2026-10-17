@@ -61,7 +61,10 @@ def fail():
     raise SystemExit(1)
 
 try:
-    request=json.load(sys.stdin)
+    line=sys.stdin.buffer.readline(256*1024+1)
+    if len(line)>256*1024 or not line.endswith(b"\n"):
+        fail()
+    request=json.loads(line)
     expected={"scheme","host","port","authority","method","path_query","headers","body_b64","timeout_seconds","max_response_bytes","max_header_bytes","max_header_count","max_header_value_bytes"}
     if not isinstance(request,dict) or set(request)!=expected:
         fail()
@@ -289,7 +292,7 @@ class D7SandboxHttpRuntime:
         }
         input_bytes = json.dumps(
             payload, ensure_ascii=True, separators=(",", ":"), allow_nan=False
-        ).encode("ascii")
+        ).encode("ascii") + b"\n"
         if len(input_bytes) > MAX_D7_HTTP_STDIN_BYTES:
             raise ValueError("d7_http_request_envelope_too_large")
 
@@ -346,9 +349,8 @@ class D7SandboxHttpRuntime:
 
             started = time.monotonic()
             threading.Thread(target=interrupt_wait, daemon=True).start()
+            # The worker reads one JSON line; Windows named pipes cannot half-close.
             raw.sendall(input_bytes)
-            if hasattr(raw, "shutdown"):
-                raw.shutdown(1)
             from docker.utils.socket import next_frame_header, read_exactly
 
             stdout = bytearray()

@@ -9,7 +9,7 @@ from agent_core.turn_modeling import digest
 
 
 def valid_target(config,request):
-    return (is_http(config) and (not request.target.attachments or config.contract_version==21
+    return (is_http(config) and (not request.target.attachments or config.contract_version in {21,22}
             and len(request.target.attachments)==len(config.authorization.attachment_indices)
             and all(a.kind=='local_path' for a in request.target.attachments)) and len(request.target.endpoints)==1
             and request.target.endpoints[0].url==config.web_authorization.allowed_origin)
@@ -18,7 +18,7 @@ def valid_target(config,request):
 def valid_turn(config,binding):
     from agent_core.hybrid_contracts import HybridTurnBinding
     return (is_http(config) and isinstance(binding,HttpTurnBinding)
-            and (not isinstance(binding,HybridTurnBinding) or config.contract_version==21
+            and (not isinstance(binding,HybridTurnBinding) or config.contract_version in {21,22}
                  and tuple(b.attachment_index for b in binding.attachments)==config.authorization.attachment_indices)
             and binding.endpoint==config.web_authorization.allowed_origin
             and binding.authorization_id==config.web_authorization.authorization_id)
@@ -39,7 +39,7 @@ def validate_mutation(store,mutation,config):
     if isinstance(candidate,AttachmentPlanBinding):
         turn=store.load_d3_turn_binding(candidate.turn_id)
         selected=attachment_binding(turn,candidate.attachment_index)
-        if (config.contract_version!=21 or not valid_turn(config,turn)
+        if (config.contract_version not in {21,22} or not valid_turn(config,turn)
                 or candidate.rule_binding_sha256!=digest(asdict(selected))):
             raise StorageError('d21_attachment_plan_not_authorized')
         return False  # The original file store gates still run.

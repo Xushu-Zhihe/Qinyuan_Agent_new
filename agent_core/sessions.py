@@ -196,7 +196,7 @@ class IntentSessions:
                 cited = {s[12:] for s in application.source_ids if s.startswith("d8-decision:")}
                 rows = [r for r in self.records(intent_id) if r.record_id in cited]
                 watermark = max((r.ordinal for r in rows), default=0)
-                if self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21}:
+                if self.app.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                     from agent_core.progress_policy import policy_for
                     from agent_core.review_contracts import D2ReviewRequest
                     request = D2ReviewRequest(**{**call["request"], "source_versions": tuple(call["request"]["source_versions"])})
@@ -291,5 +291,6 @@ class IntentSessions:
         from agent_core.session_contracts import parse_next_intents
         snapshot = self.evidence.read("request", rows[-1].model_request_id)
         suggestions = parse_next_intents(data["response"]["next_intent_candidates"],
-                                         self.visible(snapshot["request"]["session_context"]))
+                                         self.visible(snapshot["request"]["session_context"]),
+                                         maximum=None if self.app.config.contract_version == 22 else 2)
         return rows[-1].model_request_id, suggestions

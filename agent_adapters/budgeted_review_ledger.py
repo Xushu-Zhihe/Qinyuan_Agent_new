@@ -364,7 +364,7 @@ class D4ReviewLedger(FileD2ReviewLedger):
                     "source_versions": tuple(request_payload["source_versions"]),
                 }
             )
-            if self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21} and self.review_diagnostics is not None and self.review_diagnostics.progress(request):
+            if self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and self.review_diagnostics is not None and self.review_diagnostics.progress(request):
                 self.review_diagnostics.known(request, repair=True)
             self._repair_completion(request, call)
             if record.application_ref is None:
