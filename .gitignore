@@ -177,3 +177,4 @@ Plan
 # D8 HTTP public wiring and protected session recovery
 !tests/test_d20_http.py
 !tests/test_d20_public.py
+!/tests/test_d22_schemas.py
