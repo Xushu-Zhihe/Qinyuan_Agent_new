@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from uuid import uuid4
 
+from agent_core.capacity import check_capacity, estimate_frontier_tokens, format_capacity_error
 from agent_core.conclusion_contracts import conclusion_digest, _fields
 from agent_core.control_store import StorageError, UpsertIntent, UpsertTurn
 from agent_core.domain import IntentStatus, TurnStatus
@@ -16,6 +17,7 @@ from agent_core.handoff_contracts import (
     D8Capacity, D8CapacityVersion, D8HandoffRequest, D8HandoffVersion, D8HistoryItem,
     D8ReadStart, D8SummaryCandidate, D8TreeRecord, checked_refs, handoff_json,
 )
+from agent_core.intent_context import build_intent_frontier, format_frontier_for_context
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.operation_accounting import D4BudgetExhausted, D4OperationCompletion, D4OperationRecord, D4OperationStart, _uuid
 from agent_core.turn_modeling import stable_id, digest
@@ -205,6 +207,59 @@ class HandoffContext:
         if apply_revisions and self.app.revisions is not None:
             items = self.app.revisions.project(items)
         return tuple(sorted(items, key=lambda i: (i.committed_sequence, i.record_type, i.record_id)))
+
+    def active_intent_frontier(self):
+        """
+        Build explicit active Intent frontier for tree planning context.
+
+        Returns structured frontier with all pending/running Intents, their depth,
+        activity status, and progress metrics. Injected into tree planning context
+        so model can see Intent tree structure when proposing new candidates.
+
+        Design: Lenient toward input (shows full frontier), strict about boundaries
+        (only validated Intents from state).
+        """
+        frontier = build_intent_frontier(
+            intents=list(self.state.intents),
+            turns=list(self.state.turns),
+            plans=list(self.state.plans),
+            facts=list(self.state.facts),
+            task_run_id=self.state.task_run.task_run_id,
+        )
+        return frontier
+
+    def format_frontier_json(self) -> str:
+        """Format active Intent frontier as JSON for context injection."""
+        frontier = self.active_intent_frontier()
+        return format_frontier_for_context(frontier)
+
+    def check_frontier_capacity(self, available_capacity: int) -> tuple[bool, str | None]:
+        """
+        Check if active Intent frontier fits in available context capacity.
+
+        Strict boundary check: either ALL active Intents fit, or we pause with
+        explicit error listing which Intents were excluded.
+
+        Args:
+            available_capacity: Available tokens in model context
+
+        Returns:
+            (fits, error_message) tuple:
+                - fits=True, error=None if frontier fits
+                - fits=False, error=message if frontier doesn't fit
+
+        Raises:
+            D3RecoveryRequired: if capacity check fails
+        """
+        frontier = self.active_intent_frontier()
+        result = check_capacity(frontier, available_capacity)
+
+        if not result.fits:
+            error_msg = format_capacity_error(result)
+            return (False, error_msg)
+
+        return (True, None)
+
 
     def _latest_summary(self):
         rows = self.store.list_d8_handoffs(self.state.task_run.task_run_id)

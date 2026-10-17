@@ -243,8 +243,35 @@ class D3Control:
         binding: D3PlanBinding,
         result: D3PlanResult,
         source_execution_id: str | None = None,
-        *, conclusion: D8Conclusion | None = None, content: str | None = None,
+        *,
+        conclusion: D8Conclusion | None = None,
+        content: str | None = None,
+        facts: tuple[UpsertFact, ...] | None = None,
     ):
+        """
+        Complete a Plan execution.
+
+        Lenient toward semantics:
+        - Accepts 0-N Facts (via facts parameter)
+        - Maintains backward compatibility with single Fact (via content parameter)
+        - Allows Plan completion without Fact submission (exploration Plans)
+
+        Strict about execution:
+        - Requires proof_id + supporting_fact_id for new_observation mode
+        - Validates source_execution_id consistency
+        - Enforces FactStatus.VERIFIED only for satisfied outcomes
+
+        Args:
+            binding: D3PlanBinding from current Plan
+            result: D3PlanResult with outcome + proof_id
+            source_execution_id: Execution UUID for Evidence linkage
+            conclusion: Optional D8Conclusion for outer layer
+            content: Single Fact content (backward compatibility)
+            facts: Multiple Facts from Plan execution (D22 mode)
+
+        Returns:
+            D3PlanCompletion with changes
+        """
         state = self.state
         plan = next(item for item in state.plans if item.plan_id == binding.plan_id)
         changes: list[StateChange] = [
@@ -265,16 +292,22 @@ class D3Control:
                 or result.supporting_fact_id is None
             ):
                 raise D3RecoveryRequired("d3_observed_plan_support_missing")
-            changes.append(
-                UpsertFact(
-                    result.supporting_fact_id,
-                    binding.turn_id,
-                    content if content is not None else d3_fact_content(result.proof_id),
-                    source_execution_id,
-                    FactStatus.VERIFIED,
-                    f"d3:{result.proof_id}",
+
+            # D22 mode: Accept multiple Facts from Plan
+            if facts is not None:
+                changes.extend(facts)
+            # Backward compatibility: Single Fact via content parameter
+            else:
+                changes.append(
+                    UpsertFact(
+                        result.supporting_fact_id,
+                        binding.turn_id,
+                        content if content is not None else d3_fact_content(result.proof_id),
+                        source_execution_id,
+                        FactStatus.VERIFIED,
+                        f"d3:{result.proof_id}",
+                    )
                 )
-            )
         elif source_execution_id is not None:
             raise D3RecoveryRequired("d3_reused_plan_cannot_create_fact")
         if conclusion is not None:

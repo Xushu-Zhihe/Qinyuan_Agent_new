@@ -62,6 +62,34 @@ class ProbeAction:
 
 
 @dataclass(frozen=True, slots=True)
+class MCPToolCall:
+    """
+    Single MCP tool invocation within a Plan.
+
+    Lenient toward input: model specifies tool_name + parameters as JSON
+    Strict about execution: validated against registry, executed with timeout
+    """
+
+    tool_name: str  # e.g. "filesystem__read_file"
+    parameters: Mapping[str, object]  # JSON-serializable parameters
+    timeout_seconds: int  # Per-call timeout (default 30)
+
+
+@dataclass(frozen=True, slots=True)
+class MCPAction:
+    """
+    MCP-based Plan action (D22).
+
+    Replaces ProbeAction for Plans that use MCP tools instead of shell scripts.
+    A Plan can contain multiple MCPToolCall steps executed sequentially.
+    """
+
+    calls: tuple[MCPToolCall, ...]  # Ordered sequence of tool calls
+    working_directory: str  # Sandbox working directory
+    conditions: tuple[Postcondition, ...]  # Postconditions to verify
+
+
+@dataclass(frozen=True, slots=True)
 class CompleteIntentAction:
     fact_ids: tuple[str, ...]
 
@@ -79,7 +107,11 @@ class CandidateFlagAction:
 
 
 T6Action: TypeAlias = (
-    ProbeAction | CompleteIntentAction | AbandonIntentAction | CandidateFlagAction
+    ProbeAction
+    | MCPAction
+    | CompleteIntentAction
+    | AbandonIntentAction
+    | CandidateFlagAction
 )
 
 

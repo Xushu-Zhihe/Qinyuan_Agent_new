@@ -25,4 +25,20 @@ def enabled(request):
 
 
 def candidate_limit(request):
+    """
+    Return max number of Intent candidates for this request.
+
+    Returns None (unlimited) when:
+    - Contract version 22 or later (D22 multi-Intent support), OR
+    - Intent planning version 1 enabled via history_context
+
+    Otherwise returns 2 (legacy limit).
+    """
+    # Check contract version first (D22)
+    contract_version = getattr(request, 'contract_version', None)
+    if contract_version and contract_version >= 22:
+        return None
+
+    # Check legacy intent_planning version flag
     return None if enabled(request) else 2
+

@@ -22,6 +22,7 @@ from agent_adapters.cross_run_artifacts import (
 )
 from agent_adapters.cross_run_transfer import D6ArtifactTransfer
 from agent_adapters.model_evidence import FileD3ModelEvidence
+from agent_adapters.mcp_plan_executor import MCPPlanExecutor
 from agent_adapters.observation_proof_store import FileD3ProofStore
 from agent_adapters.process_fact_evidence import D5EvidenceError, FileD5Evidence
 from agent_adapters.process_fact_model import D5RedactingModel
@@ -32,7 +33,7 @@ from agent_core.conclusion_contracts import D8ReviewRequestAction
 from agent_core.conclusion_review import ConclusionReview
 from agent_core.conclusion_revision_contracts import D8ConclusionChange
 from agent_adapters.workspace_evidence import FileD3WorkspaceEvidence
-from agent_core.actions import CompleteIntentAction, ProbeAction
+from agent_core.actions import CompleteIntentAction, MCPAction, ProbeAction
 from agent_core.artifact_operations import D3WorkspaceOperations, fixed_size_script
 from agent_core.artifact_proofs import D3ObservationProofVerifier
 from agent_core.attachment_import import (
@@ -227,11 +228,13 @@ class D3Application:
         d6_artifact_transfer: D6ArtifactTransfer | None = None,
         target_network_adapter=None,
         http_sandbox=None,
+        mcp_manager=None,  # Optional: MCPManager for D22 MCP tool execution
     ) -> None:
         self.directory = directory
         self.config = config
         self.clock = clock
         self.sandbox = sandbox
+        self.mcp_manager = mcp_manager  # D22: Optional MCP tool manager
         self.d6_artifact_store = d6_artifact_store
         self.d6_artifact_transfer = d6_artifact_transfer
         if (d6_artifact_store is None) != (d6_artifact_transfer is None):
@@ -2544,6 +2547,22 @@ class D3Application:
             self.clock,
         )
 
+    def _mcp_executor(self, task_run_id: str):
+        """Create MCPPlanExecutor for D22 MCP-based Plan execution."""
+        if self.mcp_manager is None:
+            raise D3RecoveryRequired("d22_mcp_manager_not_configured")
+
+        # workspace_sandbox is D8DockerWorkspace
+        from Sandbox.d8_workspace import D8DockerWorkspace
+        if not isinstance(self.workspace.sandbox, D8DockerWorkspace):
+            raise D3RecoveryRequired("d22_mcp_requires_d8_workspace")
+
+        return MCPPlanExecutor(
+            self.mcp_manager,
+            self.workspace.sandbox,
+            task_run_id,
+        )
+
     def _reviewable_action_rejection(
         self, error: D3ProposalRejected, fallback_request_id: str
     ) -> str:
@@ -2718,6 +2737,73 @@ class D3Application:
                                         self.revisions.visible_for_execution(request_id), token)
             return True
         action = proposal.action
+
+        # D22: Handle MCPAction (MCP tool execution)
+        if isinstance(action, MCPAction):
+            executor = self._mcp_executor(plan_binding.task_run_id)
+            tool_id = self._id(f"tool/{plan_binding.plan_id}/{step_index}")
+            self._check_dispatch()
+
+            result = await executor.execute(
+                action.tool_name,
+                action.arguments,
+                tool_id,
+                plan_binding.plan_id,
+                step_index,
+                token,
+            )
+
+            if not result.success:
+                raise D3RecoveryRequired(f"d22_mcp_tool_failed: {result.error}")
+
+            self.store.mark_d3_operation_applied(request_id, tool_id)
+
+            # Record observation and create proof
+            observation_id = self._id(f"observation/{plan_binding.plan_id}")
+            receipt = await self.workspace.observe_mcp_result(
+                turn,
+                plan_binding,
+                tool_id,
+                observation_id,
+                result,
+                token,
+            )
+            proof_id = self._id(f"proof/{plan_binding.plan_id}")
+            proof = self.proofs.issue(plan_binding, observation_id, proof_id)
+            fact_id = self._id(f"fact/{plan_binding.plan_id}")
+            plan_result = D3PlanResult(
+                plan_binding.task_run_id,
+                plan_binding.plan_id,
+                "satisfied",
+                plan_binding.artifact_version_id,
+                observation_id,
+                proof_id,
+                digest(asdict(receipt)),
+                fact_id,
+            )
+
+            if self.conclusions is not None:
+                return await self._review_d8_observation(plan_binding, proof, receipts, token)
+            self.control.complete_plan(plan_binding, plan_result, proof.source_execution_id)
+
+            if proposal.review_requested:
+                sources = (request_id, tool_id, observation_id, fact_id)
+                review_id, output = self._review(
+                    turn.turn_id,
+                    plan_binding.intent_id,
+                    "action",
+                    request_id,
+                    sources,
+                )
+                return await self._route(
+                    review_id,
+                    output,
+                    plan_binding.intent_id,
+                    receipts,
+                    token,
+                )
+            return False
+
         if (
             not isinstance(action, ProbeAction)
             or action.script != script
@@ -2869,7 +2955,21 @@ class D3Application:
                 observed = D3PlanResult(binding.task_run_id, binding.plan_id, "satisfied",
                                         binding.artifact_version_id, proof.observation_id,
                                         proof.proof_id, evidence_sha, result.fact_id)
-                content = source.fact_content()
+
+                # Version 22: Use refined_content from outer layer if provided
+                content = source.fact_content()  # default template
+                if self.config.contract_version == 22:
+                    # Retrieve the review decision to check for refined_content
+                    review_result = self.conclusions.evidence.read_result(result.review_request_id)
+                    if review_result is not None and review_result["outcome"] == "valid":
+                        from agent_core.conclusion_contracts import D8ReviewDecision
+                        decision = D8ReviewDecision.from_dict(review_result["raw"])
+                        candidate_request = self.conclusions.evidence.read_request(result.proposal_request_id)
+                        if candidate_request is not None:
+                            content = self.conclusions._final_fact_content(
+                                candidate_request.candidate, decision
+                            )
+
                 self.control.complete_plan(binding, observed, proof.source_execution_id,
                                            conclusion=result, content=content)
                 return False

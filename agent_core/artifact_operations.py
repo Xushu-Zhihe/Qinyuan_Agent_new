@@ -464,6 +464,74 @@ class D3WorkspaceOperations:
             raise D3RecoveryRequired("d3_digest_integrity_exception")
         return receipt
 
+    async def observe_mcp_result(
+        self,
+        binding: D3TurnBinding,
+        plan: D3PlanBinding,
+        execution_id: str,
+        observation_id: str,
+        mcp_result,
+        token: CancellationToken,
+    ) -> D3DigestReceipt:
+        """
+        D22: Record MCP tool execution result as observation.
+        Uses same D3DigestReceipt structure but records MCP output instead of file hash.
+        """
+        artifact = self.read_artifact(plan.artifact_version_id)
+        if (
+            artifact.claim.plan_id != plan.plan_id
+            or artifact.claim.turn_id != binding.turn_id
+            or plan.observation_mode != "new_observation"
+        ):
+            raise D3RecoveryRequired("d22_mcp_artifact_mismatch")
+
+        existing = self.evidence.read_digest(observation_id)
+        if existing is not None:
+            self._repair_known(observation_id, "mcp_observation", existing)
+            return existing
+
+        if (
+            self.evidence.read_digest_claim(observation_id) is not None
+            or self.ledger.load_d3_operation(observation_id) is not None
+        ):
+            raise D3RecoveryRequired("d22_mcp_outcome_unknown")
+
+        self._budget(token)
+        claim = D3DigestClaim(
+            observation_id,
+            plan.task_run_id,
+            binding.turn_id,
+            plan.intent_id,
+            plan.plan_id,
+            plan.artifact_version_id,
+            execution_id,
+            self.state.task_run.sandbox_id,
+            mcp_result.tool_name,  # Store tool name in path field
+            digest(mcp_result.output.encode() if isinstance(mcp_result.output, str) else mcp_result.output),
+            self.clock(),
+        )
+
+        self._start(observation_id, "mcp_observation", observation_id, claim)
+        self.evidence.begin_digest(claim)
+
+        # MCP result is already synchronous, no async wait needed
+        observed = FileDigestObservation(
+            status="present",
+            sha256=claim.expected_sha256,
+            byte_size=len(mcp_result.output.encode() if isinstance(mcp_result.output, str) else mcp_result.output),
+        )
+
+        receipt = D3DigestReceipt(
+            claim,
+            observed,
+            "confirmed",
+            max(claim.started_at, self.clock()),
+        )
+
+        self.evidence.save_digest(receipt)
+        self._finish(observation_id, receipt, confirmed=True)
+        return receipt
+
     async def share(
         self,
         artifact_version_id: str,

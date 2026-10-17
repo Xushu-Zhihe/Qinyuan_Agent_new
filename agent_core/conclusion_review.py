@@ -336,6 +336,23 @@ class ConclusionReview:
             return "rejected"
         return "verified_fact"
 
+    @staticmethod
+    def _final_fact_content(candidate, decision):
+        """
+        Extract final Fact content from review decision.
+
+        Lenient toward semantics:
+        - If outer layer provided refined_content, use it (allows merging/simplification)
+        - Otherwise, preserve inner layer's candidate.content verbatim
+
+        Strict about output boundaries:
+        - refined_content must not exceed 2048 characters (enforced in D8ReviewDecision.__post_init__)
+        - merged_sources tracked separately for traceability
+        """
+        if decision.refined_content is not None:
+            return decision.refined_content
+        return candidate.content
+
     async def propose(self, proof_id, token):
         source = self.observation(proof_id)
         self._scope(source)

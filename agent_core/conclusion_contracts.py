@@ -5,9 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import Literal
 
 from agent_core.operation_accounting import _sha, _text, _time, _uuid
+
+
+class EvidenceStrength(Enum):
+    """D22: Evidence quality classification for Facts"""
+    VERIFIED = "verified"  # Program-verified observation (D8Observation)
+    INFERENCE = "inference"  # LLM-inferred from verified sources
+    UNVALIDATED = "unvalidated"  # Not yet reviewed
 
 
 def conclusion_digest(value: object) -> str:
@@ -79,6 +87,50 @@ class D8Candidate:
 
 
 @dataclass(frozen=True, slots=True)
+class FactCandidate:
+    """D22: Extended candidate format for Fact organization layer"""
+    content: str
+    layer: str  # FactLayer enum value ("evidence" | "business" | "process")
+    evidence_strength: EvidenceStrength
+    source_proof_id: str
+    inferred: bool
+    reason: str = ""
+    evidence_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _text(self.content, "content")
+        if self.layer not in {"evidence", "business", "process"}:
+            raise ValueError("fact_candidate_layer_invalid")
+        if not isinstance(self.evidence_strength, EvidenceStrength):
+            raise ValueError("fact_candidate_strength_invalid")
+        _uuid(self.source_proof_id, "source_proof_id")
+        if not isinstance(self.inferred, bool):
+            raise ValueError("fact_candidate_inferred_must_be_bool")
+        if self.reason:
+            _bounded(self.reason, "reason", 512)
+        if self.evidence_refs:
+            if not isinstance(self.evidence_refs, tuple) or not all(isinstance(r, str) for r in self.evidence_refs):
+                raise ValueError("fact_candidate_evidence_refs_invalid")
+            for ref in self.evidence_refs:
+                _uuid(ref, "evidence_ref")
+
+    @classmethod
+    def from_d8_candidate(cls, d8: D8Candidate, layer: str = "evidence",
+                         strength: EvidenceStrength = EvidenceStrength.VERIFIED,
+                         source_proof_id: str = "") -> FactCandidate:
+        """Convert D8Candidate to FactCandidate with D22 metadata"""
+        return cls(
+            content=d8.content,
+            layer=layer,
+            evidence_strength=strength,
+            source_proof_id=source_proof_id,
+            inferred=False,
+            reason=d8.reason,
+            evidence_refs=d8.evidence_refs,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class D8ReviewRequestAction:
     reason: str
 
@@ -99,15 +151,48 @@ def parse_d8_proposal(raw: object) -> D8Candidate | D8ReviewRequestAction:
 class D8ReviewDecision:
     decision: Literal["accept", "reject", "insufficient"]
     reason: str
+    refined_content: str | None = None
+    merged_sources: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.decision not in {"accept", "reject", "insufficient"}:
             raise ValueError("d8_review_decision_invalid")
         _bounded(self.reason, "reason", 512)
+        if self.refined_content is not None:
+            _bounded(self.refined_content, "refined_content", 2048)
+        if self.merged_sources is not None:
+            if not isinstance(self.merged_sources, tuple):
+                raise ValueError("d8_review_merged_sources_must_be_tuple")
+            if not all(isinstance(s, str) for s in self.merged_sources):
+                raise ValueError("d8_review_merged_sources_invalid")
+            if len(self.merged_sources) > 8:
+                raise ValueError("d8_review_too_many_merged_sources")
 
     @classmethod
     def from_dict(cls, raw: object) -> D8ReviewDecision:
-        return cls(**_fields(raw, {"decision", "reason"}))
+        fields = {"decision", "reason"}
+        optional_fields = {"refined_content", "merged_sources"}
+        all_fields = fields | optional_fields
+
+        if not isinstance(raw, dict):
+            raise ValueError("d8_review_decision_not_dict")
+
+        provided = set(raw.keys())
+        if not fields.issubset(provided):
+            raise ValueError("d8_review_decision_missing_required")
+        if not provided.issubset(all_fields):
+            raise ValueError("d8_review_decision_unknown_fields")
+
+        merged_sources = raw.get("merged_sources")
+        if merged_sources is not None:
+            merged_sources = tuple(merged_sources)
+
+        return cls(
+            decision=raw["decision"],
+            reason=raw["reason"],
+            refined_content=raw.get("refined_content"),
+            merged_sources=merged_sources,
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -196,7 +196,17 @@ def _base_output_schema(request, *, contract_version=None):
             "assertion": {"anyOf": [N, assertion]}}),
             tagged("request_review", {"reason": text(512)})]}
     if stage == "fact_review":
-        return stage, obj({"decision": S, "reason": text(512)})
+        fields = {"decision": S, "reason": text(512)}
+        if contract_version == 22:
+            # Version 22: outer layer can output refined content and merged sources
+            fields["refined_content"] = {"type": ["string", "null"], "maxLength": 2048}
+            fields["merged_sources"] = {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 8,
+            }
+        return stage, obj(fields, optional={"refined_content", "merged_sources"} if contract_version == 22 else ())
     if stage == "intent_evaluation":
         if contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.completion_evaluation import evaluation_schema
