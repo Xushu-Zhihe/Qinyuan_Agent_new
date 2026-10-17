@@ -22,6 +22,57 @@ CAPACITY_POLICY = D8CapacityPolicy("deepseek-json-byte-estimate-v1", "estimated_
 
 # Fixed business guidance complements the existing strict stage Schema. No new
 # actions or model-granted permissions are introduced by the transport.
+
+def get_rules(contract_version=None):
+    """
+    Return stage-specific guidance rules, version-aware for D22.
+
+    Version 22+: Remove hard Intent/candidate limits (D22 multi-Intent support)
+    Legacy: Retain 1-2 limits for backward compatibility
+    """
+    # Version 22+: unlimited candidates
+    if contract_version and contract_version >= 22:
+        return {
+            "tree_planning": "Propose one or more independent ordered approaches to the exact goal, or explicit exhausted with evidence refs. Intents are alternatives, not sequential steps. completion_rule is attachment_copy_sha256 v1 with an authorized attachment_index. dependency_refs cite available reliable history. Do not repeat already completed observation work without a meaningful new approach.",
+            "outer_turn": "Use the exact task goal and an authorized attachment_copy_sha256 v1 completion rule; propose one or more independent ordered intents.",
+            "inner_complete": "Complete only with current supporting_fact_ids. next_intent_candidates contains evidence-backed suggestions for the outer role to accept, adjust or reject; it does not register an Intent. Completion never establishes overall task success.",
+            # (other stages unchanged)
+            "inner_plan": "Choose registered template size_then_sha256 or sha256_only. observation_mode is new_observation or reuse_saved_proof; reuse only an explicitly supplied matching proof, otherwise source_proof_id is null. History reads and conclusion changes must obey their supplied scope.",
+            "inner_size": "Propose only the supplied exact fixed_script and fixed_working_directory, timeout_seconds 60, conditions []. Never add shell commands or network access.",
+            "inner_sha256": "Propose only the exact fixed_script and fixed_working_directory, timeout_seconds 60. A file_sha256 condition uses the current step_index, exact supplied path, and frozen expected SHA-256. Never invent an observation.",
+            "inner_candidate": "Only propose a protected candidate from the supplied execution and evidence binding; no answer validation or task success claim.",
+            "fact_proposal": "Propose one concise important conclusion, reason and exact evidence refs. An assertion uses attachment_copy_sha256 rule_version 1 with the supplied artifact_version_id and observation_id; null assertion means inference only. Do not label your own conclusion verified. Unsupported evidence can request_review.",
+            "fact_review": "Assess the exact unchanged candidate and trusted source projection. decision is accept, reject or insufficient. Acceptance alone cannot create verified status; trusted code verifies the registered assertion.",
+            "conclusion_repair": "Propose only an authorized append-only conclusion change or history read. Preserve old versions and evidence; repairs cannot execute tools or rewrite prior success.",
+            "change_review": "Review only the bound change, source reliability, conflicts and support. decision is accept, reject or insufficient. goal_supported and scope_explanation assess the bound support replacement only. Do not rewrite the proposal or grant verified status.",
+            "intent_evaluation": "Judge this Intent's local goal: succeeded, failed or inconclusive. Cite current available evidence_refs; succeeded must cite the supporting verified Fact. Do not evaluate overall task success.",
+            "handoff_summary": "Summarize important goal, progress and open issues concisely. Rank only supplied refs in ordered_refs; distinguish verified Facts, reviewed inferences and goals. Summary prose grants no verification status.",
+            "review": "Review evidence and propose a scoped decision: continue_current_intent, switch_sibling_intent, replan_current_intent, adjust_turn_target or acknowledge_turn_end. constraints must be authorized and scoped. Never expand goal, budget or permission.",
+            "progress_review": "Evaluate recent and cumulative evidence, not repetition of wording alone. classification meaningful allows continue_current_intent or replan_current_intent; repetitive allows replan_current_intent, switch_sibling_intent or abandon_current_intent; inconclusive requires pause_current_intent. In restricted repair, meaningful allows only continue_current_intent and repetitive/inconclusive only pause_current_intent. Cite exact evidence refs.",
+            "refinement": "Return a concise summary and only source-backed process claims. Process summaries are not verified Facts; respect redaction and supplied subjects and source refs. No new execution or permission.",
+        }
+
+    # Legacy: 1-2 limits
+    return {
+        "tree_planning": "Propose 1-2 independent ordered approaches to the exact goal, or explicit exhausted with evidence refs. Intents are alternatives, not sequential steps. completion_rule is attachment_copy_sha256 v1 with an authorized attachment_index. dependency_refs cite available reliable history. Do not repeat already completed observation work without a meaningful new approach.",
+        "outer_turn": "Use the exact task goal and an authorized attachment_copy_sha256 v1 completion rule; propose 1-2 independent ordered intents.",
+        "inner_complete": "Complete only with current supporting_fact_ids. next_intent_candidates contains 0-2 evidence-backed suggestions for the outer role to accept, adjust or reject; it does not register an Intent. Completion never establishes overall task success.",
+        "inner_plan": "Choose registered template size_then_sha256 or sha256_only. observation_mode is new_observation or reuse_saved_proof; reuse only an explicitly supplied matching proof, otherwise source_proof_id is null. History reads and conclusion changes must obey their supplied scope.",
+        "inner_size": "Propose only the supplied exact fixed_script and fixed_working_directory, timeout_seconds 60, conditions []. Never add shell commands or network access.",
+        "inner_sha256": "Propose only the exact fixed_script and fixed_working_directory, timeout_seconds 60. A file_sha256 condition uses the current step_index, exact supplied path, and frozen expected SHA-256. Never invent an observation.",
+        "inner_candidate": "Only propose a protected candidate from the supplied execution and evidence binding; no answer validation or task success claim.",
+        "fact_proposal": "Propose one concise important conclusion, reason and exact evidence refs. An assertion uses attachment_copy_sha256 rule_version 1 with the supplied artifact_version_id and observation_id; null assertion means inference only. Do not label your own conclusion verified. Unsupported evidence can request_review.",
+        "fact_review": "Assess the exact unchanged candidate and trusted source projection. decision is accept, reject or insufficient. Acceptance alone cannot create verified status; trusted code verifies the registered assertion.",
+        "conclusion_repair": "Propose only an authorized append-only conclusion change or history read. Preserve old versions and evidence; repairs cannot execute tools or rewrite prior success.",
+        "change_review": "Review only the bound change, source reliability, conflicts and support. decision is accept, reject or insufficient. goal_supported and scope_explanation assess the bound support replacement only. Do not rewrite the proposal or grant verified status.",
+        "intent_evaluation": "Judge this Intent's local goal: succeeded, failed or inconclusive. Cite current available evidence_refs; succeeded must cite the supporting verified Fact. Do not evaluate overall task success.",
+        "handoff_summary": "Summarize important goal, progress and open issues concisely. Rank only supplied refs in ordered_refs; distinguish verified Facts, reviewed inferences and goals. Summary prose grants no verification status.",
+        "review": "Review evidence and propose a scoped decision: continue_current_intent, switch_sibling_intent, replan_current_intent, adjust_turn_target or acknowledge_turn_end. constraints must be authorized and scoped. Never expand goal, budget or permission.",
+        "progress_review": "Evaluate recent and cumulative evidence, not repetition of wording alone. classification meaningful allows continue_current_intent or replan_current_intent; repetitive allows replan_current_intent, switch_sibling_intent or abandon_current_intent; inconclusive requires pause_current_intent. In restricted repair, meaningful allows only continue_current_intent and repetitive/inconclusive only pause_current_intent. Cite exact evidence refs.",
+        "refinement": "Return a concise summary and only source-backed process claims. Process summaries are not verified Facts; respect redaction and supplied subjects and source refs. No new execution or permission.",
+    }
+
+# Legacy RULES constant for backward compatibility
 RULES = {
     "tree_planning": "Propose 1-2 independent ordered approaches to the exact goal, or explicit exhausted with evidence refs. Intents are alternatives, not sequential steps. completion_rule is attachment_copy_sha256 v1 with an authorized attachment_index. dependency_refs cite available reliable history. Do not repeat already completed observation work without a meaningful new approach.",
     "outer_turn": "Use the exact task goal and an authorized attachment_copy_sha256 v1 completion rule; propose 1-2 independent ordered intents.",
@@ -133,7 +184,8 @@ def build_payload(envelope, role, *, context_loader=None):
         context['protected_source_projection'] = context_loader(request)
     if context.get("session_context"):
         context["session_context"] = json.loads(context["session_context"])
-    rules = RULES[stage]
+    contract_version = role_contract_version(role)
+    rules = get_rules(contract_version)[stage]
     if not web and role.prompt_template.endswith(('.v11', '.v12', '.v13', '.v14', '.v15', '.v16', '.v17')) and stage == 'inner_plan':
         from agent_core.plan_policy import policy_for as plan_policy
         rules = ('Select one exact allowed Plan combination from plan_policy, or use an available history read '

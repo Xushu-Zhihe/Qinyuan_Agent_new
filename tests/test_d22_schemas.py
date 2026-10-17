@@ -210,32 +210,37 @@ class TestD8SandboxAdapter:
 
     def test_sandbox_adapter_import(self):
         """Verify D8SandboxAdapter can be imported"""
-        try:
-            from Sandbox.d8_sandbox_adapter import D8SandboxAdapter
-            assert D8SandboxAdapter is not None
-        except ImportError:
-            pytest.skip("D8SandboxAdapter not yet implemented")
+        from agent_adapters.d8_sandbox_adapter import D8SandboxAdapter
+        assert D8SandboxAdapter is not None
 
     def test_sandbox_adapter_methods(self):
-        """Verify D8SandboxAdapter has required methods"""
-        try:
-            from Sandbox.d8_sandbox_adapter import D8SandboxAdapter
+        """Verify D8SandboxAdapter has required SandboxService methods"""
+        from agent_adapters.d8_sandbox_adapter import D8SandboxAdapter
 
-            # Create mock runtime
-            class MockRuntime:
-                def get_workspace(self, task_run_id: str):
-                    return None  # Simplified mock
+        adapter = D8SandboxAdapter()
 
-            adapter = D8SandboxAdapter(runtime=MockRuntime())
+        # Verify SandboxService interface methods exist
+        assert hasattr(adapter, "bind_task_run")
+        assert hasattr(adapter, "unbind_agent")
+        assert hasattr(adapter, "get_session")
+        assert hasattr(adapter, "execute")
+        assert hasattr(adapter, "interrupt_for_agent")
 
-            # Check methods exist (actual names from implementation)
-            assert hasattr(adapter, "bind_agent")  # Not register_agent
-            assert hasattr(adapter, "get_session")
-            assert callable(adapter.bind_agent)
-            assert callable(adapter.get_session)
+        # Verify they're callable
+        assert callable(adapter.bind_task_run)
+        assert callable(adapter.unbind_agent)
+        assert callable(adapter.get_session)
+        assert callable(adapter.execute)
+        assert callable(adapter.interrupt_for_agent)
 
-        except (ImportError, AttributeError) as e:
-            pytest.skip(f"D8SandboxAdapter not ready: {e}")
+        # Test basic binding/unbinding
+        agent_id = "test_agent_001"
+        result = adapter.get_session(agent_id)
+        assert result is None  # Not bound yet
+
+        # Test unbind on non-existent agent (should not raise)
+        adapter.unbind_agent(agent_id)
+
 
 
 if __name__ == "__main__":

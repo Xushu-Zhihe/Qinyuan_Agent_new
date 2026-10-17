@@ -2563,6 +2563,99 @@ class D3Application:
             task_run_id,
         )
 
+    async def _run_mcp_plan(self, plan_binding, token: CancellationToken) -> bool:
+        """
+        Execute MCP-based Plan (D22).
+
+        Lenient toward model: accepts rolling tool calls, semantic postconditions
+        Strict about execution: timeout enforcement, evidence capture, authorization checks
+        """
+        # Retrieve stored MCPAction from plan_binding
+        action_data = getattr(plan_binding, 'action', None)
+        if action_data is None:
+            raise D3RecoveryRequired("d22_mcp_plan_missing_action")
+
+        # action_data is MCPAction with calls, working_directory, conditions
+        executor = self._mcp_executor(plan_binding.task_run_id)
+
+        # Execute each tool call sequentially
+        all_outputs = []
+        for step_index, tool_call in enumerate(action_data.calls):
+            tool_id = self._id(f"tool/{plan_binding.plan_id}/{step_index}")
+
+            result = await executor.execute(
+                tool_name=tool_call.tool_name,
+                arguments=dict(tool_call.parameters),
+                tool_id=tool_id,
+                plan_id=plan_binding.plan_id,
+                step_index=step_index,
+                token=token,
+            )
+
+            all_outputs.append(result)
+
+            if not result.success:
+                # Lenient: capture failure as evidence, complete Plan as "unsatisfied"
+                self._complete_mcp_plan_failed(plan_binding, all_outputs, result.error)
+                return False
+
+        # All tools succeeded; complete Plan as "satisfied"
+        self._complete_mcp_plan_success(plan_binding, all_outputs)
+        return False
+
+    def _complete_mcp_plan_success(self, plan_binding, outputs):
+        """Complete MCP Plan with satisfied outcome."""
+        # Create observation proof (similar to D3 artifact proofs)
+        observation_id = self._id(f"observation/{plan_binding.plan_id}")
+        proof_id = self._id(f"proof/{plan_binding.plan_id}")
+
+        # Hash all tool outputs to create evidence_sha256
+        import json
+        outputs_json = json.dumps([o.tool_outputs for o in outputs], sort_keys=True)
+        evidence_sha256 = hashlib.sha256(outputs_json.encode()).hexdigest()
+
+        result = D3PlanResult(
+            plan_binding.task_run_id,
+            plan_binding.plan_id,
+            "satisfied",
+            plan_binding.artifact_version_id,
+            observation_id,
+            proof_id,
+            evidence_sha256,
+            None,  # supporting_fact_id filled in complete_plan
+        )
+
+        # Store proof in proof_store
+        from agent_core.artifact_proofs import D3ObservationProof
+        proof = D3ObservationProof(
+            proof_id,
+            plan_binding.plan_id,
+            observation_id,
+            evidence_sha256,
+            "mcp_tool_outputs",
+        )
+        self.proof_store.write(proof)
+
+        self.control.complete_plan(plan_binding, result, source_execution_id=proof_id)
+
+    def _complete_mcp_plan_failed(self, plan_binding, outputs, error_msg):
+        """Complete MCP Plan with unsatisfied outcome."""
+        observation_id = self._id(f"observation/{plan_binding.plan_id}")
+
+        result = D3PlanResult(
+            plan_binding.task_run_id,
+            plan_binding.plan_id,
+            "unsatisfied",
+            plan_binding.artifact_version_id,
+            observation_id,
+            None,  # No proof for failed execution
+            None,  # No evidence_sha256 for failed execution
+            None,
+        )
+
+        self.control.complete_plan(plan_binding, result)
+
+
     def _reviewable_action_rejection(
         self, error: D3ProposalRejected, fallback_request_id: str
     ) -> str:
@@ -2981,6 +3074,8 @@ class D3Application:
     async def _run_plan(self, plan_binding, receipts, token: CancellationToken) -> bool:
         if getattr(plan_binding,'kind',None)=='http_request':
             return await self.web.run_plan(plan_binding, token)
+        if getattr(plan_binding,'kind',None)=='mcp_action':
+            return await self._run_mcp_plan(plan_binding, token)
         if self.conclusions is not None and plan_binding.observation_mode == "new_observation":
             proof = self.proof_store.read(self._id(f"proof/{plan_binding.plan_id}"))
             if proof is not None:

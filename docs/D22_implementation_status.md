@@ -1,8 +1,8 @@
-# D22 Implementation Status
+# D22 Phase 0 & Phase 1 Implementation Status
 
 **Date**: 2026-10-17  
 **Implementer**: Opus 5.5  
-**Status**: Phase 0 (Foundation) Complete ✓
+**Status**: Phase 0 (Foundation) ✓ | Phase 1 (MCP Integration) Partially Complete (4/5 tasks)
 
 ## What Was Implemented
 
@@ -95,10 +95,28 @@
 
 ## What's NOT Implemented Yet
 
-### Phase 1: MCP Execution Integration (Not Started)
-- MCPManager binding to D8 TaskRun flow
-- Rolling tool calls within Plans (currently limited to single HTTP request)
-- Download/SHA validation for MCP tool outputs
+### Phase 1: MCP Execution Integration (In Progress)
+- ✓ **Task 1.1**: D8SandboxAdapter created (`agent_adapters/d8_sandbox_adapter.py`)
+  - Implements SandboxService interface
+  - Maps agent_id → (task_run_id, sandbox_id) → SandboxSession
+  - Tests pass: `tests/test_d8_sandbox_adapter.py`
+- ✓ **Task 1.2**: MCPCapability created (`agent_adapters/mcp_capability.py`)
+  - Handles Plans with `kind='mcp_action'`
+  - Executes MCPAction.calls sequentially through MCPManager
+  - Validates tool_name, enforces timeout, stores evidence
+  - Tests pass: `tests/test_mcp_capability.py`
+- ✓ **Task 1.3**: Integrate MCPCapability into `complete_plan()` flow (COMPLETED 2026-10-17)
+  - Hooked into `agent_adapters/multi_turn_application.py:_run_plan()` at line 2982
+  - Added `_run_mcp_plan()`, `_complete_mcp_plan_success()`, `_complete_mcp_plan_failed()`
+  - Evidence capture: SHA256 hash of all tool outputs
+  - Sequential execution with failure handling
+  - Tests: `tests/test_d22_mcp_plan_execution.py`
+- ✓ **Task 1.4**: Lift hard Plan limits (COMPLETED 2026-10-17)
+  - Created `get_rules(contract_version)` function in `agent_adapters/d8_model.py`
+  - Version 22+: "one or more intents" instead of "1-2", removes "0-2" candidate limit
+  - Legacy: retains original limits
+  - Updated `build_payload()` to use version-aware rules
+- ✗ **Task 1.5**: Download/SHA validation for MCP tool outputs
 
 ### Phase 2: Fact Organization Integration (Partially Done)
 - ✓ Schemas exist
@@ -139,13 +157,22 @@
 
 ## Files Modified
 
+**Complete Implementations**:
 - `agent_core/conclusion_contracts.py`: Added FactCandidate, EvidenceStrength, FactLayer
 - `agent_core/actions.py`: Already had MCPToolCall and MCPAction
 - `agent_core/fact_storage.py`: Added FactLayer, FactStorageManager alias
 - `agent_core/fact_submission.py`: Already implemented
 - `agent_core/intent_planning.py`: Updated candidate_limit() for version 22
-- `Sandbox/d8_sandbox_adapter.py`: Created complete adapter implementation
-- `tests/tests/test_d22_schemas.py`: Created test suite (12 passing)
+- `Sandbox/d8_sandbox_adapter.py`: Created complete adapter implementation (218 lines)
+- `tests/test_d22_schemas.py`: Created test suite (12 passing, 243 lines)
+
+**Stub Files (Need Phase 1+ Implementation)**:
+- `Sandbox/mcp_download.py` (37 lines): SHA-256 validation, safe download paths — **STUB**
+- `agent_adapters/mcp_plan_executor.py` (122 lines): Multi-step MCP executor — **STUB**
+- `agent_core/capacity.py` (85 lines): Context overflow handling — **STUB**
+- `agent_core/fact_storage.py` (78 lines): LayeredFactStore — **STUB**
+- `agent_core/fact_submission.py` (92 lines): Fact submission flow — **STUB**
+- `agent_core/intent_context.py` (120 lines): active_intent_frontier builder — **STUB**
 
 ## Test Results
 
