@@ -726,6 +726,9 @@ class D1AuditedModel:
 
         threading.Thread(target=invoke, daemon=True, name="d1-model-call").start()
         end = asyncio.get_running_loop().time() + timeout
+        # 轮询退避：模型通常在几毫秒内返回，固定 25ms 让步会让每次调用白等一整拍；
+        # 先从 1ms 起，逐步退到 25ms，长调用时 CPU 占用与原先一致。
+        delay = 0.001
         try:
             while not finished.is_set():
                 state = self.controller.control_state
@@ -737,8 +740,9 @@ class D1AuditedModel:
                 ):
                     raise D1RecoveryRequired("model_call_outcome_unknown")
                 await asyncio.sleep(
-                    min(0.025, max(0, end - asyncio.get_running_loop().time()))
+                    min(delay, max(0, end - asyncio.get_running_loop().time()))
                 )
+                delay = min(0.025, delay * 2)
             succeeded, raw = result[0]
             if not succeeded:
                 raise D1RecoveryRequired("model_call_outcome_unknown") from raw

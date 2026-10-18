@@ -1018,6 +1018,8 @@ class D3AuditedModel:
 
         threading.Thread(target=invoke, daemon=True, name="d3-model-call").start()
         expires = asyncio.get_running_loop().time() + timeout
+        # 轮询退避：模型通常几毫秒返回，固定 25ms 会让每次调用白等一整拍
+        delay = 0.001
         try:
             while not finished.is_set():
                 state = self.controller.control_state
@@ -1028,7 +1030,8 @@ class D3AuditedModel:
                     or asyncio.get_running_loop().time() >= expires
                 ):
                     raise D3RecoveryRequired("d3_model_call_outcome_unknown")
-                await asyncio.sleep(0.025)
+                await asyncio.sleep(delay)
+                delay = min(0.025, delay * 2)
             succeeded, raw = values[0]
             if not succeeded:
                 if isinstance(raw, BaseException):

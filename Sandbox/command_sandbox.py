@@ -77,7 +77,7 @@ class T6TaskRunSandbox(TaskRunSandbox):
         timeout_seconds: float,
     ):
         """Send one frozen D7 HTTP action through this TaskRun's forwarder."""
-        from Sandbox.d7_http_runtime import D7SandboxHttpRuntime
+        from Sandbox.http_runtime import D7SandboxHttpRuntime
 
         return D7SandboxHttpRuntime(self).execute(
             sandbox_id,

@@ -215,11 +215,13 @@ class ConclusionReview:
 
         threading.Thread(target=invoke, daemon=True, name="d8-model-call").start()
         expires = asyncio.get_running_loop().time() + timeout
+        delay = 0.001
         try:
             while not finished.is_set():
                 if self.stopped() or asyncio.get_running_loop().time() >= expires:
                     raise D3RecoveryRequired("d8_model_outcome_unknown")
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(delay)
+                delay = min(0.01, delay * 2)
             succeeded, raw = values[0]
             if not succeeded:
                 if not isinstance(raw, Exception):
@@ -320,6 +322,16 @@ class ConclusionReview:
             reason = decision.reason
             if record.outcome == "rejected" and decision.decision == "accept":
                 reason = "d8_registered_assertion_not_satisfied"
+            elif record.outcome == "reviewed_inference":
+                # Tell the proposer why this stayed an inference, otherwise it
+                # keeps restating the same semantic conclusion in new wording and
+                # spends one review per attempt on unchanged evidence.
+                reason = (
+                    "this observation has no registered assertion for the proposed "
+                    "content, so the conclusion is recorded as an inference; rewording "
+                    "it cannot make it verified. Propose a mechanical observation or "
+                    "use request_review. " + (decision.reason or "")
+                )[:512]
             result.append(D8Feedback(record.record_id, record.outcome, reason, request.candidate.content))
         return tuple(result)
 
@@ -349,14 +361,30 @@ class ConclusionReview:
         - refined_content must not exceed 2048 characters (enforced in D8ReviewDecision.__post_init__)
         - merged_sources tracked separately for traceability
         """
-        if decision.refined_content is not None:
+        if decision.refined_content is not None and len(decision.refined_content) <= 256:
             return decision.refined_content
+        # A refinement longer than the Fact ceiling cannot be stored; fall back
+        # to the accepted candidate, which the proposal schema already bounds.
+        if candidate is None:
+            # The caller must supply the accepted candidate; a missing one is a
+            # binding error, not something to crash on with an AttributeError.
+            raise ValueError("d8_final_content_candidate_missing")
         return candidate.content
 
     async def propose(self, proof_id, token):
         source = self.observation(proof_id)
         self._scope(source)
-        for ordinal in range(1, 17):
+        # The number of proposals an observation may attract is bounded by the
+        # review budget that pays for them, never by a separate magic number:
+        # every proposal costs one fact_review.
+        from agent_core.operation_accounting import D4BudgetPolicy
+        allowance = D4BudgetPolicy().category_limits.get("fact_review", 32)
+        budget = getattr(self.config, "d4_budget", None)
+        if budget is not None and getattr(budget, "category_limits", None):
+            allowance = max(allowance, budget.category_limits.get("fact_review", 0))
+        # One extra ordinal so the paying budget is always the authority that
+        # stops the loop; the allowance only guards a misconfigured budget.
+        for ordinal in range(1, allowance + 2):
             root_id = self._id(f"proposal/{source.plan_id}/{ordinal}")
             correction_id = stable_id(source.task_run_id, f"d8/correction/{root_id}")
             records = (self.store.load_d4_operation(root_id), self.store.load_d4_operation(correction_id))

@@ -56,7 +56,8 @@ CREATE TABLE d8_decisions (
 D8_CHANGES = (D8HandoffVersion, D8CapacityVersion, D8TreeRecord, D8RevisionRecord, D8DecisionRecord)
 D8_OPERATIONS = {"append_d8_handoff", "append_d8_capacity", "register_d8_tree_turn",
                  "select_d8_tree_intent", "evaluate_d8_tree_intent", "exhaust_d8_expansion",
-                 "exhaust_d8_tree_turn", "append_d8_revision", "append_d8_decision"}
+                 "exhaust_d8_tree_turn", "append_d8_revision", "append_d8_decision",
+                 "reopen_d8_intent"}
 
 
 def load_records(store, table, task_id):
@@ -238,6 +239,19 @@ def validate_handoff_mutation(store, mutation):
             raise StorageError("D8-2 Turn is not exhausted")
     elif mutation.operation == "exhaust_d8_expansion" and (turns or intents):
         raise StorageError("D8-2 exhausted expansion cannot modify Intent state")
+    elif mutation.operation == "reopen_d8_intent":
+        # An inconclusive local evaluation only means the evidence so far cannot
+        # decide the Intent. The outer review may reopen it so exploration
+        # continues autonomously instead of ending the TaskRun.
+        if record.kind != "reopened" or len(intents) != 1 or turns:
+            raise StorageError("D8-2 reopen has no exact Intent transition")
+        before = store.load_control_state_rows(record.task_run_id)
+        old = next((i for i in before.intents if i.intent_id == record.intent_id), None)
+        if (old is None or old.status is not IntentStatus.INCONCLUSIVE
+                or intents[0].intent_id != record.intent_id
+                or intents[0].status is not IntentStatus.RUNNING
+                or record.model_request_id is None):
+            raise StorageError("D8-2 reopen binding changed")
     return True
 
 

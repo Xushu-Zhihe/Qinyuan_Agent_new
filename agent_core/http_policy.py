@@ -83,6 +83,15 @@ def planning(request,raw,revisions):
     return D8PlanningResult(HttpTurnProposal(request.goal,tuple(kept)),tuple(deps),tuple(rejected))
 
 
+GOAL_INTERPRETATION = (
+    "local_goal states what this intent must establish, not how to establish it. "
+    "The executed request may use a different method or path than any wording in "
+    "local_goal; judge whether the saved observation establishes or rules out the "
+    "goal, not whether the request matches that wording. Use inconclusive only when "
+    "the evidence can neither establish nor rule out the goal."
+)
+
+
 def evaluation(app,intent_id,fact_id,history):
     from dataclasses import asdict
     from agent_core.turn_modeling import digest
@@ -99,4 +108,5 @@ def evaluation(app,intent_id,fact_id,history):
         template='http_request',observation_mode='new_observation',goal_ref=goal.ref,support_fact_ref=fact.ref,
         required_observation_refs=[execution.ref],
         capability_scope='saved_authorized_http_response_only_not_whole_task_verification',
+        goal_interpretation=GOAL_INTERPRETATION,
         http_observation=asdict(source),history_sha256=digest([asdict(i) for i in history]))

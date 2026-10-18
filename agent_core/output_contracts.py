@@ -1,6 +1,7 @@
 """Fixed D8-5 output shapes. This is not a user-extensible Schema engine."""
 
 from dataclasses import dataclass, is_dataclass, asdict
+from collections.abc import Mapping
 import json
 import math
 
@@ -192,14 +193,17 @@ def _base_output_schema(request, *, contract_version=None):
             evidence_refs = {**array({"type": "string", "enum": list(allowed)}, len(allowed), len(allowed)),
                              "uniqueItems": True}
         return stage, {"anyOf": [tagged("candidate", {
-            "content": text(), "reason": text(512), "evidence_refs": evidence_refs,
+            "content": text(256), "reason": text(512), "evidence_refs": evidence_refs,
             "assertion": {"anyOf": [N, assertion]}}),
             tagged("request_review", {"reason": text(512)})]}
     if stage == "fact_review":
         fields = {"decision": S, "reason": text(512)}
         if contract_version == 22:
-            # Version 22: outer layer can output refined content and merged sources
-            fields["refined_content"] = {"type": ["string", "null"], "maxLength": 2048}
+            # Version 22: outer layer can output refined content and merged sources.
+            # refined_content becomes the committed Fact content, so it must obey
+            # the same 256 code-point ceiling as Fact.content; advertising 2048
+            # let the model produce content the control store then refused.
+            fields["refined_content"] = {"type": ["string", "null"], "maxLength": 256}
             fields["merged_sources"] = {
                 "type": ["array", "null"],
                 "items": {"type": "string"},
@@ -270,8 +274,15 @@ def shape_issues(value, schema, path="$"):
                 expected_type = fields[key].get("type", "allowed_shape")
                 expected_type = "|".join(expected_type) if isinstance(expected_type, list) else expected_type
                 result.append(D8FormatIssue("field_missing", path + "/" + key, expected_type, "missing"))
-        if any(key not in fields for key in value):
+        extra = [key for key in value if key not in fields]
+        additional = schema.get("additionalProperties", False)
+        if extra and additional is False:
             result.append(D8FormatIssue("field_unknown", path + "/<unknown>", "declared_field", "unknown"))
+        elif extra and isinstance(additional, Mapping):
+            # Open maps such as HTTP headers declare a value schema instead of a
+            # closed field list, so their keys must not be reported as unknown.
+            for key in extra:
+                result += shape_issues(value[key], additional, path + "/" + key)
         for key in fields:
             if len(result) >= 8:
                 break

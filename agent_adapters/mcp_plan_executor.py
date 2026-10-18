@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from MCPs.Mcp_client.client import MCPManager
-    from Sandbox.d8_workspace import D8DockerWorkspace
+    from Sandbox.workspace import D8DockerWorkspace
 
 
 @dataclass(frozen=True, slots=True)

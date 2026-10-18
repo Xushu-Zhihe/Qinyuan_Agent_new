@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Literal
 from uuid import UUID
 
@@ -50,16 +50,23 @@ D4AuditCategory = Literal[
 ]
 D4AuditOutcome = Literal["known", "unknown", "failed", "present", "absent"]
 D4_CATEGORY_LIMITS: dict[str, int] = {
-    "planning": 4,
-    "action": 16,
-    "review": 8,
-    "refinement": 4,
-    "tool_dispatch": 6,
-    "sha_observation": 4,
-    "artifact_share": 4,
-    "attachment_import": 2,
+    "planning": 24,
+    "action": 48,
+    "review": 32,
+    "refinement": 16,
+    "tool_dispatch": 24,
+    "sha_observation": 8,
+    "artifact_share": 8,
+    "attachment_import": 4,
 }
 D4_AUDIT_ONLY_CATEGORIES = frozenset({"copy_preparation", "intent_stop"})
+# Only thinking/observation categories are budgeted; `total` is always derived so
+# adjusting a category limit can never desynchronise the matrix.
+D8_CATEGORY_LIMITS: dict[str, int] = {**D4_CATEGORY_LIMITS, "fact_review": 32}
+D8_HANDOFF_CATEGORY_LIMITS: dict[str, int] = {**D8_CATEGORY_LIMITS, "handoff_summary": 16}
+D4_TOTAL: int = sum(D4_CATEGORY_LIMITS.values())
+D8_TOTAL: int = sum(D8_CATEGORY_LIMITS.values())
+D8_HANDOFF_TOTAL: int = sum(D8_HANDOFF_CATEGORY_LIMITS.values())
 
 
 def _text(value: object, name: str) -> None:
@@ -96,23 +103,23 @@ def _time(value: object, name: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class D4BudgetPolicy:
-    total: int = 48
-    planning: int = 4
-    action: int = 16
-    review: int = 8
-    refinement: int = 4
-    tool_dispatch: int = 6
-    sha_observation: int = 4
-    artifact_share: int = 4
-    attachment_import: int = 2
+    total: int = field(default=D4_TOTAL)
+    planning: int = field(default=D4_CATEGORY_LIMITS["planning"])
+    action: int = field(default=D4_CATEGORY_LIMITS["action"])
+    review: int = field(default=D4_CATEGORY_LIMITS["review"])
+    refinement: int = field(default=D4_CATEGORY_LIMITS["refinement"])
+    tool_dispatch: int = field(default=D4_CATEGORY_LIMITS["tool_dispatch"])
+    sha_observation: int = field(default=D4_CATEGORY_LIMITS["sha_observation"])
+    artifact_share: int = field(default=D4_CATEGORY_LIMITS["artifact_share"])
+    attachment_import: int = field(default=D4_CATEGORY_LIMITS["attachment_import"])
 
     def __post_init__(self) -> None:
-        expected = {"total": 48, **D4_CATEGORY_LIMITS}
+        expected = {"total": D4_TOTAL, **D4_CATEGORY_LIMITS}
         if any(
             type(getattr(self, name)) is not int or getattr(self, name) != limit
             for name, limit in expected.items()
         ):
-            raise ValueError("D4 supports only the confirmed 48-start budget matrix")
+            raise ValueError("D4 supports only the confirmed budget matrix")
 
     @property
     def category_limits(self) -> dict[str, int]:
@@ -134,18 +141,18 @@ class D4BudgetPolicy:
 class D8BudgetPolicy(D4BudgetPolicy):
     """Explicit D8 policy; never inferred for an existing D4 run."""
 
-    total: int = 56
-    fact_review: int = 8
+    total: int = field(default=D8_TOTAL)
+    fact_review: int = field(default=D8_CATEGORY_LIMITS["fact_review"])
 
     def __post_init__(self) -> None:
-        expected = {"total": 56, **D4_CATEGORY_LIMITS, "fact_review": 8}
+        expected = {"total": D8_TOTAL, **D8_CATEGORY_LIMITS}
         if any(type(getattr(self, key)) is not int or getattr(self, key) != limit
                for key, limit in expected.items()):
-            raise ValueError("D8 supports only the confirmed 56-start budget matrix")
+            raise ValueError("D8 supports only the confirmed budget matrix")
 
     @property
     def category_limits(self) -> dict[str, int]:
-        return {**D4_CATEGORY_LIMITS, "fact_review": 8}
+        return dict(D8_CATEGORY_LIMITS)
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> D8BudgetPolicy:
@@ -158,19 +165,18 @@ class D8BudgetPolicy(D4BudgetPolicy):
 class D8HandoffBudgetPolicy(D8BudgetPolicy):
     """Explicit D8-2 matrix; capacity changes never upgrade an older budget."""
 
-    total: int = 60
-    handoff_summary: int = 4
+    total: int = field(default=D8_HANDOFF_TOTAL)
+    handoff_summary: int = field(default=D8_HANDOFF_CATEGORY_LIMITS["handoff_summary"])
 
     def __post_init__(self) -> None:
-        expected = {"total": 60, **D4_CATEGORY_LIMITS,
-                    "fact_review": 8, "handoff_summary": 4}
+        expected = {"total": D8_HANDOFF_TOTAL, **D8_HANDOFF_CATEGORY_LIMITS}
         if any(type(getattr(self, key)) is not int or getattr(self, key) != limit
                for key, limit in expected.items()):
-            raise ValueError("D8-2 supports only the confirmed 60-start budget matrix")
+            raise ValueError("D8-2 supports only the confirmed budget matrix")
 
     @property
     def category_limits(self) -> dict[str, int]:
-        return {**D4_CATEGORY_LIMITS, "fact_review": 8, "handoff_summary": 4}
+        return dict(D8_HANDOFF_CATEGORY_LIMITS)
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> D8HandoffBudgetPolicy:

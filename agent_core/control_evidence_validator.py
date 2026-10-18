@@ -317,6 +317,7 @@ class D3EvidenceValidator:
         checked, _ = self.proofs.read_verified(proof.source_execution_id, proof_id)
         fact = next((item for item in state.facts if item.fact_id == fact_id), None)
         original = self.ledger.load_d3_plan_result(proof.plan_id)
+        expected_content = self._fact_content(proof_id, state.task_run.task_run_id)
         if (
             checked != proof
             or fact is None
@@ -331,7 +332,7 @@ class D3EvidenceValidator:
             or fact.turn_id != binding.turn_id
             or fact.source_ref != proof.source_execution_id
             or fact.verification_ref != f"d3:{proof_id}"
-            or fact.content != self._fact_content(proof_id, state.task_run.task_run_id)
+            or (expected_content is not None and fact.content != expected_content)
             or proof.task_run_id != binding.task_run_id
             or proof.turn_id != binding.turn_id
             or proof.intent_id != binding.intent_id
@@ -1057,6 +1058,12 @@ class D3EvidenceValidator:
         if config is not None and config.d8_enabled:
             if self.conclusions is None:
                 raise D3RecoveryRequired("d8_validator_not_configured")
+            if config.contract_version in {21, 22}:
+                # Contracts 21/22 commit the content the outer review accepted
+                # (refined_content) instead of the observation template, so the
+                # template is not the expected value. None disables the equality
+                # check without weakening the surrounding bindings.
+                return None
             return self.conclusions.observation(proof_id).fact_content()
         return d3_fact_content(proof_id)
 

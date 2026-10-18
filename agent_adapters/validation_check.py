@@ -19,7 +19,7 @@ def configured_checker(declaration):
 
 
 def dispatch_check(directory, declaration, selection, *, events=None):
-    from agent_adapters.v7.task_result import snapshot_v3_task_result
+    from agent_adapters.web.task_result import snapshot_v3_task_result
     if (declaration.get('contract_version'), declaration.get('execution_profile')) not in {(19, 'd8_v19'), (20, 'd8_v20'), (21, 'd8_v21'), (22, 'd8_v22')}:
         raise ValueError('d9_validation_check_profile_unsupported')
     selection = validate_selection(declaration['task_run_id'], selection)
@@ -63,7 +63,7 @@ def dispatch_check(directory, declaration, selection, *, events=None):
         result['validation_check'] = {'state': 'adapter_unconfigured', 'query_id': selection['query_id']}
         result['exit_code'] = 2
         return result
-    from agent_adapters.d8_simulation import run_simulated_task
+    from agent_adapters.simulation import run_simulated_task
     from agent_adapters.event_export import EventExporter
     from agent_adapters.task_cli import _finish_event_export
     exporter = EventExporter(Path(events), directory / 'control.sqlite', declaration['task_run_id'], append_existing=True) if events else None

@@ -15,7 +15,7 @@ from agent_core.handoff_contracts import D8HandoffVersion, D8CapacityVersion, D8
 from agent_core.conclusion_revision_contracts import D8RevisionRecord
 from agent_core.session_contracts import D8DecisionRecord
 from agent_core.handoff_storage import D8_CHANGES, D8_OPERATIONS
-from agent_core.v7.web_contracts import (
+from agent_core.web_contracts import (
     D7WebExecutionRecord,
     D7WebPlanRecord,
     D7WebRunConfig,
@@ -1774,15 +1774,12 @@ class TaskRunSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class TurnSnapshot:
-    turn_id: str
-    task_run_id: str
-    sequence: int
-    turn_target: str
-    intent_ids: tuple[str, ...]
-    status: TurnStatus
-    parent_turn_id: str | None = None
-    triggering_intent_id: str | None = None
+class TurnSnapshot(UpsertTurn):
+    """Turn 的读投影。
+
+    字段与校验完全继承自 UpsertTurn（写命令），这里只加「转回领域对象」的能力——
+    原先两个类各自重复声明同一组 8 个字段。
+    """
 
     def to_domain(self) -> Turn:
         return Turn(
@@ -1892,19 +1889,6 @@ class FailureSummaryRecordSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class ControlStateRows:
-    task_run: TaskRunSnapshot
-    latest_checkpoint: Checkpoint
-    turns: tuple[TurnSnapshot, ...]
-    intents: tuple[IntentSnapshot, ...]
-    plans: tuple[PlanSnapshot, ...]
-    executions: tuple[ExecutionSnapshot, ...]
-    facts: tuple[FactRecordSnapshot, ...]
-    failure_summaries: tuple[FailureSummaryRecordSnapshot, ...]
-    plan_validation_records: tuple[PlanValidationRecord, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class ControlStateSnapshot:
     task_run: TaskRunSnapshot
     latest_checkpoint: Checkpoint
@@ -1915,6 +1899,11 @@ class ControlStateSnapshot:
     facts: tuple[FactRecordSnapshot, ...]
     failure_summaries: tuple[FailureSummaryRecordSnapshot, ...]
     plan_validation_records: tuple[PlanValidationRecord, ...]
+
+
+# 曾经与 ControlStateSnapshot 逐字段相同的第二个类，只保留一个名字。
+# 别名保证既有 `ControlStateRows(...)` 调用与类型注解继续可用。
+ControlStateRows = ControlStateSnapshot
 
 
 class ControlStore(Protocol):

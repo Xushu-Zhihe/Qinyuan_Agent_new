@@ -84,7 +84,7 @@ def challenge_fields(value: object) -> tuple[str, str, str, str, int, int]:
 
 
 def http_methods(value):
-    from agent_core.v7.web_contracts import D7_WEB_ALLOWED_METHODS
+    from agent_core.web_contracts import D7_WEB_ALLOWED_METHODS
     if (not isinstance(value, list) or not value or any(not isinstance(v, str) or v not in D7_WEB_ALLOWED_METHODS for v in value)
             or len(value) != len(set(value))):
         raise WorkbenchError('invalid_http_methods')

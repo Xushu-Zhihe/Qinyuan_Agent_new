@@ -52,7 +52,8 @@ from agent_core.domain import (
     PlanStatus,
     TurnStatus,
 )
-from agent_core.v7.web_contracts import D7WebRunConfig
+from agent_core.web_contracts import D7WebRunConfig
+from qinyuan_core import get_logger
 from agent_core.dual_llm_contracts import D3CommitMetadata, D3RunConfig
 from agent_core.file_inspection import FILE_TOOL
 from agent_core.file_type_fact import FileTypeFactCandidate, fact_content
@@ -1096,6 +1097,7 @@ class TaskRunController(LegacyTaskRunController):
         mutation_id: str,
     ) -> CommittedOperation:
         """Commit one independently proved file-type Fact without a candidate row."""
+        _log = get_logger("ctrl")
 
         if not isinstance(candidate, FileTypeFactCandidate):
             raise TypeError("candidate must be a FileTypeFactCandidate")
@@ -1128,6 +1130,14 @@ class TaskRunController(LegacyTaskRunController):
             source_ref=candidate.execution_id,
             status=FactStatus.VERIFIED,
             verification_ref=proof_id,
+        )
+        _log.info(
+            "fact.verified",
+            run=task_run.task_run_id,
+            turn=turn.turn_id,
+            intent=intent_id,
+            exec=candidate.execution_id,
+            fact=fact_id,
         )
         event = RuntimeEvent(
             type="control_state_committed",
@@ -1394,6 +1404,12 @@ class TaskRunController(LegacyTaskRunController):
         deps.repository.validate_candidate(state, mutation)
         commit = deps.store.commit(mutation)
         self._reload_after_commit(commit)
+        get_logger("ctrl").info(
+            "intent.completed",
+            run=task_run.task_run_id,
+            intent=intent_id,
+            fact=",".join(evaluation.verified_fact_ids),
+        )
         return CommittedOperation.from_commit(commit)
 
     def complete_verified_t6_intent(

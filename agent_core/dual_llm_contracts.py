@@ -10,7 +10,7 @@ from typing import Literal
 from uuid import UUID
 
 from agent_core.execution_authorization import D6Authorization
-from agent_core.v7.web_contracts import D7WebAuthorization
+from agent_core.web_contracts import D7WebAuthorization
 from agent_core.operation_accounting import D4BudgetPolicy, D8BudgetPolicy, D8HandoffBudgetPolicy
 from agent_core.handoff_contracts import D8HandoffConfig
 from agent_core.review_contracts import (
@@ -44,13 +44,15 @@ D3ReviewDecision = Literal[
 ]
 D3EntityKind = Literal["turn", "intent", "plan"]
 D3_CATEGORY_LIMITS: dict[str, int | None] = {
-    "outer_model": 4,
-    "inner_model": 16,
-    "tool_dispatch": 6,
-    "sha_observation": 4,
-    "attachment_import": 2,
+    # Survival guards, not exploration quotas: a fully automatic run is bounded
+    # by its deadline, not by a small number of model calls.
+    "outer_model": 32,
+    "inner_model": 96,
+    "tool_dispatch": 48,
+    "sha_observation": 8,
+    "attachment_import": 4,
     "copy_preparation": None,
-    "artifact_share": 4,
+    "artifact_share": 8,
     "intent_stop": None,
 }
 D3_SIZE_STEP = "fixed read-only attachment size check"
@@ -325,7 +327,8 @@ class D3RunConfig:
             D6Authorization.from_dict(value["d6_authorization"])
             if value.get("d6_authorization") is not None else None,
             value.get("d8_enabled", False),  # type: ignore[arg-type]
-            D8HandoffConfig.from_dict(value["handoff_config"]) if "handoff_config" in value else None,
+            D8HandoffConfig.from_dict(value["handoff_config"])
+            if value.get("handoff_config") is not None else None,
             D7WebAuthorization.from_dict(value['web_authorization']) if value.get('web_authorization') is not None else None,
             value.get('http_timeout_seconds'),
         )

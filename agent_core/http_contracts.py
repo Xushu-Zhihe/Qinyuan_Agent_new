@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from agent_core.dual_llm_contracts import _uuid, _sha, _time, D3PlanBinding, D3TurnBinding
 from agent_core.conclusion_contracts import D8Observation
-from agent_core.v7.web_contracts import D7WebRunConfig, canonical_web_origin
+from agent_core.web_contracts import D7WebRunConfig, canonical_web_origin
 from agent_core.dual_llm_modeling import D3PlanContext
 
 
@@ -92,7 +92,7 @@ class HttpPlanProposal:
     kind: str = 'http_request_saved'
 
     def __post_init__(self):
-        from agent_core.v7.web_contracts import D7_WEB_ALLOWED_METHODS
+        from agent_core.web_contracts import D7_WEB_ALLOWED_METHODS
         _uuid(self.request_evidence_id,'request_evidence_id')
         _sha(self.request_sha256,'request_sha256')
         if self.kind != 'http_request_saved' or self.method not in D7_WEB_ALLOWED_METHODS:
@@ -116,7 +116,7 @@ class HttpObservation(D8Observation):
     rule_binding_sha256: str = ''
 
     def __post_init__(self):
-        from agent_core.v7.web_contracts import D7_WEB_ALLOWED_METHODS
+        from agent_core.web_contracts import D7_WEB_ALLOWED_METHODS
         for field in ('task_run_id','turn_id','intent_id','plan_id','artifact_version_id',
                       'observation_id','proof_id','execution_id','response_evidence_id'):
             _uuid(getattr(self,field),field)

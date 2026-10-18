@@ -461,7 +461,7 @@ class D3Application:
         self.answers = None
         if config.contract_version in {19, 20, 21, 22}:
             from agent_core.answer_candidates import AnswerCandidates
-            from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
+            from agent_adapters.web.candidate_evidence import D7CandidateEvidenceService
             self.answers = AnswerCandidates(self, lambda: D7CandidateEvidenceService(
                 self.directory, self.state.task_run.task_run_id, trusted_adapter_ids=('d7_candidate_stage',)))
         self.fixed_probe_bindings = None
@@ -481,10 +481,11 @@ class D3Application:
             self.web = HttpCapability(self)
             self.conclusions.http = self.web
             self.conclusions.assembly_bindings = None
-            self.conclusions.business_diagnostics = None
             self.planning_assertion_bindings = None
             self.business_diagnostics = None
-            self.fact_business_diagnostics = None
+            # Fact diagnostics stay attached on the HTTP path: without them a
+            # rejected fact_proposal reaches the model as "proposal_rejected"
+            # with an empty issue list, so the single correction cannot help.
             self.proofs = self.web
             self.validator.proofs = self.web
             self.validator.http = self.web
@@ -2553,7 +2554,7 @@ class D3Application:
             raise D3RecoveryRequired("d22_mcp_manager_not_configured")
 
         # workspace_sandbox is D8DockerWorkspace
-        from Sandbox.d8_workspace import D8DockerWorkspace
+        from Sandbox.workspace import D8DockerWorkspace
         if not isinstance(self.workspace.sandbox, D8DockerWorkspace):
             raise D3RecoveryRequired("d22_mcp_requires_d8_workspace")
 
@@ -3057,11 +3058,15 @@ class D3Application:
                     if review_result is not None and review_result["outcome"] == "valid":
                         from agent_core.conclusion_contracts import D8ReviewDecision
                         decision = D8ReviewDecision.from_dict(review_result["raw"])
-                        candidate_request = self.conclusions.evidence.read_request(result.proposal_request_id)
-                        if candidate_request is not None:
-                            content = self.conclusions._final_fact_content(
-                                candidate_request.candidate, decision
-                            )
+                        # A fact_proposal request never carries a candidate (the
+                        # contract forbids it); the accepted candidate lives on the
+                        # fact_review request. Reading the proposal request here
+                        # yields None and crashed whenever the outer accepted
+                        # without supplying refined_content.
+                        candidate_request = self.conclusions.evidence.read_request(result.review_request_id)
+                        candidate = getattr(candidate_request, "candidate", None)
+                        if candidate is not None:
+                            content = self.conclusions._final_fact_content(candidate, decision)
 
                 self.control.complete_plan(binding, observed, proof.source_execution_id,
                                            conclusion=result, content=content)
@@ -3306,6 +3311,20 @@ class D3Application:
         self.control.complete_turn(intent.turn_id, intent_id, fact_id)
         return False
 
+    async def _reopen_or_retire(self, intent, receipts, token) -> bool:
+        """Return an inconclusive Intent to RUNNING so exploration continues.
+
+        The outer role already reviews progress every few inner decisions; this
+        method only keeps the run alive, it never turns "cannot decide yet" into
+        a terminal state. Only a found flag needs a human.
+        """
+        task_run_id = self.state.task_run.task_run_id
+        records = self.store.list_d8_tree_records(task_run_id)
+        if any(r.kind == "reopened" and r.intent_id == intent.intent_id for r in records):
+            return False
+        self.handoff.reopen_intent(intent.intent_id, self._id(f"reopen/{intent.intent_id}"))
+        return True
+
     def _tail_intent(self, turn_id: str) -> str:
         intents = [item for item in self.state.intents if item.turn_id == turn_id]
         terminal = [
@@ -3361,8 +3380,17 @@ class D3Application:
         while True:
             self._check_dispatch()
             records = self.store.list_d8_tree_records(self.state.task_run.task_run_id)
-            if any(i.status is IntentStatus.INCONCLUSIVE for i in self.state.intents):
-                return self.result("d8_local_goal_inconclusive", recovery_required=True)
+            inconclusive = next((i for i in self.state.intents
+                                 if i.status is IntentStatus.INCONCLUSIVE
+                                 and not any(r.kind == "reopened" and r.intent_id == i.intent_id
+                                             for r in records)), None)
+            if inconclusive is not None:
+                # An inconclusive local evaluation means the evidence so far
+                # cannot decide the Intent, not that the TaskRun is over. The
+                # outer role decides whether the direction is still worth
+                # exploring; only a found flag needs a human.
+                await self._reopen_or_retire(inconclusive, receipts, token)
+                continue
             active = [t for t in self.state.turns if t.status in {TurnStatus.PENDING, TurnStatus.RUNNING}]
             if not active:
                 return self.result("search_exhausted")

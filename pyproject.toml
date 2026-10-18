@@ -26,7 +26,7 @@ py-modules = ["agent"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["Agents*", "LLMs*", "MCPs*", "Sandbox*", "Skills*", "tools*", "agent_core*", "agent_adapters*", "frontend*"]
+include = ["Agents*", "LLMs*", "MCPs*", "Sandbox*", "Skills*", "tools*", "agent_core*", "agent_adapters*", "qinyuan_core*", "frontend*"]
 exclude = ["MCPs.Dirsearch_Mcp.test*"]
 
 [tool.setuptools.package-data]
@@ -43,7 +43,13 @@ cache-dir = ".test/uv-cache"
 testpaths = ["tests"]
 pythonpath = ["."]
 cache_dir = ".test/pytest-cache"
-addopts = "--basetemp=.test/pytest-tmp"
+# 默认跳过需要 Docker / 真实网络的用例（tests/conftest.py 里按模块打 live 标记）。
+# 需要时：pytest -m live（只跑 live）、pytest -m ""（全量）。
+# 默认跳过 live（需要 Docker / 真实网络）与 slow（端到端拉起 CLI 子进程）。
+# pytest -m smoke（日常）/ -m slow / -m live / -m ""（全量）
+addopts = "-m 'not live and not slow'"
+# 不再指定 --basetemp：默认落在系统临时目录，pytest 自动回收，
+# 仓库里不会因为跑一次测试就多出上百 MB 产物。
 
 [tool.ruff]
 cache-dir = ".test/ruff-cache"

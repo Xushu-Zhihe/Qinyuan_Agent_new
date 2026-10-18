@@ -64,6 +64,8 @@ class D8Candidate:
 
     def __post_init__(self) -> None:
         _text(self.content, "content")
+        # 与 domain.MAX_FACT_CONTENT_LENGTH 对齐：候选正文超长必须拒绝，不能悄悄截断。
+        _bounded(self.content, "content", 256)
         _bounded(self.reason, "reason", 512)
         if not isinstance(self.evidence_refs, tuple) or not 1 <= len(self.evidence_refs) <= 8:
             raise ValueError("d8_candidate_sources_invalid")

@@ -143,7 +143,13 @@ class HandoffContext:
                 if not fact.verification_ref or not fact.verification_ref.startswith("d3:"):
                     raise D3RecoveryRequired("d8_history_rule_not_registered")
                 observed = self.app.conclusions.observation(fact.verification_ref[3:], historical=True)
-                if observed.fact_content() != fact.content:
+                if (observed.fact_content() != fact.content
+                        and self.app.config.contract_version not in {21, 22}):
+                    # Contracts 21/22 commit the content the outer review
+                    # accepted (refined_content), so the observation template is
+                    # no longer the expected content there. Treating that as an
+                    # unavailable source made every refined Fact unreliable and
+                    # blocked the next dispatch.
                     raise D3RecoveryRequired("d8_history_fact_binding_changed")
                 artifact = observed.artifact_version_id
                 version = {"fact": asdict(fact), "source": observed.source_version_sha256}
@@ -863,6 +869,22 @@ class HandoffContext:
                      (UpsertIntent(intent.intent_id, intent.turn_id, intent.description, intent.priority,
                                    intent.intent_type, IntentStatus(decision["decision"])),))
         return decision["decision"]
+
+    def reopen_intent(self, intent_id, review_id):
+        """Return an inconclusive Intent to RUNNING after the outer review agreed.
+
+        A fully automatic TaskRun must not stop because one local evaluation
+        could not decide; only the operator decides after a flag is found.
+        """
+        intent = next(i for i in self.state.intents if i.intent_id == intent_id)
+        if intent.status is not IntentStatus.INCONCLUSIVE:
+            raise D3RecoveryRequired("d8_reopen_requires_inconclusive_intent")
+        record = D8TreeRecord(self._id("reopen/" + intent_id), self.state.task_run.task_run_id,
+                              intent.turn_id, intent_id, "reopened", review_id)
+        self._commit("reopen_d8_intent", record,
+                     (UpsertIntent(intent.intent_id, intent.turn_id, intent.description, intent.priority,
+                                   intent.intent_type, IntentStatus.RUNNING),))
+        return intent_id
 
     def exhaust_turn(self, turn):
         record = D8TreeRecord(self._id("exhaust/" + turn.turn_id), self.state.task_run.task_run_id,

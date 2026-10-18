@@ -8,8 +8,8 @@ import time
 from dataclasses import asdict, replace
 from uuid import UUID
 
-from agent_adapters.v7.http_adapter import D7HttpAdapter,D7HttpRequest,D7HttpResponseEvidenceService,D7HttpPolicy,D7HttpError
-from agent_adapters.v7.sandbox_transport import D7SandboxHttpTransport
+from agent_adapters.web.http_adapter import D7HttpAdapter,D7HttpRequest,D7HttpResponseEvidenceService,D7HttpPolicy,D7HttpError
+from agent_adapters.web.sandbox_transport import D7SandboxHttpTransport
 from agent_adapters.output_evidence import safe_failure_details, SAFE_EXCEPTION_TYPES, SAFE_HTTP_ERROR_CODES
 from agent_core.control_store import UpsertPlan,UpsertExecution,UpsertFact,PlanValidationRecordDraft,AppendPlanValidationRecord
 from agent_core.domain import PlanStep,PlanStatus,ExecutionStatus,ExecutionEvidence,PlanValidationStatus
@@ -436,12 +436,14 @@ class HttpCapability:
         self.app._check_dispatch(allow_admitted_operation_id=binding.execution_id)
         threading.Thread(target=send,daemon=True,name='d20-http-request').start()
         expires=time.monotonic()+timeout
+        delay=0.001
         while not finished.is_set():
             if token.is_cancelled or self.app.clock()>=self.task.deadline_at:
                 self.app._check_dispatch(allow_admitted_operation_id=binding.execution_id)
             if time.monotonic()>=expires:
                 raise D3RecoveryRequired('d20_http_outcome_unknown') from TimeoutError()
-            await asyncio.sleep(.025)
+            await asyncio.sleep(delay)
+            delay=min(0.025, delay*2)
         self.app._check_dispatch(allow_admitted_operation_id=binding.execution_id)
         ok,value=result[0]
         if not ok:raise D3RecoveryRequired('d20_http_outcome_unknown') from value
@@ -642,7 +644,20 @@ class HttpCapability:
         elif mutation.operation=='complete_d3_plan':
             source=self.observation(metadata.plan_result.proof_id)
             facts=[c for c in mutation.state_changes if isinstance(c,UpsertFact)]
-            if facts[0].content!=source.fact_content() or metadata.plan_result.evidence_sha256!=source.source_version_sha256:
+            if not facts:
+                # A Plan may close without a Fact when the accepted conclusion is
+                # an inference; only a satisfied Plan must carry one.
+                if getattr(metadata.plan_result,'outcome',None)=='satisfied':
+                    raise D3RecoveryRequired('d20_http_fact_missing')
+                return True
+            # Contracts 21/22 let the outer review replace the observation
+            # template with the refined_content it accepted, so an exact match
+            # against source.fact_content() can no longer hold there. The
+            # observation-version binding below still proves the source.
+            content_ok = facts[0].content == source.fact_content()
+            if not content_ok and self.app.config.contract_version in {21, 22}:
+                content_ok = bool(facts[0].content.strip())
+            if not content_ok or metadata.plan_result.evidence_sha256!=source.source_version_sha256:
                 raise D3RecoveryRequired('d20_http_fact_source_changed')
         return True
 

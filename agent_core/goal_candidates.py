@@ -11,7 +11,7 @@ from agent_core.goal_feedback import (
     ExternalValidationCheckRequest,
     ExternalValidationFeedback,
 )
-from agent_core.v7.web_contracts import D7WebRunConfig
+from agent_core.web_contracts import D7WebRunConfig
 
 
 def _uuid4(value: object, name: str) -> None:

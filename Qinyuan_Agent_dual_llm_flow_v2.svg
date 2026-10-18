@@ -1,0 +1,249 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1530" viewBox="0 0 1900 1530" role="img" aria-labelledby="t d">
+  <title id="t">Qinyuan_Agent · 双 LLM 闭环（v2）</title>
+  <desc id="d">按草图重画的闭环：Origin/Goal 冻结为根；外层只开链并仲裁，内层生命周期等于一个 Intent，会话随 Intent 结束销毁。内层在 Sandbox 内经 TOOLS/MCP 执行、自判是否达成，产出 Intent Fact 与证据，并在结束时提出下一跳 Intent；外层复核 Fact 是否 verified、提案是否采纳，仅当认可才由代码写入并挂回 Turn，随后换会话跑下一个 Intent。右侧为执行序列、缺陷实测与本图对应的收敛量。</desc>
+  <defs>
+    <marker id="a-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#475569"/></marker>
+    <marker id="a-model" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#7c5cbf"/></marker>
+    <marker id="a-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#0f766e"/></marker>
+    <marker id="a-sess" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#2563eb"/></marker>
+    <style>
+      text{font-family:"Microsoft YaHei","Noto Sans CJK SC","Segoe UI",sans-serif;fill:#172b43}
+      .title{font-size:37px;font-weight:700}
+      .sub{font-size:19px;fill:#43566d}
+      .note{font-size:14.5px;fill:#6b7c91}
+      .sec{font-size:24px;font-weight:700;fill:#1d3552}
+      .sec-sub{font-size:13.5px;fill:#7a8a9e}
+      .h{font-size:17px;font-weight:700}
+      .b{font-size:14px;fill:#31465e}
+      .b2{font-size:13px;fill:#48607a}
+      .chip-t{font-size:14px;font-weight:600;fill:#31465e}
+      .edge-l{font-size:13px;fill:#5a6c82}
+      .edge-l2{font-size:12.5px;fill:#5a6c82}
+      .panel{fill:#fff;stroke:#d7e0ea;stroke-width:1.6}
+      .n-model{fill:#f5f0ff;stroke:#8f74c9;stroke-width:2}
+      .n-data{fill:#eaf7f1;stroke:#5fa189;stroke-width:2}
+      .n-rt{fill:#e7f4f8;stroke:#4d9db1;stroke-width:2}
+      .n-code{fill:#eef4fc;stroke:#7091ba;stroke-width:2}
+      .n-turn{fill:#f3fbf7;stroke:#5fa189;stroke-width:2}
+      .chip{fill:#fff;stroke:#9fb3c9;stroke-width:1.4}
+      .e-flow{fill:none;stroke:#475569;stroke-width:2.3;marker-end:url(#a-flow);stroke-linejoin:round}
+      .e-model{fill:none;stroke:#7c5cbf;stroke-width:2.3;marker-end:url(#a-model);stroke-linejoin:round}
+      .e-data{fill:none;stroke:#0f766e;stroke-width:2.2;stroke-dasharray:9 6;marker-end:url(#a-data);stroke-linejoin:round}
+      .e-sess{fill:none;stroke:#2563eb;stroke-width:2.2;stroke-dasharray:8 5;marker-end:url(#a-sess);stroke-linejoin:round}
+      .e-spine{fill:none;stroke:#475569;stroke-width:2.2;marker-end:url(#a-flow)}
+      .badge{fill:#eef3f9;stroke:#c3d0de;stroke-width:1.4}
+      .num{font-size:13px;font-weight:700;fill:#33475f;text-anchor:middle}
+      .kk{font-family:Consolas,"Cascadia Mono",monospace;font-size:12.6px;fill:#2f4a63}
+      .stat-n{font-size:16px;font-weight:700;fill:#a4442c}
+      .hr{stroke:#e3e9f1;stroke-width:1.2}
+    </style>
+  </defs>
+
+  <rect width="1900" height="1530" fill="#f3f6fa"/>
+
+  <!-- ================= header ================= -->
+  <text x="64" y="66" class="title">Qinyuan_Agent · 双 LLM 闭环（v2）</text>
+  <text x="64" y="104" class="sub">Origin / Goal　→　外层开链　→　内层单 Intent 执行　→　Intent Fact + 证据 + 下一跳提案　→　外层复核　→　写回 Turn　→　换会话</text>
+  <text x="64" y="136" class="note">本图按你的草图重画，只保留草图上的框，没有新增节点；连线一律由可信代码执行，模型只产出候选与判断。</text>
+  <rect x="1588" y="40" width="248" height="40" rx="10" class="badge"/>
+  <text x="1712" y="66" class="num" style="fill:#4a5f78">草图拓扑 · 未加新节点</text>
+
+  <!-- edge legend -->
+  <line x1="1420" y1="132" x2="1458" y2="132" stroke="#475569" stroke-width="2.3"/>
+  <text x="1466" y="137" class="note">执行 / 编排</text>
+  <line x1="1560" y1="132" x2="1598" y2="132" stroke="#7c5cbf" stroke-width="2.3"/>
+  <text x="1606" y="137" class="note">模型判断</text>
+  <line x1="1700" y1="132" x2="1738" y2="132" stroke="#0f766e" stroke-width="2.2" stroke-dasharray="9 6"/>
+  <text x="1746" y="137" class="note">数据 / 证据</text>
+
+  <!-- ================= A. loop panel ================= -->
+  <rect x="48" y="168" width="1290" height="1250" rx="20" class="panel"/>
+  <text x="76" y="212" class="sec">A · 一个 Intent 的闭环</text>
+  <text x="76" y="240" class="sec-sub">Turn 累积 verified Fact；一条 Intent 链在它上面推进。</text>
+
+  <!-- InnerLLM -->
+  <rect x="76" y="300" width="250" height="118" rx="14" class="n-model"/>
+  <text x="96" y="344" class="h" style="font-size:24px;fill:#5b3f96">InnerLLM</text>
+  <text x="96" y="372" class="b">内层 · 执行者</text>
+  <text x="96" y="396" class="b2">生命周期 = 一个 Intent</text>
+
+  <!-- Origin / Goal -->
+  <rect x="500" y="282" width="360" height="112" rx="14" class="n-code"/>
+  <text x="520" y="320" class="h" style="font-size:21px">Origin · Goal</text>
+  <text x="520" y="348" class="b">题目与目标，一次冻结</text>
+  <text x="520" y="374" class="b2">之后每轮都进 Prompt，模型只读</text>
+
+  <!-- Turn -->
+  <rect x="470" y="450" width="340" height="230" rx="14" class="n-turn"/>
+  <text x="492" y="492" class="h" style="font-size:25px;fill:#2f6f57">Turn</text>
+  <text x="492" y="518" class="b2">本轮状态 = 已 verified 的 Fact</text>
+  <rect x="506" y="528" width="268" height="88" rx="11" class="n-data"/>
+  <text x="640" y="568" class="h" style="font-size:19px;text-anchor:middle;fill:#28624e">verified Fact</text>
+  <text x="640" y="596" class="b2" style="text-anchor:middle">N 条 · 代码落库</text>
+
+  <!-- Intent list -->
+  <rect x="400" y="752" width="480" height="150" rx="14" class="n-code"/>
+  <text x="420" y="782" class="h" style="font-size:16px">Intent 列表</text>
+  <text x="420" y="802" class="b2">内层提案 → 外层采纳 → 代码入列；其余留作兄弟</text>
+  <rect x="424" y="812" width="96" height="56" rx="9" class="chip"/><text x="472" y="846" class="chip-t" style="text-anchor:middle">Intent1</text>
+  <rect x="536" y="812" width="96" height="56" rx="9" class="chip"/><text x="584" y="846" class="chip-t" style="text-anchor:middle">Intent2</text>
+  <rect x="648" y="812" width="96" height="56" rx="9" class="chip"/><text x="696" y="850" class="chip-t" style="text-anchor:middle;fill:#8796a8">···</text>
+  <rect x="760" y="812" width="96" height="56" rx="9" class="chip"/><text x="808" y="846" class="chip-t" style="text-anchor:middle">IntentN</text>
+
+  <!-- Selected Intent -->
+  <rect x="480" y="940" width="320" height="86" rx="12" class="n-code"/>
+  <text x="640" y="978" class="h" style="font-size:19px;text-anchor:middle">Selected Intent</text>
+  <text x="640" y="1004" class="b2" style="text-anchor:middle">本轮唯一执行单元</text>
+
+  <!-- Sandbox -->
+  <rect x="400" y="1074" width="480" height="176" rx="14" class="n-rt"/>
+  <text x="424" y="1114" class="h" style="font-size:24px;fill:#1f6473">Sandbox</text>
+  <text x="424" y="1142" class="b2">内层在此执行动作，判断是否达成 Intent 目标</text>
+  <rect x="424" y="1162" width="132" height="52" rx="9" class="chip" style="fill:#fff;stroke:#7cb6c4"/><text x="490" y="1196" class="chip-t" style="text-anchor:middle">TOOLS</text>
+  <rect x="568" y="1162" width="110" height="52" rx="9" class="chip" style="fill:#fff;stroke:#7cb6c4"/><text x="623" y="1196" class="chip-t" style="text-anchor:middle">MCP</text>
+  <text x="694" y="1196" class="b2">动作与输出全部留痕</text>
+
+  <!-- Selected Intent's Fact -->
+  <rect x="480" y="1300" width="320" height="90" rx="12" class="n-data"/>
+  <text x="640" y="1336" class="h" style="font-size:18px;text-anchor:middle;fill:#28624e">Selected Intent's Fact</text>
+  <text x="640" y="1364" class="b2" style="text-anchor:middle">候选，不是结论</text>
+
+  <!-- Outer LLM -->
+  <rect x="1040" y="470" width="270" height="180" rx="14" class="n-model" style="stroke-width:2.6"/>
+  <text x="1064" y="512" class="h" style="font-size:24px;fill:#5b3f96">外层 LLM</text>
+  <text x="1064" y="542" class="b">规划 · 复盘 · 仲裁</text>
+  <text x="1064" y="570" class="b2">唯一可写 verified Fact</text>
+  <text x="1064" y="594" class="b2">裁决内层提的下一跳</text>
+  <text x="1064" y="618" class="b2">唯一可宣布 Goal 达成</text>
+
+  <!-- edges -->
+  <!-- 1. Origin -> InnerLLM : goal is always in prompt -->
+  <path d="M 500 338 H 334" class="e-flow"/>
+  <text x="417" y="326" class="edge-l" style="text-anchor:middle">Origin · Goal 常驻</text>
+
+  <!-- 2. Origin -> outer : goal sync -->
+  <path d="M 850 394 L 1028 494" class="e-data"/>
+  <text x="916" y="412" class="edge-l" style="text-anchor:middle">Goal 同步</text>
+
+  <!-- 3. outer -> InnerLLM : dispatch -->
+  <path d="M 1150 470 C 1130 265, 720 150, 268 300" class="e-model"/>
+  <text x="660" y="214" class="edge-l" style="text-anchor:middle">外层下发当前 Intent</text>
+
+  <!-- 4. Turn -> InnerLLM : new session -->
+  <path d="M 470 500 H 252 Q 240 500 240 488 V 426" class="e-sess"/>
+  <text x="252" y="436" class="edge-l">Goal + Origin + verified Fact</text>
+  <text x="252" y="456" class="edge-l">→ 拼成本轮 Prompt，起一个会话</text>
+
+  <!-- 5. verified Fact -> outer : submit -->
+  <path d="M 782 550 H 1030" class="e-data"/>
+  <text x="912" y="538" class="edge-l" style="text-anchor:middle">提交 Fact 候选 + 证据</text>
+
+  <!-- 6. outer -> verified Fact : write back after approval -->
+  <path d="M 1040 590 H 786" class="e-model"/>
+  <text x="912" y="580" class="edge-l" style="text-anchor:middle;font-size:11.8px">认可后才写入</text>
+
+  <!-- 7. Turn -> Intent list -->
+  <path d="M 640 680 V 744" class="e-spine"/>
+  <text x="652" y="726" class="edge-l">Fact 累积改变候选</text>
+
+  <!-- 8. list -> selected -->
+  <path d="M 640 902 V 932" class="e-spine"/>
+
+  <!-- 9a. outer -> Intent list : first intent / adopted next hop -->
+  <path d="M 1040 618 H 912 Q 900 618 900 630 V 788 Q 900 800 888 800 H 872" class="e-model"/>
+  <text x="890" y="700" class="edge-l" style="text-anchor:end">给定首轮 / 采纳提案</text>
+
+  <!-- 9b. outer -> selected Intent : which one runs -->
+  <path d="M 1040 645 H 972 Q 960 645 960 657 V 970 Q 960 982 948 982 H 806" class="e-model"/>
+  <text x="972" y="704" class="edge-l">外层决定跑哪一条</text>
+
+  <!-- 10/11. spine -->
+  <path d="M 640 1026 V 1066" class="e-spine"/>
+  <path d="M 640 1250 V 1292" class="e-spine"/>
+
+  <!-- 12. Sandbox -> outer : execute + self judge + next hop -->
+  <path d="M 880 1150 H 1100 Q 1112 1150 1112 1138 V 662" class="e-data"/>
+  <text x="892" y="1116" class="edge-l2">内层执行、自判</text>
+  <text x="892" y="1136" class="edge-l2">并提出下一跳 Intent</text>
+
+  <!-- 13. Intent Fact -> outer : evidence -->
+  <path d="M 800 1345 H 1228 Q 1240 1345 1240 1333 V 662" class="e-data"/>
+  <text x="812" y="1332" class="edge-l2">证据 evidence</text>
+
+  <!-- ================= B. step sequence ================= -->
+  <rect x="1370" y="168" width="480" height="712" rx="20" class="panel"/>
+  <text x="1394" y="212" class="sec" style="font-size:22px">B · 一轮怎么跑</text>
+  <text x="1394" y="236" class="sec-sub">③ 到 ⑨ 就是一个 Intent 的生命周期</text>
+
+  <circle cx="1402" cy="266" r="12" class="badge"/><text x="1402" y="271" class="num">1</text>
+  <text x="1424" y="266" class="h" style="font-size:15px">冻结根</text>
+  <text x="1424" y="286" class="b2">Origin / Goal 只读，每轮都进 Prompt。</text>
+
+  <circle cx="1402" cy="332" r="12" class="badge"/><text x="1402" y="337" class="num">2</text>
+  <text x="1424" y="332" class="h" style="font-size:15px">外层开链</text>
+  <text x="1424" y="352" class="b2">只给出第 1 个 Intent，不做完整计划。</text>
+
+  <circle cx="1402" cy="398" r="12" class="badge"/><text x="1402" y="403" class="num">3</text>
+  <text x="1424" y="398" class="h" style="font-size:15px">起会话</text>
+  <text x="1424" y="418" class="b2">一个 Intent = 一次会话，随它结束销毁。</text>
+  <text x="1424" y="436" class="b2">Prompt = Origin + Goal + verified Fact + Intent</text>
+
+  <circle cx="1402" cy="470" r="12" class="badge"/><text x="1402" y="475" class="num">4</text>
+  <text x="1424" y="470" class="h" style="font-size:15px">执行</text>
+  <text x="1424" y="490" class="b2">内层在 Sandbox 内经 TOOLS / MCP 动作。</text>
+
+  <circle cx="1402" cy="536" r="12" class="badge"/><text x="1402" y="541" class="num">5</text>
+  <text x="1424" y="536" class="h" style="font-size:15px">自判</text>
+  <text x="1424" y="556" class="b2">判断本 Intent 是否达成，附证据 evidence。</text>
+  <text x="1424" y="574" class="b2">证据不是结论，Fact 仍是候选。</text>
+
+  <circle cx="1402" cy="608" r="12" class="badge"/><text x="1402" y="613" class="num">6</text>
+  <text x="1424" y="608" class="h" style="font-size:15px">交回</text>
+  <text x="1424" y="628" class="b2">Intent Fact（候选）+ 证据 + 下一跳 Intent。</text>
+
+  <circle cx="1402" cy="674" r="12" class="badge"/><text x="1402" y="679" class="num">7</text>
+  <text x="1424" y="674" class="h" style="font-size:15px">外层复核</text>
+  <text x="1424" y="694" class="b2">Fact 是否 verified；提案是否采纳；</text>
+  <text x="1424" y="712" class="b2">本条失败就切兄弟。</text>
+
+  <circle cx="1402" cy="746" r="12" class="badge"/><text x="1402" y="751" class="num">8</text>
+  <text x="1424" y="746" class="h" style="font-size:15px">落库</text>
+  <text x="1424" y="766" class="b2">代码写入 verified Fact 与下一跳候选；</text>
+  <text x="1424" y="784" class="b2">模型不能自己写。</text>
+
+  <circle cx="1402" cy="818" r="12" class="badge"/><text x="1402" y="823" class="num">9</text>
+  <text x="1424" y="818" class="h" style="font-size:15px">换会话</text>
+  <text x="1424" y="832" class="b2">销毁当前会话，回到 ③；Goal 达成或</text>
+  <text x="1424" y="850" class="b2">预算耗尽则停。</text>
+
+  <!-- ================= C. measured defects ================= -->
+  <rect x="1370" y="900" width="480" height="296" rx="20" class="panel"/>
+  <text x="1394" y="942" class="sec" style="font-size:22px">C · 两处缺陷的实测</text>
+  <text x="1394" y="964" class="sec-sub">扫描 agent_core / agent_adapters / Sandbox / MCPs</text>
+
+  <text x="1394" y="996" class="kk"><tspan class="stat-n">231</tspan> 个模块 · <tspan class="stat-n">82,335</tspan> 行；7 个文件超 50KB（最大 312KB）</text>
+  <text x="1394" y="1022" class="kk"><tspan class="stat-n">2,133</tspan> 处字段声明，只有 <tspan class="stat-n">787</tspan> 个不同名字 → 63% 是重复</text>
+  <text x="1394" y="1048" class="kk">task_run_id 在 <tspan class="stat-n">108</tspan> 个类里重存；intent_id 53 · turn_id 45</text>
+  <text x="1394" y="1074" class="kk"><tspan class="stat-n">31</tspan> 处 contract_version == N 分支；d8_v* 368 处；schema 27</text>
+  <text x="1394" y="1100" class="kk"><tspan class="stat-n">22</tspan> 个 *contracts.py，只为了给同一个对象再包一层</text>
+  <text x="1394" y="1126" class="kk">一次运行同时记 3 个版本号：内部契约 / 公共 d8 / 提示</text>
+
+  <line x1="1394" y1="1148" x2="1826" y2="1148" class="hr"/>
+  <text x="1394" y="1170" class="b2">结果是：加一版＝复制一份文件再改，改一个字段要动十几层 DTO。</text>
+  <text x="1394" y="1192" class="b2">本图把它压回一个闭环：实体只剩 6 个，状态只剩 Turn 一处。</text>
+
+  <!-- ================= D. convergence ================= -->
+  <rect x="1370" y="1216" width="480" height="284" rx="20" class="panel"/>
+  <text x="1394" y="1258" class="sec" style="font-size:22px">D · 本图对应的收敛量</text>
+  <text x="1394" y="1282" class="kk">模块  231 → 10　　字段  2,133 → 24　　契约版本  22 → 3</text>
+  <line x1="1394" y1="1294" x2="1826" y2="1294" class="hr"/>
+  <text x="1394" y="1320" class="kk">Origin    origin, goal</text>
+  <text x="1394" y="1342" class="kk">Turn      turn_id, seq, status</text>
+  <text x="1394" y="1364" class="kk">Intent    intent_id, turn_id, text, status</text>
+  <text x="1394" y="1386" class="kk">Fact      fact_id, turn_id, intent_id, content,</text>
+  <text x="1394" y="1406" class="kk">          evidence_id, verified</text>
+  <text x="1394" y="1428" class="kk">Evidence  evidence_id, execution_id, sha256, at</text>
+  <text x="1394" y="1450" class="kk">Execution execution_id, intent_id, cmd, exit, output_ref</text>
+
+  <text x="64" y="1450" class="note">内层生命周期 = 一个 Intent；外层生命周期 = 整个 TaskRun。图只画一条 Intent 链，兄弟分支留在候选里。</text>
+</svg>

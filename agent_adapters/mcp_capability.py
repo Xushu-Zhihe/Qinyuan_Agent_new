@@ -21,7 +21,7 @@ from agent_core.actions import MCPAction, MCPToolCall
 from agent_core.dual_llm_contracts import D3PlanResult, D3RecoveryRequired
 
 if TYPE_CHECKING:
-    from agent_adapters.d8_sandbox_adapter import D8SandboxAdapter
+    from agent_adapters.sandbox_adapter import D8SandboxAdapter
     from MCPs.Mcp_client.client import MCPManager
     from agent_core.state import D8TaskRunState
 

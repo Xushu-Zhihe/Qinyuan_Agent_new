@@ -23,7 +23,7 @@ from uuid import uuid4
 
 from agent_adapters.run_files import encode, immutable_read, immutable_write
 from agent_adapters.workbench_contracts import ACTIVE_RUN_STATUSES, WorkbenchError
-from agent_core.v7.web_contracts import canonical_web_origin
+from agent_core.web_contracts import canonical_web_origin
 from agent_core.operation_accounting import D4BudgetPolicy
 from agent_core.command_contracts import T6EvidenceError
 from agent_core.runtime import TERMINAL_STATUSES
@@ -153,7 +153,7 @@ class Runner:
             if mode not in {"simulated", "real"}:
                 raise WorkbenchError("mode_required", 409)
             if mode == "real":
-                from agent_adapters.d8_model import role_config, settings_from_file
+                from agent_adapters.deepseek_roles import role_config, settings_from_file
                 try:
                     prompt_version = int(self.workbench.execution_profile.removeprefix("d8_v")) - 5
                     settings_from_file(role_config("outer_planning", version=prompt_version), D7_ENV_FILE)
@@ -260,16 +260,11 @@ class Runner:
                     "dual_llm_config": {
                         "outer_role": role_outer,
                         "inner_role": role_inner,
-                        "d4_budget": {
-                            "total": 48, "planning": 4, "action": 16,
-                            "review": 8, "refinement": 4, "tool_dispatch": 6,
-                            "sha_observation": 4, "artifact_share": 4,
-                            "attachment_import": 2,
-                        },
+                        "d4_budget": asdict(D4BudgetPolicy()),
                     },
                 }
                 if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
-                    from agent_adapters.d8_simulation import simulation_config
+                    from agent_adapters.simulation import simulation_config
                     from agent_core.operation_accounting import D8HandoffBudgetPolicy
                     request.update(execution_profile=self.workbench.execution_profile, mode=mode,
                                    d8_config=simulation_config())
@@ -278,8 +273,8 @@ class Runner:
                         value["model"] = f"d8-simulated-{role}"
                         value["prompt_template"] = f"d8-simulated-{role}-v{int(self.workbench.execution_profile.removeprefix('d8_v')) - 5}"
                     if mode == "real":
-                        from agent_adapters.d8_simulation import real_config
-                        from agent_adapters.d8_model import role_config
+                        from agent_adapters.simulation import real_config
+                        from agent_adapters.deepseek_roles import role_config
                         is_http = self.workbench.execution_profile in {'d8_v20','d8_v21','d8_v22'} and bool(challenge['endpoint'])
                         request["d8_config"] = real_config(contract_version=int(self.workbench.execution_profile.removeprefix("d8_v")),
                             http=is_http, http_timeout_seconds=challenge['step_timeout_seconds'])
@@ -329,7 +324,7 @@ class Runner:
                         "d4_budget": asdict(D4BudgetPolicy()),
                     },
                 }
-                from agent_adapters.v7.web_request import D7WebRequest
+                from agent_adapters.web.web_request import D7WebRequest
 
                 try:
                     D7WebRequest.parse(request)
@@ -546,7 +541,7 @@ class Runner:
 
     def _d9_operation(self, challenge_id, operation, selection=None):
         """Only the CLI owns checks, continuation and persisted transitions."""
-        from agent_adapters.v7.task_result import snapshot_v3_task_result
+        from agent_adapters.web.task_result import snapshot_v3_task_result
         from agent_adapters.validation_check import validate_selection
         with self.workbench.lock, self._lock:
             run = self._current(challenge_id)
@@ -751,7 +746,7 @@ class Runner:
                 if declaration.get("protocol_version") == 3:
                     # v3's projection is deliberately safe and read-only;
                     # workbench never interprets or schedules its state.
-                    from agent_adapters.v7.task_result import snapshot_v3_task_result
+                    from agent_adapters.web.task_result import snapshot_v3_task_result
 
                     progress = snapshot_v3_task_result(directory, declaration)
                 else:
@@ -775,7 +770,7 @@ class Runner:
         try:
             declaration = immutable_read(directory / "run.json")
             if declaration.get("protocol_version") == 3:
-                from agent_adapters.v7.task_result import snapshot_v3_task_result
+                from agent_adapters.web.task_result import snapshot_v3_task_result
 
                 progress = snapshot_v3_task_result(directory, declaration)
                 item = next((value for value in progress.get("executions", [])
@@ -846,7 +841,7 @@ class Runner:
                 if (declaration.get('task_run_id') != expected
                         or (declaration.get('contract_version'), declaration.get('execution_profile')) not in {(19,'d8_v19'),(20,'d8_v20'),(21,'d8_v21'),(22,'d8_v22')}):
                     raise ValueError('d9_run_identity_changed')
-                from agent_adapters.v7.task_result import snapshot_v3_task_result
+                from agent_adapters.web.task_result import snapshot_v3_task_result
                 result = snapshot_v3_task_result(agent_dir, declaration)
             except (OSError, ValueError, TypeError, AttributeError):
                 result = {'protocol_version': 3, 'contract_version': (known.get('result') or {})['contract_version'], 'task_run_id': expected,

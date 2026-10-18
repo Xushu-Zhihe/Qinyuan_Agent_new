@@ -21,7 +21,7 @@ from agent_core.operation_accounting import (
 
 if TYPE_CHECKING:
     from MCPs.Mcp_client.client import MCPManager, AgentMCPClient
-    from Sandbox.d8_sandbox_adapter import D8SandboxAdapter
+    from Sandbox.sandbox_adapter import D8SandboxAdapter
     from agent_core.control_store import D4ControlStore
 
 

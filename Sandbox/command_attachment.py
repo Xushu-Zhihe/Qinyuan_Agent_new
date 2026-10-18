@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from Sandbox.task_run_sandbox import TaskRunSandboxError
+from qinyuan_core import CodedError
 
 MAX_T6_ATTACHMENTS = 16
 MAX_T6_INPUT_BYTES = 64 * 1024 * 1024
@@ -180,10 +181,8 @@ def validate_attachment_batch(
                 raise ValueError("attachment_source_size_changed")
 
 
-class T6AttachmentImportError(RuntimeError):
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
+class T6AttachmentImportError(CodedError):
+    pass
 
 
 class T6AttachmentImporter:

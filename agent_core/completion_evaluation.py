@@ -109,6 +109,14 @@ def freeze_evaluation_policy(app, intent_id, support_fact_id, history):
     return {"version": 1, "intent_id": intent_id, "local_goal": app.redactor.redact(intent.description),
         "plan_id": plan.plan_id, "template": binding.template, "observation_mode": binding.observation_mode,
         "capability_scope": "saved_authorized_copy_size_and_sha256_only_not_whole_task_verification",
+        "goal_interpretation": (
+            "local_goal states what this intent must establish, not how to establish "
+            "it. The executed plan may use a different method or template than any "
+            "wording in local_goal; judge whether the saved observation establishes or "
+            "rules out the goal, not whether the execution matches that wording. Use "
+            "inconclusive only when the evidence can neither establish nor rule out the "
+            "goal."
+        ),
         "goal_ref": goal.ref, "support_fact_ref": support.ref,
         "required_observation_refs": [execution.ref, *(i.ref for i in size_items)],
         "sha256_observation": {"proof_id": observed.proof_id, "execution_ref": execution.ref,

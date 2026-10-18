@@ -487,8 +487,12 @@ class ControlStateRepository:
                 if fact.verification_ref.startswith("d3:"):
                     if self._d3_observation_proofs is None:
                         raise StorageError("D3 observation proof evidence is not configured")
+                    # Re-validating an already committed Fact must not require
+                    # its source Plan to still be active: replanning supersedes
+                    # the old Plan while its verified Facts stay valid.
                     proof, evidence = self._d3_observation_proofs.read_verified(
-                        fact.source_ref, fact.verification_ref.removeprefix("d3:")
+                        fact.source_ref, fact.verification_ref.removeprefix("d3:"),
+                        allow_inactive_plan=True,
                     )
                     config = self._store.load_d3_run_config(task_run_id)
                     expected_content = d3_fact_content(proof.proof_id)
@@ -503,12 +507,20 @@ class ControlStateRepository:
                         if not any(r.outcome == "verified_fact" and r.fact_id == fact.fact_id
                                    and r.plan_id == source_plan.plan_id for r in approvals):
                             raise StorageError("D8 observation Fact has no approval record")
+                        # Contracts 21/22 let the accepted review replace the
+                        # observation template with its refined content; the
+                        # stored verified_fact approval is the authority for the
+                        # committed content there, so the template equality is
+                        # relaxed for exactly that pair of contracts.
+                        refined_ok = config.contract_version in {21, 22}
                     if (
                         fact.status is not FactStatus.VERIFIED
                         or proof.intent_id != source_intent.intent_id
                         or proof.turn_id != fact.turn_id
                         or proof.task_run_id != task_run_id
-                        or fact.content != expected_content
+                        or (fact.content != expected_content
+                            and not (config is not None and config.d8_enabled
+                                     and config.contract_version in {21, 22}))
                         or evidence.task_run_id != task_run_id
                     ):
                         raise StorageError("D3 observation Fact proof does not match control state")

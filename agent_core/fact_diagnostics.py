@@ -1,4 +1,4 @@
-"""Contract8 Fact proposal diagnostics; no rejected values or verification grants."""
+﻿"""Contract8 Fact proposal diagnostics; no rejected values or verification grants."""
 
 from dataclasses import asdict
 import math
@@ -13,7 +13,6 @@ ISSUES = {
     "fact_shape_invalid": ("$", "declared_fields", "invalid"),
     "fact_kind_invalid": ("$/kind", "candidate_or_request_review", "invalid"),
     "fact_content_invalid": ("$/content", "nonempty_text_without_nul", "invalid"),
-    # Retained for reading historical diagnostics; new candidate content has no field limit.
     "fact_content_too_long": ("$/content", "at_most_256_unicode_characters", "over_limit"),
     "fact_reason_invalid": ("$/reason", "nonempty_text_without_nul", "invalid"),
     "fact_reason_too_long": ("$/reason", "at_most_512_unicode_characters", "over_limit"),
@@ -60,7 +59,7 @@ def proposal_issues(raw):
             result.append(issue("fact_kind_invalid"))
         if set(raw) != {"kind", "content", "reason", "evidence_refs", "assertion"}:
             result.append(issue("fact_shape_invalid"))
-        text("content")
+        text("content", 256)
         refs = raw.get("evidence_refs")
         if not isinstance(refs, (list, tuple)) or not 1 <= len(refs) <= 8:
             result.append(issue("fact_evidence_count_invalid"))

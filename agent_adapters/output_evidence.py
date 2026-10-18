@@ -29,6 +29,7 @@ SAFE_HTTP_ERROR_CODES = frozenset({
     "d7_http_response_headers_too_large", "d20_http_cookie_owner_changed",
     "d20_http_cookie_snapshot_invalid", "d8_frozen_configuration_mismatch",
     "d20_http_failure_diagnostic_invalid",
+    "docker_unavailable", "docker_permission_denied",
 })
 SAFE_MODEL_ERROR_CODES = SAFE_HTTP_ERROR_CODES | frozenset({
     "d3_review_provider_failure", "d3_review_call_outcome_unknown", "d4_review_dispatch_stopped",
@@ -53,6 +54,14 @@ def safe_model_error_code(value):
     return "model_call_failed"
 
 
+def _leading_errno(error):
+    """Return a leading Windows errno from tuple-shaped exception args, else None."""
+    args = getattr(error, "args", ())
+    if args and isinstance(args[0], tuple) and args[0] and isinstance(args[0][0], int):
+        return args[0][0]
+    return None
+
+
 def safe_failure_details(error):
     """Describe a bounded exception chain without persisting exception text."""
     kinds, codes, seen = [], [], set()
@@ -64,6 +73,13 @@ def safe_failure_details(error):
         if len(current.args) == 1 and isinstance(current.args[0], str):
             code = current.args[0]
             if code in SAFE_HTTP_ERROR_CODES and code not in codes:
+                codes.append(code)
+        if name == "DockerException":
+            # A Docker failure is infrastructure, not model text: keep one
+            # stable code so the operator can tell it from a model failure.
+            code = ("docker_permission_denied"
+                    if _leading_errno(current) == 5 else "docker_unavailable")
+            if code not in codes:
                 codes.append(code)
         current = current.__cause__ or current.__context__
     return {"exception_types": kinds, "error_codes": codes}

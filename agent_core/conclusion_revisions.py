@@ -7,7 +7,7 @@ from agent_core.conclusion_revision_contracts import (
     D8ChangeDecision, D8ChangeRequest, D8ConclusionChange,
     D8PriorChange, D8RevisionHistoryItem, D8RevisionRecord,
 )
-from agent_core.domain import IntentStatus
+from agent_core.domain import FactStatus, IntentStatus
 from agent_core.dual_llm_contracts import D3RecoveryRequired
 from agent_core.handoff_contracts import D8HistoryItem, handoff_json
 from agent_core.modeling import ModelError, ModelErrorKind
@@ -372,7 +372,20 @@ class ConclusionRevisions:
                 result = self.store.load_d3_plan_result(plans[-1].plan_id)
                 if result is not None and result.supporting_fact_id:
                     item = by_id.get(result.supporting_fact_id)
-                    required.append(item.ref if item else "missing")
+                    if item is not None:
+                        required.append(item.ref)
+                    elif not any(
+                        f.fact_id == result.supporting_fact_id
+                        and f.status is FactStatus.VERIFIED
+                        for f in self.store.load_control_state_rows(
+                            self.state.task_run.task_run_id).facts
+                    ):
+                        # A fact committed in this same step is not in the
+                        # history index yet; only a fact that is neither indexed
+                        # nor verified leaves the requirement unmet. The
+                        # committed state is authoritative here because the
+                        # in-memory snapshot predates the commit.
+                        required.append("missing")
             turn = turns[intent.turn_id]
             while turn.parent_turn_id:
                 trigger = turn.triggering_intent_id

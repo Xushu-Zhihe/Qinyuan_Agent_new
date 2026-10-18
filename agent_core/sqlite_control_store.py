@@ -61,7 +61,7 @@ from agent_core.control_store import (
     task_request_payload,
     validate_control_event,
 )
-from agent_core.v7.web_contracts import (
+from agent_core.web_contracts import (
     D7WebExecutionRecord,
     D7WebPlanRecord,
     D7WebRunConfig,
@@ -4930,6 +4930,9 @@ class SqliteControlStore:
                 (IntentStatus.PENDING, IntentStatus.SKIPPED): {"complete_d3_turn", "advance_d3_turn"},
                 (IntentStatus.RUNNING, IntentStatus.SUCCEEDED): {"complete_d3_intent"},
                 (IntentStatus.RUNNING, IntentStatus.ABANDONED): {"switch_d3_intent", "advance_d3_turn", "abandon_d8_intent"},
+                # An inconclusive evaluation is not a dead end: the outer review
+                # may reopen the Intent so fully automatic exploration continues.
+                (IntentStatus.INCONCLUSIVE, IntentStatus.RUNNING): {"reopen_d8_intent"},
             },
             "plan": {
                 (PlanStatus.RUNNING, PlanStatus.COMPLETED): {"complete_d3_plan"},
@@ -5777,13 +5780,30 @@ class SqliteControlStore:
             observed_at=float(row["observed_at"]),
         )
 
+    def _allow_empty_target(self, task_run_id: str) -> bool:
+        """目标是否允许为空，只取决于授权附件列表。
+
+        以前这里调用 load_d3_run_config 解码整份 D3/D5 契约，配置一旦损坏
+        （例如缺少 d5_sensitive_requirements），连任务主表都读不出来。
+        这里只取一个字段；任何解码异常都按「不允许」处理，只会让校验更严。
+        """
+
+        row = self._connection.execute(
+            "SELECT config_json FROM d3_runs WHERE task_run_id = ?",
+            (task_run_id,),
+        ).fetchone()
+        if row is None or row["config_json"] is None:
+            return False
+        try:
+            config = json.loads(row["config_json"])
+            indices = config["authorization"]["attachment_indices"]
+        except (KeyError, TypeError, ValueError):
+            return False
+        return isinstance(indices, list) and len(indices) == 0
+
     def _decode_task_run(self, row: sqlite3.Row) -> TaskRunSnapshot:
         request_value = json.loads(row["request_json"])
-        d3_config = self.load_d3_run_config(row["task_run_id"])
-        allow_empty_target = (
-            d3_config is not None
-            and d3_config.authorization.attachment_indices == ()
-        )
+        allow_empty_target = self._allow_empty_target(row["task_run_id"])
         request = TaskRequest.from_dict(
             request_value, allow_empty_target=allow_empty_target
         )

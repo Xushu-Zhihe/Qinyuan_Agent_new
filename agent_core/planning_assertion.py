@@ -253,7 +253,7 @@ class PlanningAssertionBindings:
                             kept.append({k: candidate[k] for k in ("description", "intent_type")})
                     parse_d3_turn_proposal({"turn_target": raw["turn_target"],
                                            "completion_rule": raw["completion_rule"], "intents": kept},
-                                          maximum=None if self.config.contract_version == 22 else 2)
+                                          maximum=None)
             except (ValueError, TypeError, KeyError) as exc:
                 raise D3RecoveryRequired("s2_saved_planning_business_invalid") from exc
         return record

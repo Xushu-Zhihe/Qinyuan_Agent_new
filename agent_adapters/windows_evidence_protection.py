@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from ctypes import wintypes as w
 from pathlib import Path
+from qinyuan_core import CodedError
 
 _TOKEN_QUERY = 0x0008
 _READ_CONTROL = 0x00020000
@@ -27,12 +28,8 @@ _INHERIT_FLAGS = 0x03  # OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
 _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
 
-class WindowsEvidenceProtectionError(RuntimeError):
+class WindowsEvidenceProtectionError(CodedError):
     """A fixed error code which is safe for an ordinary diagnostic channel."""
-
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
 
 
 class _Blob(c.Structure):

@@ -30,6 +30,7 @@ from agent_adapters.run_files import (
 from agent_adapters.simulated_runtime import validate_fixture
 from agent_core.attachment_import import AttachmentImportRejected
 from agent_core.runtime import TERMINAL_STATUSES
+from qinyuan_core import classify, configure, get_logger
 
 
 def snapshot_result(*args, **kwargs):
@@ -146,7 +147,7 @@ def _snapshot(directory, declaration):
 
 def _snapshot_v3(directory: Path, declaration: dict) -> dict:
     """Read the v3 TaskRun result through its versioned result adapter."""
-    from agent_adapters.v7.task_result import snapshot_v3_task_result
+    from agent_adapters.web.task_result import snapshot_v3_task_result
 
     return snapshot_v3_task_result(directory, declaration)
 
@@ -273,7 +274,7 @@ def _status_by_request_id(args) -> dict:
     if parsed is None or parsed.version != 4 or str(parsed) != request_id:
         return _request_status_error(request_id, "request_id_invalid", 2)
 
-    from agent_adapters.v7.request_staging import (
+    from agent_adapters.web.request_staging import (
         D7RequestStager,
         RequestStagingError,
     )
@@ -699,8 +700,8 @@ def dispatch(args):
         except LookupError as exc:
             raise ValueError("d7_candidate_view_terminal_encoding_unsupported") from exc
         directory, _declaration = _candidate_read_run_directory(args)
-        from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceService
-        from agent_adapters.v7.candidate_operator_view import (
+        from agent_adapters.web.candidate_evidence import D7CandidateEvidenceService
+        from agent_adapters.web.candidate_operator_view import (
             D7CandidateOperatorViewer,
             OPERATOR_CANDIDATE_VIEW_ADAPTER_ID,
         )
@@ -944,6 +945,13 @@ def dispatch(args):
 
 
 def main(argv=None):
+    # CLI 的 stdout 是 JSON、stderr 必须为空。日志默认完全静默，
+    # 要排查问题再显式打开：QY_LOG_JSONL=<path> 或 QY_LOG_CONSOLE=1。
+    configure(
+        level=os.environ.get("QY_LOG_LEVEL", "WARNING"),
+        console=bool(os.environ.get("QY_LOG_CONSOLE")),
+        jsonl=os.environ.get("QY_LOG_JSONL"),
+    )
     try:
         result = dispatch(parser().parse_args(argv))
         if result is None:
@@ -954,11 +962,19 @@ def main(argv=None):
         result = base_result()
         result["errors"].append({"code": "interrupted_before_run_started"})
     except Exception as exc:  # noqa: BLE001 -- sanitized CLI/process boundary
+        category, code, retryable = classify(exc)
+        get_logger("ctrl").error(
+            "cli.unhandled",
+            code=code,
+            category=str(category),
+            retryable=retryable,
+            exc=type(exc).__name__,
+        )
         from agent_adapters.application import base_result, safe_error
 
         from agent_adapters.protected_evidence import ProtectedEvidenceError
-        from agent_adapters.v7.candidate_evidence import D7CandidateEvidenceError
-        from agent_adapters.v7.candidate_operator_view import (
+        from agent_adapters.web.candidate_evidence import D7CandidateEvidenceError
+        from agent_adapters.web.candidate_operator_view import (
             D7CandidateOperatorViewError,
         )
 

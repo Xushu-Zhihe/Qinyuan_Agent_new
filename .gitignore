@@ -1,180 +1,63 @@
+# ---- 本地环境 ----
+.env
+.env.*.local
+.venv/
+venv/
+.uv-cache/
+.vscode
+.claude
+
+# ---- Python 缓存与打包产物 ----
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+/build/
+/dist/
+/dist-final/
+
+# ---- 测试与运行产物：统一按前缀忽略，不再逐个文件放行 ----
+/.test/
+/.test-temp-*/
+/.test-work/
+/test-artifacts/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+/.coverage
+/.coverage.*
+/coverage.xml
+/htmlcov/
+/tests/.runtime-work*/
+/tests/.test/
+/tests/.test-work/
+/tests/.sandbox-work/
+/tests/.stage-work/
+/tests/.cancel-work/
+/tests/.d7-*/
+/tests/.workbench-*/
+# pytest 在 TEMP 不可写时会退回 rootdir 建临时目录
+/pytest-of-*/
+
+# ---- 本地数据与运行目录 ----
+/challenge/
+/work/
+/workbench_data/
+runner-smoke-data
+
+# ---- 根目录示意图（保留在本地，不进仓库）----
 架构图.svg
 流程图.svg
 Qinyuan_agent架构图.svg
 Qinyuan_Agent流程图.svg
 Qinyuan_Agent_confirmed_flow.svg
+Qinyuan_Agent_dual_llm_flow.svg
 
-.vscode
-.env
-
-# Local Python environments and dependency caches
-.venv/
-venv/
-.uv-cache/
-
-# Test and runtime workspaces
-/.test/
-/.test-temp-*/
-/.test-work/
-/challenge/
-/work/
-/workbench_data/
-/tests/.test-work/
-/tests/.runtime-work/
-/tests/.sandbox-work/
-/tests/.stage-work/
-/tests/.cancel-work/
-
-# Python caches and compiled files
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-
-# Packaging output
-/build/
-/dist/
-/dist-final/
-
-.test
-tests
-!/tests/
-/tests/*
-!/tests/test_d8_revisions.py
-!/tests/test_d8_sessions.py
-!/tests/test_d8_output.py
-!/tests/test_t5_cli.py
-!/tests/test_t5_adapters.py
-!/tests/test_t5_recovery.py
-!/tests/test_workbench.py
-!/tests/test_workbench_runner.py
-!/tests/test_workbench_progress.py
-!/tests/test_t6_sandbox.py
-!/tests/test_t6_attachment.py
-!/tests/test_t6_import_journal.py
-!/tests/test_t6_command.py
-!/tests/test_t6_command_gateway.py
-!/tests/test_t6_command_runtime.py
-!/tests/test_t6_postconditions.py
-!/tests/test_t6_observation_fact.py
-!/tests/test_t6_file_digest.py
-!/tests/test_t6_network.py
-!/tests/test_t6_intent_generation.py
-!/tests/test_t6_action_model.py
-!/tests/test_t6_action_invocation.py
-!/tests/test_run_supervisor.py
-!/tests/test_task_application.py
-!/tests/test_task_cli.py
-!/tests/test_d7_cli_compatibility.py
-!/tests/test_d7_candidate_cli.py
-!/tests/test_d7_candidate_operator_view.py
-!/tests/test_d7_candidate_stage.py
-!/tests/test_d7_conflict_check.py
-!/tests/test_d7_request_status.py
-!/tests/test_d7_run_outcome.py
-!/tests/test_goal_feedback.py
-!/tests/test_d7_turn_budget.py
-!/tests/test_d7_controller_lifecycle.py
-!/tests/test_d7_candidate_evidence.py
-!/tests/test_d7_request_staging.py
-!/tests/test_d7_workbench_v3.py
-!/tests/test_d7_workbench_real.py
-!/tests/test_d7_task_result.py
-!/tests/test_d7_fake_judge.py
-!/tests/d7_fake_judge_fixture.py
-!/tests/test_d7_fake_judge_chain.py
-!/tests/test_d7_cli_fake_judge_integration.py
-!/tests/test_d7_next_turn.py
-!/tests/test_d7_http_adapter.py
-!/tests/test_d7_sandbox_http.py
-!/tests/test_d1_chain.py
-!/tests/test_d1_workspace.py
-!/tests/test_d1_persistence.py
-!/tests/test_d1_modeling.py
-!/tests/test_d2_action_envelope.py
-!/tests/test_d2_review.py
-!/tests/test_d2_chain.py
-!/tests/test_d2_control_store.py
-!/tests/test_d3_chain.py
-!/tests/test_d3_candidate_action.py
-!/tests/test_d3_candidate_stage.py
-!/tests/test_d4_budget.py
-!/tests/test_d4_chain.py
-!/tests/test_d4_lifecycle.py
-!/tests/test_d8_conclusion_review.py
-!/tests/test_d8_handoff.py
-!/tests/test_d6_core_slice.py
-!/tests/test_d6_execution_authorization.py
-!/tests/test_d6_windows_protection.py
-!/tests/test_d6_transfer.py
-!/tests/test_d6_sensitive_evidence.py
-!/tests/test_d9_public.py
-!/tests/test_d9_models.py
-!/tests/test_d9_business_diagnostics.py
+# ---- 仅本地保留的契约文档与计划 ----
 Architecture.md
 interface.md
 protocol.md
 restrict.md
-
-runner-smoke-data
-.claude
-Qinyuan_Agent_dual_llm_flow.svg
 TODO.md
-.uv-cache
-Plan
-
-# Local analysis and test caches
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.hypothesis/
-
-# Coverage reports
-/.coverage
-/.coverage.*
-/coverage.xml
-/htmlcov/
-
-# Local environment overrides
-.env.local
-.env.*.local
-
-# D9-2 Fact diagnostics and event export regression tests
-!tests/test_d9_fact_diagnostics.py
-!tests/test_d9_event_export.py
-!tests/test_d9_review_contract.py
-!tests/test_d9_fact_sources.py
-
-# S1 fixed probe contract and recovery regression tests
-!tests/test_s1_fixed_probe.py
-
-# S2 planning/assertion contract and recovery regression tests
-!tests/test_s2_planning_assertion.py
-
-# S3 progress review contract and recovery regression tests
-!tests/test_s3_progress_review.py
-
-# S4 completion, evaluation and protected candidate regression tests
-!tests/test_s4_completion_evaluation.py
-
-# S5 governance, history and summary selection regression tests
-!tests/test_s5_governance_selection.py
-
-# S5 summary rejection and recovery regression tests
-!tests/test_s5_summary_rejection.py
-
-# S6 rule consistency, trusted review projection and reason-length regression
-!tests/test_s6_rule_evidence.py
-
-# D9-3 fixed Docker boundaries and explicitly gated real-container acceptance
-!tests/test_d9_docker.py
-!tests/test_d9_docker_live.py
-
-# D9-4 candidate checkpoints and trusted feedback/public operations
-!tests/test_d9_feedback.py
-!tests/test_d9_feedback_public.py
-
-# D8 HTTP public wiring and protected session recovery
-!tests/test_d20_http.py
-!tests/test_d20_public.py
-!/tests/test_d22_schemas.py
+Plan/

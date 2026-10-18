@@ -4,13 +4,23 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Iterable, Mapping, Protocol
 
-
-class DomainError(ValueError):
-    """Raised when a confirmed core-domain contract is violated."""
+from qinyuan_core import Category, Layer, QinyuanError
 
 
-class DomainTransitionError(RuntimeError):
-    """Raised when a domain operation is invalid in the current state."""
+class DomainError(QinyuanError, ValueError):
+    """领域契约被违反（数据形状不对），重试无意义。"""
+
+    category = Category.INPUT
+    layer = Layer.CTRL
+    code = "domain.invalid"
+
+
+class DomainTransitionError(QinyuanError, RuntimeError):
+    """当前状态下不允许的领域操作，需重新读取状态再判断。"""
+
+    category = Category.CONFLICT
+    layer = Layer.CTRL
+    code = "domain.transition"
 
 
 class TurnStatus(StrEnum):

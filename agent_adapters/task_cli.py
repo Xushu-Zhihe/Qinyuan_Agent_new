@@ -36,18 +36,18 @@ def _dispatch_v3_run_task(args, raw):
     request staging and capability rejection observable even when the full
     D3 simulator is unavailable.
     """
-    from agent_adapters.v7.request_contract import V3SimulationRequest
-    from agent_adapters.v7.request_staging import D7RequestStager
+    from agent_adapters.web.request_contract import V3SimulationRequest
+    from agent_adapters.web.request_staging import D7RequestStager
 
     if "execution_profile" in raw:
-        from agent_adapters.d8_simulation import parse_request
+        from agent_adapters.simulation import parse_request
         request, _ = parse_request(raw)
     else:
         request = V3SimulationRequest.parse(raw)
     d8_real = raw.get("execution_profile") in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} and raw.get("mode") == "real"
     env_file = None
     if d8_real:
-        from agent_adapters.d8_model import settings_from_file
+        from agent_adapters.deepseek_roles import settings_from_file
         if getattr(args, "fixture", None):
             raise ValueError("fixture_forbidden_in_real_mode")
     state_dir = Path(args.state_dir).resolve()
@@ -106,7 +106,7 @@ def _dispatch_v3_run_task(args, raw):
             or declaration.get("request_id") != request.request_id
         ):
             raise ValueError("request_task_run_binding_mismatch")
-        from agent_adapters.v7.task_result import snapshot_v3_task_result
+        from agent_adapters.web.task_result import snapshot_v3_task_result
 
         result = snapshot_v3_task_result(directory, declaration)
         result["request_id"] = request.request_id
@@ -177,9 +177,9 @@ def _dispatch_v3_run_task(args, raw):
     if "execution_profile" in raw:
         declaration.update(execution_profile=raw["execution_profile"],
                            contract_version=int(raw["execution_profile"].removeprefix("d8_v")))
-        declaration["capabilities"] = ["attachment_digest_only", "d8_simulation"]
+        declaration["capabilities"] = ["attachment_digest_only", "simulation"]
     if d8_real:
-        from agent_adapters.d8_simulation import real_declaration_binding
+        from agent_adapters.simulation import real_declaration_binding
         backend = raw["d8_config"]["sandbox_backend"]
         declaration.update(env_file=str(env_file), sandbox_backend=backend)
         declaration["capabilities"] = ["attachment_digest_only", "d8_real_models",
@@ -213,7 +213,7 @@ def _dispatch_v3_run_task(args, raw):
         except Exception:
             pass  # Unknown state must not be reported as a confirmed startup failure.
         phase = "execution" if started is True else "start" if started is False else "dispatch"
-        prefix = ("d8_real" if d8_real else "d8_simulation" if "execution_profile" in raw
+        prefix = ("d8_real" if d8_real else "simulation" if "execution_profile" in raw
                   else "d7_simulation")
         error_code = f"{prefix}_{phase}_failed"
         failure = {"code": error_code, "phase": phase, **safe_failure_details(exc)}
@@ -221,7 +221,7 @@ def _dispatch_v3_run_task(args, raw):
             directory / ("dispatch-stop-" + str(uuid4()) + ".json"),
             {"stop": "recovery_required", "reason": error_code, "diagnostic": failure},
         )
-        from agent_adapters.v7.task_result import snapshot_v3_task_result
+        from agent_adapters.web.task_result import snapshot_v3_task_result
 
         result = snapshot_v3_task_result(directory, declaration)
         result.setdefault("errors", []).append(failure)
@@ -369,7 +369,7 @@ def _finish_event_export(exporter) -> tuple[int, str | None]:
 def _run_v3_simulated_operation(
     directory: Path, declaration: dict, *, operation: str, events: str | None
 ) -> dict:
-    from agent_adapters.v7.simulated_application import run_simulated_task
+    from agent_adapters.web.simulated_application import run_simulated_task
 
     if not events:
         return run_simulated_task(directory, declaration, operation=operation)
@@ -400,12 +400,12 @@ def _run_v3_simulated_operation(
 
 def _d7_web_settings(declaration: dict):
     """Load v3 Web credentials from its frozen local env-file reference."""
-    from agent_adapters.v7.model_adapter import (
+    from agent_adapters.web.model_adapter import (
         _settings_from_env_file,
         d7_model_transport_config_ref,
     )
-    from agent_adapters.v7.web_request import D7WebRequest
-    from agent_core.v7.web_contracts import D7WebRunConfig
+    from agent_adapters.web.web_request import D7WebRequest
+    from agent_core.web_contracts import D7WebRunConfig
 
     request = D7WebRequest.parse(declaration["request"])
     env_file = Path(declaration["env_file"])
@@ -426,8 +426,8 @@ def _run_v3_web_operation(
     operation: str,
     events: str | None,
 ) -> dict:
-    from agent_adapters.v7.task_result import snapshot_v3_task_result
-    from agent_adapters.v7.web_application import run_d7_web_task
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    from agent_adapters.web.web_application import run_d7_web_task
     from agent_adapters.event_export import EventExporter
 
     settings = (
@@ -493,10 +493,10 @@ def _run_v3_web_operation(
 
 
 def _dispatch_v3_real_run_task(args, raw: dict) -> dict:
-    from agent_adapters.v7.model_adapter import d7_model_transport_config_ref
-    from agent_adapters.v7.request_staging import D7RequestStager
-    from agent_adapters.v7.web_request import D7WebRequest
-    from agent_adapters.v7.task_result import snapshot_v3_task_result
+    from agent_adapters.web.model_adapter import d7_model_transport_config_ref
+    from agent_adapters.web.request_staging import D7RequestStager
+    from agent_adapters.web.web_request import D7WebRequest
+    from agent_adapters.web.task_result import snapshot_v3_task_result
 
     if args.fixture:
         raise ValueError("fixture_forbidden_in_real_mode")
@@ -506,7 +506,7 @@ def _dispatch_v3_real_run_task(args, raw: dict) -> dict:
         raise ValueError("d7_model_configuration_unavailable")
     transport_ref = d7_model_transport_config_ref(env_file)
     # Validate credentials and provider settings before creating durable run state.
-    from agent_adapters.v7.model_adapter import _settings_from_env_file
+    from agent_adapters.web.model_adapter import _settings_from_env_file
 
     _settings_from_env_file(request.outer_role, env_file)
     _settings_from_env_file(request.inner_role, env_file)
@@ -608,7 +608,7 @@ def dispatch_run_task(args):
             if set(raw) == {"protocol_version"}:
                 raise ValueError("protocol_v3_not_supported")
             if "execution_profile" in raw:
-                from agent_adapters.d8_simulation import parse_request
+                from agent_adapters.simulation import parse_request
                 parse_request(raw)
                 if raw["mode"] != args.mode:
                     raise ValueError("d8_mode_mismatch")
@@ -752,7 +752,7 @@ def dispatch_v3_existing(args, directory: Path, declaration: dict):
     read of an already terminal run is idempotent; an in-flight mutation is
     reported as requiring recovery rather than redispatched blindly.
     """
-    from agent_adapters.v7.task_result import snapshot_v3_task_result
+    from agent_adapters.web.task_result import snapshot_v3_task_result
     from agent_adapters.event_export import read_events
 
     task_id = declaration["task_run_id"]
