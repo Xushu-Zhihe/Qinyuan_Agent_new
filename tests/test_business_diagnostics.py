@@ -83,7 +83,7 @@ def test_rejection_is_safe_bound_corrected_once_and_applied(tmp_path, monkeypatc
     assert "PRIVATE_REJECTED_VALUE" not in json.dumps(asdict(correction))
     directory = args.state_dir / result["task_run_id"]
     with SqliteControlStore.open_readonly(directory / "control.sqlite") as store:
-        assert store._schema_version == CURRENT_SCHEMA_VERSION == 27
+        assert store._schema_version == CURRENT_SCHEMA_VERSION
         assert store.load_d3_run_config(result["task_run_id"]).contract_version == 7
     for path in (directory / "d8-output").glob("*business-diagnostic*.json"):
         text = path.read_text()

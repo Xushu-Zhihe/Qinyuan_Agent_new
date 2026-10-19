@@ -62,6 +62,13 @@ class ProbeAction:
 
 
 @dataclass(frozen=True, slots=True)
+class MCPCall:
+    """One rolling tool selection; identity and Sandbox are supplied by code."""
+    tool_name: str
+    arguments: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class MCPToolCall:
     """
     Single MCP tool invocation within a Plan.

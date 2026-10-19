@@ -22,11 +22,14 @@ def policy_for(request):
             or len(set(context.reusable_proof_ids)) != len(context.reusable_proof_ids)):
         raise D3RecoveryRequired('s6_plan_context_invalid')
     ordinal = len(context.prior_plan_ids) + 1
-    if ordinal not in {1, 2} or ordinal == 1 and context.reusable_proof_ids:
+    import json
+    context_packet = json.loads(getattr(request, "history_context", "") or "{}")
+    rolling = "completion_facts" in context_packet or "intent_execution" in context_packet
+    if ordinal not in {1, 2} and not rolling or ordinal == 1 and context.reusable_proof_ids:
         raise D3RecoveryRequired('s6_plan_choices_unavailable')
     template = 'size_then_sha256' if ordinal == 1 else 'sha256_only'
     choices = [{'template': template, 'observation_mode': 'new_observation', 'source_proof_id': None}]
-    if ordinal == 2:
+    if ordinal == 2 or rolling:
         choices += [{'template': template, 'observation_mode': 'reuse_saved_proof', 'source_proof_id': ref}
                     for ref in context.reusable_proof_ids]
     if getattr(request, 'history_context', ''):

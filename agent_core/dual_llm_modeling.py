@@ -125,6 +125,18 @@ class D3PlanProposal:
 
 
 def parse_d3_plan_proposal(raw: object) -> D3PlanProposal:
+    if isinstance(raw, dict) and raw.get("kind") == "request_completion":
+        from agent_core.actions import CompleteIntentAction
+        if set(raw) != {"kind", "fact_id"} or not isinstance(raw["fact_id"], str):
+            raise D3ProposalRejected("d22_completion_selection_invalid", structural=True)
+        return CompleteIntentAction((raw["fact_id"],))
+    if isinstance(raw, dict) and raw.get("kind") == "mcp_call":
+        from agent_core.actions import MCPCall
+        if (set(raw) != {"kind", "tool_name", "arguments"}
+                or not isinstance(raw["tool_name"], str) or not raw["tool_name"]
+                or not isinstance(raw["arguments"], dict)):
+            raise D3ProposalRejected("mcp.call_structure_invalid", structural=True)
+        return MCPCall(raw["tool_name"], raw["arguments"])
     if isinstance(raw, dict) and raw.get('kind') == 'attachment_observation':
         from agent_core.hybrid_contracts import AttachmentPlanProposal
         return AttachmentPlanProposal(**raw)
@@ -386,7 +398,7 @@ class D3CandidateContext:
             or self.plan_result.plan_id != self.plan_binding.plan_id
             or self.plan_result.artifact_version_id
             != self.plan_binding.artifact_version_id
-            or self.plan_result.outcome != "satisfied"
+            or self.plan_result.outcome not in {"satisfied", "no_new_information"}
         ):
             raise ValueError("D3 candidate provenance binding is inconsistent")
 
@@ -540,6 +552,23 @@ class D3AuditedModel:
             if change is not None:
                 return change
         if request.stage == "inner_plan":
+            if self.config.intent_execution_policy and isinstance(raw, dict) and raw.get("kind") == "intent_resolution":
+                from agent_core.intent_execution import parse_resolution
+                try:
+                    return parse_resolution(raw, request)
+                except (ValueError, TypeError) as exc:
+                    import os as _os
+                    if _os.environ.get("QINYUAN_DEBUG_TRACE"):
+                        import json as _json
+                        import sys as _sys
+                        print("[trace] resolution.rejected", str(exc)[:120],
+                              "keys=" + ",".join(sorted(raw)),
+                              "outcome=" + str(raw.get("outcome")),
+                              "refs=" + str(len(raw.get("evidence_refs") or [])),
+                              "facts=" + str(len(raw.get("fact_ids") or [])),
+                              "cands=" + str(len(raw.get("next_intent_candidates") or [])),
+                              file=_sys.stderr, flush=True)
+                    raise D3ProposalRejected("d22_resolution_invalid", structural=True) from exc
             if self.config.contract_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 try:
                     read = D8HistoryReadAction.parse(raw)

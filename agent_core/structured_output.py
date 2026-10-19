@@ -87,6 +87,14 @@ class StructuredOutput:
                  "reason": "output_format_invalid" if diagnostic is not None else "proposal_rejected",
                  "issues": diagnostic["issues"] if diagnostic is not None else []}
         contract = self.evidence.read("contract", correction)
+        if self.app.config.intent_execution_policy and contract is not None and contract["stage"] == "inner_plan" and diagnostic is None:
+            rejection = self.app.model_evidence.read_rejection(correction)
+            paths = {"d22_strategy_stop_summary_required": "$/outcome",
+                     "d22_resolution_source_unavailable": "$/evidence_refs",
+                     "d22_resolution_fact_not_effective": "$/fact_ids"}
+            if rejection is not None and rejection.code in paths:
+                error.update(reason=rejection.code, issues=[{"code": "json_value_invalid",
+                    "path": paths[rejection.code], "expected": "allowed_choice", "actual": "invalid"}])
         diagnostics = (getattr(self.app, "evaluation_bindings", None)
                        if contract is not None and contract["stage"] == "intent_evaluation" and self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}
                        else getattr(self.app, "review_diagnostics", None) if contract is not None and (
@@ -127,7 +135,13 @@ class StructuredOutput:
         policy = (self.app.config.handoff_config.inner_capacity
                   if record["role_config_ref"] == self.app.config.inner_role.role_config_ref
                   else self.app.config.handoff_config.outer_capacity)
-        if not self.app.handoff.capacity_port.fits(envelope, policy):
+        fits = self.app.handoff.capacity_port.fits(envelope, policy)
+        measurement = getattr(self.app.handoff.capacity_port, "last_measurement", None)
+        if self.app.config.intent_execution_policy and measurement is not None:
+            self.evidence.save("input-measurement", record["model_request_id"],
+                {"task_run_id": record["task_run_id"], "model_request_id": record["model_request_id"],
+                 "stage": record["stage"], "fits": fits, **measurement})
+        if not fits:
             raise D3RecoveryRequired("d8_output_complete_request_capacity_paused")
         self.evidence.save("contract", record["model_request_id"], record)
         if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:

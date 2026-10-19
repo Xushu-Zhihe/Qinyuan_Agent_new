@@ -115,6 +115,9 @@ class D3EvidenceValidator:
         if config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and operation.application_ref is None:
             self.handoff.app.revisions.validate_frozen_execution(request_id)
         if stage == "inner_plan":
+            if config.intent_execution_policy and isinstance(evidence.raw, dict) and evidence.raw.get("kind") == "intent_resolution":
+                from agent_core.intent_execution import parse_saved_resolution
+                return parse_saved_resolution(self.handoff.app, request_id, evidence.raw)
             return parse_d3_plan_proposal(evidence.raw)
         if config.contract_version in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and stage == "inner_complete":
             from agent_core.dual_llm_modeling import parse_session_completion
@@ -316,6 +319,9 @@ class D3EvidenceValidator:
             raise D3RecoveryRequired("d3_support_proof_missing")
         checked, _ = self.proofs.read_verified(proof.source_execution_id, proof_id)
         fact = next((item for item in state.facts if item.fact_id == fact_id), None)
+        if (fact is not None and self.conclusions is not None and self.conclusions.config.contract_version == 22
+                and (fact.source_ref != proof.source_execution_id or fact.verification_ref != f"d3:{proof_id}")):
+            return self.conclusions.check_support(state, binding, proof_id, fact_id)
         original = self.ledger.load_d3_plan_result(proof.plan_id)
         expected_content = self._fact_content(proof_id, state.task_run.task_run_id)
         if (
@@ -520,6 +526,8 @@ class D3EvidenceValidator:
             for receipt in self.workspace.list_shares(mutation.task_run_id)
             if receipt.claim.target_intent_id == binding.intent_id
         )
+        rolling = bool(self.ledger.load_d3_run_config(mutation.task_run_id).intent_execution_policy
+                       and prior and prior[-1].status is PlanStatus.COMPLETED and binding.replan_review_id is None)
         if (
             not isinstance(proposal, D3PlanProposal)
             or turn is None
@@ -550,10 +558,20 @@ class D3EvidenceValidator:
             or (not prior and binding.template != "size_then_sha256")
             or (prior and binding.template != "sha256_only")
             or (not prior and binding.replan_review_id is not None)
-            or (prior and binding.replan_review_id is None)
+            or (prior and binding.replan_review_id is None and not rolling)
         ):
             raise D3RecoveryRequired("d3_plan_proposal_owner_mismatch")
-        if prior:
+        continuation = (self.conclusions is not None and self.conclusions.config.contract_version == 22 and prior
+            and self.ledger.load_d3_plan_result(prior[-1].plan_id) is not None
+            and self.ledger.load_d3_plan_result(prior[-1].plan_id).outcome == "no_new_information")
+        if rolling:
+            pass
+        elif continuation:
+            if not any(r.plan_id == prior[-1].plan_id and r.outcome == "no_new_information"
+                       and r.review_request_id == binding.replan_review_id
+                       for r in self.ledger.list_d8_conclusions(mutation.task_run_id)):
+                raise D3RecoveryRequired("d22_continuation_not_approved")
+        elif prior:
             review_id = binding.replan_review_id
             if review_id is None:
                 raise D3RecoveryRequired("d3_replan_review_unavailable")
@@ -791,6 +809,38 @@ class D3EvidenceValidator:
     def _complete_plan(self, mutation: ControlMutation, state) -> None:
         result = mutation.d3.plan_result if mutation.d3 is not None else None
         binding = self.ledger.load_d3_plan_binding(result.plan_id) if result else None
+        if result is not None and result.outcome == "observed":
+            config = self.ledger.load_d3_run_config(mutation.task_run_id)
+            if not config.intent_execution_policy or binding is None or binding.observation_mode != "new_observation":
+                raise D3RecoveryRequired("d22_observed_result_not_enabled")
+            source = self.conclusions.observation(result.proof_id)
+            for record in mutation.state_changes:
+                if isinstance(record, D8Conclusion):
+                    self.conclusions.validate_record(record, state)
+            receipt = self.workspace.read_digest(result.observation_id)
+            if (source.plan_id != binding.plan_id or source.intent_id != binding.intent_id
+                    or source.observation_id != result.observation_id or receipt is None
+                    or result.evidence_sha256 != digest(asdict(receipt))
+                    or result.artifact_version_id != binding.artifact_version_id
+                    or result.supporting_fact_id is not None
+                    or any(isinstance(c, UpsertFact) for c in mutation.state_changes)):
+                raise D3RecoveryRequired("d22_observed_result_source_changed")
+            return
+        if result is not None and binding is not None and self.conclusions is not None and self.conclusions.config.contract_version == 22:
+            records = [c for c in mutation.state_changes if isinstance(c, D8Conclusion)]
+            reused = (result.supporting_fact_id is not None and any(f.fact_id == result.supporting_fact_id for f in state.facts))
+            if result.outcome == "no_new_information" or reused:
+                if len(records) != 1 or any(isinstance(c, UpsertFact) for c in mutation.state_changes):
+                    raise D3RecoveryRequired("d22_plan_conclusion_missing")
+                source = self.conclusions.validate_record(records[0], state)
+                if (result.proof_id != source.proof_id or result.observation_id != source.observation_id
+                        or result.artifact_version_id != binding.artifact_version_id
+                        or result.supporting_fact_id != records[0].fact_id):
+                    raise D3RecoveryRequired("d22_plan_support_changed")
+                receipt = self.workspace.read_digest(result.observation_id)
+                if receipt is None or result.evidence_sha256 != digest(asdict(receipt)):
+                    raise D3RecoveryRequired("d22_plan_source_changed")
+                return
         if result is None or binding is None or result.outcome != "satisfied":
             raise D3RecoveryRequired("d3_fixed_rule_has_no_satisfied_result")
         if result.proof_id is None or result.supporting_fact_id is None:
@@ -811,7 +861,8 @@ class D3EvidenceValidator:
                 or changes[0].fact_id != result.supporting_fact_id
                 or changes[0].source_ref != proof.source_execution_id
                 or changes[0].verification_ref != f"d3:{proof.proof_id}"
-                or changes[0].content != self._fact_content(proof.proof_id, mutation.task_run_id)
+                or (self._fact_content(proof.proof_id, mutation.task_run_id) is not None
+                    and changes[0].content != self._fact_content(proof.proof_id, mutation.task_run_id))
                 or proof.plan_id != binding.plan_id
                 or proof.artifact_version_id != binding.artifact_version_id
                 or proof.observation_id != result.observation_id
@@ -836,6 +887,16 @@ class D3EvidenceValidator:
             ):
                 raise D3RecoveryRequired("d3_reused_support_changed")
 
+    def completion_support(self, state, binding, result, fact_id):
+        if (self.conclusions.config.contract_version == 22 and result.outcome == "no_new_information"):
+            source = self.conclusions.observation(result.proof_id, historical=True)
+            _, proposal = self._known_action(binding.task_run_id, binding.plan_id, "inner_complete")
+            if (not isinstance(proposal.action, CompleteIntentAction) or proposal.action.fact_ids != (fact_id,)
+                    or fact_id not in {i["fact_id"] for i in self.conclusions.reusable_facts(source)}):
+                raise D3RecoveryRequired("d22_completion_fact_not_effective")
+            return
+        self._support(state, binding, result.proof_id, fact_id)
+
     def _complete_intent(self, mutation: ControlMutation, state) -> None:
         change = next(
             (item for item in mutation.state_changes if isinstance(item, UpsertIntent)),
@@ -848,21 +909,31 @@ class D3EvidenceValidator:
             raise D3RecoveryRequired("d3_intent_has_no_plan")
         binding = self.ledger.load_d3_plan_binding(plans[-1].plan_id)
         result = self.ledger.load_d3_plan_result(plans[-1].plan_id)
-        if binding is None or result is None or result.outcome != "satisfied":
+        if binding is None or result is None:
             raise D3RecoveryRequired("d3_latest_plan_support_missing")
-        if result.proof_id is None or result.supporting_fact_id is None:
+        request_id, proposal = self._known_action(mutation.task_run_id, binding.plan_id, "inner_complete")
+        historical = (self.conclusions is not None and self.conclusions.config.contract_version == 22 and result is not None
+                      and result.outcome == "no_new_information")
+        fact_id = result.supporting_fact_id if result else None
+        if historical:
+            source = self.conclusions.observation(result.proof_id, historical=True)
+            allowed = {i["fact_id"] for i in self.conclusions.reusable_facts(source)}
+            if not isinstance(proposal.action, CompleteIntentAction) or len(proposal.action.fact_ids) != 1:
+                raise D3RecoveryRequired("d22_completion_selection_invalid")
+            fact_id = proposal.action.fact_ids[0]
+            if fact_id not in allowed:
+                raise D3RecoveryRequired("d22_completion_fact_not_effective")
+        elif binding is None or result is None or result.outcome != "satisfied" or fact_id is None:
             raise D3RecoveryRequired("d3_latest_plan_support_missing")
-        self._support(state, binding, result.proof_id, result.supporting_fact_id)
-        request_id, proposal = self._known_action(
-            mutation.task_run_id, binding.plan_id, "inner_complete"
-        )
+        else:
+            self._support(state, binding, result.proof_id, fact_id)
         if (
             not isinstance(proposal.action, CompleteIntentAction)
-            or proposal.action.fact_ids != (result.supporting_fact_id,)
+            or proposal.action.fact_ids != (fact_id,)
             or mutation.d3 is None
             or len(mutation.d3.outcomes) != 1
             or mutation.d3.outcomes[0].evidence_refs
-            != (binding.plan_id, result.supporting_fact_id, request_id)
+            != (binding.plan_id, fact_id, request_id)
         ):
             raise D3RecoveryRequired("d3_complete_action_or_support_changed")
         self._allowed(
@@ -1048,7 +1119,7 @@ class D3EvidenceValidator:
             raise ValueError("d3_no_sibling_candidate")
         if output.decision == "replan_current_intent":
             plans = [item for item in state.plans if item.intent_id == intent.intent_id]
-            if not plans or len(plans) >= 2:
+            if not plans or len(plans) >= 2 and not self.ledger.load_d3_run_config(mutation.task_run_id).intent_execution_policy:
                 raise ValueError("d3_replan_not_available")
         if output.decision == "adjust_turn_target" and len(state.turns) >= 2:
             raise ValueError("d3_turn_limit_reached")
@@ -1085,6 +1156,10 @@ class D3EvidenceValidator:
                 raise D3RecoveryRequired("d8_validator_not_configured")
             for record in records:
                 self.conclusions.validate_record(record, state)
+            if config.contract_version == 22:
+                for fact in (c for c in mutation.state_changes if isinstance(c, UpsertFact)):
+                    if len(records) != 1 or fact.content != self.conclusions.accepted_content(records[0]):
+                        raise D3RecoveryRequired("d22_fact_content_not_approved")
             if any(isinstance(c, UpsertFact) for c in mutation.state_changes) and len(records) != 1:
                 raise D3RecoveryRequired("d8_fact_approval_missing")
         elif records:

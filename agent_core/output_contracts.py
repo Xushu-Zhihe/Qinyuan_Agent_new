@@ -93,6 +93,28 @@ def output_schema(request, *, contract_version=None):
     if contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
         from agent_core.governance_policy import patch_schema
         schema = patch_schema(request, stage, schema)
+    if stage == "inner_plan" and contract_version == 22:
+        tools = json.loads(getattr(request, "history_context", "{}") or "{}").get("mcp_tools", [])
+        choices = json.loads(getattr(request, "history_context", "{}") or "{}").get("completion_facts", [])
+        if choices and "intent_execution" not in json.loads(request.history_context):
+            completion = obj({"kind": {"type": "string", "const": "request_completion"},
+                "fact_id": {"type": "string", "enum": [i["fact_id"] for i in choices]}})
+            schema = {"anyOf": [*schema.get("anyOf", [schema]), completion]}
+        if tools:
+            calls = [obj({"kind": {"const": "mcp_call", "type": "string"},
+                          "tool_name": {"const": t["qualified_name"], "type": "string"},
+                          "arguments": {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                                        **t["input_schema"]}}) for t in tools]
+            schema = {"anyOf": [*schema.get("anyOf", [schema]), *calls]}
+    if contract_version == 22 and stage == "inner_plan" and "intent_execution" in json.loads(getattr(request, "history_context", "{}") or "{}"):
+        from agent_core.intent_execution import resolution_schema
+        context = json.loads(request.history_context)
+        branches = schema.get("anyOf", [schema])
+        if context["intent_execution"].get("stop_requested"):
+            branches = [b for b in branches if b.get("properties", {}).get("kind", {}).get("const") in {"history_query", "history_details", "history_next_page"}]
+        elif "probe" not in context["execution_feasibility"]["allowed_action_kinds"]:
+            branches = [b for b in branches if b.get("properties", {}).get("kind", {}).get("const") in {"history_query", "history_details", "history_next_page", "conclusion_change"}]
+        schema = {"anyOf": [*branches, *resolution_schema(request)["anyOf"]]}
     return stage, schema
 
 
@@ -210,7 +232,16 @@ def _base_output_schema(request, *, contract_version=None):
                 "minItems": 1,
                 "maxItems": 8,
             }
-        return stage, obj(fields, optional={"refined_content", "merged_sources"} if contract_version == 22 else ())
+        schema = obj(fields, optional={"refined_content", "merged_sources"} if contract_version == 22 else ())
+        from agent_core.conclusion_contracts import D22FactReviewRequest
+        if isinstance(request, D22FactReviewRequest):
+            fields["decision"] = {"type": "string", "enum": ["accept", "reject", "insufficient"]}
+            options = [schema, obj({"decision": {"type": "string", "const": "no_new_information"}, "reason": text(512)})]
+            if request.existing_facts:
+                options.append(obj({"decision": {"type": "string", "const": "reuse"}, "reason": text(512),
+                    "reuse_fact_id": {"type": "string", "enum": [i["fact_id"] for i in request.existing_facts]}}))
+            schema = {"anyOf": options}
+        return stage, schema
     if stage == "intent_evaluation":
         if contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.completion_evaluation import evaluation_schema
@@ -242,6 +273,14 @@ def json_type(value):
 
 
 def shape_issues(value, schema, path="$"):
+    if "$schema" in schema:
+        # MCP advertises standard JSON Schema, including optional fields and refs.
+        from itertools import islice
+        from jsonschema.validators import validator_for
+        return [D8FormatIssue("tool_argument_" + str(error.validator),
+                    path + "".join("/" + str(part) for part in error.absolute_path),
+                    "registered_tool_schema", json_type(error.instance))
+                for error in islice(validator_for(schema)(schema).iter_errors(value), 8)]
     if "anyOf" in schema:
         branches = schema["anyOf"]
         if isinstance(value, dict) and isinstance(value.get("progress"), dict):

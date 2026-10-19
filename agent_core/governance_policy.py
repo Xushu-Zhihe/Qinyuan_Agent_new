@@ -68,7 +68,9 @@ def context(raw_request, stage):
         visible.extend(retrieval['read']['items'])
         if retrieval['read'].get('next_cursor') is not None:
             cursors.append(retrieval['read']['next_cursor'])
-    return {**policy, 'refs': list(dict.fromkeys(item.get('ref') or D8HistoryItem.from_dict(item).ref for item in visible)),
+    read_refs = list(dict.fromkeys(item.get("ref") or D8HistoryItem.from_dict(item).ref for item in visible))
+    read_refs.extend(json.loads(raw_request.get("session_context") or "{}").get("compaction", {}).get("omitted_decision_refs", []))
+    return {**policy, "read_refs": list(dict.fromkeys(read_refs)), 'refs': list(dict.fromkeys(item.get('ref') or D8HistoryItem.from_dict(item).ref for item in visible)),
             'replacement_refs': [item['ref'] for item in visible if item.get('ref')
                 and item.get('record_type') in {'verified_fact', 'reviewed_inference'}],
             'cursors': list(dict.fromkeys(cursors))}
@@ -83,7 +85,7 @@ def reads_schema(ctx):
     fields = {key: NS for key in ('turn_id', 'intent_id', 'artifact_version_id')}
     fields['record_type'] = {'anyOf': [choice(('verified_fact', 'reviewed_inference', 'progress', 'intent', 'turn')), {'type': 'null'}]}
     return [tagged('history_query', {'query': obj(fields, optional=tuple(fields))}),
-            tagged('history_details', {'refs': {**array(choice(ctx['refs']), 1, 2), 'uniqueItems': True}}),
+            tagged('history_details', {'refs': {**array(choice(ctx.get('read_refs', ctx['refs'])), 1, 2), 'uniqueItems': True}}),
             tagged('history_next_page', {'cursor': choice(ctx['cursors'])})]
 
 

@@ -1,4 +1,4 @@
-"""Frozen D9-2 DeepSeek roles; D8 owns content parsing and all business gates."""
+﻿"""Frozen D9-2 DeepSeek roles; D8 owns content parsing and all business gates."""
 
 import json
 import time
@@ -17,7 +17,7 @@ from agent_core.review_contracts import D2ModelFailure
 TRANSPORT = {"version": 1, "base_url": "https://api.deepseek.com",
              "timeout_seconds": 180, "response_format": "json_object",
              "max_response_bytes": 2 * 1024 * 1024}
-PARAMETERS = (("thinking", "enabled"), ("reasoning_effort", "high"), ("max_tokens", 16384))
+PARAMETERS = (("thinking", "enabled"), ("reasoning_effort", "high"), ("max_tokens", 32768))
 CAPACITY_POLICY = D8CapacityPolicy("deepseek-json-byte-estimate-v1", "estimated_token_units", 262144, 16384)
 
 # Fixed business guidance complements the existing strict stage Schema. No new
@@ -354,10 +354,58 @@ def build_payload(envelope, role, *, context_loader=None):
         from agent_core.intent_planning import GUIDANCE
         system = system.replace('1-2', 'one or more').replace('0-2', 'zero or more')
         system += ' Contract22 Intent planning: ' + GUIDANCE
+    if (stage == "inner_plan" and role_contract_version(role) == 22
+            and json.loads(getattr(request, "history_context", "{}") or "{}").get("mcp_tools")):
+        system += (" You may select one mcp_call with tool_name and arguments from mcp_tools. "
+                   "Inspect its saved result in this Intent's session before selecting the next tool. "
+                   "Do not precommit a whole tool chain. Tool success is evidence, not a verified Fact.")
+    if stage == "inner_plan" and role_contract_version(role) == 22:
+        system += (" After a no_new_information Plan, completion_facts lists effective same-Intent conclusions. "
+                   "You may choose request_completion with fact_id instead of performing another HTTP request. "
+                   "This only requests completion; an explicit completion decision and outer goal assessment still follow.")
+    if stage == "fact_review" and hasattr(request, "existing_facts"):
+        system += (" Compare the candidate with existing_facts and their exact request/observation scopes. "
+                   "Use decision=reuse with reuse_fact_id when this supports the same effective conclusion; "
+                   "use no_new_information when no conclusion should be added. Accept creates a distinct Fact. "
+                   "Identical response bodies do not prove equal requests, server effects or independent confirmation. "
+                   "Never strengthen a claim merely because an identical body was observed twice. "
+                   "If accepted text exactly repeats an existing conclusion on identical response content, "
+                   "choose reuse or provide refined_content spelling out the different conditions/claim; "
+                   "otherwise the existing single correction is required.")
+    rolling = (json.loads(getattr(request, "history_context", "{}") or "{}").get("intent_execution")
+               if stage == "inner_plan" and role_contract_version(role) == 22 else None)
+    end_policy = (json.loads(getattr(request, "prior_summary", "{}") or "{}").get("s4_evaluation_policy", {})
+                  if stage == "intent_evaluation" and role_contract_version(role) == 22 else {})
+    if stage == "inner_plan" and rolling:
+        system += (" Rolling Intent: choose the next permitted Plan/tool or intent_resolution. "
+            "execution_feasibility.allowed_action_kinds also bounds HTTP/MCP choices: without probe, "
+            "do not request new execution; use an allowed read, conclusion change or Intent resolution. "
+            "Next-Intent suggestions may cite other valid refs in this frozen input; they need not be "
+            "included in the current resolution evidence_refs. Fact text is in items; intent_execution.facts indexes its refs. "
+            "A completed Plan is only a step. Continue within the same Intent until the local criteria are covered, "
+            "or explicitly request review/legitimate closure. No new Fact and equal responses are not saturation. "
+            "intent_resolution includes outcome, reason, evidence_refs, fact_ids, next_intent_candidates. "
+            "In reason give tested scope, remaining uncertainty and optional revisit conditions. "
+            "For succeeded cite effective Facts and their exact refs; failed needs scoped counterevidence; "
+            "inconclusive means intentional strategy closure, not simply missing evidence; review asks the outer to decide. "
+            "Candidates are suggestions only. Read missing history instead of inventing it.")
+    if stage == "progress_review" and json.loads(request.context_summary).get("d8_progress", {}).get("intent_execution_policy"):
+        system += " Progress inconclusive may continue a concrete useful check; it is not an unknown execution. A strategic switch/abandon collects an inner end summary before termination."
+    if stage == "inner_plan" and rolling and rolling.get("stop_requested"):
+        system += " The outer requested strategy closure: submit failed with scoped counterevidence or inconclusive with a concise closure summary; no new execution is permitted in this handoff."
+    if stage == "intent_evaluation" and end_policy.get("version") == 2:
+        system += (" Rolling end review: the inner proposal is in s4_evaluation_policy.proposal. "
+            "Check each local completion criterion against the cited evidence set, including contradictions. "
+            "Use continue with a concrete missing check when evidence is insufficient and progress remains feasible; "
+            "do not end an unfinished Intent merely because one Plan completed. "
+            "succeeded requires effective supporting Fact refs; failed requires counterevidence within an explicit scope. "
+            "inconclusive is strategic closure with an explicit resource/feasibility/value reason. "
+            "Observed misses only disprove a finite explicitly complete candidate domain; no global negative from partial tests. "
+            "Your reason is the concise accepted Intent result summary, not a new verified Fact.")
     return {"model": role.model, "messages": [{"role": "system", "content": system},
              {"role": "user", "content": json.dumps(context, ensure_ascii=False, allow_nan=False)}],
             "response_format": {"type": "json_object"}, "stream": False,
-            "thinking": {"type": "enabled"}, "reasoning_effort": "high", "max_tokens": 16384}
+            "thinking": {"type": "enabled"}, "reasoning_effort": "high", "max_tokens": 32768}
 
 
 class EstimatedCapacity:
@@ -368,7 +416,8 @@ class EstimatedCapacity:
     def fits(self, request, policy):
         if policy != CAPACITY_POLICY:
             raise ValueError("d8_real_capacity_policy_mismatch")
-        if not isinstance(request, D8OutputRequest):
+        is_envelope = isinstance(request, D8OutputRequest)
+        if not is_envelope:
             # The core also checks business requests after prepare() already
             # checked the exact frozen envelope including safe correction.
             stage, schema = output_schema(request, contract_version=role_contract_version(self.outer))
@@ -376,8 +425,63 @@ class EstimatedCapacity:
                                       "Return exactly one complete JSON object matching output_contract.schema. Do not use Markdown, add fields, or repair types implicitly.", None)
         stage = request.output_contract["stage"]
         role = self.inner if stage in INNER_STAGES else self.outer
-        size = len(payload_bytes(build_payload(request, role, context_loader=getattr(self, 'context_loader', None))))
+        payload = build_payload(request, role, context_loader=getattr(self, 'context_loader', None))
+        size = len(payload_bytes(payload))
+        business = request.request
+        identity = getattr(business, "model_request_id", None) or getattr(business, "review_id", None)
+        if identity is None and getattr(business, "attempt", None) is not None:
+            identity = business.attempt.model_request_id
+        self.last_measurement = {"model_request_id": identity, "stage": stage,
+            "measurement_kind": "provider_envelope" if is_envelope else "business_request_estimate",
+            "payload_utf8_bytes": size, "payload_unicode_characters": len(payload_bytes(payload).decode("utf-8")),
+            "input_tokens": None, "estimate_unit": policy.measurement_unit,
+            "sections_utf8_bytes": {k: len(json.dumps(v, ensure_ascii=False).encode("utf-8"))
+                                    for k, v in json.loads(payload["messages"][1]["content"]).items()},
+            "messages_utf8_bytes": [len(m["content"].encode("utf-8")) for m in payload["messages"]]}
+        limit = policy.total_units - policy.output_reserve_units - 4096
+        if size > limit:
+            _trace_capacity(stage, size, limit, payload)
         return size + 4096 + policy.output_reserve_units <= policy.total_units
+
+
+def _trace_capacity(stage, size, limit, payload):
+    """Report exactly what filled the model request; silent unless tracing is on."""
+    import os
+    if not os.environ.get("QINYUAN_DEBUG_TRACE"):
+        return
+    import json as _json
+    import sys
+    parts = {}
+    try:
+        body = payload.json() if hasattr(payload, "json") else payload
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        for key, value in body.items():
+            text = value if isinstance(value, str) else _json.dumps(value, ensure_ascii=False)
+            parts[key] = len(text)
+    print("[trace] fits.fail", f"stage={stage}", f"size={size}", f"limit={limit}",
+          "parts=" + _json.dumps(parts, ensure_ascii=False), file=sys.stderr, flush=True)
+    sections = {}
+    for message in (body or {}).get("messages", []) or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str):
+            continue
+        start = content.find("{")
+        if start < 0:
+            continue
+        try:
+            parsed = _json.loads(content[start:])
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                text = value if isinstance(value, str) else _json.dumps(value, ensure_ascii=False)
+                sections[key] = sections.get(key, 0) + len(text)
+    if sections:
+        top = sorted(sections.items(), key=lambda item: item[1], reverse=True)[:8]
+        print("[trace] fits.sections",
+              " ".join(f"{k}={v}" for k, v in top), file=sys.stderr, flush=True)
 
 
 def _raw_http_worker(connection, settings, payload, timeout):

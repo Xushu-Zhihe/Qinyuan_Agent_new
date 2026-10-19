@@ -1,4 +1,4 @@
-"""Local-only D7 simulation assembly over the existing D3 application."""
+﻿"""Local-only D7 simulation assembly over the existing D3 application."""
 
 from __future__ import annotations
 
@@ -335,13 +335,15 @@ def run_simulated_task(
     declaration: dict,
     *,
     operation: str = "start",
+    finalize_export=None,
 ) -> dict:
     """Run or recover one local simulated D3 TaskRun and return its projection."""
     if "execution_profile" in declaration:
         if declaration["execution_profile"] not in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
             raise ValueError("unsupported_execution_profile")
         from agent_adapters.simulation import run_simulated_task as run_d8
-        return run_d8(Path(directory), declaration, operation=operation)
+        return run_d8(Path(directory), declaration, operation=operation,
+                     finalize_export=finalize_export)
     from agent_adapters.web.task_result import snapshot_v3_task_result
 
     directory = Path(directory)

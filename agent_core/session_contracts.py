@@ -79,6 +79,8 @@ def _parse_progress_review_legacy(raw, request):
     allowed = {"meaningful": {"continue_current_intent", "replan_current_intent"},
                "repetitive": {"replan_current_intent", "switch_sibling_intent", "abandon_current_intent"},
                "inconclusive": {"pause_current_intent"}}
+    if json.loads(request.context_summary).get("d8_progress", {}).get("intent_execution_policy") == "rolling_v1":
+        allowed["inconclusive"] = {"continue_current_intent", "pause_current_intent"}
     if restricted_progress_request(request):
         allowed = {"meaningful": {"continue_current_intent"},
                    "repetitive": {"pause_current_intent"}, "inconclusive": {"pause_current_intent"}}

@@ -73,7 +73,11 @@ class IntentSessions:
             phase = "conclusion_repair" if isinstance(request, D8ChangeRequest) else "execution"
             _, _, current = self.app.handoff.select(phase, turn_id, intent_id)
             messages = []
-            for record in self.records(intent_id):
+            records = self.records(intent_id)
+            summary_record, summary = self.app.handoff._latest_summary()
+            compact = bool(self.app.config.intent_execution_policy and summary and summary_record.origin == "model_organized" and current["global_source_status"] == "available")
+            omitted = records[:-4] if compact else []
+            for record in (records[-4:] if compact else records):
                 data = self.payload(record)
                 messages.append({"role": "user", "content": data["request"],
                                  "identity": "historical_request_not_current_authorization"})
@@ -82,9 +86,16 @@ class IntentSessions:
                 messages.append({"role": "tool", "content": data["observation"],
                                  "identity": "historical_execution_projection_not_current_approval"})
             session_id = self._id("session/" + intent_id)
-            context = handoff_json({"messages": messages, "current_history": current,
+            session_packet = {"messages": messages, "current_history": current,
                                     "session_scope": "intent", "session_id": session_id,
-                                    "turn_id": turn_id, "intent_id": intent_id})
+                                    "turn_id": turn_id, "intent_id": intent_id}
+            if omitted:
+                decision_refs = {i.record_id: i.ref for i in self.app.handoff.history()}
+                session_packet["compaction"] = {"identity": "summary_and_recent_dialog_not_full_history",
+                    "summary_id": summary_record.record_id,
+                    "omitted_decision_refs": [decision_refs["decision/" + r.record_id] for r in omitted],
+                    "details_via": "history_query/history_details", "raw_decisions_retained": True}
+            context = handoff_json(session_packet)
         else:
             if saved["turn_id"] != turn_id or saved["intent_id"] != intent_id:
                 raise D3RecoveryRequired("d8_session_request_owner_changed")
@@ -150,6 +161,10 @@ class IntentSessions:
                         "facts": [asdict(f) for f in self.app.state.facts
                                   if f.source_ref in {e.execution_id for e in executions}],
                         "identity": "historical_observation_requires_current_governance_view"}
+            if self.app.mcp is not None and call.application_ref is not None:
+                tool_result = self.app.mcp.feedback(call.application_ref)
+                if tool_result is not None:
+                    observed["mcp_tool_result"] = tool_result
             data = {"metadata": asdict(record) | {"evidence_sha256": ""},
                     "request": safe_request, "response": raw, "observation": observed}
             frozen = self.evidence.read("decision", record.record_id)
@@ -221,7 +236,8 @@ class IntentSessions:
             stage = data["request"]["stage"]
             stages[stage] = stages.get(stage, 0) + 1
             executions.update(e["execution_id"] for e in data["observation"]["execution_records"])
-        return {"decision_count": len(rows), "window": 4, "continue_decisions": 4, "mode": mode,
+        return {**({"intent_execution_policy": "rolling_v1"} if self.app.config.intent_execution_policy else {}),
+                "decision_count": len(rows), "window": 4, "continue_decisions": 4, "mode": mode,
                 "cumulative": {"decision_stage_counts": stages, "saved_execution_count": len(executions),
                                "identity": "historical_progress_not_goal_verification"},
                 "recent": [{"ref": "d8-decision:" + r.record_id,
@@ -263,7 +279,10 @@ class IntentSessions:
             if output.decision == "pause_current_intent":
                 raise D3RecoveryRequired("d8_progress_" + output.progress.classification)
             return False
-        return await self.app._route(review_id, output, intent_id, receipts, token)
+        routed = await self.app._route(review_id, output, intent_id, receipts, token)
+        if self.app.config.intent_execution_policy and not routed:
+            await self.app.handoff.summarize(intent.turn_id, token)
+        return routed
 
     @staticmethod
     def visible(request):
@@ -283,6 +302,14 @@ class IntentSessions:
 
     def next_suggestions(self, intent_id):
         self.reconcile()
+        if self.app.config.intent_execution_policy:
+            success = next((r for r in self.app.store.list_d8_tree_records(self.app.state.task_run.task_run_id)
+                            if r.intent_id == intent_id and r.kind == "succeeded"), None)
+            if success is None:
+                raise D3RecoveryRequired("d22_next_suggestions_without_success")
+            raw = self.app.model_evidence.read(success.inner_request_id).raw
+            from agent_core.intent_execution import parse_saved_resolution
+            return success.inner_request_id, parse_saved_resolution(self.app, success.inner_request_id, raw).next_intent_candidates
         rows = [r for r in self.records(intent_id)
                 if self.payload(r)["request"]["stage"] == "inner_complete"]
         if not rows:

@@ -18,7 +18,7 @@ from agent_core.dual_llm_contracts import D3RecoveryRequired
 from agent_core.turn_contracts import D1RoleConfig
 from test_chain_multi_turn import Clock, Model, ReviewModel, Sandbox, Token, ProcessLoss
 from test_conclusion_review import Inner, FactReviewer, Refinement
-from test_handoff import HandoffModel
+from test_handoff import HandoffModel, TIGHT_CAPACITY
 
 
 @pytest.mark.parametrize("summary", ["legacy plain text", "[]", "1"])
@@ -69,18 +69,27 @@ class ProgressModel(ReviewModel):
 
 
 @pytest.fixture
-def session_case(tmp_path, request):
+def session_case(tmp_path, request, monkeypatch):
     source = tmp_path / "input"
     source.mkdir()
     (source / "sample.txt").write_bytes(b"D8-4 authorized local observation")
     outer = D1RoleConfig("outer_planning", "fake", "same-model", "outer-d8-4-v1")
     inner_role = D1RoleConfig("inner_action", "fake", "same-model", "inner-d8-4-v1")
     policy = D8CapacityPolicy("fake-json-v1", "unicode_codepoints", 262144, 8192)
+    budget = D8HandoffBudgetPolicy()
+    if getattr(request, "param", None) == "review8":
+        # Explicit test policy: exercise the real ledger limit without tying it
+        # to today's production defaults or replacing the admission method.
+        import agent_core.operation_accounting as accounting
+        limits = {**accounting.D8_HANDOFF_CATEGORY_LIMITS, "review": 8}
+        monkeypatch.setattr(accounting, "D8_HANDOFF_CATEGORY_LIMITS", limits)
+        monkeypatch.setattr(accounting, "D8_HANDOFF_TOTAL", sum(limits.values()))
+        budget = D8HandoffBudgetPolicy(total=sum(limits.values()), review=8)
     config = D3RunConfig(outer, inner_role, D3Authorization(str(uuid4()), (0,)),
                          outer.role_config_ref, contract_version=4 if getattr(request, "param", None) == "legacy_v4" else 5,
-                         d4_budget=D8HandoffBudgetPolicy(), d5_enabled=True,
+                         d4_budget=budget, d5_enabled=True,
                          d5_sensitive_requirements=(), d8_enabled=True,
-                         handoff_config=D8HandoffConfig(policy, policy))
+                         handoff_config=D8HandoffConfig(policy, policy, TIGHT_CAPACITY))
     sandbox, clock, token = Sandbox(), Clock(), Token()
     inner, handoff, reviewer = SessionInner(inner_role), HandoffModel(outer), ProgressModel(outer)
     def planning(request, raw):
@@ -376,13 +385,14 @@ def test_progress_budget_exhaustion_never_allows_fifth_decision(session_case, mo
     assert len(case[4].command_calls) == 2
 
 
+@pytest.mark.parametrize("session_case", ["review8"], indirect=True)
 def test_real_review_eight_limit_survives_reopen_and_stops_next_inner_decision(session_case):
     case = session_case
     case[1].modify = lambda request, raw: raw
     result = run(case)
     assert result.dispatch_status == "stopped"
     usage = case[0].store.d4_budget_usage(case[8])
-    assert dict(usage.category_counts)["review"] == 8 and usage.total_used <= 60
+    assert dict(usage.category_counts)["review"] == case[0].config.d4_budget.review == 8 and usage.total_used <= case[0].config.d4_budget.total
     current = next(i for i in case[0].state.intents if i.status.value == "running")
     assert len(case[0].sessions.records(current.intent_id)) == 4
     assert not any(r.stage == "inner_complete" and json.loads(r.session_context)["intent_id"] == current.intent_id
@@ -522,7 +532,7 @@ def test_applied_progress_audit_tampering_cannot_change_pause_to_continue(sessio
 @pytest.mark.parametrize("session_case", ["legacy_v4"], indirect=True)
 def test_actual_schema25_readonly_and_upgrade_do_not_backfill_sessions(session_case):
     import sqlite3
-    from agent_core.sqlite_control_store import SqliteControlStore, CURRENT_SCHEMA_VERSION
+    from agent_core.sqlite_control_store import SqliteControlStore, CURRENT_SCHEMA_VERSION, MIGRATION_23
     case = session_case
     path = case[0].directory / "control.sqlite"
     config = case[0].config
@@ -534,6 +544,9 @@ def test_actual_schema25_readonly_and_upgrade_do_not_backfill_sessions(session_c
         connection.execute("DELETE FROM schema_versions WHERE version=27")
         connection.execute("DROP TABLE d8_decisions")
         connection.execute("DELETE FROM schema_versions WHERE version=26")
+        assert connection.execute("SELECT COUNT(*) FROM d8_conclusions").fetchone()[0] == 0
+        connection.executescript("DROP TABLE d8_conclusions;" + MIGRATION_23)
+        connection.execute("DELETE FROM schema_versions WHERE version>=26")
     before = path.read_bytes()
     with SqliteControlStore.open_readonly(path) as readonly:
         assert readonly._schema_version == 25
@@ -541,10 +554,11 @@ def test_actual_schema25_readonly_and_upgrade_do_not_backfill_sessions(session_c
         assert readonly.list_d8_decisions(case[8]) == ()
     assert path.read_bytes() == before
     upgraded = SqliteControlStore.open(path, clock=case[5])
-    assert upgraded._schema_version == CURRENT_SCHEMA_VERSION == 27
+    assert upgraded._schema_version == CURRENT_SCHEMA_VERSION
+    assert upgraded._connection.execute("PRAGMA foreign_key_check").fetchone() is None
     assert upgraded.list_d8_decisions(case[8]) == ()
     assert upgraded.load_d3_run_config(case[8]) == config
-    assert upgraded.load_d3_run_config(case[8]).d4_budget.total == 60
+    assert upgraded.load_d3_run_config(case[8]).d4_budget == config.d4_budget
     case[0].store = upgraded
 
 

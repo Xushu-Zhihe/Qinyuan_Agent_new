@@ -12,12 +12,13 @@ def stage_decisions(scope):
     return REVIEW_DECISIONS[-1:] if scope == "turn_end" else REVIEW_DECISIONS[:-1]
 
 
-def unavailable_decisions(state, turn_id, intent_id, max_turns):
+def unavailable_decisions(state, turn_id, intent_id, max_turns, *, rolling=False):
     from agent_core.domain import IntentStatus
     result = {}
     if not any(i.turn_id == turn_id and i.status is IntentStatus.PENDING for i in state.intents):
         result["switch_sibling_intent"] = "d3_no_sibling_candidate"
-    if not 1 <= sum(p.intent_id == intent_id for p in state.plans) < 2:
+    count = sum(p.intent_id == intent_id for p in state.plans)
+    if not (count >= 1 if rolling else 1 <= count < 2):
         result["replan_current_intent"] = "d3_replan_not_available"
     if max_turns is not None and len(state.turns) >= max_turns:
         result["adjust_turn_target"] = "d3_turn_limit_reached"

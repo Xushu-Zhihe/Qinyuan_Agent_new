@@ -400,10 +400,20 @@ class TaskRunSandbox:
             binding.accepting = False
 
     def execute(self, sandbox_id: str, request: CommandRequest) -> CommandResult:
+        if not isinstance(request, CommandRequest) or request.tool != "python3":
+            raise ValueError("TaskRun fixed observations require python3")
+        return self._execute_command(sandbox_id, request)
+
+    def execute_mcp(self, sandbox_id: str, request: CommandRequest) -> CommandResult:
+        """Execute a registered MCP command in this TaskRun's existing container."""
+        if not isinstance(request, CommandRequest) or request.tool not in self._settings.allowed_tools:
+            raise ValueError("mcp.executable_not_allowed")
+        return self._execute_command(sandbox_id, request)
+
+    def _execute_command(self, sandbox_id: str, request: CommandRequest) -> CommandResult:
         binding = self._binding(sandbox_id)
         if (
             not isinstance(request, CommandRequest)
-            or request.tool != "python3"
             or not isinstance(request.arguments, tuple)
             or any(
                 not isinstance(arg, str) or "\x00" in arg for arg in request.arguments
@@ -414,7 +424,7 @@ class TaskRunSandbox:
             <= request.timeout_seconds
             <= self._settings.maximum_timeout_seconds
         ):
-            raise ValueError("TaskRun execution requires python3 and a bounded command timeout")
+            raise ValueError("TaskRun execution requires valid argv and a bounded command timeout")
         with binding.execution_lock:
             with self._lock:
                 if not binding.accepting:

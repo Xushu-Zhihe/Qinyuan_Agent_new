@@ -383,12 +383,22 @@ def _run_v3_simulated_operation(
         append_existing=operation != "start",
     )
     exporter.start_monitoring()
+    finished: dict = {}
+
+    def finish_once():
+        # The exporter keeps the control database open; the projection must not run
+        # while that is true, and finishing twice would tick a closed exporter.
+        if "value" not in finished:
+            finished["value"] = _finish_event_export(exporter)
+        return finished["value"]
+
     try:
-        result = run_simulated_task(directory, declaration, operation=operation)
+        result = run_simulated_task(directory, declaration, operation=operation,
+                                    finalize_export=finish_once)
     except BaseException:
-        _finish_event_export(exporter)
+        finish_once()
         raise
-    sequence, error = _finish_event_export(exporter)
+    sequence, error = finish_once()
     result["event_export"] = {"last_sequence": sequence, "error": error}
     if error:
         result.setdefault("errors", []).append({"code": error})

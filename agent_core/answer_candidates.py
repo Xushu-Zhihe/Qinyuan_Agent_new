@@ -60,7 +60,8 @@ class AnswerCandidates:
         binding = self.store.load_d3_plan_binding(execution.plan_id)
         result = self.store.load_d3_plan_result(execution.plan_id)
         turn = plan_turn_binding(self.store,binding) if binding else None
-        if binding is None or result is None or turn is None or result.outcome != 'satisfied':
+        if (binding is None or result is None or turn is None or result.outcome not in
+                ({'satisfied','no_new_information'} if self.app.config.contract_version==22 else {'satisfied'})):
             raise D3RecoveryRequired('d9_candidate_source_not_satisfied')
         context = AnswerCandidateContext(turn, binding, execution.execution_id, result, state.task_run.request.goal)
         role = self.app.config.inner_role

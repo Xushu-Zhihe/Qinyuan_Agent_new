@@ -1,4 +1,4 @@
-"""Public D8 core assembly; model mode is separate from the local Sandbox."""
+﻿"""Public D8 core assembly; model mode is separate from the local Sandbox."""
 
 import asyncio
 import json
@@ -21,27 +21,30 @@ from agent_core.review_contracts import D2ReviewRequest
 from agent_core.runtime import TaskRunStatus, TERMINAL_STATUSES
 
 
-def simulation_config():
+def simulation_config(*, rolling=False):
     """Confirmed explicit preset; character counts are not provider tokens."""
     policy = D8CapacityPolicy("fake-json-v1", "unicode_codepoints", 262144, 8192)
     return {
+        **({"intent_execution_policy": "rolling_v1"} if rolling else {}),
         "handoff_config": asdict(D8HandoffConfig(
-            policy, policy, D8Capacity(initial_history=32768, visible_history=131072)
+            policy, policy, D8Capacity()
         )),
         "d5_sensitive_requirements": [],
     }
 
 
-def real_config(*, contract_version=6, http=False, http_timeout_seconds=60):
+def real_config(*, contract_version=6, http=False, http_timeout_seconds=60, rolling=True):
     from agent_adapters.deepseek_roles import CAPACITY_POLICY, TRANSPORT
     result = {"handoff_config": asdict(D8HandoffConfig(
                 CAPACITY_POLICY, CAPACITY_POLICY,
-                D8Capacity(initial_history=32768, visible_history=131072))),
+                D8Capacity())),
             "d5_sensitive_requirements": [], "model_transport": dict(TRANSPORT),
             "sandbox_backend": "local_simulated"}
     if contract_version in {18, 19, 20, 21, 22}:
         from agent_adapters.docker_profile import sandbox_config
         result.update(sandbox_backend="docker", sandbox_config=sandbox_config())
+    if contract_version == 22 and rolling:
+        result["intent_execution_policy"] = "rolling_v1"
     if http:
         if contract_version not in {15, 16, 17, 18, 19, 20, 21, 22}:
             raise ValueError('d20_http_requires_contract15_or_higher')
@@ -87,12 +90,16 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
         if http:
             expected_fields.add('http_profile')
             expected_fields.add('http_timeout_seconds')
+    if isinstance(extra, dict) and "intent_execution_policy" in extra:
+        if version != 22 or extra["intent_execution_policy"] != "rolling_v1":
+            raise ValueError("d22_intent_execution_policy_invalid")
+        expected_fields.add("intent_execution_policy")
     if (not isinstance(extra, dict)
             or set(extra) != expected_fields
             or extra["d5_sensitive_requirements"] != []):
         raise ValueError("invalid_d8_configuration")
     if is_real and json.dumps(extra, sort_keys=True) != json.dumps(real_config(contract_version=version, http=http,
-            http_timeout_seconds=extra.get('http_timeout_seconds',60)), sort_keys=True):
+            http_timeout_seconds=extra.get('http_timeout_seconds',60), rolling='intent_execution_policy' in extra), sort_keys=True):
         raise ValueError("d8_real_configuration_mismatch")
     handoff = D8HandoffConfig.from_dict(extra["handoff_config"])
     for policy in (handoff.outer_capacity, handoff.inner_capacity):
@@ -134,6 +141,7 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
         d8_enabled=True, handoff_config=handoff,
         web_authorization=web_authorization,
         http_timeout_seconds=extra['http_timeout_seconds'] if http else None,
+        intent_execution_policy=extra.get('intent_execution_policy'),
     )
     return (replace(request, authorization=raw['authorization']) if http else request), config
 
@@ -204,6 +212,12 @@ class SimulationModel:
             return {"decision": "accept", "reason": "Supported within the fixed observation scope."}
         context = request.context
         if stage == "inner_plan":
+            rolling = json.loads(getattr(request, "history_context", "{}") or "{}").get("intent_execution")
+            if rolling and rolling["facts"]:
+                return dict(kind="intent_resolution", outcome="succeeded",
+                    reason="The authorized local observation meets the local criteria; overall goal remains unverified.",
+                    fact_ids=[i["fact_id"] for i in rolling["facts"]],
+                    evidence_refs=[i["ref"] for i in rolling["facts"]], next_intent_candidates=[])
             return {"template": "size_then_sha256", "observation_mode": "new_observation",
                     "source_proof_id": None}
         if stage == "inner_complete":
@@ -235,7 +249,7 @@ class _LifecycleModel:
         raise ValueError("d8_lifecycle_model_dispatch_forbidden")
 
 
-def run_simulated_task(directory, declaration, *, operation="start", validation_selection=None, validation_checker=None):
+def run_simulated_task(directory, declaration, *, operation="start", validation_selection=None, validation_checker=None, finalize_export=None):
     from agent_adapters.web.task_result import snapshot_v3_task_result
     from agent_adapters.web.request_staging import D7RequestStager
 
@@ -290,7 +304,36 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
     task_id, token = declaration["task_run_id"], _Token(directory)
     report = None
     check_record = None
+    writer_closed = False
+
+    def close_writer():
+        nonlocal writer_closed
+        if writer_closed:
+            return
+        writer_closed = True
+        try:
+            state = app.controller._persistent_state
+            if state is not None and state.task_run.status in TERMINAL_STATUSES:
+                app.controller.close()
+        finally:
+            # Paused runs retain the container, not the database/SDK handles.
+            app.store.close()
+
+    async def dispatch(resume=False):
+        try:
+            return await app.resume(task_id, token) if resume else await app.run(token)
+        finally:
+            if app.mcp is not None:
+                await app.mcp.close()
+
     try:
+        if config.contract_version == 22 and declaration["mode"] == "real" and operation in {"start", "resume"}:
+            from agent_adapters.mcp_plan_executor import MCPPlanExecutor
+            link = MCPPlanExecutor(app)
+            if operation == "start":
+                link.authorize(task_id)
+            if link.enabled(task_id):
+                app.mcp = link
         if operation == "start":
             app.start(_d3_request(declaration), directory, task_run_id=task_id)
             if declaration["mode"] == "real":
@@ -301,7 +344,7 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
                                         reason="single_intent_slice_finished")
                 app.controller.cleanup_sandbox()
             else:
-                report = asyncio.run(app.run(token))
+                report = asyncio.run(dispatch())
         elif operation == "resume":
             if declaration["mode"] == "real":
                 rows = app.store.load_control_state_rows(task_id)
@@ -309,7 +352,7 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
                     raise ValueError("d8_runtime_state_unavailable")
                 outer.bind_runtime(token, rows.task_run.deadline_at)
                 inner.bind_runtime(token, rows.task_run.deadline_at)
-            report = asyncio.run(app.resume(task_id, token))
+            report = asyncio.run(dispatch(resume=True))
         elif operation == "cancel":
             report = app.cancel(task_id)
         elif operation == "cleanup":
@@ -326,19 +369,22 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
                 check_record = app.answers.check(validation_selection, validation_checker)
         else:
             raise ValueError("unsupported_v3_operation")
-        # Release the writer before projecting: while this process still holds
-        # the write connection the read-only projection cannot see settled state
-        # and degrades to state_read_failed with an empty body.
-        app.store.close()
+        # Stop the background event exporter before projecting: it still watches the
+        # same SQLite while the run is live, and its open handles are what make the
+        # in-process projection fail while a fresh read of the same state succeeds.
+        if finalize_export is not None:
+            finalize_export()
+        close_writer()
         result = snapshot_v3_task_result(directory, declaration)
         if check_record is not None:
             result['validation_check'] = {'state': check_record.result.verdict,
                                          'query_id': check_record.request.query_id}
         if report is not None and report.recovery_required:
             reason = result.get("recovery", {}).get("reason")
-            if not reason:
-                reason = ("d8_local_goal_inconclusive" if report.stop_reason == "d8_local_goal_inconclusive"
-                          else "operation_or_evidence_unknown")
+            # The runtime knows why it stopped; a projection-side placeholder must
+            # never hide that. Prefer the concrete stop reason whenever one exists.
+            if not reason or reason == "operation_or_evidence_unknown":
+                reason = report.stop_reason or "operation_or_evidence_unknown"
             result["recovery"] = {"required": True, "reason": reason}
             result["recovery_status"] = "required"
             if report.stop_reason.startswith("d8_controller_reload_required:"):
@@ -349,18 +395,15 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
                 declaration["request_id"], task_id, directory)
         return result
     finally:
-        if app.web is not None:
-            app.web.close()
         try:
-            state = app.controller._persistent_state
-            if state is not None and state.task_run.status in TERMINAL_STATUSES:
-                app.close()
-            else:
-                # Paused real runs retain the container, not the SDK handles.
-                app.store.close()
+            if app.web is not None:
+                app.web.close()
         finally:
-            if resources is not None:
-                resources.close()
+            try:
+                close_writer()
+            finally:
+                if resources is not None:
+                    resources.close()
 
 
 def real_declaration_binding(declaration):

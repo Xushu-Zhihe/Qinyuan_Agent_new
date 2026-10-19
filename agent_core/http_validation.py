@@ -58,16 +58,20 @@ def validate_mutation(store,mutation,config):
             raise StorageError('d20_http_plan_binding_required')
         owner=next((i for i in rows.intents if i.intent_id==binding.intent_id),None)
         prior=[p for p in rows.plans if p.intent_id==binding.intent_id]
+        previous=store.load_d3_plan_result(prior[-1].plan_id) if prior else None
+        continuation=(config.contract_version==22 and previous is not None
+                      and previous.outcome=='no_new_information')
+        rolling = bool(config.intent_execution_policy and prior and prior[-1].status is PlanStatus.COMPLETED and binding.replan_review_id is None)
         plan=plans[-1]
         turn=store.load_d3_turn_binding(binding.turn_id)
         if (owner is None or owner.status is not IntentStatus.RUNNING or owner.turn_id!=binding.turn_id
                 or binding.task_run_id!=mutation.task_run_id or not valid_turn(config,turn)
-                or binding.rule_binding_sha256!=digest(asdict(turn)) or len(prior)>=2
+                or binding.rule_binding_sha256!=digest(asdict(turn)) or len(prior)>=2 and not continuation and not config.intent_execution_policy
                 or (plan.plan_id,plan.intent_id,plan.status)!=(binding.plan_id,binding.intent_id,PlanStatus.RUNNING)
                 or len(plan.steps)!=1 or plan.steps[0].description!='authorized HTTP request'
-                or bool(prior)!=(operation=='replan_d3_plan')
-                or bool(prior)!=(binding.replan_review_id is not None)
-                or len(plans)!=(2 if prior else 1)
+                or bool(prior and not rolling)!=(operation=='replan_d3_plan')
+                or bool(prior and not rolling)!=(binding.replan_review_id is not None)
+                or len(plans)!=(2 if prior and not rolling else 1)
                 or any(p.plan_id==binding.plan_id for p in rows.plans)
                 or next(t for t in rows.turns if t.turn_id==binding.turn_id).status is not TurnStatus.RUNNING):
             raise StorageError('d20_http_plan_scope_changed')
@@ -76,14 +80,20 @@ def validate_mutation(store,mutation,config):
                 or proposal.start.category!='inner_model' or proposal.completion is None
                 or proposal.completion.result_kind!='completed' or proposal.application_ref is not None):
             raise StorageError('d20_http_plan_proposal_missing')
-        if prior:
-            review=store.load_d3_review_application(mutation.task_run_id,binding.replan_review_id)
-            if (review is None or review.intent_id!=binding.intent_id
-                    or review.decision!='replan_current_intent' or review.paused_gate
-                    or len(plans)!=2 or plans[0].plan_id!=prior[-1].plan_id
+        if prior and not rolling:
+            if continuation:
+                approved=any(r.plan_id==prior[-1].plan_id and r.outcome=='no_new_information'
+                             and r.review_request_id==binding.replan_review_id
+                             for r in store.list_d8_conclusions(mutation.task_run_id))
+            else:
+                review=store.load_d3_review_application(mutation.task_run_id,binding.replan_review_id)
+                approved=(review is not None and review.intent_id==binding.intent_id
+                          and review.decision=='replan_current_intent' and not review.paused_gate)
+            reason='no_new_information' if continuation else 'replanned'
+            if (not approved or len(plans)!=2 or plans[0].plan_id!=prior[-1].plan_id
                     or plans[0].status is not PlanStatus.SUPERSEDED
                     or plans[0].intent_id!=prior[-1].intent_id or plans[0].steps!=prior[-1].steps
-                    or metadata.outcomes!=(D3Outcome('plan',prior[-1].plan_id,'superseded','replanned',
+                    or metadata.outcomes!=(D3Outcome('plan',prior[-1].plan_id,'superseded',reason,
                         (binding.replan_review_id,binding.proposal_request_id)),)):
                 raise StorageError('d20_http_replan_review_missing')
         elif metadata.outcomes:
@@ -118,15 +128,22 @@ def validate_mutation(store,mutation,config):
         binding=store.load_d3_plan_binding(result.plan_id) if result else None
         facts=[c for c in changes if isinstance(c,UpsertFact)]
         plans=[c for c in changes if isinstance(c,UpsertPlan)]
-        if (not isinstance(binding,HttpPlanBinding) or result.outcome!='satisfied'
-                or metadata!=D3CommitMetadata(plan_result=result) or len(changes)!=3
-                or len([c for c in changes if isinstance(c,D8Conclusion) and c.outcome=='verified_fact'])!=1
+        records=[c for c in changes if isinstance(c,D8Conclusion)]
+        observed = bool(config.intent_execution_policy and result.outcome == "observed")
+        no_new = config.contract_version == 22 and result.outcome == 'no_new_information'
+        reused = (config.contract_version == 22 and not facts and result.supporting_fact_id is not None
+                  and any(f.fact_id == result.supporting_fact_id for f in rows.facts))
+        if (not isinstance(binding,HttpPlanBinding) or result.outcome not in ({'satisfied','no_new_information','observed'} if config.intent_execution_policy else {'satisfied','no_new_information'} if config.contract_version==22 else {'satisfied'})
+                or metadata!=D3CommitMetadata(plan_result=result) or len(plans)!=1 or (len(records)>1 if observed else len(records)!=1)
+                or len(changes)!=1+len(records)+len(facts) or len(facts)!=(0 if observed or no_new or reused else 1)
+                or (any(r.outcome not in {'rejected','insufficient','reviewed_inference'} for r in records) if observed else records[0].outcome!=('no_new_information' if no_new else 'verified_fact'))
+                or any(r.fact_id!=result.supporting_fact_id for r in records)
                 or result.artifact_version_id!=binding.request_evidence_id
                 or result.observation_id!=binding.execution_id or result.proof_id!=binding.execution_id
-                or store.load_d3_plan_result(result.plan_id) is not None or len(facts)!=1 or len(plans)!=1
-                or facts[0].fact_id!=result.supporting_fact_id
-                or facts[0].source_ref!=binding.execution_id or facts[0].verification_ref!='d3:'+binding.execution_id
-                or facts[0].turn_id!=binding.turn_id or facts[0].status is not FactStatus.VERIFIED
+                or store.load_d3_plan_result(result.plan_id) is not None
+                or facts and (facts[0].fact_id!=result.supporting_fact_id
+                    or facts[0].source_ref!=binding.execution_id or facts[0].verification_ref!='d3:'+binding.execution_id
+                    or facts[0].turn_id!=binding.turn_id or facts[0].status is not FactStatus.VERIFIED)
                 or plans[0].plan_id!=binding.plan_id or plans[0].status is not PlanStatus.COMPLETED):
             raise StorageError('d20_http_completion_binding_changed')
     if operation not in {'register_d3_plan','replan_d3_plan'}:

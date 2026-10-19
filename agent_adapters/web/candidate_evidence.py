@@ -291,7 +291,8 @@ def _persisted_candidate(
                     or binding.artifact_version_id != candidate.source_ref
                     or result is None
                     or result.task_run_id != task_run_id
-                    or result.outcome != "satisfied"
+                    or result.outcome not in ({"satisfied", "no_new_information"}
+                        if ledger.load_d3_run_config(task_run_id).contract_version == 22 else {"satisfied"})
                     or result.evidence_sha256 != candidate.evidence_version
                 ):
                     raise ValueError("candidate_source_invalid")

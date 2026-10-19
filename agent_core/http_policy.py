@@ -35,15 +35,15 @@ def schema(request):
         if getattr(request.context.turn_binding,'kind',None)=='hybrid_origin':
             from agent_core.output_contracts import obj
             return {'anyOf':[http,*[obj({k:{'type':'null' if v is None else 'integer' if type(v) is int else 'string','enum':[v]}
-                for k,v in c.items()}) for c in attachment_choices(request.context)]]}
+                for k,v in c.items()}) for c in attachment_choices(request.context, rolling="intent_execution" in json.loads(request.history_context))]]}
         return http
     raise ValueError('d20_http_schema_stage_invalid')
 
 
-def attachment_choices(context):
+def attachment_choices(context, *, rolling=False):
     from agent_core.hybrid_contracts import HybridTurnBinding
     if not isinstance(context.turn_binding,HybridTurnBinding):return []
-    if len(context.prior_plan_ids)>=2:return []
+    if len(context.prior_plan_ids)>=2 and not rolling:return []
     template='size_then_sha256' if not context.prior_plan_ids else 'sha256_only'
     choices=[dict(kind='attachment_observation',attachment_index=b.attachment_index,template=template,
         observation_mode='new_observation',source_proof_id=None) for b in context.turn_binding.attachments]

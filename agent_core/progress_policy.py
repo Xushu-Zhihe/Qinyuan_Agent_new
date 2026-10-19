@@ -12,13 +12,13 @@ CLASSIFICATIONS = ("meaningful", "repetitive", "inconclusive")
 PAUSE = "pause_current_intent"
 
 
-def decisions(mode, sibling, replan):
+def decisions(mode, sibling, replan, *, rolling=False):
     if mode == "restricted_repair":
         return {"meaningful": ["continue_current_intent"], "repetitive": [PAUSE], "inconclusive": [PAUSE]}
     return {"meaningful": ["continue_current_intent"] + (["replan_current_intent"] if replan else []),
             "repetitive": (["replan_current_intent"] if replan else [])
                 + (["switch_sibling_intent"] if sibling else []) + ["abandon_current_intent"],
-            "inconclusive": [PAUSE]}
+            "inconclusive": ["continue_current_intent", PAUSE] if rolling else [PAUSE]}
 
 
 def freeze_policy(app, context, turn_id, intent_id, scope, actions, timeout):
@@ -28,7 +28,7 @@ def freeze_policy(app, context, turn_id, intent_id, scope, actions, timeout):
     if (not recent or recent[-1]["ordinal"] != progress["decision_count"]
             or latest not in context["source_versions"]):
         raise D3RecoveryRequired("s3_latest_decision_unavailable")
-    unavailable = unavailable_decisions(app.state, turn_id, intent_id, app.config.max_turns)
+    unavailable = unavailable_decisions(app.state, turn_id, intent_id, app.config.max_turns, rolling=bool(app.config.intent_execution_policy))
     sibling, replan = "switch_sibling_intent" not in unavailable, "replan_current_intent" not in unavailable
     mode = progress["mode"]
     return {"version": 2 if app.config.contract_version in {16, 17, 18, 19, 20, 21, 22} else 1,
@@ -36,7 +36,7 @@ def freeze_policy(app, context, turn_id, intent_id, scope, actions, timeout):
             "mode": mode, "decision_watermark": progress["decision_count"],
             "window_sha256": digest(progress), "required_latest_decision_ref": latest,
             "sibling_available": sibling, "replan_available": replan,
-            "allowed_decisions": decisions(mode, sibling, replan),
+            "allowed_decisions": decisions(mode, sibling, replan, rolling=progress.get("intent_execution_policy") == "rolling_v1"),
             "allowed_action_kinds": [a for a in ACTION_KINDS if a in actions],
             "max_action_timeout_seconds": timeout}
 
@@ -62,7 +62,7 @@ def policy_for(request):
                 or p["required_latest_decision_ref"] not in request.source_versions
                 or p["window_sha256"] != digest(progress)
                 or type(p["sibling_available"]) is not bool or type(p["replan_available"]) is not bool
-                or p["allowed_decisions"] != decisions(p["mode"], p["sibling_available"], p["replan_available"])
+                or p["allowed_decisions"] != decisions(p["mode"], p["sibling_available"], p["replan_available"], rolling=progress.get("intent_execution_policy") == "rolling_v1")
                 or not isinstance(p["allowed_action_kinds"], list)
                 or p["allowed_action_kinds"] != [a for a in ACTION_KINDS if a in p["allowed_action_kinds"]]
                 or p["mode"] == "ordinary" and not p["allowed_action_kinds"]

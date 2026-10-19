@@ -7,11 +7,11 @@ import threading
 from dataclasses import asdict, replace
 
 from agent_core.conclusion_contracts import (
-    D8Candidate, D8Conclusion, D8Feedback, D8InferenceView, D8ModelRequest, D8Observation,
+    D22FactReviewRequest, D8Candidate, D8Conclusion, D8Feedback, D8InferenceView, D8ModelRequest, D8Observation,
     D8ReviewDecision, D8ReviewRequestAction, conclusion_digest, parse_d8_proposal, fact_evidence_matches,
 )
 from agent_core.runtime import TaskRunStatus
-from agent_core.domain import IntentStatus, PlanStatus, TurnStatus
+from agent_core.domain import FactStatus, IntentStatus, PlanStatus, TurnStatus
 from agent_core.dual_llm_contracts import D3RecoveryRequired
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.operation_accounting import D4OperationCompletion, D4OperationStart
@@ -74,7 +74,21 @@ class ConclusionReview:
 
     @staticmethod
     def _parse(request, raw):
-        return parse_d8_proposal(raw) if request.stage == "fact_proposal" else D8ReviewDecision.from_dict(raw)
+        if request.stage == "fact_proposal":
+            return parse_d8_proposal(raw)
+        decision = D8ReviewDecision.from_dict(raw)
+        if (isinstance(request, D22FactReviewRequest) and decision.decision == "accept"
+                and request.candidate.assertion is not None):
+            source = request.observation
+            content = ConclusionReview._final_fact_content(request.candidate, decision)
+            for item in request.existing_facts:
+                old = item["observation"]
+                if (item["content"] == content and old["rule_id"] == source.rule_id
+                        and old["observed_sha256"] == source.observed_sha256
+                        and old["byte_size"] == source.byte_size
+                        and old.get("response_status") == getattr(source, "response_status", None)):
+                    raise ValueError("d22_ambiguous_duplicate_conclusion")
+        return decision
 
     def _sensitive(self, raw):
         if isinstance(raw, str):
@@ -93,6 +107,11 @@ class ConclusionReview:
 
     def _checked_completion(self, request, result):
         fields = {"model_request_id", "request_sha256", "outcome", "raw", "finished_at"}
+        if "rejection_code" in result:
+            if (not isinstance(request, D22FactReviewRequest) or result["outcome"] != "invalid"
+                    or result["rejection_code"] != "d22_ambiguous_duplicate_conclusion"):
+                raise D3RecoveryRequired("d22_rejection_binding_changed")
+            fields.add("rejection_code")
         bindings = getattr(self, "assembly_bindings", None)
         if bindings is not None and request.stage == "fact_proposal":
             bindings.verify_result(request, result)
@@ -265,6 +284,7 @@ class ConclusionReview:
                 raw = materialize(request, raw)
             outcome = "valid"
             issues = None
+            rejection = None
             if isinstance(raw, ModelError):
                 outcome, raw = "model_error", None
             elif self._sensitive(raw):
@@ -272,7 +292,13 @@ class ConclusionReview:
             else:
                 try:
                     self._parse(request, raw)
-                except (ValueError, TypeError, KeyError):
+                except (ValueError, TypeError, KeyError) as exc:
+                    if str(exc) == "d22_ambiguous_duplicate_conclusion":
+                        rejection = "d22_ambiguous_duplicate_conclusion"
+                        from qinyuan_core import get_logger
+                        get_logger("ctrl").info("fact.duplicate_requires_disambiguation",
+                            run=request.task_run_id, intent=request.observation.intent_id,
+                            code=rejection, category="business", request=request.model_request_id)
                     if self.business_diagnostics is not None and request.stage == "fact_proposal":
                         boundary = getattr(self, "output_boundary", None)
                         if boundary is None or boundary.diagnostic(request.model_request_id) is None:
@@ -284,6 +310,8 @@ class ConclusionReview:
             result = {"model_request_id": request.model_request_id,
                       "request_sha256": request.context_sha256, "outcome": outcome,
                       "raw": raw, "finished_at": self.clock()}
+            if rejection is not None and outcome == "invalid":
+                result["rejection_code"] = rejection
             if outcome == "invalid" and issues is not None:
                 business = self.business_diagnostics.save(request, issues, result["finished_at"])
                 result = self.business_diagnostics.rejected_result(request, business)
@@ -301,10 +329,10 @@ class ConclusionReview:
                 request, model_request_id=correction_id,
                 base_checkpoint_sequence=self.controller.control_state.latest_checkpoint.sequence,
                 correction_of_model_request_id=request.model_request_id,
-                rejection_code="d8_response_contract_invalid")
+                rejection_code=result.get("rejection_code", "d8_response_contract_invalid"))
             return await self._call(correction, token)
         if result["outcome"] != "valid":
-            raise D3RecoveryRequired(f"d8_model_{result['outcome']}")
+            raise D3RecoveryRequired(result.get("rejection_code", f"d8_model_{result['outcome']}"))
         self._scope(request.observation)
         return request.model_request_id, self._parse(request, result["raw"])
 
@@ -371,6 +399,60 @@ class ConclusionReview:
             raise ValueError("d8_final_content_candidate_missing")
         return candidate.content
 
+    def accepted_content(self, record):
+        request = self.evidence.read_request(record.review_request_id)
+        result = self._known(request)
+        return self._final_fact_content(request.candidate, self._parse(request, result["raw"]))
+
+    def reusable_facts(self, source):
+        """Current same-Intent conclusions; response equality is only a hint."""
+        app = self.app
+        history = {i.record_id: i for i in app.revisions._history()}
+        result = []
+        for fact in app.state.facts:
+            view = history.get(fact.fact_id)
+            if (fact.status is not FactStatus.VERIFIED or not app.revisions.reliable(view)
+                    or getattr(view, "current_status", "effective") != "effective"
+                    or view.intent_id != source.intent_id or fact.turn_id != source.turn_id):
+                continue
+            old = self.observation(fact.verification_ref[3:], historical=True)
+            if old.task_run_id != source.task_run_id or old.intent_id != source.intent_id:
+                raise D3RecoveryRequired("d22_fact_source_scope_changed")
+            result.append({"fact_id": fact.fact_id, "content": fact.content, "ref": view.ref,
+                           "observation": asdict(old)})
+        return tuple(result)
+
+    def fact_choice(self, request, candidate, decision):
+        source = request.observation
+        if not isinstance(request, D22FactReviewRequest):
+            if decision.decision in {"reuse", "no_new_information"}:
+                raise D3RecoveryRequired("d22_review_not_enabled")
+            return stable_id(source.task_run_id, f"d3/fact/{source.plan_id}")
+        if decision.decision == "no_new_information":
+            return None
+        selected = decision.reuse_fact_id
+        if selected is None:
+            return stable_id(source.task_run_id, f"d3/fact/{source.plan_id}")
+        frozen = next((i for i in request.existing_facts if i["fact_id"] == selected), None)
+        current = next((i for i in self.reusable_facts(source) if i["fact_id"] == selected), None)
+        if frozen is None or current != frozen:
+            raise D3RecoveryRequired("d22_reused_fact_not_effective")
+        return selected
+
+    def check_support(self, state, binding, proof_id, fact_id):
+        """Verify an explicit additional support edge without changing Fact origin."""
+        record = next((r for r in self.store.list_d8_conclusions(binding.task_run_id)
+                       if r.plan_id == binding.plan_id and r.fact_id == fact_id), None)
+        if record is None:
+            raise D3RecoveryRequired("d22_fact_support_missing")
+        source = self.validate_record(record, state, historical=True)
+        if source.proof_id != proof_id or record.outcome != "verified_fact":
+            raise D3RecoveryRequired("d22_fact_support_changed")
+        fact = next((f for f in state.facts if f.fact_id == fact_id), None)
+        if fact is None or fact_id not in {i["fact_id"] for i in self.reusable_facts(source)}:
+            raise D3RecoveryRequired("d22_reused_fact_not_effective")
+        return source, fact
+
     async def propose(self, proof_id, token):
         source = self.observation(proof_id)
         self._scope(source)
@@ -408,17 +490,22 @@ class ConclusionReview:
                 review_id, source, "fact_review", self.config.outer_role.role_config_ref,
                 self.controller.control_state.latest_checkpoint.sequence, candidate=candidate,
                 goal=request.goal, intent_description=request.intent_description)
+            if self.config.contract_version == 22 and not isinstance(review, D22FactReviewRequest) and self.evidence.read_request(review_id) is None:
+                from dataclasses import fields
+                review = D22FactReviewRequest(**{f.name: getattr(review, f.name) for f in fields(review)},
+                                              existing_facts=self.reusable_facts(source))
             actual_id, decision = await self._call(review, token)
-            outcome = self._outcome(candidate, source, decision)
+            outcome = ("no_new_information" if decision.decision == "no_new_information" else
+                       "verified_fact" if decision.decision == "reuse" else self._outcome(candidate, source, decision))
+            fact_id = self.fact_choice(review, candidate, decision) if outcome in {"verified_fact", "no_new_information"} else None
             record = D8Conclusion(self._id(f"conclusion/{proposal_id}"), source.task_run_id,
                                   source.turn_id, source.intent_id, source.plan_id, proposal_id,
                                   actual_id, conclusion_digest(asdict(candidate)), source.source_version_sha256,
-                                  outcome, stable_id(source.task_run_id, f"d3/fact/{source.plan_id}")
-                                  if outcome == "verified_fact" else None)
+                                  outcome, fact_id)
             return proposal_id, record
         raise D3RecoveryRequired("d8_proposal_allowance_exhausted")
 
-    def validate_record(self, record, state):
+    def validate_record(self, record, state, *, historical=False):
         proposal = self.evidence.read_request(record.proposal_request_id)
         review = self.evidence.read_request(record.review_request_id)
         if proposal is None or review is None:
@@ -428,7 +515,10 @@ class ConclusionReview:
             raise D3RecoveryRequired("d8_approval_not_confirmed")
         candidate = self._parse(proposal, raw_proposal["raw"])
         decision = self._parse(review, raw_review["raw"])
-        source = self.observation(review.observation.proof_id)
+        source = self.observation(review.observation.proof_id, historical=historical)
+        outcome = ("no_new_information" if decision.decision == "no_new_information" else
+                   "verified_fact" if decision.decision == "reuse" else self._outcome(candidate, source, decision))
+        expected_fact = self.fact_choice(review, candidate, decision) if outcome in {"verified_fact", "no_new_information"} else None
         if (not isinstance(candidate, D8Candidate) or proposal.stage != "fact_proposal"
                 or review.stage != "fact_review" or review.candidate != candidate
                 or proposal.observation != source or review.observation != source
@@ -436,12 +526,14 @@ class ConclusionReview:
                 != (source.task_run_id, source.turn_id, source.intent_id, source.plan_id)
                 or record.source_version_sha256 != source.source_version_sha256
                 or record.candidate_sha256 != conclusion_digest(asdict(candidate))
-                or record.outcome != self._outcome(candidate, source, decision)
+                or record.outcome != outcome or record.fact_id != expected_fact
                 or not fact_evidence_matches(candidate, source)):
             raise D3RecoveryRequired("d8_approval_binding_changed")
-        self._scope(source)
+        if not historical:
+            self._scope(source)
         if (proposal.base_checkpoint_sequence > state.latest_checkpoint.sequence
-                or review.base_checkpoint_sequence != state.latest_checkpoint.sequence):
+                or review.base_checkpoint_sequence > state.latest_checkpoint.sequence
+                or not historical and review.base_checkpoint_sequence != state.latest_checkpoint.sequence):
             raise D3RecoveryRequired("d8_approval_checkpoint_changed")
         return source
 

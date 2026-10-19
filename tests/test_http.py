@@ -85,19 +85,23 @@ class Model:
 
 
 @pytest.fixture
-def http_case(tmp_path,monkeypatch):
+def http_case(tmp_path,monkeypatch,request):
     monkeypatch.setattr(http_adapter,'WindowsEvidenceProtection',_TestOnlyProtection)
     monkeypatch.setattr(candidate_evidence,'WindowsEvidenceProtection',_TestOnlyProtection)
     from agent_adapters.deepseek_roles import role_config,EstimatedCapacity
     from agent_adapters.simulation import real_config
-    outer=role_config('outer_planning',version=15)
-    inner=role_config('inner_action',version=15)
-    public_config=real_config(contract_version=20,http=True)
+    requested=getattr(request,'param',20)
+    rolling=requested == 'rolling'
+    version=22 if rolling else requested
+    outer=role_config('outer_planning',version=version-5)
+    inner=role_config('inner_action',version=version-5)
+    public_config=real_config(contract_version=version,http=True,rolling=rolling)
     authorization_id=str(uuid4())
     config=D3RunConfig(outer,inner,D3Authorization(authorization_id,()),outer.role_config_ref,
-        contract_version=20,d4_budget=D8HandoffBudgetPolicy(),d5_enabled=True,d5_sensitive_requirements=(),
+        contract_version=version,d4_budget=D8HandoffBudgetPolicy(),d5_enabled=True,d5_sensitive_requirements=(),
         d8_enabled=True,handoff_config=D8HandoffConfig.from_dict(public_config['handoff_config']),
-        web_authorization=D7WebAuthorization(authorization_id,ORIGIN,('GET','HEAD','OPTIONS')),http_timeout_seconds=60)
+        web_authorization=D7WebAuthorization(authorization_id,ORIGIN,('GET','HEAD','OPTIONS')),http_timeout_seconds=60,
+        intent_execution_policy="rolling_v1" if rolling else None)
     models=[Model(outer),Model(inner)]
     clock,token,sandbox=Clock(),Token(),WebSandbox()
     directory=tmp_path/'run'
@@ -122,13 +126,13 @@ def http_case(tmp_path,monkeypatch):
         create=create,directory=directory,response_headers=response_headers,sandbox=sandbox)
     from agent_adapters.run_files import immutable_write
     from agent_adapters.simulation import real_declaration_binding
-    raw=dict(protocol_version=3,request_id=str(uuid4()),execution_profile='d8_v20',mode='real',
+    raw=dict(protocol_version=3,request_id=str(uuid4()),execution_profile=f'd8_v{version}',mode='real',
         d8_config=public_config,task_request=dict(goal='Observe home page and propose a candidate.',deadline_seconds=600,
             target=dict(source_root=str(tmp_path),attachments=[],endpoints=[dict(url=ORIGIN)])),
         authorization=config.web_authorization.to_dict(),dual_llm_config=dict(outer_role=asdict(outer),
             inner_role=asdict(inner),d4_budget=asdict(config.d4_budget)))
     declaration=dict(protocol_version=3,task_run_id=task,request_id=raw['request_id'],request=raw,mode='real',
-        contract_version=20,execution_profile='d8_v20',sandbox_backend='docker',env_file=str(tmp_path/'unused.env'),
+        contract_version=version,execution_profile=f'd8_v{version}',sandbox_backend='docker',env_file=str(tmp_path/'unused.env'),
         d4_budget_policy=asdict(config.d4_budget),source_root=str(directory),attachments=[],staged_attachment_paths=[],
         role_config_refs=dict(outer=outer.role_config_ref,inner=inner.role_config_ref),ids=dict(cancel=str(uuid4()),start=str(uuid4())))
     declaration=json.loads(json.dumps(declaration))

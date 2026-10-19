@@ -135,6 +135,9 @@ def d3_payload(value: object) -> dict[str, object]:
     ):
         payload["config"].pop("d5_enabled")
         payload["config"].pop("d5_sensitive_requirements")
+    config = value if isinstance(value, D3RunConfig) else value.config if isinstance(value, D3CommitMetadata) else None
+    if config is not None and config.intent_execution_policy is None:
+        (payload if isinstance(value, D3RunConfig) else payload["config"]).pop("intent_execution_policy", None)
     return payload
 
 
@@ -172,8 +175,12 @@ class D3RunConfig:
     handoff_config: D8HandoffConfig | None = None
     web_authorization: D7WebAuthorization | None = None
     http_timeout_seconds: int | None = None
+    intent_execution_policy: str | None = None
 
     def __post_init__(self) -> None:
+        if self.intent_execution_policy is not None and (
+                self.intent_execution_policy != "rolling_v1" or self.contract_version != 22):
+            raise ValueError("d22_intent_execution_policy_invalid")
         if self.web_authorization is not None and (
                 self.contract_version not in {20,21,22} or not isinstance(self.web_authorization, D7WebAuthorization)
                 or self.contract_version==20 and self.authorization.attachment_indices
@@ -285,7 +292,7 @@ class D3RunConfig:
             fields | {"d4_budget", "d5_enabled"},
             fields | {"d4_budget", "d5_enabled", "d5_sensitive_requirements"},
         )
-        if set(value) - {"d6_authorization", "d8_enabled", "handoff_config", "web_authorization", "http_timeout_seconds"} not in allowed:
+        if set(value) - {"d6_authorization", "d8_enabled", "handoff_config", "web_authorization", "http_timeout_seconds", "intent_execution_policy"} not in allowed:
             raise ValueError("invalid D3RunConfig fields")
         budget = value.get("d4_budget")
         if budget is not None and not isinstance(budget, dict):
@@ -331,6 +338,7 @@ class D3RunConfig:
             if value.get("handoff_config") is not None else None,
             D7WebAuthorization.from_dict(value['web_authorization']) if value.get('web_authorization') is not None else None,
             value.get('http_timeout_seconds'),
+            value.get('intent_execution_policy'),
         )
 
 
@@ -426,8 +434,8 @@ class D3PlanBinding:
             and self.observation_mode != "new_observation"
         ):
             raise ValueError("initial two-step Plan requires a new observation")
-        if (self.template == "size_then_sha256") == (self.replan_review_id is not None):
-            raise ValueError("only a reviewed replacement may use the one-step Plan")
+        if self.template == "size_then_sha256" and self.replan_review_id is not None:
+            raise ValueError("initial two-step Plan cannot cite a replacement review")
         if self.observation_mode == "reuse_saved_proof":
             _uuid(self.source_proof_id, "source_proof_id")
             _uuid(self.source_fact_id, "source_fact_id")
@@ -439,7 +447,7 @@ class D3PlanBinding:
 class D3PlanResult:
     task_run_id: str
     plan_id: str
-    outcome: Literal["satisfied", "not_satisfied"]
+    outcome: Literal["satisfied", "not_satisfied", "no_new_information", "observed"]
     artifact_version_id: str
     observation_id: str
     proof_id: str | None
@@ -449,11 +457,15 @@ class D3PlanResult:
     def __post_init__(self) -> None:
         for name in ("task_run_id", "plan_id", "artifact_version_id", "observation_id"):
             _uuid(getattr(self, name), name)
-        if self.outcome not in {"satisfied", "not_satisfied"}:
+        if self.outcome not in {"satisfied", "not_satisfied", "no_new_information", "observed"}:
             raise ValueError("unsupported D3 Plan result")
         if self.outcome == "satisfied":
             _uuid(self.proof_id, "proof_id")
             _uuid(self.supporting_fact_id, "supporting_fact_id")
+        elif self.outcome in {"no_new_information", "observed"}:
+            _uuid(self.proof_id, "proof_id")
+            if self.supporting_fact_id is not None:
+                raise ValueError(f"{self.outcome} cannot claim a Fact")
         elif self.proof_id is not None:
             raise ValueError("not_satisfied cannot claim a proof")
         elif self.supporting_fact_id is not None:

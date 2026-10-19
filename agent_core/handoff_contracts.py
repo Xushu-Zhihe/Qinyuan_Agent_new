@@ -1,4 +1,4 @@
-"""D8-2 internal handoff contracts. Summaries never acquire Fact identity."""
+﻿"""D8-2 internal handoff contracts. Summaries never acquire Fact identity."""
 
 from __future__ import annotations
 
@@ -17,11 +17,14 @@ def handoff_json(value) -> str:
 
 @dataclass(frozen=True, slots=True)
 class D8Capacity:
-    turn_body: int = 1024
-    global_body: int = 2048
-    initial_history: int = 8192
-    visible_history: int = 16384
-    read_return: int = 2048
+    # Sizes are JSON bytes of each packet section, not tokens. The outer budget is
+    # 262144 bytes (~128K-token DeepSeek window); these section caps must leave the
+    # whole packet inside it instead of pausing on the first multi-turn history.
+    turn_body: int = 16384
+    global_body: int = 32768
+    initial_history: int = 98304
+    visible_history: int = 131072
+    read_return: int = 16384
 
     def __post_init__(self):
         initial = (1024, 2048, 8192, 16384, 2048)
@@ -237,7 +240,7 @@ class D8TreeRecord:
         for n in ("turn_id", "intent_id", "model_request_id", "support_fact_id", "inner_request_id"):
             if getattr(self, n) is not None:
                 _uuid(getattr(self, n), n)
-        if self.kind not in {"registration", "succeeded", "failed", "inconclusive", "expansion_exhausted", "turn_exhausted", "selection", "reopened"}:
+        if self.kind not in {"registration", "succeeded", "failed", "inconclusive", "expansion_exhausted", "turn_exhausted", "selection", "evaluation_continued"}:
             raise ValueError("d8_tree_record_kind_invalid")
 
 

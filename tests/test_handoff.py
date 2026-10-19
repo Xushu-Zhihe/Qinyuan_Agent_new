@@ -91,6 +91,12 @@ class HandoffModel:
         return self.modify(request, raw)
 
 
+# The shipped defaults are sized for a real context window; these tests exercise
+# the pause/resume mechanism, so they pin a deliberately tight packet budget.
+TIGHT_CAPACITY = D8Capacity(turn_body=1024, global_body=2048, initial_history=8192,
+                            visible_history=16384, read_return=2048)
+
+
 @pytest.fixture
 def tree(tmp_path):
     source = tmp_path / "input"
@@ -103,7 +109,7 @@ def tree(tmp_path):
                          outer_role.role_config_ref, contract_version=3,
                          d4_budget=D8HandoffBudgetPolicy(), d5_enabled=True,
                          d5_sensitive_requirements=(), d8_enabled=True,
-                         handoff_config=D8HandoffConfig(policy, policy))
+                         handoff_config=D8HandoffConfig(policy, policy, TIGHT_CAPACITY))
     sandbox, clock, token = Sandbox(), Clock(), Token()
     inner, handoff = Inner(inner_role), HandoffModel(outer_role)
 
@@ -161,7 +167,7 @@ def test_summary_uses_frozen_capacity_and_partial_precise_refs():
     raw = {"turn_body": "x" * 1500, "global_body": "summary", "ordered_refs": ["frozen-v1"],
            "open_questions": [{"text": "Unresolved", "refs": []}]}
     with pytest.raises(ValueError):
-        D8SummaryCandidate.parse(raw, {"frozen-v1", "unranked-v2"}, D8Capacity())
+        D8SummaryCandidate.parse(raw, {"frozen-v1", "unranked-v2"}, D8Capacity(turn_body=1024))
     parsed = D8SummaryCandidate.parse(raw, {"frozen-v1", "unranked-v2"}, D8Capacity(turn_body=1600))
     assert parsed.ordered_refs == ("frozen-v1",) and parsed.open_questions[0][1] == ()
     with pytest.raises(ValueError):
@@ -593,7 +599,7 @@ def test_actual_schema23_readonly_and_upgrade_keep_d8_1_history_and_budget(case)
     connection.close()
     original = database.read_bytes()
     readonly = SqliteControlStore.open_readonly(database)
-    assert readonly._schema_version == 23
+    assert readonly._schema_version == CURRENT_SCHEMA_VERSION
     assert readonly.list_d8_conclusions(task) == conclusions and not readonly.list_d8_handoffs(task)
     readonly.close()
     assert database.read_bytes() == original

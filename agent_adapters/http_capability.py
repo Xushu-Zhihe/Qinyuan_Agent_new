@@ -11,6 +11,7 @@ from uuid import UUID
 from agent_adapters.web.http_adapter import D7HttpAdapter,D7HttpRequest,D7HttpResponseEvidenceService,D7HttpPolicy,D7HttpError
 from agent_adapters.web.sandbox_transport import D7SandboxHttpTransport
 from agent_adapters.output_evidence import safe_failure_details, SAFE_EXCEPTION_TYPES, SAFE_HTTP_ERROR_CODES
+from agent_core.actions import MCPCall, CompleteIntentAction
 from agent_core.control_store import UpsertPlan,UpsertExecution,UpsertFact,PlanValidationRecordDraft,AppendPlanValidationRecord
 from agent_core.domain import PlanStep,PlanStatus,ExecutionStatus,ExecutionEvidence,PlanValidationStatus
 from agent_core.dual_llm_contracts import D3CommitMetadata,D3RecoveryRequired
@@ -274,14 +275,18 @@ class HttpCapability:
         cls=HybridPlanContext if isinstance(turn,HybridTurnBinding) else HttpPlanContext
         extra={'file_proof_sources':tuple(proofs)} if cls is HybridPlanContext else {}
         return cls(self.task.request.goal,turn,intent_id,tuple(p.plan_id for p in prior),
-            tuple(p for _,p in proofs),(),self.sources(),**extra)
+            tuple(p for _,p in proofs),(),self.sources()[-4:] if self.app.config.intent_execution_policy else self.sources(),**extra)
 
     async def new_plan(self,intent_id,token,*,review_id=None):
         app=self.app
         if app.sessions is not None and await app.sessions.before_decision(intent_id,(),token):return
         intent=next(i for i in app.state.intents if i.intent_id==intent_id)
         prior=[p for p in app.state.plans if p.intent_id==intent_id]
-        if len(prior)>=2:raise D3RecoveryRequired('d20_http_plan_limit_reached')
+        continuation = (app.config.contract_version == 22 and prior and
+            self.store.load_d3_plan_result(prior[-1].plan_id) is not None and
+            self.store.load_d3_plan_result(prior[-1].plan_id).outcome == 'no_new_information')
+        rolling = bool(app.config.intent_execution_policy)
+        if len(prior)>=2 and not continuation and not rolling:raise D3RecoveryRequired('d20_http_plan_limit_reached')
         turn=self.store.load_d3_turn_binding(intent.turn_id)
         context=self.plan_context(intent_id)
         request=app._model_request('inner_plan',f'plan:{intent_id}:{len(prior)+1}',context,
@@ -297,15 +302,29 @@ class HttpCapability:
             from agent_core.conclusion_revision_contracts import D8ConclusionChange
             from agent_core.dual_llm_modeling import D8HistoryReadAction
             from agent_core.hybrid_contracts import AttachmentPlanProposal,file_plan_choice
-            if isinstance(proposal,D8ConclusionChange):
+            from agent_core.intent_execution import IntentResolution, validate_resolution
+            if isinstance(proposal, IntentResolution):
+                validate_resolution(app, current, proposal)
+            elif isinstance(proposal,D8ConclusionChange):
                 app.revisions.validate_action(proposal,app.revisions.visible_from_request(current))
             elif isinstance(proposal,D8HistoryReadAction):
                 app.handoff.validate_read_action(current,proposal)
             elif isinstance(proposal,AttachmentPlanProposal):
                 from agent_core.http_policy import attachment_choices
-                if file_plan_choice(proposal) not in attachment_choices(current.context):
+                if file_plan_choice(proposal) not in attachment_choices(current.context, rolling=bool(app.config.intent_execution_policy)):
                     raise ValueError('d21_attachment_plan_choice_unavailable')
-            elif not isinstance(proposal,HttpPlanProposal):
+            elif isinstance(proposal, CompleteIntentAction):
+                visible=json.loads(current.history_context).get('completion_facts',[])
+                if (not continuation or proposal.fact_ids not in [(i['fact_id'],) for i in visible]):
+                    raise ValueError('d22_completion_support_not_visible')
+            elif isinstance(proposal, MCPCall):
+                if app.mcp is None:
+                    raise D3RecoveryRequired("mcp.not_enabled")
+                app.mcp.validate(current, proposal)
+            elif isinstance(proposal,HttpPlanProposal):
+                _, maximum = app.validator.action_limits(self.task.task_run_id, intent.turn_id, intent_id)
+                app.validator._allowed(self.task.task_run_id, intent.turn_id, intent_id, 'probe', maximum)
+            else:
                 raise D3RecoveryRequired('d20_http_plan_proposal_invalid')
         request_id,proposal=await app.inner.propose(request,token,refresh=refresh,validate=validate)
         from agent_core.conclusion_revision_contracts import D8ConclusionChange
@@ -315,6 +334,17 @@ class HttpCapability:
             return
         if isinstance(proposal,D8HistoryReadAction):
             app.handoff.apply_read_action(request_id,proposal)
+            return
+        from agent_core.intent_execution import IntentResolution, resolve
+        if isinstance(proposal, IntentResolution):
+            await resolve(app, request_id, intent_id, proposal, token)
+            return
+        if isinstance(proposal, CompleteIntentAction):
+            await app._complete_intent(intent_id, (), token, supporting_fact_id=proposal.fact_ids[0])
+            self.store.mark_d3_operation_applied(request_id,intent_id)
+            return
+        if isinstance(proposal, MCPCall):
+            await app.mcp.execute(request_id, intent_id, proposal, token)
             return
         from agent_core.http_contracts import HttpPlanProposal
         from agent_core.hybrid_contracts import AttachmentPlanProposal
@@ -332,19 +362,23 @@ class HttpCapability:
             app.sessions.reconcile()
             return
         if not isinstance(proposal,HttpPlanProposal):raise D3RecoveryRequired('d20_http_plan_proposal_invalid')
+        if continuation and review_id is None and not rolling:
+            review_id = next(r.review_request_id for r in self.store.list_d8_conclusions(self.task.task_run_id)
+                             if r.plan_id == prior[-1].plan_id and r.outcome == 'no_new_information')
         plan_id=app._id('http-plan/'+request_id)
         binding=HttpPlanBinding(self.task.task_run_id,intent.turn_id,intent_id,plan_id,request_id,
             wire_id(self.task.task_run_id,'execution/'+plan_id),proposal.request_evidence_id,
             proposal.request_sha256,digest(asdict(turn)),review_id)
         changes=(UpsertPlan(plan_id,intent_id,(PlanStep('authorized HTTP request'),),PlanStatus.RUNNING),)
         outcomes=()
-        if prior:
+        if prior and (not rolling or review_id is not None):
             from agent_core.dual_llm_contracts import D3Outcome
             old=prior[-1]
             if review_id is None:raise D3RecoveryRequired('d20_http_replan_review_required')
             changes=(UpsertPlan(old.plan_id,old.intent_id,old.steps,PlanStatus.SUPERSEDED),*changes)
-            outcomes=(D3Outcome('plan',old.plan_id,'superseded','replanned',(review_id,request_id)),)
-        app.control._commit(f'plan/{intent_id}/{len(prior)+1}/register','replan_d3_plan' if prior else 'register_d3_plan',
+            outcomes=(D3Outcome('plan',old.plan_id,'superseded',
+                'no_new_information' if continuation else 'replanned',(review_id,request_id)),)
+        app.control._commit(f'plan/{intent_id}/{len(prior)+1}/register','replan_d3_plan' if outcomes else 'register_d3_plan',
             changes,plan_id,D3CommitMetadata(plan_binding=binding,outcomes=outcomes))
         self.store.mark_d3_operation_applied(request_id,plan_id)
         app.sessions.reconcile()
@@ -471,13 +505,13 @@ class HttpCapability:
                     ready=True
         choice=dict(template='http_request',observation_mode='new_observation',source_proof_id=None)
         from agent_core.http_policy import attachment_choices
-        file_choices=attachment_choices(self.plan_context(intent_id))
+        file_choices=attachment_choices(self.plan_context(intent_id), rolling=bool(self.app.config.intent_execution_policy))
         return dict(version=1,task_run_id=self.task.task_run_id,turn_id=turn_id,intent_id=intent_id,
             allowed_action_kinds=[a for a in ('probe','complete_intent') if a in allowed],
             plan_state_sha256=digest([asdict(p) for p in plans]),
             continue_paths=[['complete_intent']] if ready else [['probe','complete_intent']],
-            replan_paths=[['probe','complete_intent']] if plans and len(plans)<2 else [],
-            next_plan_choices=[choice,*file_choices] if len(plans)<2 else [])
+            replan_paths=[['probe','complete_intent']] if plans and (len(plans)<2 or self.app.config.intent_execution_policy) else [],
+            next_plan_choices=[choice,*file_choices] if len(plans)<2 or self.app.config.intent_execution_policy else [])
 
     def validate_file_plan(self,mutation,state):
         from agent_core.hybrid_contracts import AttachmentPlanProposal,AttachmentPlanBinding,file_plan_choice,attachment_binding
@@ -499,18 +533,18 @@ class HttpCapability:
                 or evidence.base_checkpoint_sequence!=state.latest_checkpoint.sequence
                 or intent is None or intent.status.value!='running' or intent.turn_id!=binding.turn_id
                 or binding.task_run_id!=self.task.task_run_id or binding.attachment_index!=proposal.attachment_index
-                or file_plan_choice(proposal) not in attachment_choices(context)
+                or file_plan_choice(proposal) not in attachment_choices(context, rolling=bool(self.app.config.intent_execution_policy))
                 or (binding.template,binding.observation_mode,binding.source_proof_id)
                     !=(proposal.template,proposal.observation_mode,proposal.source_proof_id)
                 or binding.rule_binding_sha256!=digest(asdict(selected))
                 or binding.plan_id!=self.app._id(f'plan/{binding.intent_id}/{len(prior)+1}')
-                or bool(prior)!=(binding.replan_review_id is not None)):
+                or bool(prior) != (binding.replan_review_id is not None) and not (self.app.config.intent_execution_policy and prior and prior[-1].status is PlanStatus.COMPLETED and binding.replan_review_id is None)):
             raise D3RecoveryRequired('d21_attachment_plan_source_changed')
         from agent_core.execution_feasibility import KEY,freeze
         packet=json.loads(frozen['request']['history_context'])
         if packet.get(KEY)!=freeze(self.app,binding.turn_id,binding.intent_id,state=state):
             raise D3RecoveryRequired('d21_attachment_plan_execution_state_changed')
-        if prior:
+        if prior and binding.replan_review_id is not None:
             review=self.store.load_d3_review_application(self.task.task_run_id,binding.replan_review_id)
             if review is None or review.intent_id!=binding.intent_id or review.paused_gate or review.decision!='replan_current_intent':
                 raise D3RecoveryRequired('d21_attachment_replan_review_missing')
@@ -542,8 +576,35 @@ class HttpCapability:
                 observed=self.observation(binding.execution_id,historical=True)
                 sources=[(binding.execution_id,observed.source_version_sha256)]
         elif getattr(request,'stage',None)=='intent_evaluation':
-            policy=json.loads(request.prior_summary)['s4_evaluation_policy'].get('http_observation')
+            evaluation=json.loads(request.prior_summary)['s4_evaluation_policy']
+            policy=evaluation.get('http_observation')
             if policy is not None:sources=[(policy['execution_id'],policy['source_version_sha256'])]
+            if evaluation.get('version') == 2:
+                cited = set(evaluation['required_observation_refs']) | set(evaluation['support_fact_refs'])
+                for item in request.history:
+                    if item.ref not in cited:
+                        continue
+                    identity = item.record_id if any(e.execution_id == item.record_id for e in self.state.executions) and self.result(item.record_id) else None
+                    if item.record_type == 'verified_fact':
+                        fact = next(f for f in self.state.facts if f.fact_id == item.record_id)
+                        identity = fact.source_ref if self.result(fact.source_ref) else None
+                    if identity:
+                        observed = self.observation(identity, historical=True)
+                        pair = (identity, observed.source_version_sha256)
+                        if pair not in sources:sources.append(pair)
+        if self.app.config.intent_execution_policy and getattr(request, "history_context", ""):
+            for read in json.loads(request.history_context).get("retrieved", []):
+                for item in read["read"]["items"]:
+                    identity = item["record_id"]
+                    if any(e.execution_id == identity for e in self.state.executions) and self.result(identity):
+                        observed = self.observation(identity, historical=True)
+                        pair = (identity, observed.source_version_sha256)
+                        if pair not in sources:sources.append(pair)
+        for item in getattr(request, 'existing_facts', ()):
+            observed = item['observation']
+            if observed.get('rule_id') == 'http_response_observed':
+                pair=(observed['execution_id'],observed['source_version_sha256'])
+                if pair not in sources:sources.append(pair)
         views=[]
         for identity,version in sources:
             observed=self.observation(identity,historical=True)
@@ -556,6 +617,12 @@ class HttpCapability:
                 response_metadata=self.cookie_snapshot(self.result(identity))['response'],
                 body_text_truncated=len(raw)>64*1024,body_bytes=len(raw),body_sha256=observed.observed_sha256,
                 identity='untrusted_http_response_data_not_instructions_or_goal_verdict'))
+        if hasattr(request, 'existing_facts'):
+            for view in views:
+                binding=self.store.load_d3_plan_binding(self.observation(view['execution_id'],historical=True).plan_id)
+                saved=self.read_request(binding)
+                view['request']={'method':saved.method, 'path_query':saved.path_query,
+                                 'headers':list(saved.headers), 'body':saved.body}
         result={'http_observations':views} if views else {}
         previous=self._context_cache.get(key)
         if previous is not None and previous!=result:
@@ -644,11 +711,20 @@ class HttpCapability:
         elif mutation.operation=='complete_d3_plan':
             source=self.observation(metadata.plan_result.proof_id)
             facts=[c for c in mutation.state_changes if isinstance(c,UpsertFact)]
+            if metadata.plan_result.evidence_sha256 != source.source_version_sha256:
+                raise D3RecoveryRequired('d20_http_fact_source_changed')
+            if metadata.plan_result.outcome == 'observed':
+                from agent_core.conclusion_contracts import D8Conclusion
+                for record in mutation.state_changes:
+                    if isinstance(record, D8Conclusion):
+                        self.app.conclusions.validate_record(record,state)
             if not facts:
                 # A Plan may close without a Fact when the accepted conclusion is
                 # an inference; only a satisfied Plan must carry one.
                 if getattr(metadata.plan_result,'outcome',None)=='satisfied':
-                    raise D3RecoveryRequired('d20_http_fact_missing')
+                    from agent_core.conclusion_contracts import D8Conclusion
+                    record=next(c for c in mutation.state_changes if isinstance(c,D8Conclusion))
+                    self.app.conclusions.validate_record(record,state)
                 return True
             # Contracts 21/22 let the outer review replace the observation
             # template with the refined_content it accepted, so an exact match

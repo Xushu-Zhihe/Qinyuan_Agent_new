@@ -91,11 +91,12 @@ def freeze_evaluation_policy(app, intent_id, support_fact_id, history):
         from agent_core.http_policy import evaluation
         return evaluation(app,intent_id,support_fact_id,history)
     result = app.store.load_d3_plan_result(plan.plan_id) if plan else None
+    historical = (app.config.contract_version == 22 and result is not None and result.outcome == "no_new_information")
     if (plan is None or binding is None or result is None or plan.status.value != "completed"
-            or result.outcome != "satisfied" or result.supporting_fact_id != support_fact_id
+            or not historical and (result.outcome != "satisfied" or result.supporting_fact_id != support_fact_id)
             or binding.intent_id != intent_id or binding.turn_id != intent.turn_id):
         raise D3RecoveryRequired("s4_evaluation_plan_unavailable")
-    app.validator._support(app.state, binding, result.proof_id, support_fact_id)
+    app.validator.completion_support(app.state, binding, result, support_fact_id)
     observed = app.conclusions.observation(result.proof_id, historical=True)
     support = next((i for i in history if i.record_id == support_fact_id), None)
     goal = next((i for i in history if i.record_id == intent_id), None)
@@ -129,6 +130,9 @@ def freeze_evaluation_policy(app, intent_id, support_fact_id, history):
 def evaluation_policy(request):
     try:
         policy = json.loads(request.prior_summary)["s4_evaluation_policy"]
+        if policy.get("version") == 2:
+            from agent_core.intent_execution import evaluation_policy as rolling_policy
+            return rolling_policy(request, policy)
         by_ref = {i.ref: i for i in request.history}
         required = [policy["goal_ref"], policy["support_fact_ref"], *policy["required_observation_refs"]]
         if (policy["version"] != 1 or type(policy["version"]) is not int
@@ -148,6 +152,9 @@ def evaluation_policy(request):
 def evaluation_schema(request):
     from agent_core.output_contracts import obj, array, text
     policy = evaluation_policy(request)
+    if policy.get("version") == 2:
+        from agent_core.intent_execution import evaluation_schema as rolling_schema
+        return rolling_schema(request, policy)
     refs = [i.ref for i in request.history if i.source_status == "available" and not i.conflict]
     fields = {"reason": text(), "evidence_refs": {**array({"type": "string", "enum": refs}, 1),
                                                         "uniqueItems": True}}

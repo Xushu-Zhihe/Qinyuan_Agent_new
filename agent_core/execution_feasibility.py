@@ -16,8 +16,8 @@ def requirements(choice):
     return ['complete_intent'] if choice['observation_mode'] == 'reuse_saved_proof' else list(ACTIONS)
 
 
-def choices(ordinal, proofs):
-    if ordinal not in (1, 2):
+def choices(ordinal, proofs, *, rolling=False):
+    if ordinal not in (1, 2) and not rolling:
         return []
     template = 'size_then_sha256' if ordinal == 1 else 'sha256_only'
     result = [{'template': template, 'observation_mode': 'new_observation', 'source_proof_id': None}]
@@ -45,10 +45,15 @@ def freeze(app, turn_id, intent_id, *, state=None):
         if binding is None:
             raise D3RecoveryRequired('d17_plan_binding_missing')
         if result is not None and result.outcome == 'satisfied':
-            app.validator._support(state, binding, result.proof_id, result.supporting_fact_id)
+            if app.config.intent_execution_policy:
+                app.conclusions.check_support(state, binding, result.proof_id, result.supporting_fact_id)
+            else:
+                app.validator._support(state, binding, result.proof_id, result.supporting_fact_id)
             proofs.append(result.proof_id)
         ready = result is not None and result.outcome == 'satisfied'
-        if not ready and binding.observation_mode == 'new_observation':
+        if not ready and result is not None and result.outcome == 'no_new_information':
+            pass
+        elif not ready and binding.observation_mode == 'new_observation':
             proof = app.proof_store.read(app._id(f'proof/{plan.plan_id}'))
             if proof is not None:
                 # The saved first observation can proceed through Fact review without a new probe.
@@ -62,7 +67,10 @@ def freeze(app, turn_id, intent_id, *, state=None):
         versions.append({'plan': asdict(plan), 'binding': asdict(binding),
                          'result': asdict(result) if result is not None else None, 'observation_ready': ready})
         latest_ready = ready
-    next_choices = choices(len(plans) + 1, proofs)
+    rolling = bool(app.config.intent_execution_policy) or (app.config.contract_version == 22 and plans and
+               app.store.load_d3_plan_result(plans[-1].plan_id) is not None and
+               app.store.load_d3_plan_result(plans[-1].plan_id).outcome == 'no_new_information')
+    next_choices = choices(len(plans) + 1, proofs, rolling=bool(rolling))
     continuation = [['complete_intent']] if latest_ready else [list(ACTIONS)]
     return {'version': 1, 'task_run_id': task, 'turn_id': turn_id, 'intent_id': intent_id,
             'allowed_action_kinds': [a for a in ACTIONS if a in allowed],

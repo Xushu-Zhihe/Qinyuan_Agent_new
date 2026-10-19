@@ -151,15 +151,20 @@ def parse_d8_proposal(raw: object) -> D8Candidate | D8ReviewRequestAction:
 
 @dataclass(frozen=True, slots=True)
 class D8ReviewDecision:
-    decision: Literal["accept", "reject", "insufficient"]
+    decision: Literal["accept", "reject", "insufficient", "reuse", "no_new_information"]
     reason: str
     refined_content: str | None = None
     merged_sources: tuple[str, ...] | None = None
+    reuse_fact_id: str | None = None
 
     def __post_init__(self) -> None:
-        if self.decision not in {"accept", "reject", "insufficient"}:
+        if self.decision not in {"accept", "reject", "insufficient", "reuse", "no_new_information"}:
             raise ValueError("d8_review_decision_invalid")
         _bounded(self.reason, "reason", 512)
+        if self.decision == "reuse":
+            _uuid(self.reuse_fact_id, "reuse_fact_id")
+        elif self.reuse_fact_id is not None:
+            raise ValueError("d22_reuse_requires_explicit_decision")
         if self.refined_content is not None:
             _bounded(self.refined_content, "refined_content", 2048)
         if self.merged_sources is not None:
@@ -173,7 +178,7 @@ class D8ReviewDecision:
     @classmethod
     def from_dict(cls, raw: object) -> D8ReviewDecision:
         fields = {"decision", "reason"}
-        optional_fields = {"refined_content", "merged_sources"}
+        optional_fields = {"refined_content", "merged_sources", "reuse_fact_id"}
         all_fields = fields | optional_fields
 
         if not isinstance(raw, dict):
@@ -194,6 +199,7 @@ class D8ReviewDecision:
             reason=raw["reason"],
             refined_content=raw.get("refined_content"),
             merged_sources=merged_sources,
+            reuse_fact_id=raw.get("reuse_fact_id"),
         )
 
 
@@ -274,7 +280,7 @@ class D8Feedback:
 
     def __post_init__(self) -> None:
         _uuid(self.record_id, "record_id")
-        if self.outcome not in {"verified_fact", "reviewed_inference", "rejected", "insufficient"}:
+        if self.outcome not in {"verified_fact", "reviewed_inference", "rejected", "insufficient", "no_new_information"}:
             raise ValueError("d8_feedback_outcome_invalid")
         _bounded(self.reason, "reason", 512)
         _text(self.content, "content")
@@ -336,7 +342,15 @@ class D8ModelRequest:
         if "session_id" in value:
             from agent_core.session_contracts import D8SessionConclusionRequest
             return D8SessionConclusionRequest(**value)
+        if "existing_facts" in value:
+            value["existing_facts"] = tuple(value["existing_facts"])
+            return D22FactReviewRequest(**value)
         return cls(**value)
+
+
+@dataclass(frozen=True, slots=True)
+class D22FactReviewRequest(D8ModelRequest):
+    existing_facts: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,7 +366,7 @@ class D8Conclusion:
     review_request_id: str
     candidate_sha256: str
     source_version_sha256: str
-    outcome: Literal["verified_fact", "reviewed_inference", "rejected", "insufficient"]
+    outcome: Literal["verified_fact", "reviewed_inference", "rejected", "insufficient", "no_new_information"]
     fact_id: str | None
 
     def __post_init__(self) -> None:
@@ -361,7 +375,7 @@ class D8Conclusion:
             _uuid(getattr(self, name), name)
         _sha(self.candidate_sha256, "candidate_sha256")
         _sha(self.source_version_sha256, "source_version_sha256")
-        if self.outcome not in {"verified_fact", "reviewed_inference", "rejected", "insufficient"}:
+        if self.outcome not in {"verified_fact", "reviewed_inference", "rejected", "insufficient", "no_new_information"}:
             raise ValueError("d8_conclusion_outcome_invalid")
         if self.outcome == "verified_fact":
             _uuid(self.fact_id, "fact_id")

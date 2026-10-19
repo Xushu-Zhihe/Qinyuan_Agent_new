@@ -423,6 +423,20 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
         return result
 
 
+def _transient_storage_read(error) -> bool:
+    import sqlite3
+    seen = set()
+    while error is not None and id(error) not in seen and len(seen) < 6:
+        seen.add(id(error))
+        if (isinstance(error, sqlite3.OperationalError)
+                and getattr(error, "sqlite_errorcode", 0) & 255 in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}):
+            return True
+        if isinstance(error, OSError) and getattr(error, "winerror", None) in {32, 33}:
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def _snapshot_once(directory: Path, declaration: dict) -> dict:
     """Return a safe result; unreadable state is represented as recovery required."""
     try:
@@ -478,8 +492,20 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                                         issue["code"] == "string_too_long" and issue["path"] == "$/reason"
                                         for issue in diagnostic["issues"])):
                                     known_model_failure = "d8_intent_evaluation_reason_too_long"
-                            elif latest.start.category == "review" and latest.start.resource_ref == latest.start.operation_id:
-                                known_model_failure = "d8_review_call_failed"
+                            else:
+                                from agent_adapters.handoff_evidence import FileD8HandoffEvidence
+                                from agent_core.turn_modeling import digest
+                                saved_failure = FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False).read(
+                                    "result", latest.start.operation_id)
+                                if (saved_failure is not None and saved_failure.get("outcome") == "model_error"
+                                        and saved_failure.get("reason") in {"d8_provider_payment_required", "d8_provider_auth_failed"}
+                                        and saved_failure.get("model_request_id") == latest.start.operation_id
+                                        and saved_failure.get("request_sha256") == latest.start.context_sha256
+                                        and latest.completion.evidence_ref == latest.start.operation_id
+                                        and latest.completion.evidence_sha256 == digest(saved_failure)):
+                                    known_model_failure = saved_failure["reason"]
+                                elif latest.start.category == "review" and latest.start.resource_ref == latest.start.operation_id:
+                                    known_model_failure = "d8_review_call_failed"
                     if is_http(config):
                         from agent_adapters.http_capability import check_http_task
                         from agent_core.dual_llm_contracts import D3RecoveryRequired
@@ -574,7 +600,16 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                 result["model_format_diagnostics"] = model_format_diagnostics
                 result["review_call_diagnostics"] = review_call_diagnostics
             if d8_unresolved:
-                result["recovery"] = {"required": True, "reason": "operation_or_evidence_unknown"}
+                # Surface the precise failing check; the generic code is a last
+                # resort so an operator never has to re-derive it by hand.
+                specific = next(
+                    (item.get("code") for item in reversed(http_diagnostics)
+                     if isinstance(item, dict) and isinstance(item.get("code"), str)
+                     and item["code"].startswith(("d20_", "d8_", "d3_"))),
+                    None,
+                )
+                result["recovery"] = {"required": True,
+                                      "reason": specific or "operation_or_evidence_unknown"}
                 result["recovery_status"] = "required"
             elif known_model_failure is not None and (result.get("task_run") or {}).get("status") == "running":
                 result["recovery"] = {"required": True, "reason": known_model_failure}
@@ -590,17 +625,17 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
         result = _empty_result(
             task_id if isinstance(task_id, str) else "unknown",
             mode if isinstance(mode, str) else "unknown",
-            error="state_read_failed",
+            error="state_read_busy" if _transient_storage_read(exc) else "state_read_failed",
             recovery=True,
         )
         result["errors"][0].update(phase="state_read", **safe_failure_details(exc))
         return result
 
 
-def _state_read_failed(result) -> bool:
+def _state_read_busy(result) -> bool:
     errors = result.get("errors") if isinstance(result, dict) else None
     return (bool(errors) and isinstance(errors[0], dict)
-            and errors[0].get("code") == "state_read_failed")
+            and errors[0].get("code") == "state_read_busy")
 
 
 def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
@@ -608,12 +643,12 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
 
     The projection runs while the run is still settling, so an evidence file or
     the SQLite WAL can be briefly unavailable. Retrying those keeps a healthy run
-    from being reported as state_read_failed with an empty body; a persistent
-    failure still returns the safe empty result.
+    from being reported as state_read_busy with an empty body; a persistent
+    failure still returns the safe empty result. Invalid evidence is not retried.
     """
     result = _snapshot_once(directory, declaration)
     for attempt in range(2):
-        if not _state_read_failed(result):
+        if not _state_read_busy(result):
             return result
         time.sleep(0.15 * (attempt + 1))
         result = _snapshot_once(directory, declaration)

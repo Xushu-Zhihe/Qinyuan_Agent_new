@@ -1,4 +1,4 @@
-"""Frozen operation admission, budget, and audit contracts."""
+﻿"""Frozen operation admission, budget, and audit contracts."""
 
 from __future__ import annotations
 

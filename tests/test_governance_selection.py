@@ -1,4 +1,4 @@
-"""S5 observable choices, frozen sources and original-ID recovery."""
+﻿"""S5 observable choices, frozen sources and original-ID recovery."""
 import asyncio
 from dataclasses import asdict, replace
 import hashlib
@@ -405,7 +405,7 @@ def test_real_v10_payload_uses_reduced_refinement_and_current_schema_offline(s5_
     assert role_contract_version(role) == 15 and 's5_selection_context' in body
     claim_properties = schema['properties']['claims']['items']['properties']
     assert 'subject_ref' not in claim_properties and 'observation_scope' not in claim_properties
-    assert payload['max_tokens'] == 16384 and payload['reasoning_effort'] == 'high'
+    assert payload['max_tokens'] == 32768 and payload['reasoning_effort'] == 'high'
 
 
 @pytest.mark.parametrize('output_case', [15], indirect=True)

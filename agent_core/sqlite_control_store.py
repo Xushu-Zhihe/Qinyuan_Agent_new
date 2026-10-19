@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import json
@@ -172,7 +172,25 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 27
+CURRENT_SCHEMA_VERSION = 28
+
+MIGRATION_28 = """
+CREATE TABLE d8_conclusions_new (
+    record_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES d3_runs(task_run_id),
+    plan_id TEXT NOT NULL REFERENCES d3_plan_bindings(plan_id),
+    proposal_request_id TEXT NOT NULL UNIQUE REFERENCES d4_operations(operation_id),
+    review_request_id TEXT NOT NULL UNIQUE REFERENCES d4_operations(operation_id),
+    fact_id TEXT REFERENCES facts(fact_id),
+    metadata_json TEXT NOT NULL,
+    event_sequence INTEGER NOT NULL
+);
+INSERT INTO d8_conclusions_new SELECT * FROM d8_conclusions;
+DROP TABLE d8_conclusions;
+ALTER TABLE d8_conclusions_new RENAME TO d8_conclusions;
+CREATE INDEX idx_d8_conclusions_run ON d8_conclusions(task_run_id, event_sequence);
+CREATE INDEX idx_d8_conclusions_fact ON d8_conclusions(fact_id);
+"""
 
 D8_OUTPUT_SCHEMA = """
 CREATE TABLE d8_refinement_corrections (
@@ -1242,6 +1260,11 @@ class SqliteControlStore:
                     self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                                          (27, self._now()))
+            if version < 28:
+                for statement in _sql_statements(MIGRATION_28):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                                         (28, self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -4573,6 +4596,14 @@ class SqliteControlStore:
             if records or mutation.operation == "append_d8_conclusion":
                 raise StorageError("D8 conclusions require explicit D8 enablement")
             return
+        result = mutation.d3.plan_result if mutation.d3 is not None else None
+        if result is not None and result.outcome == "no_new_information" and (
+                config.contract_version != 22 or len(records) != 1 or records[0].outcome != "no_new_information"):
+            raise StorageError("D22 no-information result requires its atomic review")
+        if result is not None and result.outcome == "observed" and (
+                not config.intent_execution_policy or facts or len(records) > 1
+                or any(r.outcome not in {"rejected", "insufficient", "reviewed_inference"} for r in records)):
+            raise StorageError("d22_observed_result_scope_invalid")
         if facts and (len(records) != 1 or records[0].outcome != "verified_fact"):
             raise StorageError("D8 Fact requires its atomic approval record")
         for record in records:
@@ -4590,7 +4621,15 @@ class SqliteControlStore:
                         or call.application_ref is not None):
                     raise StorageError("D8 conclusion requires unapplied known model results")
             if record.outcome == "verified_fact":
-                if len(facts) != 1 or facts[0].fact_id != record.fact_id:
+                reused = next((f for f in self.load_control_state_rows(mutation.task_run_id).facts
+                               if f.fact_id == record.fact_id), None)
+                if not facts and config.contract_version == 22 and reused is not None:
+                    owner = self._connection.execute(
+                        "SELECT intent_id FROM d3_plan_bindings WHERE plan_id=(SELECT plan_id FROM executions WHERE execution_id=?)",
+                        (reused.source_ref,)).fetchone()
+                    if owner is None or owner["intent_id"] != record.intent_id or reused.status is not FactStatus.VERIFIED:
+                        raise StorageError("D22 reused Fact scope changed")
+                elif len(facts) != 1 or facts[0].fact_id != record.fact_id:
                     raise StorageError("D8 verified conclusion requires its matching Fact")
             elif facts:
                 raise StorageError("D8 inference/rejection cannot submit a Fact")
@@ -4764,7 +4803,9 @@ class SqliteControlStore:
                 or self.load_d3_intent_binding(plan.intent_id) is None
                 or plan.status is not PlanStatus.RUNNING
                 or tuple(step.description for step in plan.steps) != expected_steps
-                or count >= 2
+                or count >= 2 and not config.intent_execution_policy and not (config.contract_version == 22 and
+                    (previous := self._connection.execute("SELECT result_json FROM d3_plan_results WHERE plan_id=(SELECT plan_id FROM plans WHERE intent_id=? ORDER BY rowid DESC LIMIT 1)", (plan.intent_id,)).fetchone()) is not None
+                    and json.loads(previous[0])["outcome"] == "no_new_information")
             ):
                 raise StorageError("D3 Plan declaration or per-Intent limit differs")
             proposal = self.load_d3_operation(binding.proposal_request_id)
@@ -4798,9 +4839,11 @@ class SqliteControlStore:
                     or result.supporting_fact_id != binding.source_fact_id
                 )
                 or result.outcome == "satisfied" and binding.observation_mode == "new_observation" and (
-                    len(facts) != 1
-                    or facts[0].fact_id != result.supporting_fact_id
-                    or facts[0].verification_ref != f"d3:{result.proof_id}"
+                    not (config.contract_version == 22 and not facts and any(
+                        isinstance(c,D8Conclusion) and c.outcome == "verified_fact" and c.fact_id == result.supporting_fact_id
+                        for c in mutation.state_changes)) and (
+                        len(facts) != 1 or facts[0].fact_id != result.supporting_fact_id
+                        or facts[0].verification_ref != f"d3:{result.proof_id}")
                 )
                 or binding.observation_mode == "reuse_saved_proof" and facts
                 or result.outcome == "not_satisfied" and facts
@@ -4930,9 +4973,6 @@ class SqliteControlStore:
                 (IntentStatus.PENDING, IntentStatus.SKIPPED): {"complete_d3_turn", "advance_d3_turn"},
                 (IntentStatus.RUNNING, IntentStatus.SUCCEEDED): {"complete_d3_intent"},
                 (IntentStatus.RUNNING, IntentStatus.ABANDONED): {"switch_d3_intent", "advance_d3_turn", "abandon_d8_intent"},
-                # An inconclusive evaluation is not a dead end: the outer review
-                # may reopen the Intent so fully automatic exploration continues.
-                (IntentStatus.INCONCLUSIVE, IntentStatus.RUNNING): {"reopen_d8_intent"},
             },
             "plan": {
                 (PlanStatus.RUNNING, PlanStatus.COMPLETED): {"complete_d3_plan"},

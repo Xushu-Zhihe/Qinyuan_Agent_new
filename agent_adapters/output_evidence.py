@@ -64,6 +64,10 @@ def _leading_errno(error):
 
 def safe_failure_details(error):
     """Describe a bounded exception chain without persisting exception text."""
+    import os
+    if os.environ.get("QINYUAN_DEBUG_ERRORS"):
+        import traceback
+        traceback.print_exception(type(error), error, error.__traceback__)
     kinds, codes, seen = [], [], set()
     current = error
     while current is not None and id(current) not in seen and len(kinds) < 6:
@@ -86,7 +90,7 @@ def safe_failure_details(error):
 
 
 class FileD8OutputEvidence(FileD8HandoffEvidence):
-    KINDS = {"contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "review-failure"}
+    KINDS = {"input-measurement", "mcp-registry", "mcp-catalog", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "review-failure"}
 
     def save_review_failure(self, request, *, error=None, failure=None):
         from dataclasses import asdict

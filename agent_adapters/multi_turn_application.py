@@ -33,7 +33,7 @@ from agent_core.conclusion_contracts import D8ReviewRequestAction
 from agent_core.conclusion_review import ConclusionReview
 from agent_core.conclusion_revision_contracts import D8ConclusionChange
 from agent_adapters.workspace_evidence import FileD3WorkspaceEvidence
-from agent_core.actions import CompleteIntentAction, MCPAction, ProbeAction
+from agent_core.actions import CompleteIntentAction, MCPCall, ProbeAction
 from agent_core.artifact_operations import D3WorkspaceOperations, fixed_size_script
 from agent_core.artifact_proofs import D3ObservationProofVerifier
 from agent_core.attachment_import import (
@@ -234,7 +234,7 @@ class D3Application:
         self.config = config
         self.clock = clock
         self.sandbox = sandbox
-        self.mcp_manager = mcp_manager  # D22: Optional MCP tool manager
+        self.mcp = MCPPlanExecutor(self, mcp_manager) if mcp_manager is not None else None
         self.d6_artifact_store = d6_artifact_store
         self.d6_artifact_transfer = d6_artifact_transfer
         if (d6_artifact_store is None) != (d6_artifact_transfer is None):
@@ -369,6 +369,8 @@ class D3Application:
             ) if config.d8_enabled else None
         )
         self.validator.conclusions = self.conclusions
+        if self.conclusions is not None:
+            self.conclusions.app = self
         self.handoff = None
         self.revisions = None
         self.sessions = None
@@ -621,14 +623,19 @@ class D3Application:
         """Repair SQLite operation completions from already-persisted evidence only."""
         if self.config.d4_budget is None:
             return
+        if self.mcp is not None:
+            self.mcp.reconcile()
         if self.web is not None:
             self.web.reconcile()
         if self.output_boundary is not None:
             self.output_boundary.reconcile_formats()
         if self.fixed_probe_bindings is not None:
             self.fixed_probe_bindings.reconcile()
-        if self.business_diagnostics is not None:
+        if self.handoff is not None:
             self.handoff.reconcile()
+        if self.config.intent_execution_policy:
+            from agent_core.intent_execution import reconcile
+            reconcile(self)
         task_run_id = self.state.task_run.task_run_id
         self.store.reconcile_d4_control_commit_audit(task_run_id)
         if self.conclusions is not None:
@@ -1540,6 +1547,8 @@ class D3Application:
         self, stage: D3ModelStage, resource_ref: str, context, name: str
     ) -> D3ModelRequest:
         task_id = self.state.task_run.task_run_id
+        if self.mcp is not None and stage == "inner_plan":
+            name += f"/after-mcp/{self.mcp.count(context.intent_id)}"
         if self.handoff is not None and stage == "inner_plan":
             count = self.handoff.read_count(context.intent_id)
             if count:
@@ -1548,6 +1557,8 @@ class D3Application:
             count = len(self.revisions.records())
             if count:
                 name += f"/after-revision/{count}"
+        if self.config.intent_execution_policy and stage == "inner_plan":
+            name += f"/after-decision/{len(self.sessions.records(context.intent_id))}"
         request_id = self._id(name)
         prior = self.store.load_d3_operation(request_id)
         role = (
@@ -2041,7 +2052,7 @@ class D3Application:
                         timeout = min(timeout, item.max_action_timeout_seconds)
             if not actions and (progress is None or progress["mode"] == "ordinary"):
                 raise D3RecoveryRequired("constraint_action_intersection_empty")
-            unavailable = unavailable_decisions(state, turn_id, intent_id, self.config.max_turns)
+            unavailable = unavailable_decisions(state, turn_id, intent_id, self.config.max_turns, rolling=bool(self.config.intent_execution_policy))
             decisions = [d for d in stage_decisions(scope) if d not in unavailable]
             context["review_policy"] = {"version": 1, "review_scope": scope,
                 "scope_bindings": {"intent": intent_id, "turn": turn_id}, "allowed_decisions": decisions,
@@ -2095,7 +2106,7 @@ class D3Application:
         output = parse_d3_review_output(raw, request)
         state = self.state
         from agent_core.review_policy import unavailable_decisions
-        reason = unavailable_decisions(state, request.turn_id, request.intent_id, self.config.max_turns).get(output.decision)
+        reason = unavailable_decisions(state, request.turn_id, request.intent_id, self.config.max_turns, rolling=bool(self.config.intent_execution_policy)).get(output.decision)
         if reason is not None and not (output.decision == "switch_sibling_intent" and self.sessions is not None
                    and self.config.contract_version != 13
                    and getattr(getattr(output, "progress", None), "classification", None) == "repetitive"):
@@ -2289,6 +2300,12 @@ class D3Application:
         *,
         review_id: str | None = None,
     ) -> None:
+        if self.config.intent_execution_policy:
+            from agent_core.intent_execution import close_stop_observation
+            close_stop_observation(self, intent_id)
+        if self.mcp is not None:
+            self._check_dispatch()
+            await self.mcp.open()
         if self.web is not None:
             return await self.web.new_plan(intent_id, token, review_id=review_id)
         if self.sessions is not None:
@@ -2374,6 +2391,20 @@ class D3Application:
                 except (ValueError, TypeError) as exc:
                     raise D3ProposalRejected("d8_history_read_action_rejected") from exc
                 return
+            from agent_core.intent_execution import IntentResolution, validate_resolution
+            if isinstance(proposal, IntentResolution):
+                validate_resolution(self, _current, proposal)
+                return
+            if isinstance(proposal, CompleteIntentAction):
+                visible = json.loads(_current.history_context).get("completion_facts", [])
+                if proposal.fact_ids not in [(i["fact_id"],) for i in visible]:
+                    raise D3ProposalRejected("d22_completion_support_not_visible")
+                return
+            if isinstance(proposal, MCPCall):
+                if self.mcp is None:
+                    raise D3ProposalRejected("mcp.not_enabled")
+                self.mcp.validate(_current, proposal)
+                return
             live_context = _current.context
             if self.config.contract_version in {16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.plan_policy import validate as validate_plan
@@ -2421,6 +2452,17 @@ class D3Application:
         if isinstance(proposal, D8HistoryReadAction):
             self.handoff.apply_read_action(request_id, proposal)
             return
+        from agent_core.intent_execution import IntentResolution, resolve
+        if isinstance(proposal, IntentResolution):
+            await resolve(self, request_id, intent_id, proposal, token)
+            return
+        if isinstance(proposal, CompleteIntentAction):
+            await self._complete_intent(intent_id, (), token, supporting_fact_id=proposal.fact_ids[0])
+            self.store.mark_d3_operation_applied(request_id, intent_id)
+            return
+        if isinstance(proposal, MCPCall):
+            await self.mcp.execute(request_id, intent_id, proposal, token)
+            return
         plan_id = self._id(f"plan/{intent_id}/{ordinal}")
         source_fact_id = None
         if proposal.observation_mode == "reuse_saved_proof":
@@ -2434,6 +2476,11 @@ class D3Application:
             source_fact_id = original.supporting_fact_id
         else:
             artifact_version_id = self._id(f"artifact/{plan_id}")
+        if review_id is None and self.config.contract_version == 22 and previous:
+            prior_result = self.store.load_d3_plan_result(previous[-1].plan_id)
+            if prior_result is not None and prior_result.outcome == "no_new_information":
+                review_id = next(r.review_request_id for r in self.store.list_d8_conclusions(self.state.task_run.task_run_id)
+                    if r.plan_id == previous[-1].plan_id and r.outcome == "no_new_information")
         plan_binding = self.control.register_plan(
             intent_id,
             proposal,
@@ -2462,6 +2509,9 @@ class D3Application:
         turn = next(item for item in self.state.turns if item.turn_id == intent.turn_id)
         if output.decision == "replan_current_intent":
             await self._new_plan(intent_id, token, review_id=review_id)
+            return True
+        if self.config.intent_execution_policy and output.decision in {"switch_sibling_intent", "abandon_current_intent"}:
+            await self._new_plan(intent_id, token)
             return True
         if output.decision == "switch_sibling_intent" or (
                 self.sessions is not None and output.decision == "abandon_current_intent"):
@@ -2547,115 +2597,6 @@ class D3Application:
             ),
             self.clock,
         )
-
-    def _mcp_executor(self, task_run_id: str):
-        """Create MCPPlanExecutor for D22 MCP-based Plan execution."""
-        if self.mcp_manager is None:
-            raise D3RecoveryRequired("d22_mcp_manager_not_configured")
-
-        # workspace_sandbox is D8DockerWorkspace
-        from Sandbox.workspace import D8DockerWorkspace
-        if not isinstance(self.workspace.sandbox, D8DockerWorkspace):
-            raise D3RecoveryRequired("d22_mcp_requires_d8_workspace")
-
-        return MCPPlanExecutor(
-            self.mcp_manager,
-            self.workspace.sandbox,
-            task_run_id,
-        )
-
-    async def _run_mcp_plan(self, plan_binding, token: CancellationToken) -> bool:
-        """
-        Execute MCP-based Plan (D22).
-
-        Lenient toward model: accepts rolling tool calls, semantic postconditions
-        Strict about execution: timeout enforcement, evidence capture, authorization checks
-        """
-        # Retrieve stored MCPAction from plan_binding
-        action_data = getattr(plan_binding, 'action', None)
-        if action_data is None:
-            raise D3RecoveryRequired("d22_mcp_plan_missing_action")
-
-        # action_data is MCPAction with calls, working_directory, conditions
-        executor = self._mcp_executor(plan_binding.task_run_id)
-
-        # Execute each tool call sequentially
-        all_outputs = []
-        for step_index, tool_call in enumerate(action_data.calls):
-            tool_id = self._id(f"tool/{plan_binding.plan_id}/{step_index}")
-
-            result = await executor.execute(
-                tool_name=tool_call.tool_name,
-                arguments=dict(tool_call.parameters),
-                tool_id=tool_id,
-                plan_id=plan_binding.plan_id,
-                step_index=step_index,
-                token=token,
-            )
-
-            all_outputs.append(result)
-
-            if not result.success:
-                # Lenient: capture failure as evidence, complete Plan as "unsatisfied"
-                self._complete_mcp_plan_failed(plan_binding, all_outputs, result.error)
-                return False
-
-        # All tools succeeded; complete Plan as "satisfied"
-        self._complete_mcp_plan_success(plan_binding, all_outputs)
-        return False
-
-    def _complete_mcp_plan_success(self, plan_binding, outputs):
-        """Complete MCP Plan with satisfied outcome."""
-        # Create observation proof (similar to D3 artifact proofs)
-        observation_id = self._id(f"observation/{plan_binding.plan_id}")
-        proof_id = self._id(f"proof/{plan_binding.plan_id}")
-
-        # Hash all tool outputs to create evidence_sha256
-        import json
-        outputs_json = json.dumps([o.tool_outputs for o in outputs], sort_keys=True)
-        evidence_sha256 = hashlib.sha256(outputs_json.encode()).hexdigest()
-
-        result = D3PlanResult(
-            plan_binding.task_run_id,
-            plan_binding.plan_id,
-            "satisfied",
-            plan_binding.artifact_version_id,
-            observation_id,
-            proof_id,
-            evidence_sha256,
-            None,  # supporting_fact_id filled in complete_plan
-        )
-
-        # Store proof in proof_store
-        from agent_core.artifact_proofs import D3ObservationProof
-        proof = D3ObservationProof(
-            proof_id,
-            plan_binding.plan_id,
-            observation_id,
-            evidence_sha256,
-            "mcp_tool_outputs",
-        )
-        self.proof_store.write(proof)
-
-        self.control.complete_plan(plan_binding, result, source_execution_id=proof_id)
-
-    def _complete_mcp_plan_failed(self, plan_binding, outputs, error_msg):
-        """Complete MCP Plan with unsatisfied outcome."""
-        observation_id = self._id(f"observation/{plan_binding.plan_id}")
-
-        result = D3PlanResult(
-            plan_binding.task_run_id,
-            plan_binding.plan_id,
-            "unsatisfied",
-            plan_binding.artifact_version_id,
-            observation_id,
-            None,  # No proof for failed execution
-            None,  # No evidence_sha256 for failed execution
-            None,
-        )
-
-        self.control.complete_plan(plan_binding, result)
-
 
     def _reviewable_action_rejection(
         self, error: D3ProposalRejected, fallback_request_id: str
@@ -2832,72 +2773,6 @@ class D3Application:
             return True
         action = proposal.action
 
-        # D22: Handle MCPAction (MCP tool execution)
-        if isinstance(action, MCPAction):
-            executor = self._mcp_executor(plan_binding.task_run_id)
-            tool_id = self._id(f"tool/{plan_binding.plan_id}/{step_index}")
-            self._check_dispatch()
-
-            result = await executor.execute(
-                action.tool_name,
-                action.arguments,
-                tool_id,
-                plan_binding.plan_id,
-                step_index,
-                token,
-            )
-
-            if not result.success:
-                raise D3RecoveryRequired(f"d22_mcp_tool_failed: {result.error}")
-
-            self.store.mark_d3_operation_applied(request_id, tool_id)
-
-            # Record observation and create proof
-            observation_id = self._id(f"observation/{plan_binding.plan_id}")
-            receipt = await self.workspace.observe_mcp_result(
-                turn,
-                plan_binding,
-                tool_id,
-                observation_id,
-                result,
-                token,
-            )
-            proof_id = self._id(f"proof/{plan_binding.plan_id}")
-            proof = self.proofs.issue(plan_binding, observation_id, proof_id)
-            fact_id = self._id(f"fact/{plan_binding.plan_id}")
-            plan_result = D3PlanResult(
-                plan_binding.task_run_id,
-                plan_binding.plan_id,
-                "satisfied",
-                plan_binding.artifact_version_id,
-                observation_id,
-                proof_id,
-                digest(asdict(receipt)),
-                fact_id,
-            )
-
-            if self.conclusions is not None:
-                return await self._review_d8_observation(plan_binding, proof, receipts, token)
-            self.control.complete_plan(plan_binding, plan_result, proof.source_execution_id)
-
-            if proposal.review_requested:
-                sources = (request_id, tool_id, observation_id, fact_id)
-                review_id, output = self._review(
-                    turn.turn_id,
-                    plan_binding.intent_id,
-                    "action",
-                    request_id,
-                    sources,
-                )
-                return await self._route(
-                    review_id,
-                    output,
-                    plan_binding.intent_id,
-                    receipts,
-                    token,
-                )
-            return False
-
         if (
             not isinstance(action, ProbeAction)
             or action.script != script
@@ -3039,9 +2914,25 @@ class D3Application:
                     (proposal_id, proof.observation_id),
                 )
                 self.store.mark_d4_operation_applied(proposal_id, review_id)
+                if self.config.intent_execution_policy and output.decision == "continue_current_intent":
+                    from agent_core.intent_execution import complete_observation
+                    complete_observation(self, binding, proof)
+                    return False
                 if await self._route(review_id, output, binding.intent_id, receipts, token):
                     return True
+                if self.config.intent_execution_policy:
+                    from agent_core.intent_execution import complete_observation
+                    complete_observation(self, binding, proof)
+                    return False
                 continue
+            if result.outcome == "no_new_information":
+                source = self.conclusions.observation(proof.proof_id)
+                observed = D3PlanResult(binding.task_run_id, binding.plan_id, "no_new_information",
+                    binding.artifact_version_id, source.observation_id, source.proof_id,
+                    source.source_version_sha256 if self.web is not None else
+                    digest(asdict(self.workspace_evidence.read_digest(source.observation_id))))
+                self.control.complete_plan(binding, observed, conclusion=result)
+                return False
             if result.outcome == "verified_fact":
                 source = self.conclusions.observation(proof.proof_id)
                 evidence_sha = (source.source_version_sha256 if self.web is not None
@@ -3050,26 +2941,14 @@ class D3Application:
                                         binding.artifact_version_id, proof.observation_id,
                                         proof.proof_id, evidence_sha, result.fact_id)
 
-                # Version 22: Use refined_content from outer layer if provided
-                content = source.fact_content()  # default template
-                if self.config.contract_version == 22:
-                    # Retrieve the review decision to check for refined_content
-                    review_result = self.conclusions.evidence.read_result(result.review_request_id)
-                    if review_result is not None and review_result["outcome"] == "valid":
-                        from agent_core.conclusion_contracts import D8ReviewDecision
-                        decision = D8ReviewDecision.from_dict(review_result["raw"])
-                        # A fact_proposal request never carries a candidate (the
-                        # contract forbids it); the accepted candidate lives on the
-                        # fact_review request. Reading the proposal request here
-                        # yields None and crashed whenever the outer accepted
-                        # without supplying refined_content.
-                        candidate_request = self.conclusions.evidence.read_request(result.review_request_id)
-                        candidate = getattr(candidate_request, "candidate", None)
-                        if candidate is not None:
-                            content = self.conclusions._final_fact_content(candidate, decision)
-
+                content = (self.conclusions.accepted_content(result) if self.config.contract_version == 22
+                           else source.fact_content())
                 self.control.complete_plan(binding, observed, proof.source_execution_id,
                                            conclusion=result, content=content)
+                return False
+            if self.config.intent_execution_policy:
+                from agent_core.intent_execution import complete_observation
+                complete_observation(self, binding, proof, conclusion=result)
                 return False
             self.controller.commit_d3_transition(
                 "append_d8_conclusion", (result,), (result.record_id,), result.outcome,
@@ -3079,8 +2958,6 @@ class D3Application:
     async def _run_plan(self, plan_binding, receipts, token: CancellationToken) -> bool:
         if getattr(plan_binding,'kind',None)=='http_request':
             return await self.web.run_plan(plan_binding, token)
-        if getattr(plan_binding,'kind',None)=='mcp_action':
-            return await self._run_mcp_plan(plan_binding, token)
         if self.conclusions is not None and plan_binding.observation_mode == "new_observation":
             proof = self.proof_store.read(self._id(f"proof/{plan_binding.plan_id}"))
             if proof is not None:
@@ -3123,6 +3000,7 @@ class D3Application:
         intent_id: str,
         receipts,
         token: CancellationToken,
+        *, supporting_fact_id: str | None = None,
     ) -> bool:
         if self.sessions is not None and await self.sessions.before_decision(intent_id, receipts, token):
             return True
@@ -3133,15 +3011,23 @@ class D3Application:
         binding = self.store.load_d3_plan_binding(plan.plan_id)
         result = self.store.load_d3_plan_result(plan.plan_id)
         turn = self.store.load_d3_plan_turn_binding(plan.plan_id)
+        historical_support = (self.config.contract_version == 22 and result is not None
+                              and result.outcome == "no_new_information")
+        if historical_support:
+            if supporting_fact_id is None:
+                await self._new_plan(intent_id, token)
+                return True
+            source = self.conclusions.observation(result.proof_id, historical=True)
+            if supporting_fact_id not in {i["fact_id"] for i in self.conclusions.reusable_facts(source)}:
+                raise D3RecoveryRequired("d22_completion_fact_not_effective")
         if (
             binding is None
             or result is None
             or turn is None
-            or result.outcome != "satisfied"
-            or result.supporting_fact_id is None
+            or not historical_support and (result.outcome != "satisfied" or result.supporting_fact_id is None)
         ):
             raise D3RecoveryRequired("d3_completion_support_unavailable")
-        fact_id = result.supporting_fact_id
+        fact_id = supporting_fact_id if historical_support else result.supporting_fact_id
         if getattr(binding,'kind',None)!='http_request' and self.conclusions is not None and binding.observation_mode == "new_observation":
             action_id, action = self.validator._known_action(binding.task_run_id, binding.plan_id, "inner_sha256")
             if action.review_requested:
@@ -3190,8 +3076,8 @@ class D3Application:
                 or live_plan is None
                 or live_plan.status is not PlanStatus.COMPLETED
                 or live_result is None
-                or live_result.outcome != "satisfied"
-                or live_result.supporting_fact_id != fact_id
+                or live_result != result
+                or not historical_support and live_result.supporting_fact_id != fact_id
             ):
                 raise D3RecoveryRequired("d3_completion_proposal_scope_expired")
             live_turn = next(
@@ -3311,19 +3197,24 @@ class D3Application:
         self.control.complete_turn(intent.turn_id, intent_id, fact_id)
         return False
 
-    async def _reopen_or_retire(self, intent, receipts, token) -> bool:
-        """Return an inconclusive Intent to RUNNING so exploration continues.
-
-        The outer role already reviews progress every few inner decisions; this
-        method only keeps the run alive, it never turns "cannot decide yet" into
-        a terminal state. Only a found flag needs a human.
-        """
-        task_run_id = self.state.task_run.task_run_id
-        records = self.store.list_d8_tree_records(task_run_id)
-        if any(r.kind == "reopened" and r.intent_id == intent.intent_id for r in records):
-            return False
-        self.handoff.reopen_intent(intent.intent_id, self._id(f"reopen/{intent.intent_id}"))
-        return True
+    def _duplicate_observation(self, proof, content: str):
+        """Return an existing verified Fact carrying the very same observation."""
+        if self.web is None:
+            return None
+        mine = self.web.result(proof.source_execution_id)
+        if not isinstance(mine, dict):
+            return None
+        key = (mine.get("request_sha256"), mine.get("body_sha256"), mine.get("status"))
+        for fact in self.state.facts:
+            if fact.status is not FactStatus.VERIFIED or fact.content != content:
+                continue
+            other = self.web.result(fact.source_ref)
+            if not isinstance(other, dict):
+                continue
+            if (other.get("request_sha256"), other.get("body_sha256"),
+                    other.get("status")) == key:
+                return fact
+        return None
 
     def _tail_intent(self, turn_id: str) -> str:
         intents = [item for item in self.state.intents if item.turn_id == turn_id]
@@ -3380,17 +3271,6 @@ class D3Application:
         while True:
             self._check_dispatch()
             records = self.store.list_d8_tree_records(self.state.task_run.task_run_id)
-            inconclusive = next((i for i in self.state.intents
-                                 if i.status is IntentStatus.INCONCLUSIVE
-                                 and not any(r.kind == "reopened" and r.intent_id == i.intent_id
-                                             for r in records)), None)
-            if inconclusive is not None:
-                # An inconclusive local evaluation means the evidence so far
-                # cannot decide the Intent, not that the TaskRun is over. The
-                # outer role decides whether the direction is still worth
-                # exploring; only a found flag needs a human.
-                await self._reopen_or_retire(inconclusive, receipts, token)
-                continue
             active = [t for t in self.state.turns if t.status in {TurnStatus.PENDING, TurnStatus.RUNNING}]
             if not active:
                 return self.result("search_exhausted")
@@ -3434,7 +3314,10 @@ class D3Application:
             if plan.status is PlanStatus.RUNNING:
                 await self._run_plan(binding, receipts, token)
             elif plan.status is PlanStatus.COMPLETED:
-                await self._complete_intent(current.intent_id, receipts, token)
+                if self.config.intent_execution_policy:
+                    await self._new_plan(current.intent_id, token)
+                else:
+                    await self._complete_intent(current.intent_id, receipts, token)
             else:
                 raise D3RecoveryRequired("d8_current_plan_not_usable")
 
@@ -3443,6 +3326,11 @@ class D3Application:
             try:
                 return await self._run_tree(token)
             except (OSError, StorageError) as exc:
+                import os as _os
+                import sys as _sys
+                if _os.environ.get("QINYUAN_DEBUG_TRACE"):
+                    print("[trace] run.persistence_error", type(exc).__name__,
+                          str(exc)[:300], file=_sys.stderr, flush=True)
                 raise D3RecoveryRequired("d8_handoff_persistence_recovery_required") from exc
         self._reconcile_known_d4_operations()
         if isinstance(self.review_ledger, D4ReviewLedger):

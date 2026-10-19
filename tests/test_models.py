@@ -1,4 +1,4 @@
-"""D9-2 offline transport contracts: no provider or Docker calls."""
+﻿"""D9-2 offline transport contracts: no provider or Docker calls."""
 
 import io
 import json
@@ -59,7 +59,7 @@ def test_stage_schema_rule_and_role_binding(stage):
     assert env.output_contract["schema"] == json.loads(payload["messages"][0]["content"].split("output_contract=")[1].split(" correction=")[0])["schema"]
     assert deepseek_roles.RULES[stage] in payload["messages"][0]["content"]
     assert payload["thinking"] == {"type": "enabled"}
-    assert payload["max_tokens"] == 16384 and payload["reasoning_effort"] == "high"
+    assert payload["max_tokens"] == 32768 and payload["reasoning_effort"] == "high"
     assert "tools" not in payload and "temperature" not in payload and "top_p" not in payload
     with pytest.raises(ValueError, match="role_binding"):
         deepseek_roles.build_payload(env, deepseek_roles.role_config("outer_planning" if role.role == "inner_action" else "inner_action"))

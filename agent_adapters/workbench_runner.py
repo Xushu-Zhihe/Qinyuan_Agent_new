@@ -267,7 +267,7 @@ class Runner:
                     from agent_adapters.simulation import simulation_config
                     from agent_core.operation_accounting import D8HandoffBudgetPolicy
                     request.update(execution_profile=self.workbench.execution_profile, mode=mode,
-                                   d8_config=simulation_config())
+                                   d8_config=simulation_config(rolling=self.workbench.execution_profile == "d8_v22"))
                     request["dual_llm_config"]["d4_budget"] = asdict(D8HandoffBudgetPolicy())
                     for role, value in (("outer", role_outer), ("inner", role_inner)):
                         value["model"] = f"d8-simulated-{role}"

@@ -176,7 +176,7 @@ class D3Control:
         previous = [item for item in state.plans if item.intent_id == intent_id]
         ordinal = len(previous) + 1
         if (ordinal == 1 and review_id is not None) or (
-            ordinal > 1 and review_id is None
+            ordinal > 1 and review_id is None and not (self.ledger.load_d3_run_config(state.task_run.task_run_id).intent_execution_policy and previous[-1].status is PlanStatus.COMPLETED)
         ):
             raise D3RecoveryRequired("d3_plan_requires_its_replanning_review")
         plan_id = self._id(f"plan/{intent_id}/{ordinal}")
@@ -294,7 +294,10 @@ class D3Control:
                 raise D3RecoveryRequired("d3_observed_plan_support_missing")
 
             # D22 mode: Accept multiple Facts from Plan
-            if facts is not None:
+            if any(f.fact_id == result.supporting_fact_id for f in state.facts):
+                if conclusion is None or conclusion.fact_id != result.supporting_fact_id:
+                    raise D3RecoveryRequired("d22_reuse_approval_missing")
+            elif facts is not None:
                 changes.extend(facts)
             # Backward compatibility: Single Fact via content parameter
             else:

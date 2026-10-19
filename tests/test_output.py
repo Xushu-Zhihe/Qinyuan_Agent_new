@@ -94,7 +94,10 @@ def output_case(tmp_path, request):
     app = create()
     task = app.start(TaskRequest.from_dict({"goal": "Observe the authorized copy",
         "target": {"attachments": [{"kind": "local_path", "path": "sample.txt"}]}}), source)
-    app.handoff.increase_capacity({"initial_history": 32768, "visible_history": 131072})
+    current_capacity = app.handoff.capacity().capacity
+    if current_capacity.initial_history < 32768 or current_capacity.visible_history < 131072:
+        app.handoff.increase_capacity({"initial_history": max(32768, current_capacity.initial_history),
+                                      "visible_history": max(131072, current_capacity.visible_history)})
     case = SimpleNamespace(app=app, models=models, token=token, sandbox=sandbox, clock=clock,
                            create=create, task=task, directory=tmp_path / "run", capacity=capacity)
     yield case

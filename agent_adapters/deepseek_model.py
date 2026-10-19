@@ -239,6 +239,31 @@ def build_payload(request, settings):
     }
 
 
+def _trace_provider_response(data, choice, message, finish, content, requested_max_tokens=None):
+    """Record why a provider response was incomplete; silent unless tracing is on.
+
+    Only diagnostic: it never alters the returned payload or the decision.
+    """
+    import os
+    if not os.environ.get("QINYUAN_DEBUG_TRACE"):
+        return
+    import json as _json
+    import sys
+    usage = data.get("usage") if isinstance(data, dict) else None
+    detail = {
+        "finish_reason": finish,
+        "content_is_none": content is None,
+        "content_chars": len(content) if isinstance(content, str) else None,
+        "usage": usage if isinstance(usage, dict) else None,
+        "reasoning_chars": len(message.get("reasoning_content") or "")
+        if isinstance(message.get("reasoning_content"), str) else None,
+        "message_keys": sorted(k for k in message if isinstance(k, str)),
+        "max_tokens_sent": requested_max_tokens,
+    }
+    print("[trace] provider.response", _json.dumps(detail, ensure_ascii=False),
+          file=sys.stderr, flush=True)
+
+
 def _http_worker(
     connection, settings, payload, timeout,
     max_response_bytes=MAX_RESPONSE_BYTES,
@@ -329,6 +354,8 @@ def _http_worker(
         if preserve_content:
             finish = choice.get("finish_reason")
             content = message.get("content")
+            _trace_provider_response(data, choice, message, finish, content,
+                                    (payload or {}).get("max_tokens"))
             if not isinstance(finish, str) or not finish:
                 connection.send({"error": "invalid_response", "reason": "provider_envelope_invalid"})
                 return
@@ -468,6 +495,11 @@ class DeepSeekModelAdapter:
                         connected = True
                         continue
                     if "error" in result:
+                        import os as _os
+                        if _os.environ.get("QINYUAN_DEBUG_TRACE"):
+                            import sys as _sys
+                            print("[trace] model.error", result.get("error"), result.get("reason"),
+                                  file=_sys.stderr, flush=True)
                         return ModelError(
                             ModelErrorKind(result["error"]), result["reason"]
                         )
