@@ -97,7 +97,7 @@ class FixedProbeBindings:
 
     def _base(self, request, finished_at):
         contract = self.output.read("contract", request.model_request_id)
-        from agent_core.output_contracts import output_schema
+        from agent_core.output_contracts import output_schema, matches_output_contract
         audit = {"stage": request.stage, "resource_ref": request.resource_ref,
                  "base_checkpoint_sequence": request.base_checkpoint_sequence,
                  "context_sha256": request.context_sha256, "role_config_ref": request.role_config_ref,
@@ -109,8 +109,7 @@ class FixedProbeBindings:
                 or contract.get("role_config_ref") != self.app.config.inner_role.role_config_ref
                 or contract.get("root_request_id") != root or contract.get("model_audit") != audit
                 or contract.get("source_request_sha256") != digest(asdict(request))
-                or contract.get("output_contract") != {"version": 1, "stage": request.stage,
-                    "schema": output_schema(request, contract_version=self.app.config.contract_version)[1]}
+                or not matches_output_contract(contract.get("output_contract"), request.stage, output_schema(request, contract_version=self.app.config.contract_version)[1], self.app.config.contract_version)
                 or type(finished_at) not in {int, float} or not math.isfinite(finished_at)):
             raise D3RecoveryRequired("s1_fixed_contract_binding_changed")
         if root != request.model_request_id:

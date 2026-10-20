@@ -333,6 +333,9 @@ class D8ModelRequest:
     def from_dict(cls, raw: dict) -> D8ModelRequest:
         value = dict(raw)
         observation = value['observation']
+        if "sources" in observation:
+            from agent_core.evidence_conclusions import EvidenceReviewRequest
+            return EvidenceReviewRequest.from_dict(raw)
         from agent_core.http_contracts import HttpObservation
         cls_observation = HttpObservation if observation.get('rule_id') == 'http_response_observed' else D16Observation if any(key in observation for key in (
             'expected_sha256', 'digest_matches_expected', 'rule_binding_sha256', 'source_version_kind')) else D8Observation
@@ -361,7 +364,7 @@ class D8Conclusion:
     task_run_id: str
     turn_id: str
     intent_id: str
-    plan_id: str
+    plan_id: str | None
     proposal_request_id: str
     review_request_id: str
     candidate_sha256: str
@@ -370,9 +373,10 @@ class D8Conclusion:
     fact_id: str | None
 
     def __post_init__(self) -> None:
-        for name in ("record_id", "task_run_id", "turn_id", "intent_id", "plan_id",
+        for name in ("record_id", "task_run_id", "turn_id", "intent_id",
                      "proposal_request_id", "review_request_id"):
             _uuid(getattr(self, name), name)
+        if self.plan_id is not None:_uuid(self.plan_id,"plan_id")
         _sha(self.candidate_sha256, "candidate_sha256")
         _sha(self.source_version_sha256, "source_version_sha256")
         if self.outcome not in {"verified_fact", "reviewed_inference", "rejected", "insufficient", "no_new_information"}:

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -172,7 +172,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 28
+CURRENT_SCHEMA_VERSION = 29
 
 MIGRATION_28 = """
 CREATE TABLE d8_conclusions_new (
@@ -190,6 +190,37 @@ DROP TABLE d8_conclusions;
 ALTER TABLE d8_conclusions_new RENAME TO d8_conclusions;
 CREATE INDEX idx_d8_conclusions_run ON d8_conclusions(task_run_id, event_sequence);
 CREATE INDEX idx_d8_conclusions_fact ON d8_conclusions(fact_id);
+"""
+
+# One migration: plan-less reviewed evidence uses the existing conclusion table;
+# Fact sources may be existing Execution rows or known reviewed MCP operations.
+MIGRATION_29 = MIGRATION_28.replace(
+    "plan_id TEXT NOT NULL REFERENCES d3_plan_bindings(plan_id)",
+    "plan_id TEXT REFERENCES d3_plan_bindings(plan_id)") + """
+CREATE TABLE facts_new (
+    fact_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+    content TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL,
+    created_event_ordinal INTEGER NOT NULL,
+    verification_ref TEXT
+);
+INSERT INTO facts_new SELECT * FROM facts;
+DROP TABLE facts;
+ALTER TABLE facts_new RENAME TO facts;
+CREATE INDEX idx_facts_context ON facts(turn_id, status, created_event_sequence DESC, created_event_ordinal DESC);
+CREATE TRIGGER facts_source_insert BEFORE INSERT ON facts
+WHEN NOT EXISTS(SELECT 1 FROM executions WHERE execution_id=NEW.source_ref)
+ AND NOT (NEW.verification_ref LIKE 'd8e:%' AND EXISTS(
+    SELECT 1 FROM d4_operations s JOIN d4_operations r
+    ON r.operation_id=substr(NEW.verification_ref,5)
+    JOIN turns t ON t.turn_id=NEW.turn_id
+    WHERE s.operation_id=NEW.source_ref AND s.task_run_id=t.task_run_id
+    AND r.task_run_id=t.task_run_id AND s.category='tool_dispatch'
+    AND r.category='fact_review' AND s.completion_json IS NOT NULL AND r.completion_json IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'Fact source unavailable'); END;
 """
 
 D8_OUTPUT_SCHEMA = """
@@ -1265,6 +1296,11 @@ class SqliteControlStore:
                     self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                                          (28, self._now()))
+            if version < 29:
+                for statement in _sql_statements(MIGRATION_29):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                                         (29, self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -4607,6 +4643,27 @@ class SqliteControlStore:
         if facts and (len(records) != 1 or records[0].outcome != "verified_fact"):
             raise StorageError("D8 Fact requires its atomic approval record")
         for record in records:
+            if record.plan_id is None:
+                if (self._schema_version<29 or config.contract_version!=22 or mutation.operation!="commit_evidence_conclusion"
+                        or self._task_run_for_intent(record.intent_id)!=mutation.task_run_id
+                        or self._task_run_for_turn(record.turn_id)!=mutation.task_run_id):
+                    raise StorageError("Evidence conclusion scope invalid")
+                for request_id,category in ((record.proposal_request_id,"action"),(record.review_request_id,"fact_review")):
+                    call=self.load_d4_operation(request_id)
+                    prefix="plan:"+record.intent_id+":"
+                    if (call is None or call.start.task_run_id!=record.task_run_id or call.start.category!=category
+                            or call.completion is None or call.completion.result_kind!="completed" or call.application_ref is not None
+                            or (category=="action" and not call.start.resource_ref.startswith(prefix))
+                            or (category=="fact_review" and call.start.resource_ref!=record.intent_id)):
+                        raise StorageError("Evidence conclusion requires known scoped model results")
+                if record.outcome=="verified_fact":
+                    old=self._connection.execute("SELECT * FROM facts WHERE fact_id=?",(record.fact_id,)).fetchone()
+                    if old is None and (len(facts)!=1 or facts[0].fact_id!=record.fact_id
+                            or facts[0].verification_ref!="d8e:"+record.review_request_id):
+                        raise StorageError("Evidence Fact requires its atomic review")
+                    if old is not None and facts:raise StorageError("Evidence reuse cannot overwrite Fact")
+                elif facts:raise StorageError("Inference cannot write verified Fact")
+                continue
             binding = self.load_d3_plan_binding(record.plan_id)
             if (record.task_run_id != mutation.task_run_id or binding is None
                     or (binding.task_run_id, binding.turn_id, binding.intent_id)
@@ -4644,6 +4701,11 @@ class SqliteControlStore:
                  record.proposal_request_id, record.review_request_id, record.fact_id,
                  canonical_json(d3_payload(record)), event_sequence),
             )
+            if record.plan_id is None:
+                proposal=self.load_d3_operation(record.proposal_request_id)
+                self._d4_companion_for_d3(proposal)
+                self._connection.execute("UPDATE d3_operations SET application_ref=? WHERE operation_id=?",
+                    (record.record_id,record.proposal_request_id))
             for request_id in (record.proposal_request_id, record.review_request_id):
                 self._mark_d4_operation_applied(request_id, record.record_id)
 
@@ -4679,7 +4741,7 @@ class SqliteControlStore:
             raise StorageError("D3 cannot be combined with a D1 or D2 run")
         allowed = {
             "append_process_fact",
-            "append_d8_conclusion",
+            "append_d8_conclusion", "commit_evidence_conclusion",
             "finish_task_run", "register_d3_turn", "select_d3_intent",
             "apply_d3_review", "register_d3_plan", "replan_d3_plan",
             "complete_d3_plan", "complete_d3_intent", "switch_d3_intent", "abandon_d8_intent",
@@ -4849,7 +4911,7 @@ class SqliteControlStore:
                 or result.outcome == "not_satisfied" and facts
             ):
                 raise StorageError("D3 Plan result is not bound to its completed Plan")
-        elif any(isinstance(item, UpsertFact) for item in mutation.state_changes):
+        elif mutation.operation != "commit_evidence_conclusion" and any(isinstance(item, UpsertFact) for item in mutation.state_changes):
             raise StorageError("D3 Fact requires the independent Plan result transaction")
         if mutation.operation == "apply_d3_review":
             self._validate_d3_review(mutation)
@@ -6000,8 +6062,8 @@ class SqliteControlStore:
             owner = self._task_run_for_plan(change.plan_id)
         elif isinstance(change, UpsertFact):
             owner = self._task_run_for_turn(change.turn_id)
-            if self._task_run_for_execution(change.source_ref) != task_run_id:
-                raise StorageError("Fact source Execution belongs to another TaskRun")
+            if self._fact_source_owner(change) != task_run_id:
+                raise StorageError("Fact source belongs to another TaskRun")
         elif isinstance(change, AppendFailureSummary):
             model_error_for_intent = (
                 change.failure_type.value == "model_error"
@@ -6291,7 +6353,7 @@ class SqliteControlStore:
         task_run_id = self._task_run_for_turn(change.turn_id)
         if task_run_id is None:
             raise StorageError("Fact Turn does not exist")
-        source_task_run_id = self._task_run_for_execution(change.source_ref)
+        source_task_run_id = self._fact_source_owner(change)
         if source_task_run_id is None or source_task_run_id != task_run_id:
             raise StorageError("Fact source_ref must be an Execution in the same TaskRun")
         existing = self._connection.execute(
@@ -6490,6 +6552,18 @@ class SqliteControlStore:
             """,
             (plan_id,),
         )
+
+    def _fact_source_owner(self, change):
+        owner=self._task_run_for_execution(change.source_ref)
+        if owner is not None:return owner
+        if self._schema_version>=29 and (change.verification_ref or "").startswith("d8e:"):
+            source=self.load_d4_operation(change.source_ref)
+            review=self.load_d4_operation(change.verification_ref[4:])
+            if (source is not None and review is not None and source.start.category=="tool_dispatch"
+                    and review.start.category=="fact_review" and source.completion is not None
+                    and review.completion is not None and source.start.task_run_id==review.start.task_run_id):
+                return source.start.task_run_id
+        return None
 
     def _task_run_for_execution(self, execution_id: str) -> str | None:
         return self._scalar(

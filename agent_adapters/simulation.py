@@ -1,4 +1,4 @@
-﻿"""Public D8 core assembly; model mode is separate from the local Sandbox."""
+"""Public D8 core assembly; model mode is separate from the local Sandbox."""
 
 import asyncio
 import json
@@ -34,9 +34,10 @@ def simulation_config(*, rolling=False):
 
 
 def real_config(*, contract_version=6, http=False, http_timeout_seconds=60, rolling=True):
-    from agent_adapters.deepseek_roles import CAPACITY_POLICY, TRANSPORT
+    from agent_adapters.deepseek_roles import default_capacity_policy, TRANSPORT
+    capacity_policy = default_capacity_policy(contract_version)
     result = {"handoff_config": asdict(D8HandoffConfig(
-                CAPACITY_POLICY, CAPACITY_POLICY,
+                capacity_policy, capacity_policy,
                 D8Capacity())),
             "d5_sensitive_requirements": [], "model_transport": dict(TRANSPORT),
             "sandbox_backend": "local_simulated"}
@@ -98,9 +99,20 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
             or set(extra) != expected_fields
             or extra["d5_sensitive_requirements"] != []):
         raise ValueError("invalid_d8_configuration")
-    if is_real and json.dumps(extra, sort_keys=True) != json.dumps(real_config(contract_version=version, http=http,
-            http_timeout_seconds=extra.get('http_timeout_seconds',60), rolling='intent_execution_policy' in extra), sort_keys=True):
-        raise ValueError("d8_real_configuration_mismatch")
+    if is_real:
+        expected = real_config(contract_version=version, http=http,
+            http_timeout_seconds=extra.get('http_timeout_seconds',60), rolling='intent_execution_policy' in extra)
+        # Accept an original frozen legacy budget after the default changes.
+        # This does not increase its allowance or rewrite the old declaration.
+        from agent_adapters.deepseek_roles import CAPACITY_POLICY, default_capacity_policy
+        frozen = D8HandoffConfig.from_dict(extra["handoff_config"])
+        allowed = (CAPACITY_POLICY, default_capacity_policy(version))
+        if any(policy not in allowed for policy in (frozen.outer_capacity, frozen.inner_capacity)):
+            raise ValueError("d8_real_capacity_policy_mismatch")
+        expected["handoff_config"]["outer_capacity"] = asdict(frozen.outer_capacity)
+        expected["handoff_config"]["inner_capacity"] = asdict(frozen.inner_capacity)
+        if json.dumps(extra, sort_keys=True) != json.dumps(expected, sort_keys=True):
+            raise ValueError("d8_real_configuration_mismatch")
     handoff = D8HandoffConfig.from_dict(extra["handoff_config"])
     for policy in (handoff.outer_capacity, handoff.inner_capacity):
         if not is_real and (policy.policy_name != "fake-json-v1" or policy.measurement_unit != "unicode_codepoints"):

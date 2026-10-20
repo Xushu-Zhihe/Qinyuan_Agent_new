@@ -50,6 +50,18 @@ D3ModelStage = Literal[
 
 MAX_D3_CANDIDATE_VALUE_BYTES = 16 * 1024
 
+# Rejection codes that already name the exact rule a proposal broke. Anything else
+# collapses to the stage-level code so an unexpected message never becomes a code.
+_KNOWN_REJECTION_PREFIXES = ("d22_", "d8_", "d9_", "d3_", "s4_")
+
+
+def _resolution_rejection_code(exc):
+    """Return the field-level rejection code carried by a resolution parse error."""
+    code = str(exc).strip()
+    if code.startswith(_KNOWN_REJECTION_PREFIXES) and len(code) <= 120:
+        return code
+    return "d22_resolution_invalid"
+
 
 class D3ProposalRejected(ValueError):
     def __init__(
@@ -125,6 +137,10 @@ class D3PlanProposal:
 
 
 def parse_d3_plan_proposal(raw: object) -> D3PlanProposal:
+    if isinstance(raw,dict) and raw.get("kind")=="fact_candidate":
+        from agent_core.evidence_conclusions import EvidenceCandidate
+        try:return EvidenceCandidate.parse(raw)
+        except (ValueError,TypeError) as exc:raise D3ProposalRejected("d22_evidence_candidate_invalid",structural=True) from exc
     if isinstance(raw, dict) and raw.get("kind") == "request_completion":
         from agent_core.actions import CompleteIntentAction
         if set(raw) != {"kind", "fact_id"} or not isinstance(raw["fact_id"], str):
@@ -552,23 +568,34 @@ class D3AuditedModel:
             if change is not None:
                 return change
         if request.stage == "inner_plan":
+            from agent_core.intent_execution import parse_working
+            try:
+                note = parse_working(request, raw)
+            except ValueError as exc:
+                raise D3ProposalRejected("d22_working_record_invalid", structural=True) from exc
+            if note is not None:
+                return note
+            if isinstance(raw,dict) and raw.get("kind")=="fact_candidate" and self.config.contract_version!=22:
+                raise D3ProposalRejected("d3_plan_fields_invalid",structural=True)
             if self.config.intent_execution_policy and isinstance(raw, dict) and raw.get("kind") == "intent_resolution":
                 from agent_core.intent_execution import parse_resolution
                 try:
                     return parse_resolution(raw, request)
                 except (ValueError, TypeError) as exc:
+                    code = _resolution_rejection_code(exc)
                     import os as _os
                     if _os.environ.get("QINYUAN_DEBUG_TRACE"):
-                        import json as _json
                         import sys as _sys
-                        print("[trace] resolution.rejected", str(exc)[:120],
+                        print("[trace] resolution.rejected", code,
                               "keys=" + ",".join(sorted(raw)),
                               "outcome=" + str(raw.get("outcome")),
                               "refs=" + str(len(raw.get("evidence_refs") or [])),
                               "facts=" + str(len(raw.get("fact_ids") or [])),
                               "cands=" + str(len(raw.get("next_intent_candidates") or [])),
                               file=_sys.stderr, flush=True)
-                    raise D3ProposalRejected("d22_resolution_invalid", structural=True) from exc
+                    # Keep the field-level code: it is persisted as the evidence reason and
+                    # rides the single correction request, so the model learns what to fix.
+                    raise D3ProposalRejected(code, structural=True) from exc
             if self.config.contract_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 try:
                     read = D8HistoryReadAction.parse(raw)
@@ -1127,7 +1154,7 @@ class D3AuditedModel:
                 ] = "accepted"
                 reason = None
                 change_response = (self.config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and isinstance(raw, dict)
-                                   and raw.get("kind") == "conclusion_change")
+                                   and raw.get("kind") in {"conclusion_change", "fact_candidate", "working_record"})
                 if change_response and self.change_response_sensitive is not None and self.change_response_sensitive(raw):
                     raw = None
                     outcome, reason = "rejected", "d8_change_sensitive_rejected"

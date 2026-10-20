@@ -89,6 +89,8 @@ class IntentSessions:
             session_packet = {"messages": messages, "current_history": current,
                                     "session_scope": "intent", "session_id": session_id,
                                     "turn_id": turn_id, "intent_id": intent_id}
+            if self.app.config.intent_execution_policy:
+                session_packet["working_record_policy"] = "unreviewed_v1"
             if omitted:
                 decision_refs = {i.record_id: i.ref for i in self.app.handoff.history()}
                 session_packet["compaction"] = {"identity": "summary_and_recent_dialog_not_full_history",
@@ -132,6 +134,8 @@ class IntentSessions:
             self.app.handoff.check_role_request_capacity(request)
 
     def reconcile(self, *, review_signal=None):
+        from agent_core.intent_execution import reconcile_working
+        reconcile_working(self.app)
         known = {r.root_request_id for r in self.records()}
         for call in self.store.list_d4_operations(self.app.state.task_run.task_run_id):
             if (call.start.role != "inner_action" or call.completion is None
@@ -165,6 +169,12 @@ class IntentSessions:
                 tool_result = self.app.mcp.feedback(call.application_ref)
                 if tool_result is not None:
                     observed["mcp_tool_result"] = tool_result
+            conclusion=next((r for r in self.store.list_d8_conclusions(call.start.task_run_id)
+                if r.plan_id is None and r.proposal_request_id==call.start.operation_id),None)
+            if conclusion is not None:
+                reviewed=self.app.conclusions.evidence.read_result(conclusion.review_request_id)
+                observed["conclusion_review"]={"outcome":conclusion.outcome,"fact_id":conclusion.fact_id,
+                    "decision":reviewed["raw"]["decision"],"reason":reviewed["raw"]["reason"]}
             data = {"metadata": asdict(record) | {"evidence_sha256": ""},
                     "request": safe_request, "response": raw, "observation": observed}
             frozen = self.evidence.read("decision", record.record_id)

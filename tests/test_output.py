@@ -65,7 +65,8 @@ def output_case(tmp_path, request):
     inner_role = D1RoleConfig("inner_action", "fake", "same-model", "inner-d8-5-v1")
     policy = D8CapacityPolicy("fake-json-v1", "unicode_codepoints", 262144, 8192)
     config = D3RunConfig(outer_role, inner_role, D3Authorization(str(uuid4()), (0,)),
-        outer_role.role_config_ref, contract_version=request.param, d4_budget=D8HandoffBudgetPolicy(),
+        outer_role.role_config_ref, contract_version=22 if request.param == "rolling" else request.param, d4_budget=D8HandoffBudgetPolicy(),
+        intent_execution_policy="rolling_v1" if request.param == "rolling" else None,
         d5_enabled=True, d5_sensitive_requirements=(), d8_enabled=True,
         handoff_config=D8HandoffConfig(policy, policy))
     sandbox, clock, token = Sandbox(), Clock(), Token()

@@ -135,7 +135,7 @@ def _empty_result(task_run_id: str, mode: str, *, error: str, recovery: bool) ->
     }
 
 
-def _snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
+def _snapshot_v3_task_result(directory: Path, declaration: dict, *, read_store=None) -> dict:
     task_id = declaration.get("task_run_id")
     mode = declaration.get("mode")
     if not isinstance(task_id, str) or declaration.get("protocol_version") != 3:
@@ -166,7 +166,8 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
             return result
         return _empty_result(task_id, result["mode"], error="start_outcome_unknown", recovery=True)
 
-    with SqliteControlStore.open_readonly(database) as store:
+    from contextlib import nullcontext
+    with (nullcontext(read_store) if read_store is not None else SqliteControlStore.open_readonly(database)) as store:
         rows = store.load_control_state_rows(task_id)
         if rows is None or rows.task_run.task_run_id != task_id:
             return _empty_result(task_id, result["mode"], error="task_run_state_unavailable", recovery=True)
@@ -236,7 +237,8 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
                 "fact_id": fact.fact_id,
                 "turn_id": fact.turn_id,
                 "content": fact.content,
-                "source_execution_id": fact.source_ref,
+                **({"source_execution_id":fact.source_ref} if any(e.execution_id==fact.source_ref for e in rows.executions)
+                   else {"source_execution_id":None,"source_operation_id":fact.source_ref}),
                 "status": fact.status.value,
                 "verification_ref": fact.verification_ref,
             }
@@ -439,6 +441,7 @@ def _transient_storage_read(error) -> bool:
 
 def _snapshot_once(directory: Path, declaration: dict) -> dict:
     """Return a safe result; unreadable state is represented as recovery required."""
+    phase = "declaration_validation"
     try:
         if ("execution_profile" in declaration.get("request", {})
                 and "execution_profile" not in declaration):
@@ -449,9 +452,12 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
         model_format_diagnostics = []
         review_call_diagnostics = []
         known_model_failure = None
+        adjudication = None
+        result = None
         if "execution_profile" in declaration:
             from agent_adapters.simulation import parse_request
             from agent_core.http_contracts import is_http
+            phase = "configuration_validation"
             _, expected = parse_request(declaration["request"])
             if (expected is None or declaration["execution_profile"] != declaration["request"]["execution_profile"]
                     or declaration.get("contract_version") != expected.contract_version
@@ -460,21 +466,26 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                 raise ValueError("d8_frozen_configuration_mismatch")
             if declaration.get("mode") == "real":
                 from agent_adapters.simulation import validate_real_declaration
+                phase = "runtime_declaration"
                 validate_real_declaration(Path(directory), declaration)
             path = Path(directory) / "control.sqlite"
             if path.exists():
+                phase = "database_open"
                 with SqliteControlStore.open_readonly(path) as store:
+                    phase = "configuration_read"
                     config = store.load_d3_run_config(declaration["task_run_id"])
                     if config != expected:
                         raise ValueError("d8_frozen_configuration_mismatch")
+                    phase = "operation_read"
                     d8_unresolved = bool(store.list_d4_unresolved_operations(declaration["task_run_id"]))
                     if config.contract_version >= 6:
                         from types import SimpleNamespace
-                        from agent_core.structured_output import StructuredOutput
+                        from agent_core.structured_output import StructuredOutput, format_stop_reason
                         from agent_adapters.output_evidence import FileD8OutputEvidence
                         output = FileD8OutputEvidence(Path(directory) / "d8-output", create=False)
                         boundary = StructuredOutput(SimpleNamespace(config=config), output)
                         operations = store.list_d4_operations(declaration["task_run_id"])
+                        phase = "output_diagnostics"
                         review_call_diagnostics = output.review_failures(operations)
                         for operation in operations:
                             diagnostic = boundary.diagnostic(operation.start.operation_id)
@@ -482,12 +493,13 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                                 if diagnostic["task_run_id"] != declaration["task_run_id"]:
                                     raise ValueError("d8_output_diagnostic_binding_changed")
                                 model_format_diagnostics.append(diagnostic)
-                        latest = max(operations, key=lambda op: op.start.started_at, default=None)
+                        # The ledger is in insertion order; clock timestamps can tie.
+                        latest = operations[-1] if operations else None
                         if latest is not None and latest.completion is not None and latest.completion.result_kind in {"rejected", "failed"}:
                             diagnostic = next((row for row in model_format_diagnostics
                                                if row["model_request_id"] == latest.start.operation_id), None)
                             if diagnostic is not None:
-                                known_model_failure = "d8_model_format_rejected"
+                                known_model_failure = format_stop_reason(diagnostic) or "d8_model_format_rejected"
                                 if (diagnostic["stage"] == "intent_evaluation" and any(
                                         issue["code"] == "string_too_long" and issue["path"] == "$/reason"
                                         for issue in diagnostic["issues"])):
@@ -510,6 +522,7 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                         from agent_adapters.http_capability import check_http_task
                         from agent_core.dual_llm_contracts import D3RecoveryRequired
                         try:
+                            phase = "http_evidence"
                             d8_unresolved |= check_http_task(Path(directory), store, config,
                                                             diagnostics=http_diagnostics)
                         except D3RecoveryRequired as exc:
@@ -526,6 +539,7 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                         diagnostics = BusinessDiagnostics(config,
                             FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
                             FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False), store)
+                        phase = "business_diagnostics"
                         business_rows = diagnostics.projection(store.list_d4_operations(declaration["task_run_id"]))
                     if config.contract_version in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                         from agent_core.fact_diagnostics import FactBusinessDiagnostics
@@ -533,6 +547,7 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                         facts = FactBusinessDiagnostics(config,
                             FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
                             FileD8Evidence(Path(directory) / "d8-conclusions", create=False), store)
+                        phase = "fact_diagnostics"
                         business_rows += facts.projection(store.list_d4_operations(declaration["task_run_id"]))
                     if config.contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                         from agent_core.review_diagnostics import ReviewDiagnostics
@@ -540,6 +555,7 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                         reviews = ReviewDiagnostics(config,
                             FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
                             FileD2ReviewLedger(Path(directory) / "d3-reviews"), store, lambda: 0)
+                        phase = "review_diagnostics"
                         business_rows += reviews.projection(store.list_d4_operations(declaration["task_run_id"]))
                         d8_unresolved |= reviews.needs_repair
                     if config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
@@ -552,6 +568,7 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                             sessions=SimpleNamespace(evidence=FileD8HandoffEvidence(
                                 Path(directory) / "d8-sessions", create=False)),
                             model_evidence=FileD3ModelEvidence(Path(directory) / "d3-models", create=False)))
+                        phase = "fixed_probe_evidence"
                         d8_unresolved |= fixed.check_task(declaration["task_run_id"])
                     if config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and not is_http(config):
                         from agent_core.planning_assertion import PlanningAssertionBindings
@@ -561,6 +578,7 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                             FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False),
                             FileD8Evidence(Path(directory) / "d8-conclusions", create=False), store,
                             FileAttachmentImportRecorder(Path(directory) / "imports", read_only=True))
+                        phase = "planning_evidence"
                         d8_unresolved |= assemblies.check_task(declaration["task_run_id"])
                     if config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
                         from agent_core.completion_evaluation import EvaluationBindings
@@ -568,6 +586,9 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                             FileD8OutputEvidence(Path(directory) / "d8-output", create=False),
                             FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False), store)
                         d8_unresolved |= evaluations.check_task(declaration["task_run_id"])
+                        phase = "evaluation_evidence"
+                        from agent_core.intent_execution import pending_adjudication
+                        adjudication = pending_adjudication(store, evaluations.handoff, evaluations.output, declaration["task_run_id"])
                         business_rows.extend(evaluations.projection(store.list_d4_operations(declaration["task_run_id"])))
                         from agent_core.completion_evaluation import check_candidate_task
                         d8_unresolved |= check_candidate_task(config,
@@ -585,8 +606,18 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                             revisions=SimpleNamespace(evidence=FileD8HandoffEvidence(Path(directory) / 'd8-revisions', create=False)),
                             refinement=SimpleNamespace(evidence=FileD5Evidence(Path(directory) / 'd5-process', create=False))),
                             FileD8OutputEvidence(Path(directory) / 'd8-output', create=False))
+                        phase = "selection_evidence"
                         d8_unresolved |= selections.check_task(declaration['task_run_id'])
-        result = _snapshot_v3_task_result(Path(directory), declaration)
+                    if config.contract_version==22:
+                        from agent_adapters.conclusion_evidence import check_evidence_conclusions
+                        phase="conclusion_evidence"
+                        check_evidence_conclusions(Path(directory),store,config,declaration['task_run_id'])
+                    phase="result_projection"
+                    result=_snapshot_v3_task_result(Path(directory),declaration,read_store=store)
+        if result is None:
+            phase = "result_projection"
+            result = _snapshot_v3_task_result(Path(directory), declaration)
+        phase = "result_assembly"
         if declaration.get("execution_profile") in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
             result.update(execution_profile=declaration["execution_profile"], contract_version=expected.contract_version)
             if expected.contract_version in {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
@@ -611,6 +642,9 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                 result["recovery"] = {"required": True,
                                       "reason": specific or "operation_or_evidence_unknown"}
                 result["recovery_status"] = "required"
+            elif adjudication is not None and (result.get("task_run") or {}).get("status") == "running":
+                result["recovery"] = {"required": True, "reason": adjudication["reason"], "cause": adjudication["cause"]}
+                result["recovery_status"] = "required"
             elif known_model_failure is not None and (result.get("task_run") or {}).get("status") == "running":
                 result["recovery"] = {"required": True, "reason": known_model_failure}
                 result["recovery_status"] = "required"
@@ -628,7 +662,8 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
             error="state_read_busy" if _transient_storage_read(exc) else "state_read_failed",
             recovery=True,
         )
-        result["errors"][0].update(phase="state_read", **safe_failure_details(exc))
+        result["errors"][0].update(phase="state_read", read_stage=phase,
+                                   **safe_failure_details(exc, include_chain=True))
         return result
 
 

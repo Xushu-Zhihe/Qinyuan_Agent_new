@@ -903,6 +903,10 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"applied"}),
         ),
+        "commit_evidence_conclusion": OperationResultRule(
+            event_type=_CONTROL_EVENT_TYPE,
+            allowed_results=frozenset({"verified_fact","reviewed_inference","rejected","insufficient","no_new_information"}),
+        ),
         "append_d8_conclusion": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
             allowed_results=frozenset({"reviewed_inference", "rejected", "insufficient"}),
@@ -1118,7 +1122,13 @@ def validate_control_event(
         or conclusions[0].outcome == "verified_fact"
     ):
         raise ValueError("D8 inference/rejection requires its dedicated typed append")
-    if conclusions and operation not in {"append_d8_conclusion", "complete_d3_plan"}:
+    if operation=="commit_evidence_conclusion":
+        facts=[c for c in state_changes if isinstance(c,UpsertFact)]
+        if (len(conclusions)!=1 or conclusions[0].plan_id is not None or len(facts)>1
+                or len(state_changes)!=len(facts)+1 or any(f.status is not FactStatus.VERIFIED or f.fact_id!=conclusions[0].fact_id
+                    or f.verification_ref!="d8e:"+conclusions[0].review_request_id for f in facts)):
+            raise ValueError("Evidence conclusion requires one atomic reviewed record")
+    if conclusions and operation not in {"append_d8_conclusion", "complete_d3_plan", "commit_evidence_conclusion"}:
         raise ValueError("D8 conclusion requires its dedicated operation")
     if operation == "complete_d3_plan":
         tail = state_changes[1:]
@@ -1167,7 +1177,7 @@ def validate_control_event(
         or state_changes[0].status is not IntentStatus.SUCCEEDED
     ):
         raise ValueError("Intent completion requires one succeeded Intent change")
-    if operation not in {"commit_verified_file_type_fact", "commit_verified_t6_observation", "commit_verified_t6_fact", "complete_d3_plan"} and any(
+    if operation not in {"commit_verified_file_type_fact", "commit_verified_t6_observation", "commit_verified_t6_fact", "complete_d3_plan", "commit_evidence_conclusion"} and any(
         isinstance(change, UpsertFact) and change.verification_ref is not None
         for change in state_changes
     ):

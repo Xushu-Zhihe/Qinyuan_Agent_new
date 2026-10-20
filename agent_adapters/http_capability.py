@@ -302,8 +302,14 @@ class HttpCapability:
             from agent_core.conclusion_revision_contracts import D8ConclusionChange
             from agent_core.dual_llm_modeling import D8HistoryReadAction
             from agent_core.hybrid_contracts import AttachmentPlanProposal,file_plan_choice
-            from agent_core.intent_execution import IntentResolution, validate_resolution
-            if isinstance(proposal, IntentResolution):
+            from agent_core.intent_execution import IntentResolution, validate_resolution, WorkingRecord, validate_working
+            if isinstance(proposal, WorkingRecord):
+                validate_working(app, current, proposal)
+                return
+            from agent_core.evidence_conclusions import EvidenceCandidate
+            if isinstance(proposal,EvidenceCandidate):
+                app.evidence_conclusions.validate_candidate(current,proposal)
+            elif isinstance(proposal, IntentResolution):
                 validate_resolution(app, current, proposal)
             elif isinstance(proposal,D8ConclusionChange):
                 app.revisions.validate_action(proposal,app.revisions.visible_from_request(current))
@@ -335,7 +341,10 @@ class HttpCapability:
         if isinstance(proposal,D8HistoryReadAction):
             app.handoff.apply_read_action(request_id,proposal)
             return
-        from agent_core.intent_execution import IntentResolution, resolve
+        from agent_core.intent_execution import IntentResolution, resolve, WorkingRecord, apply_working
+        if isinstance(proposal, WorkingRecord):
+            apply_working(app, request_id)
+            return
         if isinstance(proposal, IntentResolution):
             await resolve(app, request_id, intent_id, proposal, token)
             return
@@ -345,6 +354,10 @@ class HttpCapability:
             return
         if isinstance(proposal, MCPCall):
             await app.mcp.execute(request_id, intent_id, proposal, token)
+            return
+        from agent_core.evidence_conclusions import EvidenceCandidate
+        if isinstance(proposal,EvidenceCandidate):
+            await app.evidence_conclusions.submit(request_id,intent_id,proposal,token)
             return
         from agent_core.http_contracts import HttpPlanProposal
         from agent_core.hybrid_contracts import AttachmentPlanProposal
@@ -579,7 +592,7 @@ class HttpCapability:
             evaluation=json.loads(request.prior_summary)['s4_evaluation_policy']
             policy=evaluation.get('http_observation')
             if policy is not None:sources=[(policy['execution_id'],policy['source_version_sha256'])]
-            if evaluation.get('version') == 2:
+            if evaluation.get('version') in {2, 3}:
                 cited = set(evaluation['required_observation_refs']) | set(evaluation['support_fact_refs'])
                 for item in request.history:
                     if item.ref not in cited:
@@ -601,7 +614,7 @@ class HttpCapability:
                         pair = (identity, observed.source_version_sha256)
                         if pair not in sources:sources.append(pair)
         for item in getattr(request, 'existing_facts', ()):
-            observed = item['observation']
+            observed = item.get('observation',{})
             if observed.get('rule_id') == 'http_response_observed':
                 pair=(observed['execution_id'],observed['source_version_sha256'])
                 if pair not in sources:sources.append(pair)

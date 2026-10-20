@@ -12,6 +12,7 @@ SAFE_EXCEPTION_TYPES = frozenset({
     "ReadTimeout", "ConnectTimeout", "SSLError", "gaierror", "OtherError",
     "AttributeError", "KeyError", "UnboundLocalError", "ProgrammingError",
     "OperationalError", "IntegrityError", "D5EvidenceError", "D5SensitiveDataError",
+    "StorageError", "T6EvidenceError", "JSONDecodeError", "IncompleteRead",
 })
 SAFE_HTTP_ERROR_CODES = frozenset({
     "d20_http_outcome_unknown", "d20_http_cancelled_after_result",
@@ -40,6 +41,15 @@ SAFE_MODEL_ERROR_CODES = SAFE_HTTP_ERROR_CODES | frozenset({
     "d9_review_contract_binding_changed", "d9_review_request_missing",
     "d9_review_request_invalid", "d9_review_request_binding_changed",
     "d5_redaction_configuration_unavailable", "model_call_failed",
+    "http_timeout", "model_total_timeout", "model_connect_timeout", "model_cancelled",
+    "model_budget_exhausted", "response_rejected", "empty_response",
+    "d8_model_output_budget_exhausted", "d8_model_output_truncated",
+    "d22_evidence_source_unavailable", "d22_evidence_source_scope_changed",
+    "d22_evidence_source_version_changed", "d22_evidence_review_missing",
+    "d22_evidence_review_unknown", "d22_evidence_proposal_changed",
+    "d22_evidence_request_missing_or_changed", "d22_evidence_conclusion_binding_changed",
+    "d22_evidence_decision_changed", "d22_reused_fact_not_effective",
+    "d22_fact_approval_missing", "d22_fact_content_or_source_changed",
 })
 
 
@@ -62,13 +72,13 @@ def _leading_errno(error):
     return None
 
 
-def safe_failure_details(error):
+def safe_failure_details(error, *, include_chain=False):
     """Describe a bounded exception chain without persisting exception text."""
     import os
-    if os.environ.get("QINYUAN_DEBUG_ERRORS"):
+    if os.environ.get("QINYUAN_DEBUG_ERRORS") and not include_chain:
         import traceback
         traceback.print_exception(type(error), error, error.__traceback__)
-    kinds, codes, seen = [], [], set()
+    kinds, codes, seen, chain = [], [], set(), []
     current = error
     while current is not None and id(current) not in seen and len(kinds) < 6:
         seen.add(id(current))
@@ -85,12 +95,37 @@ def safe_failure_details(error):
                     if _leading_errno(current) == 5 else "docker_unavailable")
             if code not in codes:
                 codes.append(code)
+        if include_chain:
+            location = None
+            frame = current.__traceback__
+            while frame is not None:
+                module = frame.tb_frame.f_globals.get("__name__", "")
+                if isinstance(module, str) and module.startswith(("agent_core.", "agent_adapters.", "Sandbox.")):
+                    location = {"module": module, "line": frame.tb_lineno}
+                frame = frame.tb_next
+            code = current.args[0] if len(current.args) == 1 and isinstance(current.args[0], str) else None
+            allowed = SAFE_MODEL_ERROR_CODES | {
+                "d8_handoff_evidence_unavailable", "d8_output_diagnostic_binding_changed",
+                "d8_output_diagnostic_fields_invalid", "d8_output_diagnostic_measurement_invalid",
+                "evidence_read_failed", "invalid_evidence_checksum", "oversized_evidence"}
+            node = {"exception_type": kinds[-1], "code": code if code in allowed else None,
+                    "source_location": location}
+            for key in ("errno", "winerror", "sqlite_errorcode"):
+                value = getattr(current, key, None)
+                if type(value) is int:
+                    node[key] = value
+            if node["code"] is not None and node["code"] not in codes:
+                codes.append(node["code"])
+            chain.append(node)
         current = current.__cause__ or current.__context__
-    return {"exception_types": kinds, "error_codes": codes}
+    result = {"exception_types": kinds, "error_codes": codes}
+    if include_chain:
+        result["exception_chain"] = chain
+    return result
 
 
 class FileD8OutputEvidence(FileD8HandoffEvidence):
-    KINDS = {"input-measurement", "mcp-registry", "mcp-catalog", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "review-failure"}
+    KINDS = {"provider-request", "provider-result", "input-measurement", "mcp-registry", "mcp-catalog", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "review-failure"}
 
     def save_review_failure(self, request, *, error=None, failure=None):
         from dataclasses import asdict

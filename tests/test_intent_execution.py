@@ -363,7 +363,7 @@ def test_failed_review_requires_saved_observation_not_model_assertion(saved_obse
     item = SimpleNamespace(ref="saved-ref", record_type="progress", source_status="available", conflict=False,
         identity="historical_decision_not_verified", content=json.dumps(data))
     request = SimpleNamespace(history=(item,))
-    policy = {"support_fact_refs": [], "proposal": {"outcome": "failed"}}
+    policy = {"version": 2, "support_fact_refs": [], "proposal": {"outcome": "failed"}}
     raw = dict(decision="failed", reason="The observed condition negates this bounded local goal.", evidence_refs=[item.ref])
     if saved_observation:
         assert parse_evaluation(request, raw, policy)["decision"] == "failed"
@@ -608,3 +608,314 @@ def test_fact_support_reference_is_corrected_without_a_new_observation(http_case
     result = asyncio.run(c.app.run(c.token))
     assert result.stop_reason == "d9_awaiting_external_feedback", result
     assert len(attempts) == 2 and len(c.sends) == 1 and len(c.app.state.facts) == 1
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_outer_selects_second_candidate_and_support_tracks_the_selected_subset(http_case):
+    from agent_core.output_contracts import shape_issues
+    from agent_core.intent_execution import parse_evaluation, selected_fact_refs
+    from agent_core.handoff_contracts import D8HandoffRequest
+    c = http_case
+    install(c, steps=2)
+    original = c.models[0].invoke
+    evaluations = []
+    def outer(envelope, *args):
+        if envelope.output_contract["stage"] == "intent_evaluation":
+            policy = json.loads(envelope.request.prior_summary)["s4_evaluation_policy"]
+            assert policy["version"] == 3 and len(policy["support_fact_refs"]) == 2
+            result = dict(decision="succeeded", reason="The second scoped observation suffices; first remains valid but is redundant.",
+                          evidence_refs=[policy["support_fact_refs"][1]])
+            assert not shape_issues(result, envelope.output_contract["schema"])
+            assert parse_evaluation(envelope.request, result, policy) == result
+            evaluations.append((envelope, result))
+            return result
+        return original(envelope, *args)
+    c.models[0].invoke = outer
+    assert asyncio.run(c.app.run(c.token)).stop_reason == "d9_awaiting_external_feedback"
+    record = next(r for r in c.app.store.list_d8_tree_records(c.task) if r.kind == "succeeded")
+    request = D8HandoffRequest.from_dict(c.app.handoff.evidence.read("request", record.model_request_id))
+    policy = json.loads(request.prior_summary)["s4_evaluation_policy"]
+    from agent_core.intent_execution import evaluation_schema, observation_refs
+    schema = evaluation_schema(request, policy)
+    for decision, refs in [("succeeded", [policy["support_fact_refs"][1]]), ("failed", [observation_refs(request)[0]]), ("continue", [policy["goal_ref"]])]:
+        sample = dict(decision=decision, reason="A meaningful scoped decision.", evidence_refs=refs)
+        assert not shape_issues(sample, schema)
+        assert parse_evaluation(request, sample, policy) == sample
+    for decision in ("succeeded", "failed"):
+        bad = dict(decision=decision, reason="Unsupported.", evidence_refs=[policy["goal_ref"]])
+        assert shape_issues(bad, schema)
+        with pytest.raises(ValueError):
+            parse_evaluation(request, bad, policy)
+    assert shape_issues(dict(decision="continue", reason="  ", evidence_refs=[policy["goal_ref"]]), schema)
+    assert record.support_fact_id == c.app.state.facts[1].fact_id != request.support_fact_id
+    assert len(c.app.state.facts) == 2 and selected_fact_refs(policy, evaluations[0][1]) == [policy["support_fact_refs"][1]]
+    # Historical requests keep the old all-required contract; no stored evidence is rewritten.
+    old = dict(policy, version=2)
+    with pytest.raises(ValueError, match="success_support_required"):
+        parse_evaluation(request, evaluations[0][1], old)
+    from agent_adapters.deepseek_roles import build_payload
+    system = build_payload(evaluations[0][0], c.app.config.outer_role)["messages"][0]["content"]
+    assert "not mandatory citations" in system and "Succeeded must cite support_fact_ref" not in system
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+@pytest.mark.parametrize("unknown", [False, True])
+def test_failed_end_review_is_durable_pending_not_business_inconclusive(http_case, unknown):
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    c = http_case
+    install(c, steps=1)
+    original = c.models[0].invoke
+    attempts = []
+    def outer(envelope, *args):
+        if envelope.output_contract["stage"] == "intent_evaluation":
+            attempts.append(envelope)
+            policy = json.loads(envelope.request.prior_summary)["s4_evaluation_policy"]
+            return dict(decision="succeeded", reason="Incomplete support choice.", evidence_refs=[policy["goal_ref"]])
+        return original(envelope, *args)
+    c.models[0].invoke = outer
+    first = asyncio.run(c.app.run(c.token))
+    assert first.stop_reason == "d22_awaiting_adjudication" and first.recovery_required, first
+    assert len(attempts) == 2 and len(c.sends) == len(c.app.state.facts) == 1
+    assert attempts[1].correction["issues"][0]["path"] == "$/evidence_refs"
+    assert c.app.state.intents[0].status.value == "running"
+    assert not any(r.kind in {"failed", "inconclusive", "succeeded", "turn_exhausted"} for r in c.app.store.list_d8_tree_records(c.task))
+    assert not c.app.store.list_d4_unresolved_operations(c.task)
+    assert snapshot_v3_task_result(c.directory, c.declaration)["recovery"]["reason"] == "d22_awaiting_adjudication"
+    if unknown:
+        from uuid import uuid4
+        from agent_core.operation_accounting import D4OperationStart
+        c.app.store.begin_d4_operation(D4OperationStart(str(uuid4()), c.task, "action", c.clock(),
+            c.app.state.latest_checkpoint.sequence, "0" * 64, "controlled-unknown-call", c.app.config.d4_budget.budget_policy_ref,
+            "inner_action", c.app.config.inner_role.role_config_ref))
+    before = len(c.app.store.list_d4_operations(c.task))
+    c.app.store.close()
+    c.app = c.create()
+    second = asyncio.run(c.app.resume(c.task, c.token))
+    assert second.stop_reason == ("d4_operation_outcome_unknown" if unknown else "d22_awaiting_adjudication"), second
+    assert second.recovery_required
+    assert len(c.app.store.list_d4_operations(c.task)) == before and len(attempts) == 2 and len(c.sends) == 1
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+@pytest.mark.parametrize("crash", [False, True])
+def test_working_observation_skips_fact_review_and_recovers_committed_progress(http_case, monkeypatch, crash):
+    import agent_core.intent_execution as execution
+    from test_chain_multi_turn import ProcessLoss
+    c = http_case
+    install(c, steps=2)
+    original_inner, original_outer = c.models[1].invoke, c.models[0].invoke
+    notes, fact_reviews = [], []
+    def inner(envelope, *args):
+        if envelope.output_contract["stage"] == "fact_proposal" and len(c.sends) == 1:
+            notes.append(envelope.request.model_request_id)
+            return dict(kind="working_record", content="Unreviewed observation: inspect another candidate; this is not a conclusion.",
+                        evidence_refs=[envelope.request.observation.proof_id])
+        return original_inner(envelope, *args)
+    def outer(envelope, *args):
+        if envelope.output_contract["stage"] == "fact_review":
+            fact_reviews.append(envelope)
+        return original_outer(envelope, *args)
+    c.models[1].invoke, c.models[0].invoke = inner, outer
+    if crash:
+        apply = execution.apply_working
+        def lost(*args):
+            raise ProcessLoss("observed committed before working application marker")
+        monkeypatch.setattr(execution, "apply_working", lost)
+        with pytest.raises(ProcessLoss):
+            asyncio.run(c.app.run(c.token))
+        assert len(c.sends) == 1 and not c.app.state.facts
+        monkeypatch.setattr(execution, "apply_working", apply)
+        c.app.store.close()
+        c.app = c.create()
+        result = asyncio.run(c.app.resume(c.task, c.token))
+    else:
+        result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "d9_awaiting_external_feedback", result
+    assert len(c.sends) == 2 and len(fact_reviews) == len(c.app.state.facts) == len(notes) == 1
+    first_plan = c.app.state.plans[0]
+    assert c.app.store.load_d3_plan_result(first_plan.plan_id).outcome == "observed"
+    assert c.app.store.load_d4_operation(notes[0]).application_ref is not None
+    history = c.app.handoff.history()
+    note = next(i for i in history if i.identity == "unreviewed_working_record")
+    assert note.record_type == "progress"
+    catalog = c.app.evidence_conclusions.catalog(c.app.state.intents[0].intent_id)
+    assert note.ref not in {s["ref"] for s in catalog}
+    from agent_core.evidence_conclusions import EvidenceCandidate
+    from types import SimpleNamespace
+    with pytest.raises(ValueError):
+        EvidenceCandidate("An unsupported conclusion.", "Work record only.", (note.ref,), False)
+    candidate = EvidenceCandidate("An unsupported conclusion.", "Work record only.", (note.record_id.removeprefix("decision/"),), False)
+    request = SimpleNamespace(history_context=json.dumps({"evidence_sources": catalog}), context=SimpleNamespace(intent_id=c.app.state.intents[0].intent_id))
+    with pytest.raises(ValueError):
+        c.app.evidence_conclusions.validate_candidate(request, candidate)
+    assert not any(r.outcome == "reviewed_inference" for r in c.app.store.list_d8_conclusions(c.task))
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_inner_working_record_continues_same_intent_without_new_tool_or_fact_review(http_case):
+    c = http_case
+    install(c, steps=1)
+    inner, outer = c.models[1].invoke, c.models[0].invoke
+    notes, fact_reviews = [], []
+    def choose(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan":
+            packet = json.loads(envelope.request.history_context)
+            if packet["intent_execution"]["facts"] and not notes:
+                notes.append(envelope.request.model_request_id)
+                return dict(kind="working_record", content="Hypothesis: the observed response may be a shared handler; not verified.",
+                    evidence_refs=[packet["intent_execution"]["facts"][0]["ref"]])
+        return inner(envelope, *args)
+    def review(envelope, *args):
+        if envelope.output_contract["stage"] == "fact_review":fact_reviews.append(envelope)
+        return outer(envelope, *args)
+    c.models[1].invoke, c.models[0].invoke = choose, review
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "d9_awaiting_external_feedback", result
+    assert len(c.sends) == len(c.app.state.facts) == len(notes) == len(fact_reviews) == 1
+    row = c.app.store.load_d4_operation(notes[0])
+    assert row.application_ref and row.completion
+    assert any(i.identity == "unreviewed_working_record" for i in c.app.handoff.history())
+
+
+from test_output import output_case
+
+
+@pytest.mark.parametrize("output_case", ["rolling"], indirect=True)
+def test_attachment_observation_can_remain_a_working_record_without_fact_review(output_case):
+    c = output_case
+    def choose(envelope, raw):
+        if envelope.output_contract["stage"] == "fact_proposal":
+            return dict(kind="working_record", content="Unreviewed copy observation; end this exploration without a durable conclusion.",
+                        evidence_refs=[envelope.request.observation.proof_id])
+        if envelope.output_contract["stage"] == "inner_plan" and c.app.state.plans:
+            context = json.loads(envelope.request.history_context)
+            return dict(kind="intent_resolution", outcome="inconclusive", reason="This exploratory direction is closed within its tested scope.",
+                evidence_refs=[i["ref"] for i in context["items"]], fact_ids=[], next_intent_candidates=[])
+        return raw
+    def review(envelope, raw):
+        if envelope.output_contract["stage"] == "intent_evaluation":
+            return dict(decision="inconclusive", reason="Legitimate bounded strategy closure, no impossibility claim.",
+                        evidence_refs=[i.ref for i in envelope.request.history])
+        return raw
+    original_inner = c.models["inner"].invoke
+    def invoke_inner(envelope, *args):
+        if envelope.output_contract["stage"] == "fact_proposal" or envelope.output_contract["stage"] == "inner_plan" and c.app.state.plans:
+            c.models["inner"].calls.append(envelope)
+            return choose(envelope, {})
+        return original_inner(envelope, *args)
+    c.models["inner"].invoke = invoke_inner
+    original_handoff = c.models["handoff"].invoke
+    def invoke_handoff(envelope, *args):
+        if envelope.output_contract["stage"] == "intent_evaluation":
+            c.models["handoff"].calls.append(envelope)
+            return review(envelope, {})
+        return original_handoff(envelope, *args)
+    c.models["handoff"].invoke = invoke_handoff
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "search_exhausted", (result.stop_reason, [(e.request.stage, type(getattr(e.request, "context", None)).__name__) for e in c.models["inner"].calls], [(o.start.role, o.start.operation_id) for o in c.app.store.list_d4_unresolved_operations(c.task)])
+    assert not c.app.state.facts and not c.models["fact"].calls
+    assert len(c.app.state.plans) == 1
+    observed = c.app.store.load_d3_plan_result(c.app.state.plans[0].plan_id)
+    assert observed.outcome == "observed" and c.app.proof_store.read(observed.proof_id)
+    assert any(i.identity == "unreviewed_working_record" for i in c.app.handoff.history())
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_mcp_result_working_record_and_legal_end_without_formal_fact(http_case):
+    from test_mcp_link import Tools
+    from agent_adapters.mcp_plan_executor import MCPPlanExecutor
+    c = http_case
+    tools = Tools(c.task, c.app.state.task_run.sandbox_id)
+    c.app.mcp = MCPPlanExecutor(c.app, tools)
+    c.app.mcp.authorize(c.task)
+    original_outer = c.models[0].invoke
+    notes = []
+    def choose(envelope, *args):
+        if envelope.output_contract["stage"] != "inner_plan":
+            raise AssertionError(envelope.output_contract["stage"])
+        context = json.loads(envelope.request.history_context)
+        if not context.get("evidence_sources"):
+            return dict(kind="mcp_call", tool_name="shell.run_bash", arguments=dict(script="printf test"))
+        if not notes:
+            source = next(i for i in context["items"] if i["identity"] == "historical_decision_not_verified")
+            notes.append(envelope.request.model_request_id)
+            return dict(kind="working_record", content="Unreviewed command result; no formal conclusion is warranted.", evidence_refs=[source["ref"]])
+        return dict(kind="intent_resolution", outcome="inconclusive", reason="Exploratory direction closed within observed scope.",
+            evidence_refs=[i["ref"] for i in context["items"]], fact_ids=[], next_intent_candidates=[])
+    def review(envelope, *args):
+        if envelope.output_contract["stage"] == "intent_evaluation":
+            return dict(decision="inconclusive", reason="Legitimate strategic closure, not a technical verdict.",
+                        evidence_refs=[i.ref for i in envelope.request.history])
+        assert envelope.output_contract["stage"] != "fact_review"
+        return original_outer(envelope, *args)
+    c.models[1].invoke, c.models[0].invoke = choose, review
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "search_exhausted", result
+    assert len(tools.calls) == len(notes) == 1 and not c.sends and not c.app.state.facts
+    assert c.app.state.plans == () and c.app.state.executions == ()
+    assert any(i.identity == "unreviewed_working_record" for i in c.app.handoff.history())
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_next_turn_required_history_uses_only_outer_selected_fact_support(http_case, monkeypatch):
+    from test_chain_multi_turn import ProcessLoss
+    c = http_case
+    install(c, steps=3)
+    outer, inner = c.models[0].invoke, c.models[1].invoke
+    selected, candidates = [], []
+    def choose_outer(envelope, *args):
+        if envelope.output_contract["stage"] == "intent_evaluation":
+            policy = json.loads(envelope.request.prior_summary)["s4_evaluation_policy"]
+            candidates.extend(policy["support_fact_refs"])
+            selected.extend(policy["support_fact_refs"][1:])
+            return dict(decision="succeeded", reason="The last two scoped observations jointly cover the goal.", evidence_refs=selected)
+        if envelope.output_contract["stage"] == "tree_planning" and envelope.request.turn_id:
+            return dict(kind="candidates", intents=[dict(description="Explore an independent next direction.", intent_type=None, dependency_refs=[])])
+        return outer(envelope, *args)
+    def choose_inner(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_candidate":return dict(action=dict(kind="no_candidate"))
+        return inner(envelope, *args)
+    c.models[0].invoke, c.models[1].invoke = choose_outer, choose_inner
+    new_plan = c.app._new_plan
+    async def stop_at_child(intent_id, *args, **kwargs):
+        if len(c.app.state.turns) == 2:
+            raise ProcessLoss("child registered; inspect its required support before execution")
+        return await new_plan(intent_id, *args, **kwargs)
+    monkeypatch.setattr(c.app, "_new_plan", stop_at_child)
+    with pytest.raises(ProcessLoss):asyncio.run(c.app.run(c.token))
+    child = c.app.state.turns[-1]
+    _, _, context = c.app.handoff.select("execution", child.turn_id, child.intent_ids[0])
+    assert len(selected) == 2 and set(selected) <= set(context["required_refs"])
+    assert candidates[0] not in context["required_refs"]
+    record = next(r for r in c.app.store.list_d8_tree_records(c.task) if r.kind == "succeeded")
+    from agent_core.intent_execution import result_summary
+    assert result_summary(c.app, record)["evidence_refs"] == selected
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_specific_business_rejection_is_bound_and_reaches_the_one_correction(http_case, monkeypatch):
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    c = http_case
+    install(c, steps=1)
+    parse, invoke = c.app.handoff._parse, c.models[0].invoke
+    rejected, attempts = [], []
+    def reject_once(request, raw):
+        if request.stage == "intent_evaluation" and not rejected:
+            rejected.append(request.model_request_id)
+            raise ValueError("d22_resolution_success_support_required")
+        return parse(request, raw)
+    def outer(envelope, *args):
+        if envelope.output_contract["stage"] == "intent_evaluation":attempts.append(envelope)
+        return invoke(envelope, *args)
+    monkeypatch.setattr(c.app.handoff, "_parse", reject_once)
+    c.models[0].invoke = outer
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "d9_awaiting_external_feedback", result
+    assert len(attempts) == 2 and len(c.sends) == 1
+    issue = attempts[1].correction["issues"][0]
+    assert issue == dict(code="d22_resolution_success_support_required", path="$/evidence_refs", expected="at_least_one_candidate_fact", actual="rejected")
+    diagnostic = c.app.evaluation_bindings.read(rejected[0], check_operation=True)
+    assert diagnostic["diagnostic_version"] == 2 and diagnostic["result"]["raw"] is None
+    projected = snapshot_v3_task_result(c.directory, c.declaration)
+    assert not projected["recovery"]["required"], projected
+    assert any(row["stage"] == "intent_evaluation" and row["diagnostic_version"] == 2 and row["issues"] == [issue] for row in projected["business_diagnostics"])

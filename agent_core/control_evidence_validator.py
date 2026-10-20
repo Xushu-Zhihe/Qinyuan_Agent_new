@@ -1164,6 +1164,14 @@ class D3EvidenceValidator:
                 raise D3RecoveryRequired("d8_fact_approval_missing")
         elif records:
             raise D3RecoveryRequired("d8_not_enabled")
+        if mutation.operation=="commit_evidence_conclusion":
+            if len(records)!=1 or records[0].plan_id is not None or config.contract_version!=22:
+                raise D3RecoveryRequired("d22_evidence_commit_invalid")
+            record=records[0]
+            self.conclusions.app.evidence_conclusions.validate_current_reuse(record)
+            if not any(i.intent_id==record.intent_id and i.turn_id==record.turn_id and i.status.value=="running" for i in state.intents):
+                raise D3RecoveryRequired("d22_evidence_scope_ended")
+            return
         http = getattr(self, 'http', None)
         if http is not None and http.validate_mutation(mutation, state):
             return

@@ -72,6 +72,16 @@ class AnswerCandidates:
     async def after_success(self, intent, token):
         if intent.status is not IntentStatus.SUCCEEDED:
             raise D3RecoveryRequired('d9_candidate_requires_local_success')
+        if self.app.config.contract_version==22 and self.app.evidence_conclusions is not None:
+            plans={p.plan_id for p in self.app.state.plans if p.intent_id==intent.intent_id and p.status is PlanStatus.COMPLETED}
+            eligible=any(e.plan_id in plans and e.status is ExecutionStatus.SUCCEEDED and e.output_ref is not None for e in self.app.state.executions)
+            records=[r for r in self.store.list_d8_conclusions(self.app.state.task_run.task_run_id)
+                     if r.intent_id==intent.intent_id and r.plan_id is None and r.outcome=="verified_fact"]
+            if not eligible and records:
+                from qinyuan_core import get_logger
+                get_logger("ctrl").info("candidate.skipped",run=self.app.state.task_run.task_run_id,
+                    intent=intent.intent_id,code="candidate_evidence_type_not_supported",category="business")
+                return False
         request = self._request(intent)
         identity, candidate = await self.app.inner.propose_candidate(request, token, self.protected_factory())
         if token.is_cancelled:

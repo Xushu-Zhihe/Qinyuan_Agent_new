@@ -162,6 +162,11 @@ class ControlStateRepository:
             for change in mutation.state_changes:
                 if not isinstance(change, UpsertFact):
                     continue
+                if (change.verification_ref or "").startswith("d8e:"):
+                    manager=getattr(self,"_evidence_conclusions",None)
+                    if manager is None:raise StorageError("Reviewed evidence port not configured")
+                    manager.validate_fact(change,rows,tuple(c for c in mutation.state_changes if isinstance(c,D8Conclusion)))
+                    continue
                 execution = executions[change.source_ref]
                 if execution.status not in EXECUTION_TERMINAL_STATUSES:
                     raise StorageError("Fact source Execution must be terminal")
@@ -474,6 +479,11 @@ class ControlStateRepository:
                 )
 
         for fact in rows.facts:
+            if (fact.verification_ref or "").startswith("d8e:"):
+                manager=getattr(self,"_evidence_conclusions",None)
+                if manager is None:raise StorageError("Reviewed evidence port not configured")
+                manager.validate_fact(fact,rows,d8_pending)
+                continue
             source = executions.get(fact.source_ref)
             turn = turns.get(fact.turn_id)
             if source is None or turn is None:

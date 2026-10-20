@@ -25,6 +25,9 @@ from agent_core.operation_accounting import D4BudgetExhausted, D4OperationComple
 from agent_core.turn_modeling import stable_id, digest
 
 
+EVALUATION_FALLBACK_LIMIT = 3
+
+
 @dataclass(frozen=True)
 class D8PlanningResult:
     proposal: D3TurnProposal | None
@@ -166,6 +169,16 @@ class HandoffContext:
                 handoff_json({"kind": "execution", "status": execution.status.value,
                               "step_index": execution.step_index}), (execution.execution_id,), asdict(execution))
         for fact in state.facts:
+            if (fact.verification_ref or "").startswith("d8e:"):
+                record=next((r for r in self.store.list_d8_conclusions(task_id) if r.review_request_id==fact.verification_ref[4:]),None)
+                if record is None:raise D3RecoveryRequired("d22_fact_approval_missing")
+                status="available"
+                try:self.app.evidence_conclusions.validate_fact(fact,state)
+                except D3RecoveryRequired:status="unavailable"
+                add(fact.fact_id,"verified_fact",fact.turn_id,record.intent_id,None,fact.content,
+                    (fact.source_ref,fact.verification_ref),{"fact":asdict(fact),"source":record.source_version_sha256},"outer_reviewed_evidence_fact",status)
+                items[-1]=replace(items[-1],scope="historical")
+                continue
             execution = next(e for e in state.executions if e.execution_id == fact.source_ref)
             intent = intents[plans[execution.plan_id].intent_id]
             artifact, status, version = None, "available", asdict(fact)
@@ -198,6 +211,14 @@ class HandoffContext:
             if view.scope_status == "ended":
                 items[-1] = replace(items[-1], scope="historical")
         for record in self.store.list_d8_conclusions(task_id):
+            if record.plan_id is None and record.outcome=="reviewed_inference":
+                request=self.app.conclusions.evidence.read_request(record.review_request_id)
+                status="available"
+                try:self.app.evidence_conclusions.validate_record(record,state)
+                except D3RecoveryRequired:status="unavailable"
+                add(record.record_id,"reviewed_inference",record.turn_id,record.intent_id,None,
+                    self.app.conclusions.accepted_content(record),(record.proposal_request_id,record.review_request_id),
+                    asdict(record),"reviewed_inference_not_verified",status)
             add("review/" + record.record_id, "progress", record.turn_id, record.intent_id, None,
                 handoff_json({"kind": "conclusion_review", "outcome": record.outcome,
                               "fact_id": record.fact_id}), (record.review_request_id,), asdict(record))
@@ -206,8 +227,8 @@ class HandoffContext:
                 data = self.app.sessions.payload(record)
                 add("decision/" + record.record_id, "progress", record.turn_id, record.intent_id, None,
                     handoff_json({"decision": data["response"], "observation": data["observation"],
-                                  "identity": "historical_decision_not_verified"}),
-                    (record.model_request_id,), asdict(record), "historical_decision_not_verified")
+                                  "identity": "unreviewed_working_record" if data["response"].get("kind") == "working_record" else "historical_decision_not_verified"}),
+                    (record.model_request_id,), asdict(record), "unreviewed_working_record" if data["response"].get("kind") == "working_record" else "historical_decision_not_verified")
         for record in self.store.list_d8_tree_records(task_id):
             if record.turn_id not in turns:
                 continue
@@ -370,7 +391,10 @@ class HandoffContext:
                                   if r.intent_id == trigger and r.kind == "succeeded")
                     original = self.evidence.read("request", parent.model_request_id)
                     policy = json.loads(original["prior_summary"])["s4_evaluation_policy"]
-                    required.update(ref for ref in policy.get("support_fact_refs", []) if ref != policy.get("support_fact_ref"))
+                    from agent_core.intent_execution import selected_fact_refs
+                    decision = self._known_call(D8HandoffRequest.from_dict(original))["raw"]
+                    required.update(ref for ref in selected_fact_refs(policy, decision)
+                                    if by_ref[ref].record_id != parent.support_fact_id)
             current = turns.get(current.parent_turn_id) if current.parent_turn_id else None
         if intent_id:
             required.add(by_id[intent_id].ref)
@@ -435,6 +459,7 @@ class HandoffContext:
             room = max(0, target - sum(i.record_type == kind for i in chosen))
             candidates = [i for i in items if i.record_type == kind and i.ref not in required
                           and i.source_status == "available" and not i.conflict and group(i) < 5
+                          and (i.identity != "unreviewed_working_record" or i.intent_id == intent_id)
                           and (self.app.revisions is None or self.app.revisions.reliable(i))]
             candidates.sort(key=lambda i: (group(i), ranks.get(i.ref, len(ranks)), -i.committed_sequence, i.ref))
             optional.extend(candidates[:room])
@@ -500,7 +525,7 @@ class HandoffContext:
         if request.stage == "intent_evaluation":
             from agent_core.intent_execution import parse_evaluation
             policy = json.loads(request.prior_summary).get("s4_evaluation_policy", {})
-            if policy.get("version") == 2:
+            if policy.get("version") in {2, 3}:
                 return parse_evaluation(request, raw, policy)
             value = _fields(raw, {"decision", "reason", "evidence_refs"})
             if (value["decision"] not in {"succeeded", "failed", "inconclusive"}
@@ -732,7 +757,7 @@ class HandoffContext:
                 if self.state.latest_checkpoint.sequence != current.base_checkpoint_sequence:
                     raise D3RecoveryRequired("d8_handoff_request_stale")
                 policy = self.app.config.handoff_config.outer_capacity
-                if not self.capacity_port.fits(current, policy):
+                if not self._fits_complete_request(current, policy):
                     self._pause("complete_model_request", [i.ref for i in current.history],
                                 policy.total_units, None)
                 if self.app.output_boundary is not None:
@@ -752,6 +777,7 @@ class HandoffContext:
                     raw = materialize(current, raw)
                 outcome, reason, rejected_indices = "valid", None, []
                 business_issues = None
+                evaluation_issue = None
                 if isinstance(raw, ModelError):
                     if raw.kind in {ModelErrorKind.TIMED_OUT, ModelErrorKind.CANCELLED}:
                         raise D3RecoveryRequired("d8_model_outcome_unknown")
@@ -765,6 +791,8 @@ class HandoffContext:
                         if isinstance(parsed, D8PlanningResult):
                             rejected_indices = list(parsed.rejected_indices)
                     except (ValueError, TypeError, KeyError) as exc:
+                        from agent_core.intent_execution import EVALUATION_ISSUES
+                        evaluation_issue = str(exc) if str(exc) in EVALUATION_ISSUES else None
                         outcome, reason = "invalid", "d8_output_contract_rejected"
                         if isinstance(exc, D8DependencyCandidatesRejected):
                             reason = "d8_all_dependency_candidates_rejected"
@@ -796,7 +824,7 @@ class HandoffContext:
                     if outcome == "valid":
                         result = evaluations.save(current, result)
                     elif outcome == "invalid" and self.app.output_boundary.diagnostic(current.model_request_id) is None:
-                        result = evaluations.save_diagnostic(current, result)
+                        result = evaluations.save_diagnostic(current, result, evaluation_issue)
                 self.evidence.save("result", current.model_request_id, result)
                 result = self._known_call(current)
             if self.app.output_boundary is not None and result["outcome"] != "stale":
@@ -931,12 +959,38 @@ class HandoffContext:
                       UpsertIntent(intent.intent_id, intent.turn_id, intent.description,
                                    intent.priority, intent.intent_type, IntentStatus.RUNNING)))
 
+    def note_evaluation_fallback(self, code):
+        """Count consecutive unreadable evaluation verdicts.
+
+        Returns True while the tree may degrade this Intent to ``inconclusive``.
+        Returns False once the limit is reached, so a *systemic* evaluator failure
+        (for example a schema and parser that disagree) still stops the run instead
+        of silently turning every Intent inconclusive.
+        """
+        self._evaluation_fallbacks = getattr(self, "_evaluation_fallbacks", 0) + 1
+        _trace("evaluation.fallback", code=code, count=self._evaluation_fallbacks)
+        return self._evaluation_fallbacks < EVALUATION_FALLBACK_LIMIT
+
+    def note_evaluation_success(self):
+        self._evaluation_fallbacks = 0
+
     async def evaluate_intent(self, intent_id, plan_id, fact_id, inner_request_id, token):
         intent = next(i for i in self.state.intents if i.intent_id == intent_id)
         request, _ = self._request("intent_evaluation", intent.turn_id, intent_id, fact_id)
         final, decision = await self.call(request, token)
         if decision is None:
-            raise D3RecoveryRequired("d8_local_goal_evaluation_failed")
+            # An unreadable verdict leaves this Intent unjudged; that is a local
+            # unknown, not an unknown run state, so degrade to inconclusive.
+            if not self.note_evaluation_fallback("d8_local_goal_evaluation_invalid"):
+                raise D3RecoveryRequired("d8_local_goal_evaluation_failed")
+            record = D8TreeRecord(self._id("evaluation/" + final.model_request_id), request.task_run_id,
+                                  intent.turn_id, intent_id, "inconclusive", final.model_request_id,
+                                  fact_id, inner_request_id)
+            self._commit("evaluate_d8_tree_intent", record,
+                         (UpsertIntent(intent.intent_id, intent.turn_id, intent.description, intent.priority,
+                                       intent.intent_type, IntentStatus.INCONCLUSIVE),))
+            return "inconclusive"
+        self.note_evaluation_success()
         record = D8TreeRecord(self._id("evaluation/" + final.model_request_id), request.task_run_id,
                               intent.turn_id, intent_id, decision["decision"], final.model_request_id,
                               fact_id, inner_request_id)
@@ -1061,11 +1115,14 @@ class HandoffContext:
                 if (request.turn_id, request.intent_id) != (record.turn_id, record.intent_id):
                     raise D3RecoveryRequired("d8_exhaustion_scope_changed")
             else:
+                from agent_core.intent_execution import support_anchor
+                policy = json.loads(request.prior_summary).get("s4_evaluation_policy", {})
+                anchor = support_anchor(request, policy, parsed) if policy.get("version") in {2, 3} else request.support_fact_id
                 if (("evaluation_continued" if parsed["decision"] == "continue" else parsed["decision"]) != record.kind
-                        or (request.turn_id, request.intent_id, request.support_fact_id)
+                        or (request.turn_id, request.intent_id, anchor)
                         != (record.turn_id, record.intent_id, record.support_fact_id)):
                     raise D3RecoveryRequired("d8_local_goal_decision_changed")
-                if json.loads(request.prior_summary).get("s4_evaluation_policy", {}).get("version") == 2:
+                if json.loads(request.prior_summary).get("s4_evaluation_policy", {}).get("version") in {2, 3}:
                     from agent_core.intent_execution import validate_record
                     validate_record(self.app, request, record)
                     return
@@ -1320,6 +1377,8 @@ class HandoffContext:
             if self.app.config.intent_execution_policy and request.stage == "inner_plan":
                 from agent_core.intent_execution import execution_context
                 packet["intent_execution"] = execution_context(self.app, intent_id)
+            if self.app.evidence_conclusions is not None and request.stage=="inner_plan":
+                packet["evidence_sources"]=self.app.evidence_conclusions.catalog(intent_id)
             if self.app.mcp is not None and request.stage == "inner_plan":
                 from agent_adapters.mcp_plan_executor import compact_tools
                 packet["mcp_tools"] = compact_tools(self.app.mcp.tools)
@@ -1360,15 +1419,22 @@ class HandoffContext:
         result = D8ExecutionModelRequest(**values,
                                          history_context=saved["history_context"],
                                          history_capacity_version=saved["capacity_version"])
-        if not self.capacity_port.fits(result, self.app.config.handoff_config.inner_capacity):
+        if not self._fits_complete_request(result, self.app.config.handoff_config.inner_capacity):
             self._pause("complete_model_request", (), self.app.config.handoff_config.inner_capacity.total_units, None)
         self.evidence.save("execution-context", request.model_request_id, saved)
         return result
 
+    def _fits_complete_request(self, request, policy):
+        # New v22 uses the same frozen presentation for preliminary checks and
+        # actual dispatch. Otherwise duplicate input could fail before prepare().
+        if self.app.config.contract_version == 22 and self.app.output_boundary is not None:
+            request = self.app.output_boundary._contract(request)[0]
+        return self.capacity_port.fits(request, policy)
+
     def freeze_execution_request(self, request):
         if self.app.output_boundary is not None:
             self.app.output_boundary.prepare(request)
-        if not self.capacity_port.fits(request, self.app.config.handoff_config.inner_capacity):
+        if not self._fits_complete_request(request, self.app.config.handoff_config.inner_capacity):
             self._pause("complete_model_request", (), self.app.config.handoff_config.inner_capacity.total_units, None)
         data = {"task_run_id": request.task_run_id, "model_request_id": request.model_request_id,
                 "capacity_version": request.history_capacity_version, "history_context": request.history_context}
@@ -1381,7 +1447,7 @@ class HandoffContext:
         policy = (self.app.config.handoff_config.inner_capacity
                   if role_ref == self.app.config.inner_role.role_config_ref
                   else self.app.config.handoff_config.outer_capacity)
-        if not self.capacity_port.fits(request, policy):
+        if not self._fits_complete_request(request, policy):
             self._pause("complete_model_request", (), policy.total_units, None)
 
     def validate_read_action(self, request, action):

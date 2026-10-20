@@ -1,4 +1,4 @@
-﻿"""D9-2 offline transport contracts: no provider or Docker calls."""
+"""D9-2 offline transport contracts: no provider or Docker calls."""
 
 import io
 import json
@@ -37,7 +37,7 @@ def envelope(stage="inner_plan", *, session="", correction=None):
 
 def private_fixture(tmp_path):
     path = tmp_path / "private.env"
-    path.write_text("QINYUAN_LLM_BACKEND=openai\nOPENAI_BASE_URL=https://api.deepseek.com\n"
+    path.write_text("QINYUAN_LLM_BACKEND=openai\nOPENAI_BASE_URL=" + deepseek_roles.TRANSPORT["base_url"] + "\nQINYUAN_ALLOW_CUSTOM_ENDPOINT=1\n"
                     "OPENAI_API_KEY=offline-private-key\nQINYUAN_LLM_TIMEOUT_SECONDS=180\n")
     return path
 
@@ -128,8 +128,8 @@ class Pipe:
         pass
 
 
-def worker_response(monkeypatch, content, finish="stop", *, extra=None, status=200):
-    body = json.dumps({"choices": [{"message": {"content": content, "reasoning_content": "PRIVATE_THOUGHT", **(extra or {})}, "finish_reason": finish}]}).encode()
+def worker_response(monkeypatch, content, finish="stop", *, extra=None, status=200, usage=None, with_diagnostic=False):
+    body = json.dumps({"usage": usage, "choices": [{"message": {"content": content, "reasoning_content": "PRIVATE_THOUGHT", **(extra or {})}, "finish_reason": finish}]}).encode()
     class Client:
         sock = SimpleNamespace(settimeout=lambda _: None)
         def connect(self): pass
@@ -140,7 +140,10 @@ def worker_response(monkeypatch, content, finish="stop", *, extra=None, status=2
     pipe = Pipe()
     deepseek_roles._raw_http_worker(pipe, deepseek_model.DeepSeekSettings("deepseek-flash", "offline-private-key"), {}, 180)
     assert "PRIVATE_THOUGHT" not in repr(pipe.sent)
-    return pipe.sent[-1]
+    diagnostic = {}
+    for sent in pipe.sent:
+        diagnostic.update(sent.get("diagnostic", {}))
+    return (pipe.sent[-1], diagnostic) if with_diagnostic else pipe.sent[-1]
 
 
 @pytest.mark.parametrize("content,finish,issue", [
@@ -180,7 +183,7 @@ def install_controlled_transport(monkeypatch, *, alter=None):
     class ControlledModel(original):
         def __init__(self, role, settings):
             class Transport:
-                def _invoke_payload(_, payload, timeout, token):
+                def _invoke_payload(_, payload, timeout, token, *, diagnostic=None):
                     captured.append((self.current, payload))
                     if alter:
                         changed = alter(self.current, len(captured))
@@ -288,7 +291,7 @@ def test_env_credentials_do_not_override_frozen_roles_or_leak(tmp_path, monkeypa
     settings = deepseek_roles.settings_from_file(role, path)
     assert settings.api_key == "offline-private-key"
     assert "offline-private-key" not in repr(settings)
-    assert settings.model == "deepseek-flash"
+    assert settings.model == role.model
     with pytest.raises(ValueError, match="role_configuration"):
         deepseek_roles.settings_from_file(replace(role, model="other"), path)
     with pytest.raises(ValueError, match="invalid_d8_configuration"):
@@ -308,7 +311,7 @@ def test_single_argument_review_has_runtime_timeout_cancel_and_failure_mapping(t
     stage, schema = output_schema(business)
     env = D8OutputRequest(business, {"version": 1, "stage": stage, "schema": schema}, "Return JSON", None)
     calls = []
-    def invoke(payload, timeout, token):
+    def invoke(payload, timeout, token, *, diagnostic=None):
         calls.append((timeout, token))
         return ModelError(failure, "http_transport_failure" if failure == ModelErrorKind.PROVIDER_FAILURE else "fixed_safe_reason")
     adapter = deepseek_roles.D8DeepSeekModel(role, deepseek_roles.settings_from_file(role, private_fixture(tmp_path)),
@@ -345,3 +348,177 @@ def test_workbench_real_emits_frozen_roles_and_keeps_credentials_private(tmp_pat
     assert raw["task_request"]["target"]["endpoints"] == []
     assert "offline-private-key" not in text
     assert parse_request(raw)[1].contract_version == 6
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+def test_provider_numeric_diagnostics_preserve_incomplete_content_length(monkeypatch, finish):
+    result, detail = worker_response(monkeypatch, "汉字{", finish, with_diagnostic=True, usage={
+        "prompt_tokens": 123, "completion_tokens": 32768, "total_tokens": 32891,
+        "completion_tokens_details": {"reasoning_tokens": 32760, "private": "PRIVATE_USAGE"},
+        "secret": "PRIVATE_USAGE", "prompt_cache_hit_tokens": True})
+    assert detail["transport_end"] == "response_received" and detail["http_status"] == 200
+    assert detail["finish_reason"] == finish and detail["content_chars"] == 3
+    assert detail["content_utf8_bytes"] == 7 and detail["reasoning_chars"] == len("PRIVATE_THOUGHT")
+    assert detail["usage"] == {"prompt_tokens": 123, "completion_tokens": 32768,
+        "total_tokens": 32891, "completion_tokens_details": {"reasoning_tokens": 32760}}
+    assert "PRIVATE" not in json.dumps(detail) and result["payload"]["content"] == "汉字{"
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "timeout", "http_402"])
+def test_transport_end_diagnostics_distinguish_wire_and_provider_failures(monkeypatch, failure):
+    class Client:
+        sock = SimpleNamespace(settimeout=lambda _: None)
+        def connect(self): pass
+        def request(self, *args, **kwargs): pass
+        def getresponse(self):
+            def read(_):
+                if failure == "incomplete":raise deepseek_model.http.client.IncompleteRead(b"private partial", 50)
+                raise TimeoutError("private timeout")
+            return SimpleNamespace(status=402 if failure == "http_402" else 200, read=read)
+        def close(self): pass
+    monkeypatch.setattr(deepseek_model.http.client, "HTTPSConnection", lambda *a, **k: Client())
+    pipe = Pipe()
+    deepseek_roles._raw_http_worker(pipe, deepseek_model.DeepSeekSettings("deepseek-flash", "offline-private-key"), {}, 180)
+    detail = {}
+    for sent in pipe.sent:detail.update(sent.get("diagnostic", {}))
+    assert detail["transport_end"] == {"incomplete": "incomplete_response", "timeout": "timeout", "http_402": "http_error"}[failure]
+    assert detail["http_status"] == (402 if failure == "http_402" else 200)
+    assert "private" not in repr(pipe.sent)
+
+
+@pytest.mark.parametrize("failure", ["length", "timeout", "http_402"])
+def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_path, monkeypatch, failure):
+    from agent_adapters.output_evidence import FileD8OutputEvidence
+    from agent_core.turn_modeling import digest
+    monkeypatch.delenv("QINYUAN_DEBUG_TRACE", raising=False)
+    role = deepseek_roles.role_config("outer_planning")
+    uid = lambda: str(uuid4())
+    from agent_core.review_contracts import D2ReviewRequest
+    business = D2ReviewRequest(uid(), uid(), 1, 1, "turn_start", uid(), uid(), uid(), None, 1, "v1", (), 0, "{}")
+    stage, schema = output_schema(business)
+    env = D8OutputRequest(business, {"version": 1, "stage": stage, "schema": schema}, "Return JSON", None)
+    def invoke(payload, timeout, token, *, diagnostic):
+        diagnostic.update(http_status=402 if failure == "http_402" else 200,
+                          transport_end="response_received" if failure == "length" else "timeout" if failure == "timeout" else "http_error")
+        if failure == "length":
+            diagnostic.update(deepseek_model._response_diagnostic({"usage": {
+                "completion_tokens": 32768, "completion_tokens_details": {"reasoning_tokens": 32760}}},
+                {"reasoning_content": "PRIVATE_THOUGHT"}, "length", "PRIVATE_RESPONSE"))
+            return {"content": "PRIVATE_RESPONSE", "finish_reason": "length"}
+        return ModelError(ModelErrorKind.TIMED_OUT if failure == "timeout" else ModelErrorKind.PROVIDER_FAILURE,
+                          "http_timeout" if failure == "timeout" else "deepseek_http_402")
+    adapter = deepseek_roles.D8DeepSeekModel(role, deepseek_roles.settings_from_file(role, private_fixture(tmp_path)),
+        transport=SimpleNamespace(_invoke_payload=invoke))
+    directory = tmp_path / "d8-output"
+    adapter.bind_diagnostics(FileD8OutputEvidence(directory))
+    adapter.invoke(env, 90, SimpleNamespace(is_cancelled=False))
+    persisted = FileD8OutputEvidence(directory, create=False)
+    sent = persisted.read("provider-request", business.review_id)
+    result = persisted.read("provider-result", business.review_id)
+    assert sent["model_request_id"] == business.review_id and sent["task_run_id"] == business.task_run_id
+    assert sent["parameters"] == {"model": role.model, "response_format": {"type": "json_object"},
+        "stream": False, "thinking": {"type": "enabled"}, "reasoning_effort": "high", "max_tokens": 32768}
+    assert sent["timeout_seconds"] == 90 and result["request_sha256"] == digest(sent)
+    if failure == "length":
+        assert result["transport"]["usage"]["completion_tokens"] == 32768
+        assert result["transport"]["finish_reason"] == "length" and result["transport"]["content_chars"] == 16
+    text = json.dumps([sent, result])
+    assert "PRIVATE" not in text and "offline-private-key" not in text and "messages" not in text
+    assert len(list(directory.glob("*.json"))) == 2
+
+
+def test_real_adapter_diagnostics_are_connected_to_public_assembly(tmp_path, monkeypatch):
+    from agent_adapters.output_evidence import FileD8OutputEvidence
+    result, args, captured = run_real_offline(tmp_path, monkeypatch)
+    records = FileD8OutputEvidence(args.state_dir / result["task_run_id"] / "d8-output", create=False)
+    for env, payload in captured:
+        request = getattr(env.request, "attempt", env.request)
+        identity = getattr(request, "model_request_id", None) or getattr(request, "review_id", None)
+        assert records.read("provider-request", identity)["parameters"]["model"] == payload["model"]
+        assert records.read("provider-result", identity)["model_request_id"] == identity
+
+
+def test_missing_output_contract_identifies_stage_without_read_retry(tmp_path, monkeypatch):
+    from agent_adapters.web import task_result as projection
+    def alter(env, number):
+        if env.output_contract["stage"] == "fact_review":
+            return {"content": '{"decision":', "finish_reason": "length"}
+    result, args, captured = run_real_offline(tmp_path, monkeypatch, alter=alter)
+    directory = args.state_dir / result["task_run_id"]
+    request = next(e.request for e, _ in captured if e.output_contract["stage"] == "fact_review")
+    (directory / "d8-output" / ("d8-handoff-contract-" + request.model_request_id + ".json")).unlink()
+    monkeypatch.setattr(projection.time, "sleep", lambda _: pytest.fail("corrupt evidence must not be retried"))
+    view = projection.snapshot_v3_task_result(directory, immutable_read(directory / "run.json"))
+    error = view["errors"][0]
+    assert error["code"] == "state_read_failed" and error["read_stage"] == "output_diagnostics"
+    assert "d8_output_diagnostic_binding_changed" in error["error_codes"]
+    assert error["exception_chain"][0]["source_location"]["module"] == "agent_core.structured_output"
+    assert not view["verified_facts"]
+
+
+
+def diagnostic_pipe_worker(connection, settings, payload, timeout):
+    """Actual child/pipe lifecycle, without HTTP or model invocation."""
+    connection.send({"connected": True})
+    connection.send({"diagnostic": {"http_status": 200, "transport_end": "response_received",
+        "finish_reason": "length", "content_chars": 3, "usage": {"completion_tokens": 32768}}})
+    if payload["case"] == "result":
+        connection.send({"payload": {"content": "{}[", "finish_reason": "length"}})
+    elif payload["case"] == "error":
+        connection.send({"error": "invalid_response", "reason": "provider_content_invalid"})
+    connection.close()
+
+
+@pytest.mark.parametrize("case", ["result", "error", "lost"])
+def test_parent_transport_retains_metadata_on_result_error_and_lost_worker(case):
+    adapter = deepseek_model.DeepSeekModelAdapter(
+        deepseek_model.DeepSeekSettings("deepseek-flash", "offline-private-key"), worker=diagnostic_pipe_worker)
+    detail = {}
+    result = adapter._invoke_payload({"case": case}, 15, SimpleNamespace(is_cancelled=False), diagnostic=detail)
+    assert detail["usage"]["completion_tokens"] == 32768 and detail["finish_reason"] == "length"
+    if case == "result":assert result["finish_reason"] == "length"
+    else:assert isinstance(result, ModelError)
+    assert detail["transport_end"] == ("worker_lost" if case == "lost" else "response_received")
+
+
+def test_shared_schema_preserves_all_enum_constraints_without_mutating_source():
+    # Same reference list occurs in several real output branches.
+    choices = {"type": "string", "enum": [str(uuid4()) for _ in range(30)], "maxLength": 80}
+    schema = {"anyOf": [{"properties": {"a": choices}}, {"properties": {"b": choices}}]}
+    before = json.dumps(schema)
+    shared = deepseek_roles._shared_schema(schema)
+    def expand(value):
+        if isinstance(value, dict):
+            if set(value) == {"$ref"}:
+                return expand(shared["$defs"][value["$ref"].split("/")[-1]])
+            return {k: expand(v) for k, v in value.items() if k != "$defs"}
+        return [expand(v) for v in value] if isinstance(value, list) else value
+    assert expand(shared) == schema
+    assert len(json.dumps(shared)) < len(before)
+    assert json.dumps(schema) == before
+
+
+def test_shared_history_retains_tools_evidence_and_unequal_sections():
+    history = {"items": [{"ref": "fact:1", "content": "observation" * 100}],
+               "mcp_tools": [{"name": "tool", "parameters": "x" * 200}],
+               "scope": "new"}
+    current = {**history, "scope": "old", "session_only": "preserve"}
+    context = {"history_context": json.dumps(history), "session_context": {"current_history": current}}
+    deepseek_roles._shared_history(context)
+    projected = context["session_context"]["current_history"]
+    assert context["history_context"] == history
+    restored = {k: history[v["$ref"].split("/")[-1]] if isinstance(v, dict) and set(v) == {"$ref"} else v
+                for k, v in projected.items()}
+    assert restored == {**history, "scope": "old", "session_only": "preserve"}
+    assert projected["items"] == {"$ref": "#/history_context/items"}
+    assert projected["scope"] == "old"
+
+
+@pytest.mark.parametrize("version, marker, valid", [(22, "shared_refs_v1", True),
+    (21, "shared_refs_v1", False), (22, "unknown", False)])
+def test_shared_presentation_marker_never_weakens_schema_binding(version, marker, valid):
+    from agent_core.output_contracts import matches_output_contract
+    schema = {"type": "string", "enum": ["original"]}
+    contract = {"version": 1, "stage": "inner_plan", "schema": schema, "input_projection": marker}
+    assert matches_output_contract(contract, "inner_plan", schema, version) is valid
+    assert not matches_output_contract(contract, "inner_plan", {"type": "string"}, version)

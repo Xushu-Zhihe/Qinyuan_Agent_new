@@ -66,6 +66,9 @@ def assertion_schema():
 
 def materialize(request, wire):
     from agent_core.output_contracts import output_schema, decode_response
+    from agent_core.intent_execution import parse_working
+    if request.stage == "fact_proposal" and parse_working(request, wire) is not None:
+        return json.loads(json.dumps(wire, ensure_ascii=False))
     raw, issues, terminal, _ = decode_response(wire, output_schema(request, contract_version=12)[1])
     if issues or terminal:
         raise D3RecoveryRequired("s2_wire_not_validated")
@@ -111,7 +114,7 @@ class PlanningAssertionBindings:
         return op
 
     def _base(self, request, finished):
-        from agent_core.output_contracts import output_schema
+        from agent_core.output_contracts import output_schema, matches_output_contract
         identity = request.model_request_id
         contract = self.output.read("contract", identity)
         role = self.config.outer_role if request.stage == "tree_planning" else self.config.inner_role
@@ -125,8 +128,7 @@ class PlanningAssertionBindings:
                 or contract.get("source_request_sha256") != digest(asdict(request))
                 or contract.get("root_request_id") != root
                 or contract.get("correction_of_model_request_id") != request.correction_of_model_request_id
-                or contract.get("output_contract") != {"version": 1, "stage": request.stage,
-                    "schema": output_schema(request, contract_version=self.config.contract_version)[1]}):
+                or not matches_output_contract(contract.get("output_contract"), request.stage, output_schema(request, contract_version=self.config.contract_version)[1], self.config.contract_version)):
             raise D3RecoveryRequired("s2_binding_contract_changed")
         self._operation(request, finished)
         policy = planning_policy(request) if request.stage == "tree_planning" else {
@@ -231,7 +233,8 @@ class PlanningAssertionBindings:
         if record is not None and request.stage == "fact_proposal":
             from agent_core.conclusion_contracts import parse_d8_proposal
             try:
-                parse_d8_proposal(record["canonical_response"])
+                from agent_core.intent_execution import parse_working
+                parse_working(request, record["canonical_response"]) or parse_d8_proposal(record["canonical_response"])
             except (ValueError, TypeError, KeyError) as exc:
                 raise D3RecoveryRequired("s2_saved_fact_business_invalid") from exc
         if record is not None and request.stage == "tree_planning":

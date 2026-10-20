@@ -460,6 +460,11 @@ class D3Application:
             self.conclusions.output_boundary = self.output_boundary
             self.refinement.output_boundary = self.output_boundary
             self.review_ledger.output_boundary = self.output_boundary
+        self.evidence_conclusions=None
+        if self.config.contract_version==22:
+            from agent_core.evidence_conclusions import EvidenceConclusions
+            self.evidence_conclusions=EvidenceConclusions(self)
+            self.controller._persistent.repository._evidence_conclusions=self.evidence_conclusions
         self.answers = None
         if config.contract_version in {19, 20, 21, 22}:
             from agent_core.answer_candidates import AnswerCandidates
@@ -640,6 +645,8 @@ class D3Application:
         self.store.reconcile_d4_control_commit_audit(task_run_id)
         if self.conclusions is not None:
             self.conclusions.reconcile()
+        if self.evidence_conclusions is not None:
+            self.evidence_conclusions.reconcile()
         if self.refinement is not None:
             try:
                 self.refinement.reconcile()
@@ -971,6 +978,10 @@ class D3Application:
                 self._bound_task_run_id
             ):
                 raise D4RecoveryRequired("d4_cancellation_requested")
+        if self.handoff is not None and self.output_boundary is not None:
+            from agent_core.intent_execution import pending_adjudication
+            if pending_adjudication(self.store, self.handoff.evidence, self.output_boundary.evidence, self.state.task_run.task_run_id):
+                raise D3RecoveryRequired("d22_awaiting_adjudication")
         if self._dispatch_stopped():
             raise D3RecoveryRequired("d3_dispatch_stopped")
         if self._d7_task_has_feedback_conflict(self.state.task_run.task_run_id):
@@ -1150,6 +1161,12 @@ class D3Application:
             if self.config.d5_enabled and not self._redaction_configured:
                 return self.result("d5_redaction_configuration_unavailable", recovery_required=True)
             self.store.reconcile_d4_control_commit_audit(task_run_id)
+            if self.handoff is not None and self.output_boundary is not None and self.state.task_run.status is TaskRunStatus.RUNNING and not token.is_cancelled:
+                from agent_core.intent_execution import pending_adjudication
+                if pending_adjudication(self.store, self.handoff.evidence, self.output_boundary.evidence, task_run_id):
+                    stopped = self._settle_stoppage()
+                    return self.result(stopped or "d22_awaiting_adjudication", recovery_required=(
+                        stopped is None or stopped == "d4_operation_outcome_unknown" or stopped.endswith("cleanup_unknown")))
             if (self.answers is not None and not token.is_cancelled
                     and self.state.task_run.status in {TaskRunStatus.RUNNING, TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK}
                     and self.clock() < self.state.task_run.deadline_at):
@@ -1549,6 +1566,9 @@ class D3Application:
         task_id = self.state.task_run.task_run_id
         if self.mcp is not None and stage == "inner_plan":
             name += f"/after-mcp/{self.mcp.count(context.intent_id)}"
+        if self.evidence_conclusions is not None and stage == "inner_plan":
+            count=sum(r.plan_id is None and r.intent_id==context.intent_id for r in self.store.list_d8_conclusions(task_id))
+            if count:name += f"/after-conclusion/{count}"
         if self.handoff is not None and stage == "inner_plan":
             count = self.handoff.read_count(context.intent_id)
             if count:
@@ -2237,6 +2257,10 @@ class D3Application:
             )
             self._after_review(application.review_id)
             return application.review_id, output
+        if self.handoff is not None and self.output_boundary is not None:
+            from agent_core.intent_execution import pending_adjudication
+            if pending_adjudication(self.store, self.handoff.evidence, self.output_boundary.evidence, self.state.task_run.task_run_id):
+                raise D3RecoveryRequired("d22_awaiting_adjudication")
         if self._dispatch_stopped():
             self.review_ledger.record_not_called(request, "d3_review_dispatch_stopped")
             raise D3RecoveryRequired("d3_review_not_called")
@@ -2391,7 +2415,10 @@ class D3Application:
                 except (ValueError, TypeError) as exc:
                     raise D3ProposalRejected("d8_history_read_action_rejected") from exc
                 return
-            from agent_core.intent_execution import IntentResolution, validate_resolution
+            from agent_core.intent_execution import IntentResolution, validate_resolution, WorkingRecord, validate_working
+            if isinstance(proposal, WorkingRecord):
+                validate_working(self, _current, proposal)
+                return
             if isinstance(proposal, IntentResolution):
                 validate_resolution(self, _current, proposal)
                 return
@@ -2399,6 +2426,10 @@ class D3Application:
                 visible = json.loads(_current.history_context).get("completion_facts", [])
                 if proposal.fact_ids not in [(i["fact_id"],) for i in visible]:
                     raise D3ProposalRejected("d22_completion_support_not_visible")
+                return
+            from agent_core.evidence_conclusions import EvidenceCandidate
+            if isinstance(proposal,EvidenceCandidate):
+                self.evidence_conclusions.validate_candidate(_current,proposal)
                 return
             if isinstance(proposal, MCPCall):
                 if self.mcp is None:
@@ -2452,7 +2483,10 @@ class D3Application:
         if isinstance(proposal, D8HistoryReadAction):
             self.handoff.apply_read_action(request_id, proposal)
             return
-        from agent_core.intent_execution import IntentResolution, resolve
+        from agent_core.intent_execution import IntentResolution, resolve, WorkingRecord, apply_working
+        if isinstance(proposal, WorkingRecord):
+            apply_working(self, request_id)
+            return
         if isinstance(proposal, IntentResolution):
             await resolve(self, request_id, intent_id, proposal, token)
             return
@@ -2462,6 +2496,10 @@ class D3Application:
             return
         if isinstance(proposal, MCPCall):
             await self.mcp.execute(request_id, intent_id, proposal, token)
+            return
+        from agent_core.evidence_conclusions import EvidenceCandidate
+        if isinstance(proposal,EvidenceCandidate):
+            await self.evidence_conclusions.submit(request_id,intent_id,proposal,token)
             return
         plan_id = self._id(f"plan/{intent_id}/{ordinal}")
         source_fact_id = None
@@ -2904,6 +2942,11 @@ class D3Application:
             if self.sessions is not None and await self.sessions.before_decision(binding.intent_id, receipts, token):
                 return True
             proposal_id, result = await self.conclusions.propose(proof.proof_id, token)
+            from agent_core.intent_execution import WorkingRecord, complete_observation, apply_working
+            if isinstance(result, WorkingRecord):
+                complete_observation(self, binding, proof)
+                apply_working(self, proposal_id)
+                return False
             if isinstance(result, D8ReviewRequestAction):
                 if self.sessions is not None:
                     # This is a pure review request, with no pending tool action.
@@ -3246,6 +3289,9 @@ class D3Application:
             raise D3RecoveryRequired("d3_tail_review_not_read_only")
 
     async def _run_tree(self, token: CancellationToken) -> D3Result:
+        from agent_core.intent_execution import pending_adjudication
+        if self.config.intent_execution_policy and pending_adjudication(self.store, self.handoff.evidence, self.output_boundary.evidence, self.state.task_run.task_run_id):
+            self._check_dispatch()
         if self.answers is not None and not token.is_cancelled:
             await self.answers.reconcile_known(token)
             if self.state.task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK:

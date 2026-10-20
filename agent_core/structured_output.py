@@ -5,7 +5,7 @@ import json
 import math
 import re
 from agent_core.dual_llm_contracts import D3RecoveryRequired
-from agent_core.output_contracts import D8OutputRequest, D8FormatIssue, decode_response, output_schema
+from agent_core.output_contracts import D8OutputRequest, D8FormatIssue, decode_response, output_schema, matches_output_contract
 from agent_core.handoff_contracts import handoff_json
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.review_contracts import D2ReviewRequest, D2ModelFailure, D2ModelResponse
@@ -18,6 +18,18 @@ def _instruction(correcting):
     if correcting:
         text += " The preceding proposal was rejected. Generate the complete response again using the declared structure and safe correction information; all business restrictions still apply."
     return text
+
+
+def format_stop_reason(diagnostic):
+    """One classification for scheduler stops and the public recovery view."""
+    if diagnostic is None:
+        return None
+    if diagnostic["terminal"] is not None:
+        return "d8_model_" + diagnostic["terminal"]
+    if (diagnostic["correction_of_model_request_id"] is not None
+            and any(issue["code"] == "output_truncated" for issue in diagnostic["issues"])):
+        return "d8_model_output_truncated"
+    return None
 
 
 class StructuredOutput:
@@ -63,13 +75,18 @@ class StructuredOutput:
         instruction = _instruction(correction is not None)
         safe = self.app.redactor.redact_model_input(request)
         shape = {"version": 1, "stage": stage, "schema": schema}
+        prior = self.evidence.read("contract", identity) or (self.evidence.read("contract", correction) if correction else None)
+        if self.app.config.contract_version == 22 and (prior is None or prior["output_contract"].get("input_projection") == "shared_refs_v1"):
+            shape["input_projection"] = "shared_refs_v1"
         envelope = D8OutputRequest(safe, shape, instruction, error)
         audit = ({"stage": request.stage, "resource_ref": request.resource_ref,
                   "base_checkpoint_sequence": request.base_checkpoint_sequence,
                   "context_sha256": request.context_sha256, "role_config_ref": request.role_config_ref,
                   "correction_of_model_request_id": request.correction_of_model_request_id}
                  if isinstance(request, D3ModelRequest) else None)
-        return envelope, {"contract_version": self.app.config.contract_version, "model_request_id": identity,
+        policy=({"incomplete_response_policy":"bounded_once_v1"} if
+            (prior is None and self.app.config.contract_version==22 or prior is not None and prior.get("incomplete_response_policy")=="bounded_once_v1") else {})
+        return envelope, {**policy,"contract_version": self.app.config.contract_version, "model_request_id": identity,
             "task_run_id": task, "role_config_ref": role_ref, "stage": stage,
             "root_request_id": root, "correction_of_model_request_id": correction,
             "source_request_sha256": digest(asdict(request)),
@@ -91,7 +108,8 @@ class StructuredOutput:
             rejection = self.app.model_evidence.read_rejection(correction)
             paths = {"d22_strategy_stop_summary_required": "$/outcome",
                      "d22_resolution_source_unavailable": "$/evidence_refs",
-                     "d22_resolution_fact_not_effective": "$/fact_ids"}
+                     "d22_resolution_fact_not_effective": "$/fact_ids",
+                     "d22_working_source_changed": "$/evidence_refs"}
             if rejection is not None and rejection.code in paths:
                 error.update(reason=rejection.code, issues=[{"code": "json_value_invalid",
                     "path": paths[rejection.code], "expected": "allowed_choice", "actual": "invalid"}])
@@ -156,7 +174,7 @@ class StructuredOutput:
         if saved is None or saved["task_run_id"] != task or saved["safe_request_sha256"] != digest(asdict(safe_request)):
             raise D3RecoveryRequired("d8_output_request_not_frozen")
         stage, schema = output_schema(safe_request, contract_version=self.app.config.contract_version)
-        if saved["output_contract"] != {"version": 1, "stage": stage, "schema": schema}:
+        if not matches_output_contract(saved["output_contract"], stage, schema, self.app.config.contract_version):
             raise D3RecoveryRequired("d8_output_schema_changed")
         correction = saved["correction_of_model_request_id"]
         expected_error = self._error(correction)
@@ -192,7 +210,7 @@ class StructuredOutput:
                 or result.get("stage") != contract["stage"]
                 or result.get("root_request_id") != contract["root_request_id"]
                 or result.get("correction_of_model_request_id") != contract["correction_of_model_request_id"]
-                or result.get("terminal") not in {None, "output_truncated", "completion_invalid", "output_size_exceeded", "output_depth_exceeded"}
+                or result.get("terminal") not in {None, "output_truncated", "completion_invalid", "output_size_exceeded", "output_depth_exceeded", "output_budget_exhausted"}
                 or not isinstance(result.get("issues"), list) or not 1 <= len(result["issues"]) <= 8):
             raise D3RecoveryRequired("d8_output_diagnostic_binding_changed")
         names = set()
@@ -280,9 +298,9 @@ class StructuredOutput:
         return result
 
     def terminal_check(self, request):
-        result = self.failure(request)
-        if result is not None and result["terminal"] is not None:
-            raise D3RecoveryRequired("d8_model_" + result["terminal"])
+        reason = format_stop_reason(self.failure(request))
+        if reason is not None:
+            raise D3RecoveryRequired(reason)
 
     def normalize(self, request, response):
         task, identity = self.identity(request)
@@ -292,6 +310,19 @@ class StructuredOutput:
             response = response.response
         envelope = self.envelope(request)
         raw, issues, terminal, units = decode_response(response, envelope.output_contract["schema"])
+        contract=self.evidence.read("contract",identity)
+        if terminal=="output_truncated" and contract.get("incomplete_response_policy")=="bounded_once_v1":
+            provider=self.evidence.read("provider-result",identity)
+            sent=self.evidence.read("provider-request",identity)
+            transport=(provider or {}).get("transport",{})
+            used=transport.get("usage",{}).get("completion_tokens")
+            limit=(sent or {}).get("max_tokens")
+            if sent is not None:limit=sent.get("parameters",{}).get("max_tokens",limit)
+            if type(used) is int and type(limit) is int and used>=limit:
+                terminal="output_budget_exhausted"
+            elif transport.get("transport_end") in {None,"response_received"}:
+                # One correction under the original budget, no partial-response parsing.
+                terminal=None
         if not issues and self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.selection_bindings import STAGES
             from agent_core.governance_policy import requires_binding, MixedClaimSources
@@ -357,6 +388,9 @@ class StructuredOutput:
 class StructuredModel:
     def __init__(self, boundary, adapter):
         self.boundary, self.adapter = boundary, adapter
+        bind = getattr(adapter, "bind_diagnostics", None)
+        if bind is not None:
+            bind(boundary.evidence)
 
     @property
     def role_config(self):

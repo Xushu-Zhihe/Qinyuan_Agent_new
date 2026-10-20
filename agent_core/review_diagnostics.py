@@ -83,11 +83,11 @@ class ReviewDiagnostics:
                 or contract.get("root_request_id") != request.review_root_id
                 or type(finished_at) not in {int, float} or not math.isfinite(finished_at)):
             raise D3RecoveryRequired("d9_review_contract_binding_changed")
-        from agent_core.output_contracts import output_schema
+        from agent_core.output_contracts import output_schema, matches_output_contract
         context = json.loads(request.context_summary)
         context.pop("checkpoint", None)
         if (digest(context) != request.context_version
-                or contract["output_contract"] != {"version": 1, "stage": stage, "schema": output_schema(request, contract_version=self.config.contract_version)[1]}):
+                or not matches_output_contract(contract["output_contract"], stage, output_schema(request, contract_version=self.config.contract_version)[1], self.config.contract_version)):
             raise D3RecoveryRequired("d9_review_frozen_policy_changed")
         root = self.output.read("review-root", request.review_root_id)
         if not isinstance(root, dict) or root.get("task_run_id") != request.task_run_id:

@@ -124,6 +124,9 @@ def validate_resolution(app, request, proposal):
         if not supports:
             raise D3RecoveryRequired("d22_resolution_fact_source_missing")
         support = supports[-1]
+        if support.plan_id is None:
+            app.evidence_conclusions.validate_fact(next(f for f in app.state.facts if f.fact_id==fact_id),app.state)
+            continue
         binding = app.store.load_d3_plan_binding(support.plan_id)
         result = app.store.load_d3_plan_result(support.plan_id)
         if result is None or result.supporting_fact_id != fact_id:
@@ -150,7 +153,7 @@ def pending_stop(app, intent_id):
 
 
 def execution_context(app, intent_id):
-    return {"policy": POLICY, "facts": [{"fact_id": f["fact_id"], "ref": f["ref"]}
+    return {"policy": POLICY, "review_contract": "candidate_subset_v1", "facts": [{"fact_id": f["fact_id"], "ref": f["ref"]}
                                       for f in facts(app, intent_id)],
         "stop_requested": pending_stop(app, intent_id),
         "goal_rule": "A local goal with observable completion criteria and explicit scope, not a predetermined action list.",
@@ -177,7 +180,7 @@ def make_request(app, intent_id, inner_id, proposal):
         all_items[ref] = by_ref[ref]
     selected = tuple(all_items.values())
     fact_refs = [next(i.ref for i in selected if i.record_id == fid) for fid in proposal.fact_ids]
-    policy = dict(version=2, policy=POLICY, intent_id=intent_id,
+    policy = dict(version=3 if packet(frozen["request"])["intent_execution"].get("review_contract") == "candidate_subset_v1" else 2, policy=POLICY, intent_id=intent_id,
         local_goal=intent.description, inner_request_id=inner_id, proposal=asdict(proposal),
         goal_ref=next(i.ref for i in selected if i.record_id == intent_id),
         support_fact_ref=fact_refs[0] if fact_refs else None, support_fact_refs=fact_refs,
@@ -209,6 +212,29 @@ def evaluation_policy(request, policy):
     return policy
 
 
+def observation_refs(request):
+    def observed(item):
+        if item.record_type == "verified_fact" or item.identity == "saved_execution_observation_not_verified_fact":
+            return True
+        if item.identity == "historical_decision_not_verified":
+            return bool(json.loads(item.content).get("observation", {}).get("mcp_tool_result"))
+        return False
+    return [i.ref for i in request.history if i.source_status == "available" and not i.conflict and observed(i)]
+
+
+def selected_fact_refs(policy, decision):
+    if policy["version"] == 2:
+        return policy["support_fact_refs"]
+    return [r for r in policy["support_fact_refs"] if r in decision["evidence_refs"]]
+
+
+def support_anchor(request, policy, decision):
+    if policy["version"] == 2:
+        return request.support_fact_id
+    selected = selected_fact_refs(policy, decision)
+    return next((i.record_id for r in selected for i in request.history if i.ref == r), None)
+
+
 def evaluation_schema(request, policy):
     from agent_core.output_contracts import obj, array, text
     refs = [i.ref for i in request.history if i.source_status == "available" and not i.conflict]
@@ -217,25 +243,37 @@ def evaluation_schema(request, policy):
         decisions.append("succeeded")
     if policy["proposal"]["outcome"] in {"inconclusive", "review"}:
         decisions.append("inconclusive")
-    return obj({"decision": {"type": "string", "enum": decisions}, "reason": text(),
-        "evidence_refs": {**array({"type": "string", "enum": refs}, 1), "uniqueItems": True}})
+    fields = {"reason": text(), "evidence_refs": {**array({"type": "string", "enum": refs}, 1), "uniqueItems": True}}
+    if policy["version"] == 2:
+        return obj({"decision": {"type": "string", "enum": decisions}, **fields})
+    fields["reason"].update(minLength=1, pattern=r"^[^\x00]*[^\s\x00][^\x00]*$")
+    branches = []
+    for decision in decisions:
+        required = policy["support_fact_refs"] if decision == "succeeded" else observation_refs(request) if decision == "failed" else None
+        if required == []:
+            continue
+        evidence = dict(fields["evidence_refs"])
+        if required is not None:
+            evidence["contains"] = {"type": "string", "enum": required}
+        branches.append(obj({"decision": {"type": "string", "const": decision}, **fields, "evidence_refs": evidence}))
+    return {"anyOf": branches}
 
 
 def parse_evaluation(request, raw, policy):
     from agent_core.output_contracts import decode_response
-    parsed, issues, terminal, _ = decode_response(raw, evaluation_schema(request, policy))
+    schema = evaluation_schema(request, policy)
+    if policy["version"] == 3:
+        # Decode the common structure first so a direct parser rejection has the exact safe reason.
+        from agent_core.output_contracts import obj, array, text
+        refs = [i.ref for i in request.history if i.source_status == "available" and not i.conflict]
+        schema = obj({"decision": {"type": "string", "enum": [b["properties"]["decision"]["const"] for b in schema["anyOf"]]},
+            "reason": text(), "evidence_refs": {**array({"type": "string", "enum": refs}, 1), "uniqueItems": True}})
+    parsed, issues, terminal, _ = decode_response(raw, schema)
     if issues or terminal or not parsed["reason"].strip() or "\x00" in parsed["reason"]:
         raise ValueError("d22_resolution_review_invalid")
-    if parsed["decision"] == "succeeded" and not set(policy["support_fact_refs"]) <= set(parsed["evidence_refs"]):
+    if parsed["decision"] == "succeeded" and (not selected_fact_refs(policy, parsed) if policy["version"] == 3 else not set(policy["support_fact_refs"]) <= set(parsed["evidence_refs"])):
         raise ValueError("d22_resolution_success_support_required")
-    def observed(item):
-        if item.record_type == "verified_fact" or item.identity == "saved_execution_observation_not_verified_fact":
-            return True
-        if item.identity == "historical_decision_not_verified":
-            return bool(json.loads(item.content).get("observation", {}).get("mcp_tool_result"))
-        return False
-    if parsed["decision"] == "failed" and not any(
-            i.ref in parsed["evidence_refs"] and observed(i) for i in request.history):
+    if parsed["decision"] == "failed" and not set(observation_refs(request)) & set(parsed["evidence_refs"]):
         raise ValueError("d22_resolution_negative_observation_required")
     return parsed
 
@@ -273,13 +311,35 @@ async def resolve(app, request_id, intent_id, proposal, token):
     from agent_core.handoff_contracts import D8TreeRecord
     request = make_request(app, intent_id, request_id, proposal)
     final, decision = await app.handoff.call(request, token)
-    if decision is None:
-        raise D3RecoveryRequired("d22_resolution_review_unavailable")
     intent = next(i for i in app.state.intents if i.intent_id == intent_id)
+    if decision is None:
+        if json.loads(final.prior_summary)["s4_evaluation_policy"]["version"] == 3:
+            from qinyuan_core import get_logger
+            get_logger("ctrl").info("intent.resolution", run=request.task_run_id, intent=intent_id,
+                request=final.model_request_id, outcome="awaiting_adjudication", category="technical_result")
+            raise D3RecoveryRequired("d22_awaiting_adjudication")
+        # The reviewer could not produce a readable verdict. The Intent is unjudged,
+        # not the run state, so degrade locally and let the tree pick a sibling.
+        if not app.handoff.note_evaluation_fallback("d22_resolution_review_invalid"):
+            raise D3RecoveryRequired("d22_resolution_review_unavailable")
+        record = D8TreeRecord(app._id("evaluation/" + final.model_request_id), request.task_run_id,
+            intent.turn_id, intent_id, "inconclusive", final.model_request_id,
+            request.support_fact_id, request_id)
+        app.handoff._commit("evaluate_d8_tree_intent", record,
+            (UpsertIntent(intent_id, intent.turn_id, intent.description, intent.priority,
+                          intent.intent_type, IntentStatus.INCONCLUSIVE),))
+        app.store.mark_d3_operation_applied(request_id, record.record_id)
+        app.sessions.reconcile()
+        from qinyuan_core import get_logger
+        get_logger("ctrl").info("intent.resolution", run=request.task_run_id, intent=intent_id,
+            request=final.model_request_id, outcome="inconclusive",
+            category="business_result", reason="resolution_review_invalid")
+        return
+    app.handoff.note_evaluation_success()
     status = decision["decision"]
     record = D8TreeRecord(app._id("evaluation/" + final.model_request_id), request.task_run_id,
         intent.turn_id, intent_id, "evaluation_continued" if status == "continue" else status,
-        final.model_request_id, request.support_fact_id, request_id)
+        final.model_request_id, support_anchor(final, json.loads(final.prior_summary)["s4_evaluation_policy"], decision), request_id)
     change = UpsertIntent(intent_id, intent.turn_id, intent.description, intent.priority,
         intent.intent_type, IntentStatus.RUNNING if status == "continue" else IntentStatus(status))
     app.handoff._commit("evaluate_d8_tree_intent", record, (change,))
@@ -314,7 +374,7 @@ def reconcile(app):
                 raise D3RecoveryRequired("d22_resolution_application_changed")
             continue
         raw = app.handoff.evidence.read("request", record.model_request_id)
-        if json.loads(raw["prior_summary"]).get("s4_evaluation_policy", {}).get("version") != 2:
+        if json.loads(raw["prior_summary"]).get("s4_evaluation_policy", {}).get("version") not in {2, 3}:
             continue
         from agent_core.handoff_contracts import D8HandoffRequest
         validate_record(app, D8HandoffRequest.from_dict(raw), record)
@@ -335,3 +395,119 @@ def result_summary(app, record):
     return dict(kind=record.kind, inner_summary=policy["proposal"]["reason"],
         reviewed_summary=result["raw"]["reason"], evidence_refs=result["raw"]["evidence_refs"],
         identity="reviewed_intent_result_not_verified_fact", scope="conditions_and_tested_domain_at_decision_time")
+
+
+EVALUATION_ISSUES = {
+    "d22_resolution_success_support_required": ("$/evidence_refs", "at_least_one_candidate_fact"),
+    "d22_resolution_negative_observation_required": ("$/evidence_refs", "observed_source_reference"),
+    "d22_resolution_review_invalid": ("$/reason", "nonempty_valid_local_goal_decision"),
+}
+
+
+def pending_adjudication(store, evidence, output, task_id):
+    """Derive a durable gate from completed review lineage; never dispatch or change state."""
+    from agent_core.structured_output import format_stop_reason
+    for op in store.list_d4_operations(task_id):
+        if op.completion is None or op.application_ref is not None or op.start.role != "outer_planning" or op.start.category != "review":
+            continue
+        request = evidence.read("request", op.start.operation_id)
+        if request is None or request.get("stage") != "intent_evaluation":
+            continue
+        policy = json.loads(request["prior_summary"]).get("s4_evaluation_policy", {})
+        if policy.get("version") != 3:
+            continue
+        inner = store.load_d3_operation(policy["inner_request_id"])
+        if inner is None or inner.application_ref is not None:
+            continue
+        result = evidence.read("result", op.start.operation_id)
+        if result is None or result["outcome"] == "valid":
+            continue
+        diagnostic = output.read("diagnostic", op.start.operation_id)
+        if (request.get("correction_of_model_request_id") is not None or result["outcome"] != "invalid"
+                or format_stop_reason(diagnostic) is not None):
+            return {"reason": "d22_awaiting_adjudication", "intent_id": request["intent_id"],
+                    "model_request_id": request["model_request_id"], "cause": result.get("reason") or result["outcome"]}
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingRecord:
+    content: str
+    evidence_refs: tuple[str, ...]
+
+
+def working_refs(request):
+    """Availability is frozen in the request; original sources are checked again before application."""
+    session = json.loads(getattr(request, "session_context", "{}") or "{}")
+    if request.stage == "fact_proposal":
+        return [request.observation.proof_id] if session.get("working_record_policy") == "unreviewed_v1" else None
+    context = packet(request)
+    if (context.get("intent_execution", {}).get("review_contract") != "candidate_subset_v1"
+            or context["intent_execution"].get("stop_requested")):
+        return None
+    return [r for r, item in visible_items(request).items() if item["source_status"] == "available" and not item.get("conflict")]
+
+
+def working_schema(request):
+    from agent_core.output_contracts import tagged, text, array
+    refs = working_refs(request)
+    if not refs:
+        return None
+    return tagged("working_record", {"content": {**text(512), "minLength": 1, "pattern": r"^[^\x00]*[^\s\x00][^\x00]*$"},
+        "evidence_refs": {**array({"type": "string", "enum": refs}, 1, 8), "uniqueItems": True}})
+
+
+def parse_working(request, raw):
+    if not isinstance(raw, dict) or raw.get("kind") != "working_record":
+        return None
+    from agent_core.output_contracts import decode_response
+    schema = working_schema(request)
+    if schema is None:
+        raise ValueError("d22_working_record_unavailable")
+    value, issues, terminal, _ = decode_response(raw, schema)
+    if issues or terminal or not value["content"].strip() or "\x00" in value["content"]:
+        raise ValueError("d22_working_record_invalid")
+    return WorkingRecord(value["content"], tuple(value["evidence_refs"]))
+
+
+def validate_working(app, request, note):
+    if request.stage == "fact_proposal":
+        app.conclusions._scope(request.observation)
+        if list(note.evidence_refs) != working_refs(request):
+            from agent_core.dual_llm_modeling import D3ProposalRejected
+            raise D3ProposalRejected("d22_working_source_changed")
+        return
+    live = {i.ref: i for i in app.handoff.history()}
+    frozen = visible_items(request)
+    for ref in note.evidence_refs:
+        item = live.get(ref)
+        if (ref not in frozen or item is None or item.source_status != "available" or item.conflict
+                or handoff_json(item.visible()) != handoff_json(frozen[ref])
+                or app.revisions is not None and not app.revisions.reliable(item)):
+            from agent_core.dual_llm_modeling import D3ProposalRejected
+            raise D3ProposalRejected("d22_working_source_changed")
+
+
+def apply_working(app, request_id):
+    app.store.mark_d4_operation_applied(request_id, app._id("working/" + request_id))
+    app.sessions.reconcile()
+
+
+def reconcile_working(app):
+    # Applied marker may be missing after an observed Plan commit; reuse only a known result.
+    for op in app.store.list_d4_operations(app.state.task_run.task_run_id):
+        if op.completion is None or op.application_ref is not None or op.start.role != "inner_action":
+            continue
+        saved = app.sessions.evidence.read("request", op.start.operation_id)
+        if saved is None:
+            continue
+        raw = saved["request"]
+        result = (app.conclusions.evidence.read_result(op.start.operation_id) if raw["stage"] == "fact_proposal"
+                  else None)
+        if result is None or result["outcome"] != "valid" or result["raw"].get("kind") != "working_record":
+            continue
+        plan = app.store.load_d3_plan_result(raw["observation"]["plan_id"])
+        if plan is not None and plan.outcome == "observed" and plan.proof_id == raw["observation"]["proof_id"]:
+            request = app.conclusions.evidence.read_request(op.start.operation_id)
+            parse_working(request, result["raw"])
+            app.store.mark_d4_operation_applied(op.start.operation_id, app._id("working/" + op.start.operation_id))

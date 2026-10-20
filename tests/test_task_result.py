@@ -209,3 +209,48 @@ def test_feedback_history_boundary_rejects_invalid_event_sequence(tmp_path, sequ
     finally:
         app.cancel()
         app.close()
+
+
+
+def test_real_sqlite_exclusive_lock_is_busy_and_has_numeric_exception_chain(tmp_path, monkeypatch):
+    import sqlite3
+    from agent_adapters.web import task_result as projection
+    path = tmp_path / "control.sqlite"
+    with sqlite3.connect(path) as writer:
+        writer.execute("CREATE TABLE schema_versions (version INTEGER)")
+        writer.execute("INSERT INTO schema_versions VALUES (28)")
+    writer = sqlite3.connect(path)
+    pauses = []
+    monkeypatch.setattr(projection.time, "sleep", lambda seconds: pauses.append(seconds))
+    try:
+        writer.execute("BEGIN EXCLUSIVE")
+        result = projection.snapshot_v3_task_result(tmp_path, dict(protocol_version=3, task_run_id=str(uuid4()), mode="simulated"))
+        error = result["errors"][0]
+        assert error["code"] == "state_read_busy" and error["read_stage"] == "result_projection"
+        assert len(pauses) == 2
+        node = next(n for n in error["exception_chain"] if n["exception_type"] == "OperationalError")
+        assert node["sqlite_errorcode"] & 255 == sqlite3.SQLITE_BUSY
+        assert node["source_location"]["module"] == "agent_core.sqlite_control_store"
+        assert str(tmp_path) not in str(error)
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_state_read_exception_chain_keeps_codes_without_message_or_debug_leak(tmp_path, monkeypatch, capsys):
+    from agent_adapters.web import task_result as projection
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    def read(*args):
+        try:
+            raise PermissionError(13, "PRIVATE_PATH_AND_KEY")
+        except PermissionError as exc:
+            raise D3RecoveryRequired("d8_handoff_evidence_unavailable") from exc
+    monkeypatch.setenv("QINYUAN_DEBUG_ERRORS", "1")
+    monkeypatch.setattr(projection, "_snapshot_v3_task_result", read)
+    monkeypatch.setattr(projection.time, "sleep", lambda _: pytest.fail("permanent errors must not be retried"))
+    result = projection.snapshot_v3_task_result(tmp_path, dict(protocol_version=3, task_run_id=str(uuid4()), mode="simulated"))
+    error = result["errors"][0]
+    assert error["exception_types"] == ["D3RecoveryRequired", "PermissionError"]
+    assert error["exception_chain"][1]["errno"] == 13
+    assert error["error_codes"] == ["d8_handoff_evidence_unavailable"]
+    assert "PRIVATE" not in str(result) + capsys.readouterr().err

@@ -164,7 +164,7 @@ def test_withdrawn_conflicted_and_foreign_scope_fact_are_not_reusable(http_case,
 @pytest.mark.parametrize('http_case',[22],indirect=True)
 def test_schema27_migrates_once_preserving_records_and_readonly_history(http_case):
     import sqlite3
-    from agent_core.sqlite_control_store import SqliteControlStore,MIGRATION_23
+    from agent_core.sqlite_control_store import SqliteControlStore,MIGRATION_23,CURRENT_SCHEMA_VERSION
     case=http_case
     assert asyncio.run(case.app.run(case.token)).stop_reason=='d9_awaiting_external_feedback'
     path=case.directory/'control.sqlite'
@@ -175,13 +175,23 @@ def test_schema27_migrates_once_preserving_records_and_readonly_history(http_cas
         db.executescript('ALTER TABLE d8_conclusions RENAME TO temporary_conclusions; DROP INDEX idx_d8_conclusions_run; DROP INDEX idx_d8_conclusions_fact;'+MIGRATION_23)
         db.executemany('INSERT INTO d8_conclusions VALUES (?,?,?,?,?,?,?,?)',saved)
         db.execute('DROP TABLE temporary_conclusions')
-        db.execute('DELETE FROM schema_versions WHERE version=28')
+        # Rebuild the other table changed after schema27, including its original source FK.
+        db.execute('DROP TRIGGER facts_source_insert')
+        facts=db.execute('SELECT * FROM facts').fetchall()
+        db.execute('DROP TABLE facts')
+        db.execute("CREATE TABLE facts(fact_id TEXT PRIMARY KEY,turn_id TEXT NOT NULL REFERENCES turns(turn_id),content TEXT NOT NULL,source_ref TEXT NOT NULL REFERENCES executions(execution_id),status TEXT NOT NULL,created_event_sequence INTEGER NOT NULL,created_event_ordinal INTEGER NOT NULL,verification_ref TEXT)")
+        db.executemany('INSERT INTO facts VALUES (?,?,?,?,?,?,?,?)',facts)
+        db.execute('CREATE INDEX idx_facts_context ON facts(turn_id,status,created_event_sequence DESC,created_event_ordinal DESC)')
+        db.execute('DELETE FROM schema_versions WHERE version>27')
     with SqliteControlStore.open_readonly(path) as old:
         assert old._schema_version==27 and len(old.list_d8_conclusions(case.task))==1
     with SqliteControlStore.open(path) as migrated:
-        assert migrated._schema_version==28
+        assert migrated._schema_version==CURRENT_SCHEMA_VERSION
         assert [tuple(r) for r in migrated._connection.execute('SELECT * FROM d8_conclusions ORDER BY event_sequence')]==saved
         assert migrated._connection.execute('PRAGMA foreign_key_check').fetchone() is None
+        assert [tuple(r) for r in migrated._connection.execute('SELECT * FROM facts')]==facts
+        assert next(r for r in migrated._connection.execute('PRAGMA table_info(d8_conclusions)') if r[1]=='plan_id')[3]==0
+        assert migrated._connection.execute('SELECT COUNT(*) FROM schema_versions WHERE version=29').fetchone()[0]==1
         assert migrated._connection.execute('SELECT COUNT(*) FROM schema_versions WHERE version=28').fetchone()[0]==1
     with SqliteControlStore.open(path) as again:
         assert len(again.list_d8_conclusions(case.task))==1

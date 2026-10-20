@@ -28,6 +28,14 @@ class D8FormatIssue:
     actual: str
 
 
+def matches_output_contract(value, stage, schema, contract_version):
+    """Recognize only the frozen v22 presentation marker; keep every Schema check."""
+    expected = {"version": 1, "stage": stage, "schema": schema}
+    if contract_version == 22 and isinstance(value, dict) and value.get("input_projection") == "shared_refs_v1":
+        expected["input_projection"] = "shared_refs_v1"
+    return value == expected
+
+
 def obj(properties, optional=()):
     return {"type": "object", "properties": properties,
             "required": [k for k in properties if k not in optional],
@@ -115,6 +123,19 @@ def output_schema(request, *, contract_version=None):
         elif "probe" not in context["execution_feasibility"]["allowed_action_kinds"]:
             branches = [b for b in branches if b.get("properties", {}).get("kind", {}).get("const") in {"history_query", "history_details", "history_next_page", "conclusion_change"}]
         schema = {"anyOf": [*branches, *resolution_schema(request)["anyOf"]]}
+    if contract_version==22 and stage=="inner_plan":
+        packet=json.loads(getattr(request,"history_context","{}") or "{}")
+        sources=packet.get("evidence_sources",[])
+        if sources and not packet.get("intent_execution",{}).get("stop_requested"):
+            candidate=tagged("fact_candidate",{"content":text(256),"reason":text(512),
+                "evidence_refs":{**array({"type":"string","enum":[s["ref"] for s in sources]},1,8),"uniqueItems":True},
+                "inferred":{"type":"boolean"}})
+            schema={"anyOf":[*schema.get("anyOf",[schema]),candidate]}
+    if contract_version == 22 and stage in {"inner_plan", "fact_proposal"}:
+        from agent_core.intent_execution import working_schema
+        note = working_schema(request)
+        if note is not None:
+            schema = {"anyOf": [*schema.get("anyOf", [schema]), note]}
     return stage, schema
 
 
@@ -148,6 +169,8 @@ def _base_output_schema(request, *, contract_version=None):
                                       "evidence_refs": array(S, 1, 8)})
         return "progress_review" if progress else "review", obj(fields)
     stage = request.stage
+    from agent_core.evidence_conclusions import EvidenceReviewRequest, review_schema
+    if isinstance(request,EvidenceReviewRequest):return stage,review_schema(request)
     if isinstance(request, D8ChangeRequest):
         if stage == "fact_proposal":
             return "conclusion_repair", {"anyOf": [CHANGE, *READS]}
@@ -294,6 +317,10 @@ def shape_issues(value, schema, path="$"):
             matched = [s for s in branches if s.get("properties", {}).get("kind", {}).get("const") == value["kind"]]
             if matched:
                 branches = matched
+        if isinstance(value, dict) and isinstance(value.get("decision"), str):
+            matched = [s for s in branches if s.get("properties", {}).get("decision", {}).get("const") == value["decision"]]
+            if matched:
+                branches = matched
         options = [shape_issues(value, s, path) for s in branches]
         return min(options, key=len)
     actual = json_type(value)
@@ -340,8 +367,12 @@ def shape_issues(value, schema, path="$"):
             if len(result) >= 8:
                 break
             result += shape_issues(item, schema["items"], path + "/" + str(index))
-    elif actual == "string" and len(value) > schema.get("maxLength", len(value)):
-        result.append(D8FormatIssue("string_too_long", path, "allowed_length", "string"))
+    elif actual == "string":
+        import re
+        if len(value) > schema.get("maxLength", len(value)):
+            result.append(D8FormatIssue("string_too_long", path, "allowed_length", "string"))
+        if len(value) < schema.get("minLength", 0) or "pattern" in schema and re.search(schema["pattern"], value) is None:
+            result.append(D8FormatIssue("string_value_invalid", path, "nonempty_text", "string"))
     elif actual in {"integer", "number"} and (value < schema.get("minimum", value) or value > schema.get("maximum", value)):
         result.append(D8FormatIssue("number_out_of_range", path, "allowed_range", actual))
     return result[:8]
@@ -412,7 +443,9 @@ def decode_response(response, schema):
         finish, response = response.finish_reason, response.content
     if finish != "stop":
         code = "output_truncated" if finish == "length" else "completion_invalid"
-        return None, [D8FormatIssue(code, "$", "complete_response", "incomplete")], code, None
+        units=({"utf8_bytes":len(response.encode("utf-8")),"unicode_characters":len(response),"tokens":None}
+               if isinstance(response,str) else None)
+        return None, [D8FormatIssue(code, "$", "complete_response", "incomplete")], code, units
     if is_dataclass(response):
         try:
             response = asdict(response)

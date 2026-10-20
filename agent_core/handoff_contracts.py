@@ -1,4 +1,4 @@
-﻿"""D8-2 internal handoff contracts. Summaries never acquire Fact identity."""
+"""D8-2 internal handoff contracts. Summaries never acquire Fact identity."""
 
 from __future__ import annotations
 
@@ -17,9 +17,8 @@ def handoff_json(value) -> str:
 
 @dataclass(frozen=True, slots=True)
 class D8Capacity:
-    # Sizes are JSON bytes of each packet section, not tokens. The outer budget is
-    # 262144 bytes (~128K-token DeepSeek window); these section caps must leave the
-    # whole packet inside it instead of pausing on the first multi-turn history.
+    # Packet-section limits are JSON bytes. The separately frozen capacity Port
+    # checks the full model request; these values are not a model token window.
     turn_body: int = 16384
     global_body: int = 32768
     initial_history: int = 98304

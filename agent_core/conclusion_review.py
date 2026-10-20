@@ -16,6 +16,7 @@ from agent_core.dual_llm_contracts import D3RecoveryRequired
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.operation_accounting import D4OperationCompletion, D4OperationStart
 from agent_core.turn_modeling import stable_id
+from agent_core.evidence_conclusions import EvidenceReviewRequest, EvidenceObservation, resource
 
 
 class ConclusionReview:
@@ -63,6 +64,11 @@ class ConclusionReview:
 
     def _scope(self, source: D8Observation) -> None:
         state = self.controller.control_state
+        if isinstance(source,EvidenceObservation):
+            self.app.evidence_conclusions.validate_sources(source)
+            if self.stopped() or not any(i.intent_id==source.intent_id and i.status is IntentStatus.RUNNING and i.turn_id==source.turn_id for i in state.intents):
+                raise D3RecoveryRequired("d22_evidence_scope_ended")
+            return
         if (self.stopped() or self.observation(source.proof_id) != source
                 or self.store.load_d3_run_config(source.task_run_id) != self.config):
             raise D3RecoveryRequired("d8_scope_or_source_changed")
@@ -75,7 +81,11 @@ class ConclusionReview:
     @staticmethod
     def _parse(request, raw):
         if request.stage == "fact_proposal":
-            return parse_d8_proposal(raw)
+            from agent_core.intent_execution import parse_working
+            return parse_working(request, raw) or parse_d8_proposal(raw)
+        if isinstance(request,EvidenceReviewRequest):
+            from agent_core.evidence_conclusions import parse_evidence_review
+            return parse_evidence_review(request,raw)
         decision = D8ReviewDecision.from_dict(raw)
         if (isinstance(request, D22FactReviewRequest) and decision.decision == "accept"
                 and request.candidate.assertion is not None):
@@ -108,7 +118,7 @@ class ConclusionReview:
     def _checked_completion(self, request, result):
         fields = {"model_request_id", "request_sha256", "outcome", "raw", "finished_at"}
         if "rejection_code" in result:
-            if (not isinstance(request, D22FactReviewRequest) or result["outcome"] != "invalid"
+            if (not isinstance(request, (D22FactReviewRequest,EvidenceReviewRequest)) or result["outcome"] != "invalid"
                     or result["rejection_code"] != "d22_ambiguous_duplicate_conclusion"):
                 raise D3RecoveryRequired("d22_rejection_binding_changed")
             fields.add("rejection_code")
@@ -137,7 +147,9 @@ class ConclusionReview:
                                      request.model_request_id, conclusion_digest(result))
 
     def _known(self, request, *, repair=True):
-        if self.config.contract_version in {16, 17, 18, 19, 20, 21, 22} and request.observation.rule_id!='http_response_observed':
+        if isinstance(request,EvidenceReviewRequest):
+            self.app.evidence_conclusions.validate_sources(request.observation)
+        elif self.config.contract_version in {16, 17, 18, 19, 20, 21, 22} and request.observation.rule_id!='http_response_observed':
             from agent_core.conclusion_contracts import D16Observation
             if (not isinstance(request.observation, D16Observation)
                     or request.observation != self.observation(request.observation.proof_id, historical=True)):
@@ -151,7 +163,7 @@ class ConclusionReview:
         expected = D4OperationStart(request.model_request_id, request.task_run_id,
                                    "action" if request.stage == "fact_proposal" else "fact_review",
                                    record.start.started_at, request.base_checkpoint_sequence,
-                                   request.context_sha256, request.observation.plan_id,
+                                   request.context_sha256, resource(request),
                                    self.config.d4_budget.budget_policy_ref,
                                    "inner_action" if request.stage == "fact_proposal" else "outer_planning",
                                    request.role_config_ref)
@@ -272,7 +284,7 @@ class ConclusionReview:
                 request.model_request_id, request.task_run_id,
                 "action" if request.stage == "fact_proposal" else "fact_review",
                 self.clock(), request.base_checkpoint_sequence, request.context_sha256,
-                request.observation.plan_id, self.config.d4_budget.budget_policy_ref,
+                resource(request), self.config.d4_budget.budget_policy_ref,
                 "inner_action" if request.stage == "fact_proposal" else "outer_planning",
                 request.role_config_ref))
             raw = await self._invoke(request, token)
@@ -415,6 +427,7 @@ class ConclusionReview:
                     or getattr(view, "current_status", "effective") != "effective"
                     or view.intent_id != source.intent_id or fact.turn_id != source.turn_id):
                 continue
+            if not (fact.verification_ref or "").startswith("d3:"):continue
             old = self.observation(fact.verification_ref[3:], historical=True)
             if old.task_run_id != source.task_run_id or old.intent_id != source.intent_id:
                 raise D3RecoveryRequired("d22_fact_source_scope_changed")
@@ -481,6 +494,10 @@ class ConclusionReview:
             if self.prepare_inner_request is not None:
                 request = self.prepare_inner_request(request)
             proposal_id, candidate = await self._call(request, token)
+            from agent_core.intent_execution import WorkingRecord, validate_working
+            if isinstance(candidate, WorkingRecord):
+                validate_working(self.app, self.evidence.read_request(proposal_id), candidate)
+                return proposal_id, candidate
             if isinstance(candidate, D8ReviewRequestAction):
                 return proposal_id, candidate
             if not fact_evidence_matches(candidate, source):
@@ -506,6 +523,7 @@ class ConclusionReview:
         raise D3RecoveryRequired("d8_proposal_allowance_exhausted")
 
     def validate_record(self, record, state, *, historical=False):
+        if record.plan_id is None:return self.app.evidence_conclusions.validate_record(record,state)
         proposal = self.evidence.read_request(record.proposal_request_id)
         review = self.evidence.read_request(record.review_request_id)
         if proposal is None or review is None:
@@ -555,6 +573,7 @@ class ConclusionReview:
         result = []
         state = self.controller.control_state
         for record in self.store.list_d8_conclusions(task_run_id):
+            if record.plan_id is None:continue
             if record.outcome != "reviewed_inference":
                 continue
             plan = next((p for p in state.plans if p.plan_id == record.plan_id), None)

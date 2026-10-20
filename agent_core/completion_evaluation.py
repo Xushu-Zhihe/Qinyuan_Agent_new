@@ -130,7 +130,7 @@ def freeze_evaluation_policy(app, intent_id, support_fact_id, history):
 def evaluation_policy(request):
     try:
         policy = json.loads(request.prior_summary)["s4_evaluation_policy"]
-        if policy.get("version") == 2:
+        if policy.get("version") in {2, 3}:
             from agent_core.intent_execution import evaluation_policy as rolling_policy
             return rolling_policy(request, policy)
         by_ref = {i.ref: i for i in request.history}
@@ -152,7 +152,7 @@ def evaluation_policy(request):
 def evaluation_schema(request):
     from agent_core.output_contracts import obj, array, text
     policy = evaluation_policy(request)
-    if policy.get("version") == 2:
+    if policy.get("version") in {2, 3}:
         from agent_core.intent_execution import evaluation_schema as rolling_schema
         return rolling_schema(request, policy)
     refs = [i.ref for i in request.history if i.source_status == "available" and not i.conflict]
@@ -192,7 +192,7 @@ def materialize_candidate(request, wire, *, allow_none=False):
 
 def candidate_binding(output, request, candidate, body_sha256, byte_size):
     """The candidate value is deliberately absent, including from canonical data."""
-    from agent_core.output_contracts import output_schema
+    from agent_core.output_contracts import output_schema, matches_output_contract
     contract = output.read("contract", request.model_request_id)
     if (not isinstance(body_sha256, str) or len(body_sha256) != 64
             or any(c not in '0123456789abcdef' for c in body_sha256)
@@ -204,8 +204,7 @@ def candidate_binding(output, request, candidate, body_sha256, byte_size):
             or contract.get("root_request_id") != request.model_request_id
             or contract.get("task_run_id") != request.task_run_id
             or contract.get("role_config_ref") != request.role_config_ref
-            or contract.get("output_contract") != {"version": 1, "stage": "inner_candidate",
-                "schema": output_schema(request, contract_version=contract['contract_version'])[1]}):
+            or not matches_output_contract(contract.get("output_contract"), "inner_candidate", output_schema(request, contract_version=contract['contract_version'])[1], contract['contract_version'])):
         raise D3RecoveryRequired("s4_candidate_contract_changed")
     return {"binding_version": 1, "contract_version": contract['contract_version'],
             "task_run_id": request.task_run_id, "model_request_id": request.model_request_id,
@@ -334,7 +333,7 @@ class EvaluationBindings:
 
     def _base(self, request, finished):
         import math
-        from agent_core.output_contracts import output_schema
+        from agent_core.output_contracts import output_schema, matches_output_contract
         contract = self.output.read("contract", request.model_request_id)
         root = request.correction_of_model_request_id or request.model_request_id
         if (self._request(request.model_request_id) != request
@@ -346,8 +345,7 @@ class EvaluationBindings:
                 or contract.get("role_config_ref") != self.config.outer_role.role_config_ref
                 or request.role_config_ref != self.config.outer_role.role_config_ref
                 or contract.get("source_request_sha256") != digest(asdict(request))
-                or contract.get("output_contract") != {"version": 1, "stage": request.stage,
-                    "schema": output_schema(request, contract_version=14)[1]}
+                or not matches_output_contract(contract.get("output_contract"), request.stage, output_schema(request, contract_version=14)[1], contract["contract_version"])
                 or type(finished) not in {int, float} or not math.isfinite(finished)):
             raise D3RecoveryRequired("s4_evaluation_contract_changed")
         if root != request.model_request_id:
@@ -396,10 +394,17 @@ class EvaluationBindings:
                 or result["reason"] != (None if result["outcome"] == "valid" else "d8_output_contract_rejected")):
             raise D3RecoveryRequired("s4_evaluation_result_binding_changed")
 
-    def save_diagnostic(self, request, result):
+    def save_diagnostic(self, request, result, issue_code=None):
         issues = [{"code": "evaluation_business_rejected", "path": "$",
                    "expected": "valid_local_goal_decision", "actual": "rejected"}]
-        record = {**self._base(request, result["finished_at"]), "diagnostic_version": 1,
+        version = 1
+        if evaluation_policy(request).get("version") == 3:
+            from agent_core.intent_execution import EVALUATION_ISSUES
+            code = issue_code if issue_code in EVALUATION_ISSUES else "d22_resolution_review_invalid"
+            path, expected = EVALUATION_ISSUES[code]
+            issues = [{"code": code, "path": path, "expected": expected, "actual": "rejected"}]
+            version = 2
+        record = {**self._base(request, result["finished_at"]), "diagnostic_version": version,
                   "issues": issues, "result": result}
         self._operation(request, result["finished_at"])
         self.output.save("evaluation-diagnostic", request.model_request_id, record)
@@ -416,10 +421,21 @@ class EvaluationBindings:
         self._check_result(request, result)
         issues = [{"code": "evaluation_business_rejected", "path": "$",
                    "expected": "valid_local_goal_decision", "actual": "rejected"}]
+        version = record.get("diagnostic_version")
+        if version == 2 and evaluation_policy(request).get("version") == 3:
+            from agent_core.intent_execution import EVALUATION_ISSUES
+            saved_issues = record.get("issues", [])
+            code = saved_issues[0].get("code") if len(saved_issues) == 1 else None
+            if code not in EVALUATION_ISSUES:
+                raise D3RecoveryRequired("s4_evaluation_diagnostic_changed")
+            path, expected = EVALUATION_ISSUES[code]
+            issues = [{"code": code, "path": path, "expected": expected, "actual": "rejected"}]
+        elif version != 1:
+            raise D3RecoveryRequired("s4_evaluation_diagnostic_changed")
         if (not isinstance(result, dict) or result.get("outcome") != "invalid" or result.get("raw") is not None
                 or self.output.read("evaluation-binding", identity) is not None
                 or self.output.read("diagnostic", identity) is not None
-                or record != {**self._base(request, result.get("finished_at")), "diagnostic_version": 1,
+                or record != {**self._base(request, result.get("finished_at")), "diagnostic_version": version,
                               "issues": issues, "result": result}):
             raise D3RecoveryRequired("s4_evaluation_diagnostic_changed")
         if check_operation:
@@ -508,7 +524,7 @@ class EvaluationBindings:
         for op in operations:
             record = self.read(op.start.operation_id, check_operation=True)
             if record is not None:
-                rows.append({"diagnostic_version": 1, "stage": "intent_evaluation",
+                rows.append({"diagnostic_version": record["diagnostic_version"], "stage": "intent_evaluation",
                     "model_request_id": record["model_request_id"], "root_request_id": record["root_request_id"],
                     "issues": record["issues"], "diagnostic_sha256": digest(record)})
         return rows

@@ -239,6 +239,37 @@ def build_payload(request, settings):
     }
 
 
+def _response_diagnostic(data, message, finish, content):
+    """Keep only bounded numeric provider metadata; never response/thought text."""
+    usage = data.get("usage") if isinstance(data, dict) else None
+    numeric_usage = {}
+    if isinstance(usage, dict):
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                    "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+            value = usage.get(key)
+            if type(value) is int and value >= 0:
+                numeric_usage[key] = value
+        for key, names in (("completion_tokens_details", ("reasoning_tokens",)),
+                           ("prompt_tokens_details", ("cached_tokens",))):
+            details = usage.get(key)
+            if isinstance(details, dict):
+                values = {name: details[name] for name in names
+                          if type(details.get(name)) is int and details[name] >= 0}
+                if values:
+                    numeric_usage[key] = values
+    return {
+        "finish_reason": finish if isinstance(finish, str) and finish in {
+            "stop", "length", "content_filter", "tool_calls", "function_call",
+            "insufficient_system_resource"} else "other",
+        "content_is_none": content is None,
+        "content_chars": len(content) if isinstance(content, str) else None,
+        "content_utf8_bytes": len(content.encode("utf-8")) if isinstance(content, str) else None,
+        "reasoning_chars": len(message["reasoning_content"])
+            if isinstance(message.get("reasoning_content"), str) else None,
+        "usage": numeric_usage or None,
+    }
+
+
 def _trace_provider_response(data, choice, message, finish, content, requested_max_tokens=None):
     """Record why a provider response was incomplete; silent unless tracing is on.
 
@@ -249,17 +280,8 @@ def _trace_provider_response(data, choice, message, finish, content, requested_m
         return
     import json as _json
     import sys
-    usage = data.get("usage") if isinstance(data, dict) else None
-    detail = {
-        "finish_reason": finish,
-        "content_is_none": content is None,
-        "content_chars": len(content) if isinstance(content, str) else None,
-        "usage": usage if isinstance(usage, dict) else None,
-        "reasoning_chars": len(message.get("reasoning_content") or "")
-        if isinstance(message.get("reasoning_content"), str) else None,
-        "message_keys": sorted(k for k in message if isinstance(k, str)),
-        "max_tokens_sent": requested_max_tokens,
-    }
+    detail = _response_diagnostic(data, message, finish, content)
+    detail["max_tokens_sent"] = requested_max_tokens
     print("[trace] provider.response", _json.dumps(detail, ensure_ascii=False),
           file=sys.stderr, flush=True)
 
@@ -272,6 +294,9 @@ def _http_worker(
     """Never print or transmit raw errors/credentials through the result channel."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     client = None
+    def report(**detail):
+        if preserve_content:
+            connection.send({"diagnostic": detail})
     try:
         # http.client ignores HTTP(S)_PROXY and performs no redirect or retry.
         parsed = urlsplit(settings.base_url)
@@ -300,7 +325,19 @@ def _http_worker(
             },
         )
         response = client.getresponse()
+        report(http_status=response.status)
         if response.status != 200:
+            report(transport_end="http_error")
+            import os as _os
+            if _os.environ.get("QINYUAN_DEBUG_TRACE"):
+                import sys as _sys
+                try:
+                    body = response.read(2048)
+                except Exception:
+                    body = b""
+                text = body.decode("utf-8", "replace")
+                print("[trace] provider.http_error", response.status,
+                      text[:400].replace("\n", " "), file=_sys.stderr, flush=True)
             kind = (
                 "authentication_failed"
                 if response.status in (401, 403)
@@ -313,6 +350,13 @@ def _http_worker(
             )
             return
         raw = response.read(max_response_bytes + 1)
+        report(response_utf8_bytes=len(raw))
+        if len(raw) > max_response_bytes:
+            report(transport_end="response_limit")
+        elif isinstance(getattr(response, "length", None), int) and response.length > 0:
+            raise http.client.IncompleteRead(b"", response.length)
+        else:
+            report(transport_end="response_received")
         if len(raw) > max_response_bytes or settings.api_key.encode() in raw:
             connection.send(
                 {"error": "invalid_response", "reason": "response_rejected"}
@@ -343,6 +387,7 @@ def _http_worker(
                 connection, T6ActionValidationCode.PROVIDER_CHOICES_INVALID,
             )
             return
+        report(**_response_diagnostic(data, message, choice.get("finish_reason"), message.get("content")))
         if message.get("tool_calls") or message.get("function_call"):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
@@ -393,9 +438,16 @@ def _http_worker(
             )
             return
         connection.send({"payload": result})
+    except http.client.IncompleteRead as exc:
+        report(transport_end="incomplete_response")
+        if exc.partial:
+            report(response_utf8_bytes=len(exc.partial))
+        connection.send({"error": "provider_failure", "reason": "http_transport_failure"})
     except TimeoutError:
+        report(transport_end="timeout")
         connection.send({"error": "timed_out", "reason": "http_timeout"})
     except Exception:  # noqa: BLE001 -- process boundary must not leak raw HTTP errors
+        report(transport_end="transport_error")
         connection.send(
             {"error": "provider_failure", "reason": "http_transport_failure"}
         )
@@ -458,7 +510,9 @@ class DeepSeekModelAdapter:
         )
         return NormalizedIntentActionResponse(action)
 
-    def _invoke_payload(self, payload, timeout_seconds, cancellation_token):
+    def _invoke_payload(self, payload, timeout_seconds, cancellation_token, *, diagnostic=None):
+        diagnostic = diagnostic if diagnostic is not None else {}
+        diagnostic["transport_end"] = "not_dispatched"
         if cancellation_token.is_cancelled:
             return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
         timeout = min(float(timeout_seconds), self.settings.timeout_seconds)
@@ -474,23 +528,26 @@ class DeepSeekModelAdapter:
         connected = False
         try:
             process.start()
+            diagnostic["transport_end"] = "unknown"
             writer.close()
             while True:
                 if cancellation_token.is_cancelled:
+                    diagnostic["transport_end"] = "cancelled"
                     return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
                 if time.monotonic() >= end:
+                    diagnostic["transport_end"] = "timeout"
                     return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
                 if not connected and time.monotonic() >= connect_end:
+                    diagnostic["transport_end"] = "timeout"
                     return ModelError(ModelErrorKind.TIMED_OUT, "model_connect_timeout")
                 if reader.poll(min(0.025, max(0, end - time.monotonic()))):
-                    try:
-                        result = reader.recv()
-                    except EOFError:
-                        return ModelError(
-                            ModelErrorKind.PROVIDER_FAILURE, "model_worker_lost"
-                        )
+                    result = reader.recv()
                     if cancellation_token.is_cancelled:
+                        diagnostic["transport_end"] = "cancelled"
                         return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
+                    if "diagnostic" in result:
+                        diagnostic.update(result["diagnostic"])
+                        continue
                     if result.get("connected") is True:
                         connected = True
                         continue
@@ -515,9 +572,13 @@ class DeepSeekModelAdapter:
                             )
                     return result.get("payload")
                 if not process.is_alive():
+                    diagnostic["transport_end"] = "worker_lost"
                     return ModelError(
                         ModelErrorKind.PROVIDER_FAILURE, "model_worker_lost"
                     )
+        except (EOFError, BrokenPipeError):
+            diagnostic["transport_end"] = "worker_lost"
+            return ModelError(ModelErrorKind.PROVIDER_FAILURE, "model_worker_lost")
         finally:
             if process.pid is not None:
                 if process.is_alive():

@@ -299,6 +299,9 @@ def validate_control_ownership(rows: ControlStateRows) -> None:
             "Execution parent belongs to another TaskRun or does not exist"
         )
     for fact in rows.facts:
+        if (fact.verification_ref or "").startswith("d8e:"):
+            if fact.turn_id not in turns:raise StorageError("Reviewed Fact Turn is outside TaskRun")
+            continue  # Store and evidence repository validate the reviewed source.
         source = executions.get(fact.source_ref)
         if source is None or fact.turn_id not in turns:
             raise StorageError("Fact parents must belong to this TaskRun")

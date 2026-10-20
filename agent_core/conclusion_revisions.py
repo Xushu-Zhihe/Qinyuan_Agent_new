@@ -1,6 +1,7 @@
 """D8-3 review, immutable changes, current projections and dependency gates."""
 
 from dataclasses import asdict, replace
+import json
 
 from agent_core.conclusion_contracts import conclusion_digest
 from agent_core.conclusion_revision_contracts import (
@@ -83,15 +84,15 @@ class ConclusionRevisions:
                     status = "available"
                     for source in sources:
                         try:
-                            current = self.app.conclusions.observation(source["proof_id"], historical=True)
-                            if asdict(current) != source:
+                            current = self._source_snapshot(source)
+                            if current != source:
                                 status = "unavailable"
                         except D3RecoveryRequired:
                             status = "unavailable"
                     actor = next(i for i in self.state.intents if i.intent_id == record.actor_intent_id)
                     entry = D8HistoryItem(record.record_id, record.task_run_id, "reviewed_inference",
                                           actor.turn_id, actor.intent_id,
-                                          sources[0]["artifact_version_id"] if sources else None,
+                                          sources[0].get("artifact_version_id") if sources else None,
                                           action.content if status == "available" else "",
                                           tuple(action.evidence_refs), record.evidence_sha256,
                                           data["commit_sequence"], "reviewed_inference_not_verified",
@@ -180,7 +181,7 @@ class ConclusionRevisions:
             if item.record_type != "verified_fact" or item.source_status != "available":
                 continue
             fact = next((f for f in self.state.facts if f.fact_id == item.record_id), None)
-            if fact is None:
+            if fact is None or not (fact.verification_ref or "").startswith("d3:"):
                 continue
             observed = self.app.conclusions.observation(fact.verification_ref[3:], historical=True)
             claims.append((item.ref, observed.artifact_version_id, observed.observation_scope, observed.observed_sha256))
@@ -537,34 +538,46 @@ class ConclusionRevisions:
         self._actor(request.actor_intent_id)
         return request, self._parse(request, result["raw"])
 
+    def _source_snapshot(self, source):
+        if "sources" in source:
+            from agent_core.evidence_conclusions import EvidenceObservation
+            observed=EvidenceObservation(**{**source,"sources":tuple(source["sources"])})
+            self.app.evidence_conclusions.validate_sources(observed)
+            return json.loads(handoff_json(asdict(observed)))
+        return asdict(self.app.conclusions.observation(source["proof_id"],historical=True))
+
     def _sources(self, action, history):
-        by_ref = {i.ref: i for i in history}
-        result = {}
+        by_ref = {i.ref:i for i in history}
+        result={}
+        def include(observed):
+            source=json.loads(handoff_json(asdict(observed)))
+            self._source_snapshot(source)
+            result[conclusion_digest(source)]=source
+        def include_fact(fact):
+            if (fact.verification_ref or "").startswith("d8e:"):
+                _,observed=self.app.evidence_conclusions.validate_fact(fact,self.state)
+            else:
+                observed=self.app.conclusions.observation(fact.verification_ref[3:],historical=True)
+            include(observed)
         for ref in action.evidence_refs:
-            item = by_ref[ref]
-            if item.record_type == "verified_fact":
-                fact = next(f for f in self.state.facts if f.fact_id == item.record_id)
-                observed = self.app.conclusions.observation(fact.verification_ref[3:], historical=True)
-                result[observed.proof_id] = asdict(observed)
+            item=by_ref[ref]
+            if item.record_type=="verified_fact":
+                include_fact(next(f for f in self.state.facts if f.fact_id==item.record_id))
             else:
                 for source in item.source_refs:
-                    fact = next((f for f in self.state.facts if f.verification_ref == source), None)
-                    if fact is not None:
-                        observed = self.app.conclusions.observation(fact.verification_ref[3:], historical=True)
-                        result[observed.proof_id] = asdict(observed)
-                record = next((r for r in self.store.list_d8_conclusions(self.state.task_run.task_run_id)
-                               if r.record_id == item.record_id), None)
+                    fact=next((f for f in self.state.facts if f.verification_ref==source),None)
+                    if fact is not None:include_fact(fact)
+                record=next((r for r in self.store.list_d8_conclusions(self.state.task_run.task_run_id) if r.record_id==item.record_id),None)
                 if record is not None:
-                    request = self.app.conclusions.evidence.read_request(record.review_request_id)
-                    observed = self.app.conclusions.observation(request.observation.proof_id, historical=True)
-                    result[observed.proof_id] = asdict(observed)
-                revision = next((r for r in self.records() if r.record_id == item.record_id), None)
+                    request=self.app.conclusions.evidence.read_request(record.review_request_id)
+                    if record.plan_id is None:include(request.observation)
+                    else:include(self.app.conclusions.observation(request.observation.proof_id,historical=True))
+                revision=next((r for r in self.records() if r.record_id==item.record_id),None)
                 if revision is not None:
                     for source in self._payload(revision)[0]["sources"]:
-                        observed = self.app.conclusions.observation(source["proof_id"], historical=True)
-                        if asdict(observed) != source:
+                        if self._source_snapshot(source)!=source:
                             raise D3RecoveryRequired("d8_revision_inference_source_changed")
-                        result[observed.proof_id] = source
+                        result[conclusion_digest(source)]=source
         if action.content is not None and not result:
             raise D3RecoveryRequired("d8_revision_inference_has_no_safe_observation")
         return list(result.values())
