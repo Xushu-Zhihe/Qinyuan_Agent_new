@@ -173,4 +173,4 @@ uv run pytest tests/test_docker.py -q
 | `workbench_data/` | 工作台本地数据和运行记录 |
 | `.test/` | 本地测试、构建与缓存产物 |
 
-本地设计约束、流程图、计划和验收记录保留在 `restrict/`、`Plan/` 等位置，按当前 `.gitignore` 不随仓库提交。README 描述当前使用方式，具体变更过程在对应计划与验收文档中记录。
+
