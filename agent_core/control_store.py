@@ -22,6 +22,7 @@ from agent_core.web_contracts import (
     canonical_web_origin,
 )
 from agent_core.domain import (
+    MAX_FACT_CONTENT_LENGTH,
     Execution,
     ExecutionStatus,
     Fact,
@@ -377,7 +378,7 @@ class UpsertFact:
         _non_empty(self.fact_id, "UpsertFact.fact_id")
         _non_empty(self.turn_id, "UpsertFact.turn_id")
         _non_empty(self.content, "UpsertFact.content")
-        if len(self.content) > 256:
+        if len(self.content) > MAX_FACT_CONTENT_LENGTH:
             raise ValueError("UpsertFact.content must be at most 256 Unicode code points")
         _non_empty(self.source_ref, "UpsertFact.source_ref")
         if self.verification_ref is not None:

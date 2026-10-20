@@ -10,6 +10,7 @@ from typing import Literal, NoReturn, cast
 from uuid import uuid4
 
 from agent_core.review_contracts import (
+    MAX_REVIEW_ATTEMPTS, LEGACY_REVIEW_CALL_LIMIT,
     D2AllowedActionKinds,
     D2Constraint,
     D2MaxActionTimeout,
@@ -74,8 +75,8 @@ def _saved_request(raw: object) -> D2ReviewRequest:
 class D2ReviewCoordinator:
     """Begin before I/O; replay known results; apply through a trusted owner."""
 
-    MAX_ATTEMPTS_PER_ROOT = 2
-    MAX_REVIEW_CALLS_PER_TASK_RUN = 8
+    MAX_ATTEMPTS_PER_ROOT = MAX_REVIEW_ATTEMPTS
+    MAX_REVIEW_CALLS_PER_TASK_RUN = LEGACY_REVIEW_CALL_LIMIT
 
     def __init__(
         self,
@@ -260,7 +261,11 @@ class D2ReviewCoordinator:
                     "refused",
                 }:
                     failure = "unknown" if outcome == "started" else str(outcome)
-                    self._pause(request, failure, failure)
+                    boundary = getattr(self.ledger, "output_boundary", None)
+                    saved = _saved_request(root.get("last_request"))
+                    if not (outcome == "provider_failure" and boundary is not None
+                            and boundary.retryable_technical_failure(saved)):
+                        self._pause(request, failure, failure)
                 applied = cast(list[dict], root.get("applied", []))
                 if applied:
                     last = applied[-1]
@@ -297,10 +302,8 @@ class D2ReviewCoordinator:
             request = self._refresh(request)
             if attempts >= self.MAX_ATTEMPTS_PER_ROOT:
                 self._pause(request, "review_retry_exhausted")
-            if (
-                self.ledger.review_call_count(request.task_run_id)
-                >= self.MAX_REVIEW_CALLS_PER_TASK_RUN
-            ):
+            call_limit = getattr(self.ledger, "review_call_limit", self.MAX_REVIEW_CALLS_PER_TASK_RUN)
+            if call_limit is not None and self.ledger.review_call_count(request.task_run_id) >= call_limit:
                 self._pause(request, "review_budget_exhausted")
             generation = request.review_generation
             if root is not None and root.get("last_request") is not None:
@@ -350,7 +353,10 @@ class D2ReviewCoordinator:
                     reason=raw.reason if raw else "empty_response",
                 )
                 if outcome not in {"empty_response", "invalid_response"}:
-                    self._pause(current, outcome, outcome)
+                    boundary = getattr(self.ledger, "output_boundary", None)
+                    if not (outcome == "provider_failure" and boundary is not None
+                            and boundary.retryable_technical_failure(current)):
+                        self._pause(current, outcome, outcome)
                 if current.review_attempt >= self.MAX_ATTEMPTS_PER_ROOT:
                     self._pause(current, "review_retry_exhausted", outcome)
                 request = current

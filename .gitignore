@@ -56,10 +56,7 @@ Qinyuan_Agent_dual_llm_flow.svg
 Qinyuan_Agent_dual_llm_flow_v2.svg
 Qinyuan_Agent_dual_llm_flow_v2.png
 # ---- 仅本地保留的契约文档与计划 ----
-Architecture.md
-interface.md
-protocol.md
-restrict.md
+restrict
 TODO.md
 Plan/
 

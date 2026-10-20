@@ -310,7 +310,11 @@ class ControlStateRepository:
             config = self._store.load_d3_run_config(rows.task_run.task_run_id)
             if config is None or config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 raise StorageError("control state contains multiple running Turns")
-            leaf = max((turns[i] for i in running_turns), key=lambda t: t.sequence)
+            if config.intent_execution_policy == "continuous_v1":
+                # A parked old root is retained for audit; it has no dispatchable Intent.
+                active = {i.turn_id for i in rows.intents if i.status in {IntentStatus.RUNNING, IntentStatus.PENDING}}
+                running_turns = [i for i in running_turns if i in active]
+            leaf = max((turns[i] for i in running_turns), key=lambda t: t.sequence, default=None)
             chain = set()
             while leaf is not None and leaf.turn_id not in chain:
                 chain.add(leaf.turn_id)

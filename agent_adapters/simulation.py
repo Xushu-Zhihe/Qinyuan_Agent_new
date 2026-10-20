@@ -25,7 +25,7 @@ def simulation_config(*, rolling=False):
     """Confirmed explicit preset; character counts are not provider tokens."""
     policy = D8CapacityPolicy("fake-json-v1", "unicode_codepoints", 262144, 8192)
     return {
-        **({"intent_execution_policy": "rolling_v1"} if rolling else {}),
+        **({"intent_execution_policy": "continuous_v1"} if rolling else {}),
         "handoff_config": asdict(D8HandoffConfig(
             policy, policy, D8Capacity()
         )),
@@ -45,7 +45,7 @@ def real_config(*, contract_version=6, http=False, http_timeout_seconds=60, roll
         from agent_adapters.docker_profile import sandbox_config
         result.update(sandbox_backend="docker", sandbox_config=sandbox_config())
     if contract_version == 22 and rolling:
-        result["intent_execution_policy"] = "rolling_v1"
+        result["intent_execution_policy"] = "continuous_v1"
     if http:
         if contract_version not in {15, 16, 17, 18, 19, 20, 21, 22}:
             raise ValueError('d20_http_requires_contract15_or_higher')
@@ -92,7 +92,7 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
             expected_fields.add('http_profile')
             expected_fields.add('http_timeout_seconds')
     if isinstance(extra, dict) and "intent_execution_policy" in extra:
-        if version != 22 or extra["intent_execution_policy"] != "rolling_v1":
+        if version != 22 or extra["intent_execution_policy"] not in {"rolling_v1", "continuous_v1"}:
             raise ValueError("d22_intent_execution_policy_invalid")
         expected_fields.add("intent_execution_policy")
     if (not isinstance(extra, dict)
@@ -111,6 +111,8 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
             raise ValueError("d8_real_capacity_policy_mismatch")
         expected["handoff_config"]["outer_capacity"] = asdict(frozen.outer_capacity)
         expected["handoff_config"]["inner_capacity"] = asdict(frozen.inner_capacity)
+        if "intent_execution_policy" in extra:
+            expected["intent_execution_policy"] = extra["intent_execution_policy"]
         if json.dumps(extra, sort_keys=True) != json.dumps(expected, sort_keys=True):
             raise ValueError("d8_real_configuration_mismatch")
     handoff = D8HandoffConfig.from_dict(extra["handoff_config"])
@@ -294,7 +296,8 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
         if config.contract_version in {18, 19, 20, 21, 22}:
             from agent_adapters.docker_profile import connect
             from agent_adapters.application import RecordedSandbox
-            resources, sandbox = connect(declaration["request"]["d8_config"]["sandbox_config"], directory)
+            resources, sandbox = connect(declaration["request"]["d8_config"]["sandbox_config"], directory,
+                                         wait_for_ready=operation == "start")
             if config.web_authorization is not None:
                 from agent_adapters.target_network_cleanup import RecordedTargetNetwork
                 from Sandbox.target_network import T6TargetNetwork

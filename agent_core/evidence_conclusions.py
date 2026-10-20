@@ -1,7 +1,8 @@
 """Evidence-bound explicit Fact requests; tool execution never creates a Fact."""
 from dataclasses import asdict, dataclass
 import json
-from agent_core.conclusion_contracts import D8Conclusion, D8ReviewDecision, conclusion_digest
+from agent_core.domain import MAX_FACT_CONTENT_LENGTH
+from agent_core.conclusion_contracts import MAX_CONCLUSION_REASON_LENGTH, D8Conclusion, D8ReviewDecision, conclusion_digest
 from agent_core.dual_llm_contracts import D3RecoveryRequired
 from agent_core.operation_accounting import _uuid, _sha
 from agent_core.turn_modeling import stable_id
@@ -16,10 +17,10 @@ class EvidenceCandidate:
     def __post_init__(self):
         if (not isinstance(self.content, str)
                 or not self.content.strip()
-                or len(self.content) > 256
+                or len(self.content) > MAX_FACT_CONTENT_LENGTH
                 or (not isinstance(self.reason, str))
                 or (not self.reason.strip())
-                or (len(self.reason) > 512)
+                or (len(self.reason) > MAX_CONCLUSION_REASON_LENGTH)
                 or ('\x00' in self.content + self.reason)
                 or (type(self.inferred) is not bool)
                 or (not 1 <= len(self.evidence_refs) <= 8)
@@ -107,9 +108,9 @@ def resource(request):
 def review_schema(request):
     from agent_core.output_contracts import obj, text, array
     decisions = ['accept', 'reject', 'insufficient', 'no_new_information']
-    base = obj({'decision': {'type': 'string', 'enum': decisions}, 'reason': text(512), 'refined_content': {'type': ['string', 'null'], 'maxLength': 256}, 'merged_sources': {'type': ['array', 'null'], 'items': {'type': 'string', 'enum': list(request.candidate.evidence_refs)}, 'minItems': 1, 'uniqueItems': True}}, optional=('refined_content', 'merged_sources'))
+    base = obj({'decision': {'type': 'string', 'enum': decisions}, 'reason': text(MAX_CONCLUSION_REASON_LENGTH), 'refined_content': {'type': ['string', 'null'], 'maxLength': MAX_FACT_CONTENT_LENGTH}, 'merged_sources': {'type': ['array', 'null'], 'items': {'type': 'string', 'enum': list(request.candidate.evidence_refs)}, 'minItems': 1, 'uniqueItems': True}}, optional=('refined_content', 'merged_sources'))
     if request.existing_facts:
-        return {'anyOf': [base, obj({'decision': {'type': 'string', 'const': 'reuse'}, 'reason': text(512), 'reuse_fact_id': {'type': 'string', 'enum': [f['fact_id'] for f in request.existing_facts]}})]}
+        return {'anyOf': [base, obj({'decision': {'type': 'string', 'const': 'reuse'}, 'reason': text(MAX_CONCLUSION_REASON_LENGTH), 'reuse_fact_id': {'type': 'string', 'enum': [f['fact_id'] for f in request.existing_facts]}})]}
     return base
 
 def evidence_signatures(observation):
@@ -202,7 +203,7 @@ class EvidenceConclusions:
     def validate_candidate(self, request, candidate):
         from agent_core.dual_llm_modeling import D3ProposalRejected
         packet=json.loads(request.history_context)
-        if packet.get('intent_execution',{}).get('stop_requested'):
+        if packet.get('intent_execution',{}).get('stop_requested') and not packet['intent_execution']['stop_requested'].get('fact_candidate_allowed'):
             raise D3ProposalRejected('d22_strategy_stop_summary_required')
         frozen = {s['ref']: s for s in packet.get('evidence_sources', [])}
         for ref in candidate.evidence_refs:
@@ -242,7 +243,14 @@ class EvidenceConclusions:
             app.store.mark_d3_operation_applied(proposal_id, old.record_id)
             return
         request = self._request(proposal_id, intent_id, candidate)
-        final, decision = await app.conclusions._call(request, token)
+        from agent_core.conclusion_review import OptionalConclusionFormatError
+        try:
+            final, decision = await app.conclusions._call(request, token)
+        except OptionalConclusionFormatError as exc:
+            app.conclusions.record_optional_failure(proposal_id, exc.request_id)
+            app.conclusions.finish_optional_failure(proposal_id)
+            app.sessions.reconcile()
+            return
         outcome = 'verified_fact' if decision.decision == 'reuse' or (decision.decision == 'accept' and (not candidate.inferred)) else 'reviewed_inference' if decision.decision == 'accept' else 'no_new_information' if decision.decision == 'no_new_information' else 'rejected' if decision.decision == 'reject' else 'insufficient'
         fact_id = decision.reuse_fact_id if decision.decision == 'reuse' else self._id('evidence-fact/' + proposal_id) if outcome == 'verified_fact' else None
         record = D8Conclusion(self._id('evidence-conclusion/' + proposal_id), request.task_run_id, request.observation.turn_id, intent_id, None, proposal_id, final, conclusion_digest(asdict(candidate)), request.observation.source_version_sha256, outcome, fact_id)

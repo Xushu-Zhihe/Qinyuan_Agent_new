@@ -240,7 +240,7 @@ def test_d5_format_correction_charged_and_committed_by_correction_id(output_case
         assert case.app.refinement.evidence.read_result(root)["outcome"] == "invalid"
         assert case.app.store.load_d4_operation(fact.model_request_id).application_ref == fact.process_fact_id
     used = dict(case.app.store.d4_budget_usage(case.task).category_counts)["refinement"]
-    assert used == len(case.models["refinement"].calls) <= 4
+    assert used == len(case.models["refinement"].calls) <= case.app.config.d4_budget.refinement
     before = len(case.models["refinement"].calls)
     reopen(case)
     assert run(case).stop_reason == "search_exhausted"
@@ -322,7 +322,8 @@ def test_diagnostic_write_failure_stops_and_unknown_resume_does_not_reask(output
 def test_d5_exhausted_quota_keeps_original_invalid_without_correction(output_case):
     from agent_core.operation_accounting import D4OperationStart, D4OperationCompletion
     case = output_case
-    for _ in range(3):
+    limit = case.app.config.d4_budget.refinement
+    for _ in range(limit - 1):
         identity = str(uuid4())
         case.app.store.begin_d4_operation(D4OperationStart(identity, case.task, "refinement", case.clock(),
             case.app.state.latest_checkpoint.sequence, "0" * 64, case.task,
@@ -332,7 +333,7 @@ def test_d5_exhausted_quota_keeps_original_invalid_without_correction(output_cas
     case.models["refinement"].transform = lambda _, raw: {**raw, "claims": {}}
     assert run(case).stop_reason == "search_exhausted"
     assert len(case.models["refinement"].calls) == 1
-    assert dict(case.app.store.d4_budget_usage(case.task).category_counts)["refinement"] == 4
+    assert dict(case.app.store.d4_budget_usage(case.task).category_counts)["refinement"] == limit
     assert not case.app.store.list_process_facts(case.task)
     request = case.models["refinement"].calls[0].request
     assert case.app.refinement.evidence.read_result(request.attempt.model_request_id)["outcome"] == "invalid"

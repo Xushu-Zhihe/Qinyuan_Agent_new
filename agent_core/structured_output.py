@@ -5,7 +5,7 @@ import json
 import math
 import re
 from agent_core.dual_llm_contracts import D3RecoveryRequired
-from agent_core.output_contracts import D8OutputRequest, D8FormatIssue, decode_response, output_schema, matches_output_contract
+from agent_core.output_contracts import D8ModelResponse, D8OutputRequest, D8FormatIssue, decode_response, output_schema, matches_output_contract
 from agent_core.handoff_contracts import handoff_json
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.review_contracts import D2ReviewRequest, D2ModelFailure, D2ModelResponse
@@ -13,10 +13,16 @@ from agent_core.process_facts import D5RefinementRequest
 from agent_core.turn_modeling import digest, stable_id
 
 
-def _instruction(correcting):
+def _instruction(correcting, *, length_limited=False):
     text = "Return exactly one complete JSON object matching output_contract.schema. Do not use Markdown, add fields, or repair types implicitly."
     if correcting:
-        text += " The preceding proposal was rejected. Generate the complete response again using the declared structure and safe correction information; all business restrictions still apply."
+        if length_limited:
+            text += (" The previous generation ended at a length limit without a complete usable decision. "
+                     "This is the only regeneration opportunity. Use the current Intent, preserved progress and evidence "
+                     "to finish only this decision and return complete JSON. Do not repeat executed tools or treat "
+                     "this technical failure as an Intent outcome; all business restrictions still apply.")
+        else:
+            text += " The preceding proposal was rejected. Generate the complete response again using the declared structure and safe correction information; all business restrictions still apply."
     return text
 
 
@@ -30,6 +36,12 @@ def format_stop_reason(diagnostic):
             and any(issue["code"] == "output_truncated" for issue in diagnostic["issues"])):
         return "d8_model_output_truncated"
     return None
+
+
+def transient_provider_result(evidence, identity):
+    transport = (evidence.read("provider-result", identity) or {}).get("transport", {})
+    return (transport.get("transport_end") == "http_error"
+            and transport.get("http_status") in {429, 500, 502, 503})
 
 
 class StructuredOutput:
@@ -72,7 +84,7 @@ class StructuredOutput:
         if isinstance(request, D2ReviewRequest):
             role_ref = self.app.config.outer_role.role_config_ref
         error = self._error(correction)
-        instruction = _instruction(correction is not None)
+        instruction = _instruction(correction is not None, length_limited=error is not None and error["reason"] == "output_length_limit")
         safe = self.app.redactor.redact_model_input(request)
         shape = {"version": 1, "stage": stage, "schema": schema}
         prior = self.evidence.read("contract", identity) or (self.evidence.read("contract", correction) if correction else None)
@@ -104,6 +116,12 @@ class StructuredOutput:
                  "reason": "output_format_invalid" if diagnostic is not None else "proposal_rejected",
                  "issues": diagnostic["issues"] if diagnostic is not None else []}
         contract = self.evidence.read("contract", correction)
+        if diagnostic is None and self.evidence.read("provider-result", correction) is not None:
+            error["reason"] = "previous_model_call_failed"
+        if (diagnostic is not None and contract is not None
+                and contract["role_config_ref"] == self.app.config.inner_role.role_config_ref
+                and any(issue["code"] == "output_truncated" for issue in diagnostic["issues"])):
+            error["reason"] = "output_length_limit"
         if self.app.config.intent_execution_policy and contract is not None and contract["stage"] == "inner_plan" and diagnostic is None:
             rejection = self.app.model_evidence.read_rejection(correction)
             paths = {"d22_strategy_stop_summary_required": "$/outcome",
@@ -143,6 +161,20 @@ class StructuredOutput:
                 error['http_request_policy'] = self.app.web.policy()
             else:
                 error['allowed_plan_choices'] = plan_policy(snapshot['request'])['allowed_choices']
+            from agent_core.execution_feasibility import KEY
+            feasibility = json.loads(snapshot['request']['history_context']).get(KEY)
+            if feasibility is not None:
+                error[KEY] = feasibility
+            rejection = self.app.model_evidence.read_rejection(correction)
+            if rejection is not None and rejection.code == 'd3_action_rejected_by_review_constraint':
+                error['reason'] = rejection.code
+        if self.app.config.contract_version >= 11 and contract is not None and contract["stage"] in {"inner_size", "inner_sha256"}:
+            from agent_core.fixed_probe import fixed_probe_policy
+            original, _ = self.app.fixed_probe_bindings._request(correction)
+            error["fixed_probe_policy"] = fixed_probe_policy(original)
+            rejection = self.app.model_evidence.read_rejection(correction)
+            if rejection is not None and rejection.code == "d3_action_rejected_by_review_constraint":
+                error["reason"] = rejection.code
         return error
 
     def prepare(self, request):
@@ -178,7 +210,7 @@ class StructuredOutput:
             raise D3RecoveryRequired("d8_output_schema_changed")
         correction = saved["correction_of_model_request_id"]
         expected_error = self._error(correction)
-        if saved["instruction"] != _instruction(correction is not None) or saved["correction"] != expected_error:
+        if saved["instruction"] != _instruction(correction is not None, length_limited=expected_error is not None and expected_error["reason"] == "output_length_limit") or saved["correction"] != expected_error:
             raise D3RecoveryRequired("d8_output_frozen_description_changed")
         # Model workers read frozen files only; SQLite belongs to the dispatch thread.
         if isinstance(safe_request, D5RefinementRequest) and correction is not None:
@@ -201,13 +233,16 @@ class StructuredOutput:
         if result is None:
             return None
         contract = self.evidence.read("contract", identity)
-        if (contract is None or set(result) != {"contract_version", "task_run_id", "model_request_id",
-                "root_request_id", "correction_of_model_request_id", "stage", "contract_sha256",
-                "terminal", "issues", "output_measurement", "finished_at"}
-                or result.get("contract_version") != self.app.config.contract_version or result.get("model_request_id") != identity
-                or result.get("contract_sha256") != digest(contract)
-                or result.get("task_run_id") != contract["task_run_id"]
-                or result.get("stage") != contract["stage"]
+        fields = {"contract_version", "task_run_id", "model_request_id", "root_request_id",
+                  "correction_of_model_request_id", "stage", "contract_sha256", "terminal", "issues",
+                  "output_measurement", "finished_at"}
+        if "optional_output_kind" in result:
+            fields.add("optional_output_kind")
+            if result["optional_output_kind"] != "fact_candidate" or result.get("stage") != "inner_plan":
+                raise D3RecoveryRequired("d8_output_diagnostic_binding_changed")
+        if (contract is None or set(result) != fields or result.get("contract_version") != self.app.config.contract_version
+                or result.get("model_request_id") != identity or result.get("contract_sha256") != digest(contract)
+                or result.get("task_run_id") != contract["task_run_id"] or result.get("stage") != contract["stage"]
                 or result.get("root_request_id") != contract["root_request_id"]
                 or result.get("correction_of_model_request_id") != contract["correction_of_model_request_id"]
                 or result.get("terminal") not in {None, "output_truncated", "completion_invalid", "output_size_exceeded", "output_depth_exceeded", "output_budget_exhausted"}
@@ -242,8 +277,11 @@ class StructuredOutput:
                     or issue["code"] not in codes or not isinstance(issue["path"], str)
                     or issue["path"].split("/")[0] != "$" or len(issue["path"]) > 128
                     or not isinstance(issue["expected"], str) or not isinstance(issue["actual"], str)
-                    or any(label not in labels for label in issue["expected"].split("|"))
-                    or issue["actual"] not in labels
+                    or not (all(label in labels for label in issue["expected"].split("|")) and issue["actual"] in labels
+                        or issue["code"] == "string_too_long"
+                        and re.fullmatch(r"unicode_codepoints_le_[0-9]{1,5}", issue["expected"])
+                        and re.fullmatch(r"unicode_codepoints_[0-9]{1,5}", issue["actual"])
+                        and 0 <= int(issue["expected"].rsplit("_", 1)[1]) < int(issue["actual"].rsplit("_", 1)[1]) <= 65536)
                     or any(p not in names and p != "<unknown>" and not re.fullmatch(r"[0-9]+", p)
                            for p in issue["path"].split("/")[1:])):
                 raise D3RecoveryRequired("d8_output_diagnostic_fields_invalid")
@@ -297,6 +335,14 @@ class StructuredOutput:
             raise D3RecoveryRequired("d8_output_diagnostic_request_changed")
         return result
 
+    def retryable_technical_failure(self, request):
+        # Only a definitely ended transient response may share the one correction.
+        if self.app.config.intent_execution_policy != "continuous_v1":return False
+        _, identity = self.identity(request)
+        _, correction = self._correction(request, identity)
+        if correction is not None:return False
+        return transient_provider_result(self.evidence, identity)
+
     def terminal_check(self, request):
         reason = format_stop_reason(self.failure(request))
         if reason is not None:
@@ -315,13 +361,17 @@ class StructuredOutput:
             provider=self.evidence.read("provider-result",identity)
             sent=self.evidence.read("provider-request",identity)
             transport=(provider or {}).get("transport",{})
-            used=transport.get("usage",{}).get("completion_tokens")
+            used=(transport.get("usage") or {}).get("completion_tokens")
             limit=(sent or {}).get("max_tokens")
             if sent is not None:limit=sent.get("parameters",{}).get("max_tokens",limit)
+            known_end = provider is None or transport.get("transport_end") == "response_received"
             if type(used) is int and type(limit) is int and used>=limit:
                 terminal="output_budget_exhausted"
-            elif transport.get("transport_end") in {None,"response_received"}:
-                # One correction under the original budget, no partial-response parsing.
+                if (known_end and contract["role_config_ref"] == self.app.config.inner_role.role_config_ref
+                        and contract["correction_of_model_request_id"] is None):
+                    terminal=None
+            elif known_end:
+                # Share the original single correction; never parse partial output.
                 terminal=None
         if not issues and self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             from agent_core.selection_bindings import STAGES
@@ -375,6 +425,17 @@ class StructuredOutput:
             "stage": contract["stage"], "contract_sha256": digest(contract),
             "terminal": terminal, "issues": [asdict(i) for i in issues],
             "output_measurement": units, "finished_at": self.app.clock()}
+        if envelope.output_contract["stage"] == "inner_plan" and terminal is None:
+            candidate = response.content if isinstance(response, D8ModelResponse) else response
+            if not isinstance(response, D8ModelResponse) or response.finish_reason == "stop":
+                if isinstance(candidate, str):
+                    try:
+                        candidate = json.loads(candidate)
+                    except ValueError:
+                        candidate = None
+                if isinstance(candidate, dict) and candidate.get("kind") == "fact_candidate":
+                    # Keep only the trusted optional-branch discriminator, never rejected prose.
+                    diagnostic["optional_output_kind"] = "fact_candidate"
         self.evidence.save("diagnostic", identity, diagnostic)
         if terminal is not None:
             if isinstance(request, D2ReviewRequest):

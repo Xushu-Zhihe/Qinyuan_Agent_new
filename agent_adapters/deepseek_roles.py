@@ -14,16 +14,16 @@ from agent_core.turn_contracts import D1RoleConfig
 from agent_core.review_contracts import D2ModelFailure
 
 
-TRANSPORT = {"version": 1, "base_url": "https://api.scnet.cn/api/llm/v1",
+TRANSPORT = {"version": 1, "base_url": "https://api.deepseek.com",
              "timeout_seconds": 180, "response_format": "json_object",
              "max_response_bytes": 2 * 1024 * 1024}
-PARAMETERS = (("thinking", "enabled"), ("reasoning_effort", "high"), ("max_tokens", 32768))
+PARAMETERS = (("thinking", "enabled"), ("reasoning_effort", "high"))
 CAPACITY_POLICY = D8CapacityPolicy("deepseek-json-byte-estimate-v1", "estimated_token_units", 262144, 16384)
-# User-confirmed SCNET deployment limits. Decimal bounds are deliberately no
-# larger than advertised 1M/384K; generation stays at the frozen 32768 tokens.
-SCNET_V41_CAPACITY = D8CapacityPolicy(
-    "scnet-v4.1-flash-conservative-bytes-v1", "estimated_token_units", 1_000_000, 32768)
+# User-confirmed deployment limits. Reserve the advertised maximum because
+# the provider default is not observed; this reserve is never sent as a limit.
 SCNET_V41_MAX_OUTPUT = 384_000
+SCNET_V41_CAPACITY = D8CapacityPolicy(
+    "scnet-v4.1-flash-conservative-bytes-v1", "estimated_token_units", 1_000_000, SCNET_V41_MAX_OUTPUT)
 
 
 def default_capacity_policy(contract_version):
@@ -310,7 +310,7 @@ def build_payload(envelope, role, *, context_loader=None):
     if role.prompt_template.endswith((".v8", ".v9", ".v10", ".v11", ".v12", ".v13", ".v14", ".v15", ".v16", ".v17")) and stage == "progress_review":
         from agent_core.progress_policy import policy_for as progress_policy
         rules = ("Judge meaningful long work versus meaningless repetition from the recent and cumulative evidence. "
-                 "Choose classification and a compatible current decision from progress_policy; inconclusive pauses. "
+                 "Choose classification and a compatible current decision exactly from progress_policy. "
                  "Keep rationale/source_ids and progress.reason/evidence_refs separately and explicitly. "
                  "progress.evidence_refs must include required_latest_decision_ref; source_ids need not duplicate it. "
                  "Trusted code binds the decision watermark and advances it only after accepted bound review. "
@@ -436,15 +436,30 @@ def build_payload(envelope, role, *, context_loader=None):
     if role.prompt_template.endswith((".v7", ".v8", ".v9", ".v10", ".v11", ".v12", ".v13", ".v14", ".v15", ".v16", ".v17")):
         system += " Safe diagnostics are fixed constraint labels, not new permissions. Correct only within this frozen request."
     if role.prompt_template.endswith((".v3", ".v4")) and stage == "fact_proposal":
-        system += " Keep content concise, nonempty and without NUL; it has no per-field character limit. Keep reason nonempty, without NUL and at most 512 Unicode characters. Full-response and context capacity limits still apply. Use unique canonical UUID4 or UUID5 evidence_refs supplied in the observation, and the exact registered assertion rule and IDs. Safe diagnostics explain existing proposal restrictions; they do not verify a Fact or bypass outer review."
+        system += " Keep content and reason concise, nonempty and without NUL. Obey the branch-specific Unicode character limits in output_contract; reference long evidence instead of copying it. Full-response and context capacity limits still apply. Use unique canonical UUID4 or UUID5 evidence_refs supplied in the observation, and the exact registered assertion rule and IDs. Safe diagnostics explain existing proposal restrictions; they do not verify a Fact or bypass outer review."
     if role.prompt_template.endswith((".v5", ".v6")) and stage == "fact_proposal":
         from agent_core.conclusion_contracts import allowed_fact_evidence_refs
         context["allowed_evidence_refs"] = list(allowed_fact_evidence_refs(request.observation))
-        system += " Keep content concise, nonempty and without NUL; it has no per-field character limit. Keep reason nonempty, without NUL and at most 512 Unicode characters. Full-response and context capacity limits still apply. A candidate must explicitly set evidence_refs to exactly the supplied allowed_evidence_refs, containing the current proof_id only. artifact_version_id, observation_id and execution_id identify objects or assertion parameters; they are not admissible proof citations. Do not add or substitute those IDs. Use the exact registered assertion rule and IDs. If you cannot propose a supported candidate, use the existing request_review branch. Safe diagnostics do not verify a Fact or bypass outer review."
+        system += " Keep content and reason concise, nonempty and without NUL. Obey the branch-specific Unicode character limits in output_contract; reference long evidence instead of copying it. Full-response and context capacity limits still apply. A candidate must explicitly set evidence_refs to exactly the supplied allowed_evidence_refs, containing the current proof_id only. artifact_version_id, observation_id and execution_id identify objects or assertion parameters; they are not admissible proof citations. Do not add or substitute those IDs. Use the exact registered assertion rule and IDs. If you cannot propose a supported candidate, use the existing request_review branch. Safe diagnostics do not verify a Fact or bypass outer review."
     if role.prompt_template.endswith((".v7", ".v8", ".v9", ".v10", ".v11", ".v12", ".v13", ".v14", ".v15", ".v16", ".v17")) and stage == "fact_proposal":
         from agent_core.conclusion_contracts import allowed_fact_evidence_refs
         context["allowed_evidence_refs"] = list(allowed_fact_evidence_refs(request.observation))
-        system += " Keep content concise, nonempty and without NUL; it has no per-field character limit. Keep reason nonempty, without NUL and at most 512 Unicode characters. Full-response and context capacity limits still apply. Explicit evidence_refs must equal allowed_evidence_refs, the current proof_id only. Never substitute artifact, observation or execution IDs for proof citations. Preserve inference versus assertion selection; neither diagnostics nor deterministic binding bypasses outer review or trusted verification."
+        system += " Keep content and reason concise, nonempty and without NUL. Obey the branch-specific Unicode character limits in output_contract; reference long evidence instead of copying it. Full-response and context capacity limits still apply. Explicit evidence_refs must equal allowed_evidence_refs, the current proof_id only. Never substitute artifact, observation or execution IDs for proof citations. Preserve inference versus assertion selection; neither diagnostics nor deterministic binding bypasses outer review or trusted verification."
+    if stage in {"fact_proposal", "fact_review", "inner_plan"}:
+        # Explain the same limits the frozen Schema enforces, including working-record alternatives.
+        limits = []
+        for branch in schema.get("anyOf", [schema]):
+            props = branch.get("properties", {})
+            kind = props.get("kind", {}).get("const", "response")
+            fields = {key: value["maxLength"] for key, value in props.items()
+                      if key in {"content", "reason", "refined_content"} and "maxLength" in value}
+            if fields:
+                limits.append({"branch": kind, "maximum_unicode_codepoints": fields})
+        if limits:
+            system += (" Text limits count Unicode code points, not UTF-8 bytes or tokens. "
+                "Keep all limited fields comfortably below their maxima, including on correction; "
+                "a correction must satisfy every field, not only the reported one. Never output diagnostic prose "
+                "inside a reason field. Current branch limits=" + json.dumps(limits, ensure_ascii=False))
     if stage == "intent_evaluation":
         system += " Keep reason concise, nonempty and without NUL; it has no per-field character limit. Full-response and context capacity limits still apply."
     if role.prompt_template.endswith('.v17') and stage in {'tree_planning', 'inner_complete'}:
@@ -488,8 +503,22 @@ def build_payload(envelope, role, *, context_loader=None):
             "Candidates are suggestions only. Read missing history instead of inventing it.")
     if stage == "progress_review" and json.loads(request.context_summary).get("d8_progress", {}).get("intent_execution_policy"):
         system += " Progress inconclusive may continue a concrete useful check; it is not an unknown execution. A strategic switch/abandon collects an inner end summary before termination."
+    if stage == "progress_review" and json.loads(request.context_summary).get("d8_progress", {}).get("intent_execution_policy"):
+        system += (" Compare the unchanged Intent goal and each completion criterion with all relevant evidence. "
+            "Meaningful work may still be off-goal or already sufficient. Name the specific remaining gap before continuing. "
+            "When coverage is sufficient or the next work belongs to another Intent, choose request_intent_resolution with "
+            "constraints=[] and exact evidence refs. This requests an inner end proposal, never directly succeeds or fails the Intent. "
+            "The inner and end reviewer must still justify the verdict; unrelated useful work is not progress on this goal.")
     if stage == "inner_plan" and rolling and rolling.get("stop_requested"):
-        system += " The outer requested strategy closure: submit failed with scoped counterevidence or inconclusive with a concise closure summary; no new execution is permitted in this handoff."
+        stop = rolling["stop_requested"]
+        if stop["decision"] == "request_intent_resolution":
+            system += (" End-proposal phase: no new Plan, tool execution or working record. Submit an evidence-bound "
+                "intent_resolution: succeeded requires effective formal support and goal coverage; otherwise justify failed or "
+                "inconclusive within observed scope. A request to summarize is not an instruction to declare failure. "
+                "When fact_candidate_allowed is true, you may nominate one important formal Fact from original evidence first; "
+                "a rejected candidate does not prove the Intent failed. History reads are available only when history_reads_allowed permits them; preserve the end-proposal reserve. No automatic budget increase or third correction.")
+        else:
+            system += " The outer requested strategy closure: submit failed with scoped counterevidence or inconclusive with a concise closure summary; no new execution is permitted in this handoff."
     from agent_core.intent_execution import working_schema
     if contract_version == 22 and stage in {"inner_plan", "fact_proposal"} and working_schema(request) is not None:
         system += (" You may return working_record with concise content and exact source evidence_refs to save an unreviewed "
@@ -521,7 +550,7 @@ def build_payload(envelope, role, *, context_loader=None):
             "Your reason is the concise accepted Intent result summary, not a new verified Fact.")
     evidence_context=json.loads(getattr(request,"history_context","{}") or "{}") if contract_version==22 and stage=="inner_plan" else {}
     if (contract_version==22 and stage=="inner_plan" and evidence_context.get("evidence_sources")
-            and not evidence_context.get("intent_execution",{}).get("stop_requested")):
+            and (not evidence_context.get("intent_execution",{}).get("stop_requested") or evidence_context["intent_execution"]["stop_requested"].get("fact_candidate_allowed"))):
         system += (" To record an important finding, submit fact_candidate with content, reason, evidence_refs and inferred. "
             "Choose exact refs from evidence_sources; MCP, HTTP and attachment observations are eligible. "
             "Use inferred=true for hypotheses. Tool success never creates a Fact automatically. "
@@ -541,7 +570,7 @@ def build_payload(envelope, role, *, context_loader=None):
     return {"model": role.model, "messages": [{"role": "system", "content": system},
              {"role": "user", "content": json.dumps(context, ensure_ascii=False, allow_nan=False)}],
             "response_format": {"type": "json_object"}, "stream": False,
-            "thinking": {"type": "enabled"}, "reasoning_effort": "high", "max_tokens": 32768}
+            "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
 
 
 class EstimatedCapacity:
@@ -564,11 +593,12 @@ class EstimatedCapacity:
         payload = build_payload(request, role, context_loader=getattr(self, 'context_loader', None))
         size = len(payload_bytes(payload))
         if policy == SCNET_V41_CAPACITY:
+            requested_output = payload.get("max_tokens", SCNET_V41_MAX_OUTPUT)
             if (role.model != "DeepSeek-V4.1-Flash"
                     or TRANSPORT["base_url"] != "https://api.scnet.cn/api/llm/v1"
-                    or type(payload.get("max_tokens")) is not int
-                    or not 0 < payload["max_tokens"] <= SCNET_V41_MAX_OUTPUT
-                    or payload["max_tokens"] > policy.output_reserve_units):
+                    or type(requested_output) is not int
+                    or not 0 < requested_output <= SCNET_V41_MAX_OUTPUT
+                    or requested_output > policy.output_reserve_units):
                 raise ValueError("d22_model_capacity_binding_mismatch")
         business = request.request
         identity = getattr(business, "model_request_id", None) or getattr(business, "review_id", None)
@@ -586,7 +616,7 @@ class EstimatedCapacity:
                 counting_method="conservative_utf8_bytes_plus_margin",
                 estimated_input_tokens=size + 4096,
                 context_window_tokens=policy.total_units,
-                requested_output_tokens=payload["max_tokens"],
+                requested_output_tokens=payload.get("max_tokens"),
                 output_reserve_tokens=policy.output_reserve_units,
                 model_max_output_tokens=SCNET_V41_MAX_OUTPUT)
         limit = policy.total_units - policy.output_reserve_units - 4096

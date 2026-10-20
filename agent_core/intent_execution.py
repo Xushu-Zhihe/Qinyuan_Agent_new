@@ -10,7 +10,11 @@ POLICY = "rolling_v1"
 
 
 def enabled(config):
-    return config.intent_execution_policy == POLICY
+    return config.intent_execution_policy in {POLICY, "continuous_v1"}
+
+
+def continuous(config):
+    return config.intent_execution_policy == "continuous_v1"
 
 
 def packet(request):
@@ -71,7 +75,7 @@ def resolution_schema(request):
     if facts and "complete_intent" in allowed:
         choices.insert(0, (["succeeded"], 1))
     if context["intent_execution"].get("stop_requested"):
-        choices = [(["failed", "inconclusive"], 0)]
+        choices = [(["failed", "inconclusive"], 0)] + ([(["succeeded"], 1)] if closure_only(request) and facts and "complete_intent" in allowed else [])
     return {"anyOf": [obj({"kind": {"type": "string", "const": "intent_resolution"},
         "outcome": {"type": "string", "enum": outcomes}, "reason": text(),
         "evidence_refs": {**array(source, 1), "uniqueItems": True},
@@ -95,7 +99,7 @@ def facts(app, intent_id):
 
 def validate_resolution(app, request, proposal):
     from agent_core.dual_llm_modeling import D3ProposalRejected
-    if packet(request)["intent_execution"].get("stop_requested") and proposal.outcome not in {"failed", "inconclusive"}:
+    if packet(request)["intent_execution"].get("stop_requested") and not closure_only(request) and proposal.outcome not in {"failed", "inconclusive"}:
         raise D3ProposalRejected("d22_strategy_stop_summary_required")
     available = visible_items(request)
     selected = checked_refs(list(proposal.evidence_refs), set(available))
@@ -137,7 +141,7 @@ def validate_resolution(app, request, proposal):
 def pending_stop(app, intent_id):
     reviews = [r for r in app.store.list_d3_review_applications(app.state.task_run.task_run_id)
                if r.intent_id == intent_id and not r.paused_gate
-               and r.decision in {"switch_sibling_intent", "abandon_current_intent"}]
+               and r.decision in {"switch_sibling_intent", "abandon_current_intent", "request_intent_resolution"}]
     if not reviews:
         return None
     review = reviews[-1]
@@ -153,9 +157,15 @@ def pending_stop(app, intent_id):
 
 
 def execution_context(app, intent_id):
-    return {"policy": POLICY, "review_contract": "candidate_subset_v1", "facts": [{"fact_id": f["fact_id"], "ref": f["ref"]}
+    notes = []
+    if continuous(app.config):
+        for row in app.store.list_d8_tree_records(app.state.task_run.task_run_id):
+            if row.intent_id == intent_id and row.kind == "suspended":
+                note = app.handoff.evidence.read("pause", row.record_id)
+                if note is not None:notes.append(note)
+    return {**({"technical_history": notes, "revisit_count": visits(app.store, app.state.task_run.task_run_id, intent_id)} if notes else {}), "policy": POLICY, "review_contract": "candidate_subset_v1", "facts": [{"fact_id": f["fact_id"], "ref": f["ref"]}
                                       for f in facts(app, intent_id)],
-        "stop_requested": pending_stop(app, intent_id),
+        "stop_requested": stop_request(app, intent_id),
         "goal_rule": "A local goal with observable completion criteria and explicit scope, not a predetermined action list.",
         "next_decision": "Continue with a Plan/tool, request a review, or propose an evidence-bound Intent resolution.",
         "stop_rule": "No new Fact and repeated responses do not prove saturation. Negative observations may increase coverage; prerequisites may enable later progress.",
@@ -279,7 +289,7 @@ def parse_evaluation(request, raw, policy):
 
 
 def close_stop_observation(app, intent_id):
-    if pending_stop(app, intent_id) is None:
+    if stop_request(app, intent_id) is None:
         return
     running = [p for p in app.state.plans if p.intent_id == intent_id and p.status.value == "running"]
     if not running:
@@ -291,6 +301,8 @@ def close_stop_observation(app, intent_id):
     else:
         proof = app.proof_store.read(app._id("proof/" + plan.plan_id))
     if proof is None:
+        if stop_request(app, intent_id)["decision"] == "request_intent_resolution":
+            return  # Finish this already admitted bounded Plan; do not open another one.
         raise D3RecoveryRequired("d22_stop_observation_unavailable")
     complete_observation(app, binding, proof)
 
@@ -348,6 +360,7 @@ async def resolve(app, request_id, intent_id, proposal, token):
     from qinyuan_core import get_logger
     get_logger("ctrl").info("intent.resolution", run=request.task_run_id, intent=intent_id,
         request=final.model_request_id, outcome=status, category="business_progress" if status == "continue" else "business_result")
+    await finish_budget_closure(app, token)
 
 
 def validate_record(app, request, record):
@@ -407,7 +420,10 @@ EVALUATION_ISSUES = {
 def pending_adjudication(store, evidence, output, task_id):
     """Derive a durable gate from completed review lineage; never dispatch or change state."""
     from agent_core.structured_output import format_stop_reason
+    config = store.load_d3_run_config(task_id)
+    handled = suspended_calls(store, task_id) if config is not None and continuous(config) else set()
     for op in store.list_d4_operations(task_id):
+        if op.start.operation_id in handled:continue
         if op.completion is None or op.application_ref is not None or op.start.role != "outer_planning" or op.start.category != "review":
             continue
         request = evidence.read("request", op.start.operation_id)
@@ -422,6 +438,10 @@ def pending_adjudication(store, evidence, output, task_id):
         result = evidence.read("result", op.start.operation_id)
         if result is None or result["outcome"] == "valid":
             continue
+        from agent_core.structured_output import transient_provider_result
+        if (config is not None and continuous(config) and request.get("correction_of_model_request_id") is None
+                and result["outcome"] == "model_error" and transient_provider_result(output, op.start.operation_id)):
+            continue  # Its single known-ended correction must be admitted before parking.
         diagnostic = output.read("diagnostic", op.start.operation_id)
         if (request.get("correction_of_model_request_id") is not None or result["outcome"] != "invalid"
                 or format_stop_reason(diagnostic) is not None):
@@ -511,3 +531,311 @@ def reconcile_working(app):
             request = app.conclusions.evidence.read_request(op.start.operation_id)
             parse_working(request, result["raw"])
             app.store.mark_d4_operation_applied(op.start.operation_id, app._id("working/" + op.start.operation_id))
+
+
+def closure_marker(app, intent_id):
+    if continuous(app.config):return None
+    return app.handoff.evidence.read("pause", app._id("budget-closure/" + intent_id))
+
+
+def budget_stop_reason(store, evidence, task_id):
+    """One small pause receipt per Intent; readonly callers never repair it."""
+    from agent_core.turn_modeling import stable_id
+    config = store.load_d3_run_config(task_id)
+    if config is not None and continuous(config):return None
+    intent_ids = {r.intent_id for r in store.list_d8_tree_records(task_id) if r.intent_id is not None}
+    for intent_id in sorted(intent_ids):
+        record = evidence.read("pause", stable_id(task_id, "d3/budget-stop/" + intent_id))
+        if record is not None:
+            if record != {"intent_id": intent_id, "reason": record.get("reason")} or record["reason"] not in {
+                    "d22_closure_budget_unavailable", "d22_closure_requires_more_budget", "d22_closure_completed_budget_stop"}:
+                raise D3RecoveryRequired("d22_budget_pause_changed")
+            return record["reason"]
+    return None
+
+
+def stop_for_budget(app, intent_id, reason):
+    app.handoff.evidence.save("pause", app._id("budget-stop/" + intent_id), {"intent_id": intent_id, "reason": reason})
+    from qinyuan_core import get_logger
+    get_logger("ctrl").info("budget.closure_stopped", intent=intent_id, reason=reason, category="resource_limit")
+    raise D3RecoveryRequired(reason)
+
+
+def closing_candidate_used(app, intent_id, marker):
+    if marker is None:
+        return False
+    for row in app.sessions.records(intent_id):
+        if app.conclusions.optional_failure(row.model_request_id) is not None:
+            request = app.sessions.evidence.read("request", row.model_request_id)
+            if request["request"]["stage"] == "inner_plan" and request["request"]["base_checkpoint_sequence"] >= marker["checkpoint_sequence"]:
+                return True
+    for row in app.store.list_d8_conclusions(app.state.task_run.task_run_id):
+        if row.intent_id == intent_id and row.plan_id is None:
+            request = app.sessions.evidence.read("request", row.proposal_request_id)
+            if request is not None and request["request"]["base_checkpoint_sequence"] >= marker["checkpoint_sequence"]:
+                return True
+    return False
+
+
+def closure_requirements(app, intent_id):
+    required = {"action": 2, "review": 2, "handoff_summary": 2}
+    marker = closure_marker(app, intent_id)
+    stop = pending_stop(app, intent_id)
+    if ((stop is None or stop["decision"] == "request_intent_resolution") and not facts(app, intent_id)
+            and not closing_candidate_used(app, intent_id, marker) and app.evidence_conclusions.catalog(intent_id)):
+        required["action"] += 2
+        required["fact_review"] = 2
+    return required
+
+
+def remaining_budget(app):
+    usage = app.store.d4_budget_usage(app.state.task_run.task_run_id)
+    used = dict(usage.category_counts)
+    return {k: limit - used.get(k, 0) for k, limit in app.config.d4_budget.category_limits.items()}
+
+
+def exploration_cost(app, intent_id):
+    # Bound one admitted capability path, including one possible periodic review/summary.
+    # Corrections consume starts, but not extra logical decisions in the four-decision window.
+    plans = [p for p in app.state.plans if p.intent_id == intent_id]
+    file_path = app.web is None or bool(app.config.authorization.attachment_indices)
+    steps = (2 if not plans else 1) if file_path else 0
+    return {"action": 2 * (2 + steps), "tool_dispatch": max(1, steps),
+            "fact_review": 2, "review": 2 * (steps + 2), "handoff_summary": 2,
+            **({"sha_observation": 1} if file_path else {})}
+
+
+def prepare_closure(app, intent_id):
+    if not enabled(app.config) or continuous(app.config):
+        return
+    # Complete/apply an already known decision before considering another exploration.
+    for call in app.store.list_d4_operations(app.state.task_run.task_run_id):
+        if call.completion is None or call.application_ref is not None or call.start.role != "inner_action":
+            continue
+        saved = app.sessions.evidence.read("request", call.start.operation_id)
+        result = app.model_evidence.read(call.start.operation_id)
+        if (saved is not None and saved["intent_id"] == intent_id and saved["request"]["stage"] == "inner_plan"
+                and call.start.base_checkpoint_sequence == app.state.latest_checkpoint.sequence
+                and result is not None):
+            return
+    marker = closure_marker(app, intent_id)
+    needed = closure_requirements(app, intent_id)
+    left = remaining_budget(app)
+    if any(left[k] < count for k, count in needed.items()):
+        stop_for_budget(app, intent_id, "d22_closure_budget_unavailable")
+    if marker is not None:
+        return
+    cost = exploration_cost(app, intent_id)
+    next_reserve = dict(needed)
+    if "fact_review" not in next_reserve and not facts(app, intent_id):
+        # A new observation may still yield no approved Fact. Preserve the option to nominate its saved evidence.
+        next_reserve.update(action=4, fact_review=2)
+    if any(left[k] < next_reserve.get(k, 0) + cost.get(k, 0) for k in set(next_reserve) | set(cost)):
+        app.handoff.evidence.save("pause", app._id("budget-closure/" + intent_id),
+            {"intent_id": intent_id, "checkpoint_sequence": app.state.latest_checkpoint.sequence})
+        from qinyuan_core import get_logger
+        get_logger("ctrl").info("budget.closure_requested", intent=intent_id, required=next_reserve,
+            remaining={k: left[k] for k in set(needed) | set(cost)}, category="resource_limit")
+
+
+def stop_request(app, intent_id):
+    stop = pending_stop(app, intent_id)
+    marker = closure_marker(app, intent_id) if enabled(app.config) else None
+    if marker is not None:
+        if marker != {"intent_id": intent_id, "checkpoint_sequence": marker.get("checkpoint_sequence")} or type(marker["checkpoint_sequence"]) is not int:
+            raise D3RecoveryRequired("d22_budget_closure_changed")
+        return {"review_id": app._id("budget-closure/" + intent_id), "decision": "request_intent_resolution",
+            "reason": "Remaining category budgets are reserved for a bounded end proposal, its review and necessary summary.",
+            "fact_candidate_allowed": (stop is None or stop["decision"] == "request_intent_resolution") and not closing_candidate_used(app, intent_id, marker) and not facts(app, intent_id),
+            "history_reads_allowed": remaining_budget(app)["action"] >= closure_requirements(app, intent_id)["action"] + 2,
+            **(stop if stop is not None and stop["decision"] != "request_intent_resolution" else {})}
+    if stop is not None and stop["decision"] == "request_intent_resolution":
+        stop["fact_candidate_allowed"] = not facts(app, intent_id)
+    return stop
+
+
+async def finish_budget_closure(app, token):
+    if not enabled(app.config) or continuous(app.config):
+        return
+    for row in app.store.list_d8_tree_records(app.state.task_run.task_run_id):
+        if row.kind not in {"succeeded", "failed", "inconclusive", "evaluation_continued"} or row.intent_id is None:
+            continue
+        marker = closure_marker(app, row.intent_id)
+        if marker is None or not row.inner_request_id:
+            continue
+        saved = app.sessions.evidence.read("request", row.inner_request_id)
+        stop = packet(saved["request"]).get("intent_execution", {}).get("stop_requested") or {}
+        if not stop or saved["request"]["base_checkpoint_sequence"] < marker["checkpoint_sequence"]:
+            continue
+        if row.kind == "evaluation_continued":
+            stop_for_budget(app, row.intent_id, "d22_closure_requires_more_budget")
+        await app.handoff.summarize(row.turn_id, token)
+        stop_for_budget(app, row.intent_id, "d22_closure_completed_budget_stop")
+
+
+def closure_only(request):
+    return (packet(request).get("intent_execution", {}).get("stop_requested") or {}).get("decision") == "request_intent_resolution"
+
+
+# Continuous scheduling keeps technical suspension separate from business verdicts.
+def visits(store, task_id, intent_id):
+    return sum(r.kind == "resumed" and r.intent_id == intent_id for r in store.list_d8_tree_records(task_id))
+
+
+def suspended_calls(store, task_id):
+    return {r.model_request_id for r in store.list_d8_tree_records(task_id)
+            if r.kind == "suspended" and r.model_request_id is not None}
+
+
+def retry_candidate(store, state, turn_id):
+    from agent_core.domain import IntentStatus
+    rows = store.list_d8_tree_records(state.task_run.task_run_id)
+    siblings = sorted((i for i in state.intents if i.turn_id == turn_id), key=lambda i: i.priority)
+    for index, item in enumerate(siblings[:-1]):
+        if item.status is not IntentStatus.SUSPENDED or visits(store, state.task_run.task_run_id, item.intent_id):
+            continue
+        next_item = siblings[index + 1]
+        if next_item.status not in {IntentStatus.FAILED, IntentStatus.INCONCLUSIVE, IntentStatus.ABANDONED, IntentStatus.SUSPENDED}:
+            continue
+        parked = next((n for n, r in enumerate(rows) if r.kind == "suspended" and r.intent_id == item.intent_id), None)
+        if parked is not None and any(r.intent_id == next_item.intent_id and r.kind in {
+                "failed", "inconclusive", "suspended"} for r in rows[parked + 1:]):
+            return item
+    return None
+
+
+def runnable_turns(store, state):
+    from agent_core.domain import IntentStatus, TurnStatus
+    rows = store.list_d8_tree_records(state.task_run.task_run_id)
+    def work(turn):
+        if retry_candidate(store, state, turn.turn_id) is not None:return True
+        for item in state.intents:
+            if item.turn_id != turn.turn_id:continue
+            if item.status in {IntentStatus.PENDING, IntentStatus.RUNNING}:return True
+            if item.status is IntentStatus.SUCCEEDED and not any(t.triggering_intent_id == item.intent_id for t in state.turns) and not any(
+                    r.kind == "expansion_exhausted" and r.intent_id == item.intent_id for r in rows):return True
+        # Fully resolved leaves still need their ordinary exhaustion/summary commit.
+        return not any(i.turn_id == turn.turn_id and i.status is IntentStatus.SUSPENDED for i in state.intents) and not any(
+            t.parent_turn_id == turn.turn_id and t.status is not TurnStatus.COMPLETED for t in state.turns)
+    return [t for t in state.turns if t.status in {TurnStatus.PENDING, TurnStatus.RUNNING} and work(t)]
+
+
+def validate_local_transition(store, mutation, state):
+    from agent_core.control_store import StorageError, UpsertIntent
+    from agent_core.domain import IntentStatus, ExecutionStatus
+    record = next(r for r in mutation.state_changes if hasattr(r, "kind"))
+    changes = [c for c in mutation.state_changes if isinstance(c, UpsertIntent)]
+    old = next((i for i in state.intents if i.intent_id == record.intent_id), None)
+    if (mutation.operation != {"suspended": "suspend_d8_intent", "resumed": "resume_d8_intent"}.get(record.kind)
+            or record.support_fact_id is not None or record.inner_request_id is not None
+            or not continuous(store.load_d3_run_config(mutation.task_run_id)) or old is None
+            or len(changes) != 1 or len(mutation.state_changes) != 2
+            or changes[0].intent_id != old.intent_id or record.turn_id != old.turn_id
+            or any(e.status is ExecutionStatus.RUNNING for e in state.executions)):
+        raise StorageError("d22_local_transition_scope_invalid")
+    if record.kind == "suspended":
+        if old.status is not IntentStatus.RUNNING or changes[0].status is not IntentStatus.SUSPENDED:
+            raise StorageError("d22_suspension_requires_running_intent")
+        if record.model_request_id:
+            op = store.load_d4_operation(record.model_request_id)
+            if op is None or op.completion is None or op.application_ref is not None or op.start.task_run_id != mutation.task_run_id:
+                raise StorageError("d22_suspension_result_unknown")
+    elif record.kind == "resumed":
+        expected = retry_candidate(store, state, old.turn_id)
+        if (old.status is not IntentStatus.SUSPENDED or changes[0].status is not IntentStatus.RUNNING
+                or expected is None or expected.intent_id != old.intent_id or record.model_request_id is not None):
+            raise StorageError("d22_revisit_not_available")
+    else:
+        raise StorageError("d22_local_transition_kind_invalid")
+
+
+def resume_local(app, intent):
+    from agent_core.control_store import UpsertIntent
+    from agent_core.domain import IntentStatus
+    from agent_core.handoff_contracts import D8TreeRecord
+    first = next(r for r in app.store.list_d8_tree_records(app.state.task_run.task_run_id)
+                 if r.kind == "suspended" and r.intent_id == intent.intent_id)
+    record = D8TreeRecord(app._id("revisit/" + first.record_id), app.state.task_run.task_run_id,
+        intent.turn_id, intent.intent_id, "resumed", None)
+    app.handoff._commit("resume_d8_intent", record, (UpsertIntent(intent.intent_id, intent.turn_id,
+        intent.description, intent.priority, intent.intent_type, IntentStatus.RUNNING),))
+
+
+def suspend_local(app, intent, error):
+    from agent_core.domain import IntentStatus, ExecutionStatus
+    from agent_core.dual_llm_modeling import D3ProposalRejected
+    from agent_core.control_store import UpsertIntent
+    from agent_core.handoff_contracts import D8TreeRecord
+    from agent_core.review import D2ReviewPaused
+    if not continuous(app.config) or intent.status is not IntentStatus.RUNNING:return False
+    if app.store.list_d4_unresolved_operations(app.state.task_run.task_run_id) or any(
+            e.status is ExecutionStatus.RUNNING for e in app.state.executions):return False
+    code = getattr(error, "code", None) or str(error)
+    context_failure = code.startswith("d8_context_paused:")
+    allowed = {"d22_awaiting_adjudication", "d8_progress_inconclusive", "d8_progress_repetitive",
+        "d8_model_output_truncated", "d8_model_output_budget_exhausted", "d8_model_format_rejected",
+        "d8_model_invalid", "d8_model_model_error", "d8_model_sensitive_rejected"}
+    if not context_failure and not isinstance(error, (D3ProposalRejected, D2ReviewPaused)) and code not in allowed:return False
+    identity = None
+    for op in (() if context_failure else reversed(app.store.list_d4_operations(app.state.task_run.task_run_id))):
+        if op.completion is None or op.application_ref is not None or op.start.role is None:continue
+        key = op.start.operation_id
+        saved = app.sessions.evidence.read("request", key) or app.handoff.evidence.read("request", key) or app.output_boundary.evidence.read("review-request", key)
+        if saved is None:
+            obj = app.conclusions.evidence.read_request(key)
+            saved = asdict(obj) if obj is not None else None
+        owner = (saved or {}).get("intent_id") or (saved or {}).get("observation", {}).get("intent_id")
+        if owner == intent.intent_id:
+            provider = app.output_boundary.evidence.read("provider-result", key)
+            transport_end = (provider or {}).get("transport", {}).get("transport_end")
+            if (provider or {}).get("transport", {}).get("http_status") in {401, 402, 403}:return False
+            model = app.model_evidence.read(key)
+            raw = model.raw if model is not None and isinstance(model.raw, dict) else {}
+            if (transport_end in {"timeout", "cancelled", "transport_error", "incomplete_response", "worker_lost", "unknown"}
+                    or raw.get("kind") in {"timed_out", "cancelled", "authentication_failed"}
+                    or str(raw.get("short_reason", "")).endswith(("http_401", "http_402", "http_403"))):
+                return False  # Scope is not safe to advance while the call outcome is unknown.
+            identity = key
+            break
+    if not context_failure and identity is None:return False
+    # No technical event is promoted to a business failure or verified Fact.
+    record_id = app._id(f"suspend/{intent.intent_id}/{visits(app.store, app.state.task_run.task_run_id, intent.intent_id)}")
+    note = {"intent_id": intent.intent_id, "reason": code if context_failure or code in allowed else "d22_local_model_failure",
+            "failed_request_id": identity, "identity": "technical_suspension_not_business_verdict"}
+    app.handoff.evidence.save("pause", record_id, note)
+    record = D8TreeRecord(record_id, app.state.task_run.task_run_id, intent.turn_id, intent.intent_id, "suspended", identity)
+    app.handoff._commit("suspend_d8_intent", record, (UpsertIntent(intent.intent_id, intent.turn_id,
+        intent.description, intent.priority, intent.intent_type, IntentStatus.SUSPENDED),))
+    from qinyuan_core import get_logger
+    get_logger("ctrl").info("intent.suspended", run=record.task_run_id, intent=intent.intent_id,
+        code=note["reason"], request=identity, category="technical_result")
+    return True
+
+
+def park_pending_adjudication(app):
+    from agent_core.domain import IntentStatus
+    if not continuous(app.config):return False
+    pending = pending_adjudication(app.store, app.handoff.evidence, app.output_boundary.evidence,
+                                   app.state.task_run.task_run_id)
+    if pending is None:return False
+    intent = next(i for i in app.state.intents if i.intent_id == pending["intent_id"])
+    return intent.status is IntentStatus.RUNNING and suspend_local(app, intent, D3RecoveryRequired(pending["reason"]))
+
+
+async def replan_root_once(app, receipts, token):
+    from agent_core.handoff_contracts import D8HandoffRequest
+    marker_id = app._id("continuous/root-replan")
+    done_id = app._id("continuous/root-replan-done")
+    if app.handoff.evidence.read("pause", done_id) is not None:return False
+    marker = app.handoff.evidence.read("pause", marker_id)
+    if marker is None:
+        app._root_replanning = True
+        try:request, _ = app.handoff._request("tree_planning", None)
+        finally:app._root_replanning = False
+        app.handoff.evidence.save("request", request.model_request_id, asdict(request))
+        marker = {"model_request_id": request.model_request_id}
+        app.handoff.evidence.save("pause", marker_id, marker)
+    request = D8HandoffRequest.from_dict(app.handoff.evidence.read("request", marker["model_request_id"]))
+    turn_id = await app.handoff.plan_expansion(None, None, receipts, token, frozen_request=request)
+    app.handoff.evidence.save("pause", done_id, {"model_request_id": request.model_request_id, "turn_id": turn_id})
+    return turn_id is not None

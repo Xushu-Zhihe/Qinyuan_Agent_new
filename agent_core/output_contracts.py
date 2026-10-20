@@ -5,6 +5,9 @@ from collections.abc import Mapping
 import json
 import math
 
+from agent_core.domain import MAX_FACT_CONTENT_LENGTH
+from agent_core.conclusion_contracts import MAX_CONCLUSION_REASON_LENGTH
+
 
 @dataclass(frozen=True)
 class D8OutputRequest:
@@ -119,15 +122,16 @@ def output_schema(request, *, contract_version=None):
         context = json.loads(request.history_context)
         branches = schema.get("anyOf", [schema])
         if context["intent_execution"].get("stop_requested"):
-            branches = [b for b in branches if b.get("properties", {}).get("kind", {}).get("const") in {"history_query", "history_details", "history_next_page"}]
+            branches = ([b for b in branches if b.get("properties", {}).get("kind", {}).get("const") in {"history_query", "history_details", "history_next_page"}]
+                        if context["intent_execution"]["stop_requested"].get("history_reads_allowed", True) else [])
         elif "probe" not in context["execution_feasibility"]["allowed_action_kinds"]:
             branches = [b for b in branches if b.get("properties", {}).get("kind", {}).get("const") in {"history_query", "history_details", "history_next_page", "conclusion_change"}]
         schema = {"anyOf": [*branches, *resolution_schema(request)["anyOf"]]}
     if contract_version==22 and stage=="inner_plan":
         packet=json.loads(getattr(request,"history_context","{}") or "{}")
         sources=packet.get("evidence_sources",[])
-        if sources and not packet.get("intent_execution",{}).get("stop_requested"):
-            candidate=tagged("fact_candidate",{"content":text(256),"reason":text(512),
+        if sources and (not packet.get("intent_execution",{}).get("stop_requested") or packet["intent_execution"]["stop_requested"].get("fact_candidate_allowed")):
+            candidate=tagged("fact_candidate",{"content":text(MAX_FACT_CONTENT_LENGTH),"reason":text(MAX_CONCLUSION_REASON_LENGTH),
                 "evidence_refs":{**array({"type":"string","enum":[s["ref"] for s in sources]},1,8),"uniqueItems":True},
                 "inferred":{"type":"boolean"}})
             schema={"anyOf":[*schema.get("anyOf",[schema]),candidate]}
@@ -238,17 +242,17 @@ def _base_output_schema(request, *, contract_version=None):
             evidence_refs = {**array({"type": "string", "enum": list(allowed)}, len(allowed), len(allowed)),
                              "uniqueItems": True}
         return stage, {"anyOf": [tagged("candidate", {
-            "content": text(256), "reason": text(512), "evidence_refs": evidence_refs,
+            "content": text(MAX_FACT_CONTENT_LENGTH), "reason": text(MAX_CONCLUSION_REASON_LENGTH), "evidence_refs": evidence_refs,
             "assertion": {"anyOf": [N, assertion]}}),
-            tagged("request_review", {"reason": text(512)})]}
+            tagged("request_review", {"reason": text(MAX_CONCLUSION_REASON_LENGTH)})]}
     if stage == "fact_review":
-        fields = {"decision": S, "reason": text(512)}
+        fields = {"decision": S, "reason": text(MAX_CONCLUSION_REASON_LENGTH)}
         if contract_version == 22:
             # Version 22: outer layer can output refined content and merged sources.
             # refined_content becomes the committed Fact content, so it must obey
             # the same 256 code-point ceiling as Fact.content; advertising 2048
             # let the model produce content the control store then refused.
-            fields["refined_content"] = {"type": ["string", "null"], "maxLength": 256}
+            fields["refined_content"] = {"type": ["string", "null"], "maxLength": MAX_FACT_CONTENT_LENGTH}
             fields["merged_sources"] = {
                 "type": ["array", "null"],
                 "items": {"type": "string"},
@@ -259,9 +263,9 @@ def _base_output_schema(request, *, contract_version=None):
         from agent_core.conclusion_contracts import D22FactReviewRequest
         if isinstance(request, D22FactReviewRequest):
             fields["decision"] = {"type": "string", "enum": ["accept", "reject", "insufficient"]}
-            options = [schema, obj({"decision": {"type": "string", "const": "no_new_information"}, "reason": text(512)})]
+            options = [schema, obj({"decision": {"type": "string", "const": "no_new_information"}, "reason": text(MAX_CONCLUSION_REASON_LENGTH)})]
             if request.existing_facts:
-                options.append(obj({"decision": {"type": "string", "const": "reuse"}, "reason": text(512),
+                options.append(obj({"decision": {"type": "string", "const": "reuse"}, "reason": text(MAX_CONCLUSION_REASON_LENGTH),
                     "reuse_fact_id": {"type": "string", "enum": [i["fact_id"] for i in request.existing_facts]}}))
             schema = {"anyOf": options}
         return stage, schema
@@ -370,7 +374,7 @@ def shape_issues(value, schema, path="$"):
     elif actual == "string":
         import re
         if len(value) > schema.get("maxLength", len(value)):
-            result.append(D8FormatIssue("string_too_long", path, "allowed_length", "string"))
+            result.append(D8FormatIssue("string_too_long", path, f"unicode_codepoints_le_{schema['maxLength']}", f"unicode_codepoints_{len(value)}"))
         if len(value) < schema.get("minLength", 0) or "pattern" in schema and re.search(schema["pattern"], value) is None:
             result.append(D8FormatIssue("string_value_invalid", path, "nonempty_text", "string"))
     elif actual in {"integer", "number"} and (value < schema.get("minimum", value) or value > schema.get("maximum", value)):

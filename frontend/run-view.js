@@ -3,7 +3,7 @@
 // Presentation only: no scheduling, state transitions, or success inference.
 const RunView = (() => {
   const get = (id) => document.getElementById(id);
-  const labels = { pending: "待执行", running: "运行中", awaiting_external_feedback: "等待外部反馈", achieved: "目标已确认", accepted: "已接受", unknown: "未知，待核查", conflict: "裁决冲突，待核查", not_evaluated: "未评估", succeeded: "已通过", completed: "已完成", failed: "失败", inconclusive: "无法判定", timed_out: "超时", cancelled: "已取消", rejected: "已拒绝", starting: "启动中", cancelling: "取消与清理中", cleaning: "资源清理中", cleanup_confirmed: "资源已清理", paused: "已暂停 · Sandbox 保留", recovery_required: "需要显式恢复", deadline_exceeded: "总时限已到", finished: "已结束" };
+  const labels = { pending: "待执行", suspended: "技术挂起", running: "运行中", awaiting_external_feedback: "等待外部反馈", achieved: "目标已确认", accepted: "已接受", unknown: "未知，待核查", conflict: "裁决冲突，待核查", not_evaluated: "未评估", succeeded: "已通过", completed: "已完成", failed: "失败", inconclusive: "无法判定", timed_out: "超时", cancelled: "已取消", rejected: "已拒绝", starting: "启动中", cancelling: "取消与清理中", cleaning: "资源清理中", cleanup_confirmed: "资源已清理", paused: "已暂停 · Sandbox 保留", recovery_required: "需要显式恢复", deadline_exceeded: "总时限已到", finished: "已结束" };
   const actionLabels = { probe: "提出下一次探测", complete_intent: "提出完成 Intent", abandon_intent: "放弃当前 Intent", candidate_flag: "提交待验证候选", awaiting_response: "等待模型响应", model_error: "模型错误", invalid_structure: "结构校验失败" };
   let current = null;
   let filter = null;
@@ -46,7 +46,7 @@ const RunView = (() => {
     const metrics = [metric("当前阶段", phase), metric("剩余总时限", remaining), metric("已验证观察", String(progress.verified_facts?.length || 0)), metric("待验证候选", String(progress.pending_candidates?.length || 0)), metric("目标评估", goal)];
     if (progress.protocol_version === 3) {
       metrics.push(metric("已提交 Checkpoint", String(progress.checkpoint?.sequence ?? "—")));
-      if (progress.budget?.status === "available") metrics.push(metric("操作预算", `${progress.budget.total_used} / ${progress.budget.total_limit}`));
+      if (progress.budget?.status === "available") metrics.push(metric("操作预算", progress.budget.total_limit == null ? `${progress.budget.total_used} 次（按 deadline）` : `${progress.budget.total_used} / ${progress.budget.total_limit}`));
     }
     get("run-summary").classList.toggle("v3", progress.protocol_version === 3);
     get("run-summary").replaceChildren(...metrics);

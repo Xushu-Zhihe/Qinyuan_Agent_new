@@ -293,10 +293,10 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict, *, read_store=N
             result["budget"] = {
                 "status": "available",
                 "policy_ref": usage.budget_policy_ref,
-                "total_limit": config.d4_budget.total,
+                "total_limit": None if config.intent_execution_policy == "continuous_v1" else config.d4_budget.total,
                 "total_used": usage.total_used,
                 "category_limits": {
-                    name: getattr(config.d4_budget, name)
+                    name: None if config.intent_execution_policy == "continuous_v1" else getattr(config.d4_budget, name)
                     for name, _ in usage.category_counts
                 },
                 "category_counts": dict(usage.category_counts),
@@ -495,7 +495,25 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                                 model_format_diagnostics.append(diagnostic)
                         # The ledger is in insertion order; clock timestamps can tie.
                         latest = operations[-1] if operations else None
-                        if latest is not None and latest.completion is not None and latest.completion.result_kind in {"rejected", "failed"}:
+                        from agent_core.intent_execution import suspended_calls
+                        handled_format = suspended_calls(store, declaration["task_run_id"]) if config.intent_execution_policy == "continuous_v1" else set()
+                        from agent_adapters.handoff_evidence import FileD8HandoffEvidence
+                        from agent_core.conclusion_contracts import conclusion_digest
+                        from agent_core.turn_modeling import stable_id
+                        sessions = FileD8HandoffEvidence(Path(directory) / "d8-sessions", create=False)
+                        for record in store.list_d8_decisions(declaration["task_run_id"]):
+                            if record.disposition != "technical_failure":
+                                continue
+                            data = sessions.read("decision", record.record_id)
+                            if data is None or conclusion_digest(data) != record.evidence_sha256:
+                                raise ValueError("d22_optional_failure_binding_changed")
+                            notice = data["observation"].get("optional_conclusion_failure")
+                            if (notice is None or notice.get("proposal_request_id") != record.model_request_id
+                                    or notice != sessions.read("pause", stable_id(record.task_run_id,
+                                        "d8/optional-format/" + record.model_request_id))):
+                                raise ValueError("d22_optional_failure_binding_changed")
+                            handled_format.add(notice["failed_request_id"])
+                        if latest is not None and latest.start.operation_id not in handled_format and latest.application_ref is None and latest.completion is not None and latest.completion.result_kind in {"rejected", "failed"}:
                             diagnostic = next((row for row in model_format_diagnostics
                                                if row["model_request_id"] == latest.start.operation_id), None)
                             if diagnostic is not None:
@@ -589,6 +607,10 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                         phase = "evaluation_evidence"
                         from agent_core.intent_execution import pending_adjudication
                         adjudication = pending_adjudication(store, evaluations.handoff, evaluations.output, declaration["task_run_id"])
+                        from agent_core.intent_execution import budget_stop_reason
+                        budget_pause = budget_stop_reason(store, evaluations.handoff, declaration["task_run_id"])
+                        if budget_pause is not None:
+                            known_model_failure = budget_pause
                         business_rows.extend(evaluations.projection(store.list_d4_operations(declaration["task_run_id"])))
                         from agent_core.completion_evaluation import check_candidate_task
                         d8_unresolved |= check_candidate_task(config,

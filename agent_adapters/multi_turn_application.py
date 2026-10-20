@@ -111,7 +111,7 @@ from agent_core.review_contracts import (
     D2ReviewRequest,
     D2ReviewScope,
 )
-from agent_core.runtime import TaskRunStatus
+from agent_core.runtime import TaskRunStatus, TERMINAL_STATUSES
 from agent_core.sqlite_control_store import SqliteControlStore
 from agent_core.turn_modeling import digest, stable_id
 
@@ -982,6 +982,11 @@ class D3Application:
             from agent_core.intent_execution import pending_adjudication
             if pending_adjudication(self.store, self.handoff.evidence, self.output_boundary.evidence, self.state.task_run.task_run_id):
                 raise D3RecoveryRequired("d22_awaiting_adjudication")
+        if self.config.intent_execution_policy:
+            from agent_core.intent_execution import budget_stop_reason
+            reason = budget_stop_reason(self.store, self.handoff.evidence, self.state.task_run.task_run_id)
+            if reason is not None:
+                raise D3RecoveryRequired(reason)
         if self._dispatch_stopped():
             raise D3RecoveryRequired("d3_dispatch_stopped")
         if self._d7_task_has_feedback_conflict(self.state.task_run.task_run_id):
@@ -990,6 +995,8 @@ class D3Application:
             self.state.task_run.task_run_id
         ):
             if application.paused_gate:
+                from agent_core.intent_execution import continuous, suspended_calls
+                if continuous(self.config) and application.review_id in suspended_calls(self.store, self.state.task_run.task_run_id):continue
                 raise D3RecoveryRequired(application.pause_reason or "d3_review_paused")
         if self.revisions is not None and not allow_conclusion_repair:
             self.revisions.check_required()
@@ -1162,7 +1169,8 @@ class D3Application:
                 return self.result("d5_redaction_configuration_unavailable", recovery_required=True)
             self.store.reconcile_d4_control_commit_audit(task_run_id)
             if self.handoff is not None and self.output_boundary is not None and self.state.task_run.status is TaskRunStatus.RUNNING and not token.is_cancelled:
-                from agent_core.intent_execution import pending_adjudication
+                from agent_core.intent_execution import pending_adjudication, park_pending_adjudication
+                park_pending_adjudication(self)
                 if pending_adjudication(self.store, self.handoff.evidence, self.output_boundary.evidence, task_run_id):
                     stopped = self._settle_stoppage()
                     return self.result(stopped or "d22_awaiting_adjudication", recovery_required=(
@@ -1579,6 +1587,11 @@ class D3Application:
                 name += f"/after-revision/{count}"
         if self.config.intent_execution_policy and stage == "inner_plan":
             name += f"/after-decision/{len(self.sessions.records(context.intent_id))}"
+        if self.config.intent_execution_policy == "continuous_v1" and stage != "outer_turn":
+            from agent_core.intent_execution import visits
+            actor = getattr(context, "intent_id", None) or getattr(getattr(context, "plan_binding", None), "intent_id", None)
+            visit = visits(self.store, task_id, actor)
+            if visit:name += f"/revisit/{visit}"
         request_id = self._id(name)
         prior = self.store.load_d3_operation(request_id)
         role = (
@@ -2325,7 +2338,8 @@ class D3Application:
         review_id: str | None = None,
     ) -> None:
         if self.config.intent_execution_policy:
-            from agent_core.intent_execution import close_stop_observation
+            from agent_core.intent_execution import close_stop_observation, prepare_closure
+            prepare_closure(self, intent_id)
             close_stop_observation(self, intent_id)
         if self.mcp is not None:
             self._check_dispatch()
@@ -2472,9 +2486,10 @@ class D3Application:
                 self.inner.reject(request_id, "d3_plan_template_or_source_unavailable")
                 raise D3ProposalRejected("d3_plan_template_or_source_unavailable")
         else:
-            request_id, proposal = await self.inner.propose(
-                request, token, refresh=refresh, validate=validate
-            )
+            decision = await self._propose_inner_plan(request, token, refresh=refresh, validate=validate)
+            if decision is None:
+                return
+            request_id, proposal = decision
         from agent_core.dual_llm_modeling import D8HistoryReadAction
         if isinstance(proposal, D8ConclusionChange):
             await self.revisions.review(proposal, intent_id, request_id,
@@ -2548,7 +2563,9 @@ class D3Application:
         if output.decision == "replan_current_intent":
             await self._new_plan(intent_id, token, review_id=review_id)
             return True
-        if self.config.intent_execution_policy and output.decision in {"switch_sibling_intent", "abandon_current_intent"}:
+        if self.config.intent_execution_policy and output.decision in {"switch_sibling_intent", "abandon_current_intent", "request_intent_resolution"}:
+            if output.decision == "request_intent_resolution" and any(p.intent_id == intent_id and p.status is PlanStatus.RUNNING for p in self.state.plans):
+                return False
             await self._new_plan(intent_id, token)
             return True
         if output.decision == "switch_sibling_intent" or (
@@ -2635,6 +2652,18 @@ class D3Application:
             ),
             self.clock,
         )
+
+    async def _propose_inner_plan(self, request, token, *, refresh, validate):
+        try:
+            return await self.inner.propose(request, token, refresh=refresh, validate=validate)
+        except D3ProposalRejected as exc:
+            identity = exc.model_request_id
+            if not self.config.intent_execution_policy or identity is None or self.conclusions.optional_format(identity) is None:
+                raise
+            self.conclusions.record_optional_failure(identity, identity)
+            self.conclusions.finish_optional_failure(identity)
+            self.sessions.reconcile()
+            return None
 
     def _reviewable_action_rejection(
         self, error: D3ProposalRejected, fallback_request_id: str
@@ -2767,18 +2796,13 @@ class D3Application:
                 or action.conditions != conditions
             ):
                 raise D3ProposalRejected("d3_fixed_probe_rejected")
-            try:
-                self.validator._allowed(
-                    plan_binding.task_run_id,
-                    turn.turn_id,
-                    plan_binding.intent_id,
-                    "probe",
-                    action.timeout_seconds,
-                )
-            except D3RecoveryRequired as exc:
-                if "rejected_by_review_constraint" in str(exc):
-                    raise D3ProposalRejected(str(exc)) from exc
-                raise
+            self.validator._allowed(
+                plan_binding.task_run_id,
+                turn.turn_id,
+                plan_binding.intent_id,
+                "probe",
+                action.timeout_seconds,
+            )
 
         try:
             if self.config.d4_budget is None:
@@ -2941,7 +2965,19 @@ class D3Application:
             self._check_dispatch()
             if self.sessions is not None and await self.sessions.before_decision(binding.intent_id, receipts, token):
                 return True
-            proposal_id, result = await self.conclusions.propose(proof.proof_id, token)
+            from agent_core.intent_execution import stop_request, complete_observation
+            if (stop_request(self, binding.intent_id) or {}).get("decision") == "request_intent_resolution":
+                complete_observation(self, binding, proof)
+                return False
+            from agent_core.conclusion_review import OptionalConclusionFormatError
+            try:
+                proposal_id, result = await self.conclusions.propose(proof.proof_id, token)
+            except OptionalConclusionFormatError as exc:
+                self.conclusions.record_optional_failure(exc.proposal_id, exc.request_id)
+                complete_observation(self, binding, proof)
+                self.conclusions.finish_optional_failure(exc.proposal_id)
+                self.sessions.reconcile()
+                return False
             from agent_core.intent_execution import WorkingRecord, complete_observation, apply_working
             if isinstance(result, WorkingRecord):
                 complete_observation(self, binding, proof)
@@ -3156,18 +3192,13 @@ class D3Application:
                 candidate.action, CompleteIntentAction
             ) or candidate.action.fact_ids != (fact_id,):
                 raise D3ProposalRejected("d3_completion_fact_rejected")
-            try:
-                self.validator._allowed(
-                    self.state.task_run.task_run_id,
-                    intent.turn_id,
-                    intent_id,
-                    "complete_intent",
-                    None,
-                )
-            except D3RecoveryRequired as exc:
-                if "rejected_by_review_constraint" in str(exc):
-                    raise D3ProposalRejected(str(exc)) from exc
-                raise
+            self.validator._allowed(
+                self.state.task_run.task_run_id,
+                intent.turn_id,
+                intent_id,
+                "complete_intent",
+                None,
+            )
 
         try:
             if self.config.d4_budget is None:
@@ -3289,7 +3320,14 @@ class D3Application:
             raise D3RecoveryRequired("d3_tail_review_not_read_only")
 
     async def _run_tree(self, token: CancellationToken) -> D3Result:
-        from agent_core.intent_execution import pending_adjudication
+        if self.config.intent_execution_policy:
+            from agent_core.intent_execution import finish_budget_closure, budget_stop_reason
+            reason = budget_stop_reason(self.store, self.handoff.evidence, self.state.task_run.task_run_id)
+            if reason is not None:
+                self._check_dispatch()
+            await finish_budget_closure(self, token)
+        from agent_core.intent_execution import pending_adjudication, park_pending_adjudication
+        park_pending_adjudication(self)
         if self.config.intent_execution_policy and pending_adjudication(self.store, self.handoff.evidence, self.output_boundary.evidence, self.state.task_run.task_run_id):
             self._check_dispatch()
         if self.answers is not None and not token.is_cancelled:
@@ -3312,15 +3350,29 @@ class D3Application:
             exhausted = any(r.kind == "expansion_exhausted" and r.turn_id is None
                             for r in self.store.list_d8_tree_records(self.state.task_run.task_run_id))
             if exhausted:
-                return self.result("search_exhausted")
-            await self.handoff.plan_expansion(None, None, receipts, token)
+                if self.config.intent_execution_policy == "continuous_v1":
+                    from agent_core.intent_execution import replan_root_once
+                    if not await replan_root_once(self, receipts, token):return self.result("d22_waiting_for_direction")
+                else:return self.result("search_exhausted")
+            if not exhausted:await self.handoff.plan_expansion(None, None, receipts, token)
         while True:
             self._check_dispatch()
             records = self.store.list_d8_tree_records(self.state.task_run.task_run_id)
             active = [t for t in self.state.turns if t.status in {TurnStatus.PENDING, TurnStatus.RUNNING}]
+            if self.config.intent_execution_policy == "continuous_v1":
+                from agent_core.intent_execution import runnable_turns, retry_candidate, resume_local
+                active = runnable_turns(self.store, self.state)
             if not active:
+                if self.config.intent_execution_policy == "continuous_v1":
+                    from agent_core.intent_execution import replan_root_once
+                    if await replan_root_once(self, receipts, token):continue
+                    return self.result("d22_waiting_for_direction")
                 return self.result("search_exhausted")
             turn = max(active, key=lambda t: t.sequence)
+            if self.config.intent_execution_policy == "continuous_v1":
+                revisit = retry_candidate(self.store, self.state, turn.turn_id)
+                if revisit is not None:
+                    resume_local(self, revisit)
             current = next((i for i in self.state.intents if i.turn_id == turn.turn_id and i.status is IntentStatus.RUNNING), None)
             if current is None:
                 unfinished = next((i for i in sorted(self.state.intents, key=lambda i: i.priority)
@@ -3345,27 +3397,37 @@ class D3Application:
                 if turn.parent_turn_id:
                     await self.handoff.summarize(turn.parent_turn_id, token)
                 continue
-            plans = [p for p in self.state.plans if p.intent_id == current.intent_id]
-            if not plans:
-                turn_binding = self.store.load_d3_turn_binding(turn.turn_id)
-                sources = ((turn_binding.authorization_id, turn_binding.proposal_request_id) if self.web is not None
-                           else (turn_binding.import_id, turn_binding.proposal_request_id))
-                review_id, output = self._review(turn.turn_id, current.intent_id, "turn_start", None, sources)
-                if await self._route(review_id, output, current.intent_id, receipts, token):
-                    continue
+            try:
+                await self._drive_tree_intent(current, receipts, token)
+            except (D3RecoveryRequired, D3ProposalRejected, D2ReviewPaused) as exc:
+                from agent_core.intent_execution import suspend_local
+                live = next(i for i in self.state.intents if i.intent_id == current.intent_id)
+                if suspend_local(self, live, exc):continue
+                raise
+
+    async def _drive_tree_intent(self, current, receipts, token):
+        turn = next(t for t in self.state.turns if t.turn_id == current.turn_id)
+        plans = [p for p in self.state.plans if p.intent_id == current.intent_id]
+        if not plans:
+            turn_binding = self.store.load_d3_turn_binding(turn.turn_id)
+            sources = ((turn_binding.authorization_id, turn_binding.proposal_request_id) if self.web is not None
+                       else (turn_binding.import_id, turn_binding.proposal_request_id))
+            review_id, output = self._review(turn.turn_id, current.intent_id, "turn_start", None, sources)
+            if await self._route(review_id, output, current.intent_id, receipts, token):
+                return
+            await self._new_plan(current.intent_id, token)
+            return
+        plan = plans[-1]
+        binding = self.store.load_d3_plan_binding(plan.plan_id)
+        if plan.status is PlanStatus.RUNNING:
+            await self._run_plan(binding, receipts, token)
+        elif plan.status is PlanStatus.COMPLETED:
+            if self.config.intent_execution_policy:
                 await self._new_plan(current.intent_id, token)
-                continue
-            plan = plans[-1]
-            binding = self.store.load_d3_plan_binding(plan.plan_id)
-            if plan.status is PlanStatus.RUNNING:
-                await self._run_plan(binding, receipts, token)
-            elif plan.status is PlanStatus.COMPLETED:
-                if self.config.intent_execution_policy:
-                    await self._new_plan(current.intent_id, token)
-                else:
-                    await self._complete_intent(current.intent_id, receipts, token)
             else:
-                raise D3RecoveryRequired("d8_current_plan_not_usable")
+                await self._complete_intent(current.intent_id, receipts, token)
+        else:
+            raise D3RecoveryRequired("d8_current_plan_not_usable")
 
     async def _run(self, token: CancellationToken) -> D3Result:
         if self.handoff is not None:
@@ -3481,7 +3543,29 @@ class D3Application:
                 continue
         raise D3RecoveryRequired("d3_internal_transition_limit")
 
+    async def _wait_continuation(self, token):
+        # The per-dispatch lock is released while waiting for recovery/verification.
+        import asyncio
+        remaining = self.state.task_run.deadline_at - self.clock()
+        if remaining > 0 and not token.is_cancelled:await asyncio.sleep(min(1.0, remaining))
+
     async def run(self, token: CancellationToken) -> D3Result:
+        if self.config.intent_execution_policy != "continuous_v1":return await self._run_once(token)
+        waiting_reason = None
+        while True:
+            result = await self._run_once(token)
+            if self.state.task_run.status in TERMINAL_STATUSES or token.is_cancelled:return result
+            if self.clock() >= self.state.task_run.deadline_at:
+                return replace(result, stop_reason="task_run_deadline_exceeded")
+            if result.stop_reason != waiting_reason:
+                from qinyuan_core import get_logger
+                get_logger("ctrl").info("task.waiting", run=self.state.task_run.task_run_id,
+                    code=result.stop_reason, category="technical_wait" if result.recovery_required else "strategy_wait")
+                waiting_reason = result.stop_reason
+            await self._wait_continuation(token)
+            self.controller.reload_state()
+
+    async def _run_once(self, token: CancellationToken) -> D3Result:
         with run_lock(self.directory):
             self._token = token
             try:

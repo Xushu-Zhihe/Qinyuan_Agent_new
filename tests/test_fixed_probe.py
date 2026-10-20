@@ -78,6 +78,7 @@ def test_bad_choice_is_safely_corrected_once(tmp_path, monkeypatch, failure):
     size = [e for e in seen if e.request.stage == 'inner_size']
     assert len(size) == 2 and size[1].correction is not None
     assert size[1].correction['issues']
+    assert size[1].correction['fixed_probe_policy']['max_timeout_seconds'] == size[0].request.context.max_timeout_seconds
     output = FileD8OutputEvidence(directory / 'd8-output', create=False)
     assert output.read('fixed-probe-binding', size[0].request.model_request_id) is None
     assert output.read('fixed-probe-binding', size[1].request.model_request_id)

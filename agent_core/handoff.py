@@ -512,10 +512,18 @@ class HandoffContext:
                         [i.ref for i in items if i not in chosen])
         return tuple(chosen), tuple(i for i in items if i not in chosen), result
 
+    def _new_root_directions(self, request, result):
+        policy = json.loads(request.prior_summary).get("continuous_root_replan")
+        if policy is not None and result.proposal is not None:
+            prior = {" ".join(value.split()).casefold() for value in policy["previous_directions"]}
+            if any(" ".join(item.description.split()).casefold() in prior for item in result.proposal.intents):
+                raise ValueError("d22_root_direction_already_attempted")
+        return result
+
     def _parse(self, request, raw):
         if self.app.web is not None and request.stage == 'tree_planning':
             from agent_core.http_policy import planning
-            return planning(request, raw, self.app.revisions)
+            return self._new_root_directions(request, planning(request, raw, self.app.revisions))
         refs = {i.ref for i in request.history}
         if request.stage == "handoff_summary":
             candidate = D8SummaryCandidate.parse(raw, refs, request.capacity)
@@ -572,7 +580,7 @@ class HandoffContext:
                                        maximum=None if self.app.config.contract_version == 22 else 2)
         if parsed.attachment_index not in self.app.config.authorization.attachment_indices:
             raise ValueError("d8_planning_attachment_unauthorized")
-        return D8PlanningResult(parsed, tuple(dependencies), tuple(rejected))
+        return self._new_root_directions(request, D8PlanningResult(parsed, tuple(dependencies), tuple(rejected)))
 
     def _known_call(self, request):
         if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
@@ -704,6 +712,10 @@ class HandoffContext:
         if stage == "tree_planning" and intent_id and self.app.sessions is not None:
             suggestions = self.app.sessions.next_suggestions(intent_id)
         selected, omitted, packet = self.select(stage, turn_id, intent_id, support_fact_id)
+        if stage == "tree_planning" and getattr(self.app, "_root_replanning", False):
+            packet["continuous_root_replan"] = {
+                "previous_directions": [i.description for i in self.state.intents],
+                "rule": "This is the sole continuation root. Propose materially different authorized directions using preserved evidence, or explicitly return exhausted. Do not repeat an old direction with only different tools or parameters."}
         if self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22} and stage == "intent_evaluation":
             from agent_core.completion_evaluation import freeze_evaluation_policy
             packet["s4_evaluation_policy"] = freeze_evaluation_policy(
@@ -727,6 +739,7 @@ class HandoffContext:
         latest, _ = self._latest_summary()
         global_hint = latest.record_id if latest is not None and latest.turn_id != turn_id else None
         name = f"{stage}/{turn_id}/{intent_id}/{conclusion_digest([asdict(i) for i in selected])}/{version.version}/{global_hint}"
+        if stage == "tree_planning" and getattr(self.app, "_root_replanning", False):name += "/root-replan-once"
         request_id = self._id(name)
         saved = self.evidence.read("request", request_id)
         if saved is not None:
@@ -837,7 +850,9 @@ class HandoffContext:
                     "d8_provider_payment_required", "d8_provider_auth_failed"}:
                 # The known response and completion are durable before stopping.
                 raise D3RecoveryRequired(result["reason"])
-            if result["outcome"] != "invalid" or attempt == 1:
+            technical_retry = (result["outcome"] == "model_error" and self.app.output_boundary is not None
+                               and self.app.output_boundary.retryable_technical_failure(current))
+            if (result["outcome"] != "invalid" and not technical_retry) or attempt == 1:
                 _trace("call.return_none", stage=current.stage, attempt=attempt, outcome=result["outcome"])
                 return current, None
             correction_id = self._id(f"correction/{request.model_request_id}")
@@ -906,7 +921,7 @@ class HandoffContext:
         self._commit("append_d8_handoff", record)
         return record
 
-    async def plan_expansion(self, parent_turn_id, trigger_id, receipts, token):
+    async def plan_expansion(self, parent_turn_id, trigger_id, receipts, token, *, frozen_request=None):
         support = None
         if parent_turn_id:
             await self.summarize(parent_turn_id, token)
@@ -917,7 +932,8 @@ class HandoffContext:
             support = successes[0].support_fact_id
             if self.app.revisions is not None:
                 support = self.app.revisions.parent_fact(trigger_id, support)
-        request, _ = self._request("tree_planning", parent_turn_id, trigger_id, support)
+        request = frozen_request
+        if request is None:request, _ = self._request("tree_planning", parent_turn_id, trigger_id, support)
         final, planned = await self.call(request, token)
         if not isinstance(planned, D8PlanningResult):
             raise D3RecoveryRequired("d8_planning_failed_not_exhausted")
@@ -1077,6 +1093,16 @@ class HandoffContext:
             if frozen != self.history():
                 raise D3RecoveryRequired("d8_summary_source_snapshot_changed")
             return
+        if record.kind in {"suspended", "resumed"}:
+            from agent_core.intent_execution import validate_local_transition
+            validate_local_transition(self.store, mutation, state)
+            if record.kind == "suspended":
+                note = self.evidence.read("pause", record.record_id)
+                if (note is None or note.get("intent_id") != record.intent_id
+                        or note.get("failed_request_id") != record.model_request_id
+                        or note.get("identity") != "technical_suspension_not_business_verdict"):
+                    raise D3RecoveryRequired("d22_suspension_evidence_changed")
+            return
         if record.model_request_id:
             raw_request = self.evidence.read("request", record.model_request_id)
             if raw_request is None:
@@ -1090,6 +1116,12 @@ class HandoffContext:
             if any(current.get(i.ref) != i for i in request.history):
                 raise D3RecoveryRequired("d8_tree_source_changed")
             if record.kind == "registration":
+                if state.turns and request.turn_id is None:
+                    marker = self.evidence.read("pause", self.app._id("continuous/root-replan"))
+                    contract = self.app.output_boundary.evidence.read("contract", record.model_request_id)
+                    if (self.app.config.intent_execution_policy != "continuous_v1" or marker is None
+                            or contract is None or contract["root_request_id"] != marker["model_request_id"]):
+                        raise D3RecoveryRequired("d22_root_replan_binding_changed")
                 if not isinstance(parsed, D8PlanningResult) or parsed.proposal is None:
                     raise D3RecoveryRequired("d8_registration_has_no_candidates")
                 change = next(c for c in mutation.state_changes if isinstance(c, UpsertTurn))
@@ -1453,6 +1485,9 @@ class HandoffContext:
     def validate_read_action(self, request, action):
         import json
         packet = json.loads(request.history_context)
+        if (packet.get("intent_execution", {}).get("stop_requested") or {}).get("history_reads_allowed") is False:
+            from agent_core.dual_llm_modeling import D3ProposalRejected
+            raise D3ProposalRejected("d22_closure_history_not_allowed")
         visible = {i["ref"] for i in packet["items"]}
         visible.update(json.loads(getattr(request, "session_context", "{}") or "{}").get("compaction", {}).get("omitted_decision_refs", []))
         for old in packet["retrieved"]:

@@ -284,7 +284,7 @@ class HttpCapability:
         prior=[p for p in app.state.plans if p.intent_id==intent_id]
         continuation = (app.config.contract_version == 22 and prior and
             self.store.load_d3_plan_result(prior[-1].plan_id) is not None and
-            self.store.load_d3_plan_result(prior[-1].plan_id).outcome == 'no_new_information')
+            self.store.load_d3_plan_result(prior[-1].plan_id).outcome == 'no_new_information' and review_id is None)
         rolling = bool(app.config.intent_execution_policy)
         if len(prior)>=2 and not continuation and not rolling:raise D3RecoveryRequired('d20_http_plan_limit_reached')
         turn=self.store.load_d3_turn_binding(intent.turn_id)
@@ -332,7 +332,9 @@ class HttpCapability:
                 app.validator._allowed(self.task.task_run_id, intent.turn_id, intent_id, 'probe', maximum)
             else:
                 raise D3RecoveryRequired('d20_http_plan_proposal_invalid')
-        request_id,proposal=await app.inner.propose(request,token,refresh=refresh,validate=validate)
+        decision=await app._propose_inner_plan(request,token,refresh=refresh,validate=validate)
+        if decision is None:return
+        request_id,proposal=decision
         from agent_core.conclusion_revision_contracts import D8ConclusionChange
         from agent_core.dual_llm_modeling import D8HistoryReadAction
         if isinstance(proposal,D8ConclusionChange):

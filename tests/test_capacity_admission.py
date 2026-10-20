@@ -30,13 +30,15 @@ def test_confirmed_profile_is_new22_only_and_legacy_is_retained(monkeypatch, tmp
 
 
 @pytest.mark.parametrize("overshoot", [-1, 0, 1])
-def test_full_request_boundary_accounts_for_output_and_margin(monkeypatch, overshoot):
+@pytest.mark.parametrize("explicit", [False, True])
+def test_full_request_boundary_accounts_for_output_and_margin(monkeypatch, overshoot, explicit):
     role = roles.role_config("inner_action")
     role = replace(role, model="DeepSeek-V4.1-Flash")
     monkeypatch.setitem(roles.TRANSPORT, "base_url", "https://api.scnet.cn/api/llm/v1")
     policy = roles.SCNET_V41_CAPACITY
     payload = dict(model=role.model, messages=[dict(role="system", content="rule"),
-        dict(role="user", content="{}")], max_tokens=32768)
+        dict(role="user", content="{}")])
+    if explicit:payload["max_tokens"] = 32768
     limit = policy.total_units - policy.output_reserve_units - 4096
     payload["padding"] = "x" * (limit - len(roles.payload_bytes({**payload, "padding": ""})) + overshoot)
     monkeypatch.setattr(roles, "build_payload", lambda *a, **k: payload)
@@ -45,8 +47,9 @@ def test_full_request_boundary_accounts_for_output_and_margin(monkeypatch, overs
     assert capacity.fits(envelope, policy) is (overshoot <= 0)
     assert capacity.last_measurement["input_tokens"] is None
     assert capacity.last_measurement["estimated_input_tokens"] == len(roles.payload_bytes(payload)) + 4096
-    assert capacity.last_measurement["output_reserve_tokens"] == 32768
-    assert payload["max_tokens"] == 32768
+    assert capacity.last_measurement["output_reserve_tokens"] == roles.SCNET_V41_MAX_OUTPUT
+    assert capacity.last_measurement["requested_output_tokens"] == (32768 if explicit else None)
+    assert ("max_tokens" in payload) is explicit
 
 
 def test_previously_paused_request_size_can_pass_without_dropping_context(monkeypatch):

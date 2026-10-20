@@ -34,6 +34,7 @@ class TurnStatus(StrEnum):
 
 class IntentStatus(StrEnum):
     PENDING = "pending"
+    SUSPENDED = "suspended"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"

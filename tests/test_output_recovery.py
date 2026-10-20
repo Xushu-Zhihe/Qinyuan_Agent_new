@@ -3,6 +3,7 @@ import asyncio
 import json
 import pytest
 from test_http import http_case
+from test_output import output_case
 from test_intent_execution import install
 from agent_core.output_contracts import D8ModelResponse
 
@@ -87,7 +88,7 @@ def test_new_shared_payload_and_legacy_frozen_request_remain_separate(http_case,
     original = build_payload(legacy, role, context_loader=loader)
     assert isinstance(json.loads(original["messages"][1]["content"])["history_context"], str)
     assert len(payload_bytes(projected)) < len(payload_bytes(original))
-    assert projected["max_tokens"] == original["max_tokens"] == 32768
+    assert "max_tokens" not in projected and "max_tokens" not in original
     assert projected["thinking"] == original["thinking"]
     assert json.dumps(envelope.output_contract) == before
     capacity = c.app.handoff.capacity_port
@@ -119,3 +120,378 @@ def test_new_shared_payload_and_legacy_frozen_request_remain_separate(http_case,
     correction = replace(envelope.request, model_request_id=str(uuid4()),
                          correction_of_model_request_id=identity)
     assert "input_projection" not in boundary._contract(correction)[0].output_contract
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+@pytest.mark.parametrize("stage", ["fact_proposal", "fact_review"])
+@pytest.mark.parametrize("bad", ["length", "missing"])
+def test_optional_fact_format_exhaustion_keeps_observation_and_continues(http_case, stage, bad):
+    from agent_adapters.deepseek_roles import build_payload
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    c = http_case
+    install(c, steps=2, stop="inconclusive")
+    model = c.models[1] if stage == "fact_proposal" else c.models[0]
+    original = model.invoke
+    attempts = []
+    def invoke(envelope, *args):
+        raw = original(envelope, *args)
+        if envelope.output_contract["stage"] == stage and len(c.sends) == 1:
+            attempts.append(envelope)
+            if bad == "missing":
+                return {k: v for k, v in raw.items() if k != "reason"}
+            if stage == "fact_proposal" and len(attempts) == 1:
+                return {**raw, "content": "PRIVATE_REJECTED_TEXT" * 20, "reason": "R" * 513}
+            return {**raw, "reason": "R" * 513}
+        return raw
+    model.invoke = invoke
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "search_exhausted", result
+    assert len(attempts) == 2 and len(c.sends) == 2 and len(c.app.state.facts) == 1
+    assert c.app.store.load_d3_plan_result(c.app.state.plans[0].plan_id).outcome == "observed"
+    assert c.app.state.intents[0].status.value == "inconclusive"
+    if bad == "length":
+        issues = attempts[1].correction["issues"]
+        assert any(i["path"] == "$/reason" and i["expected"] == "unicode_codepoints_le_512"
+                   and i["actual"] == "unicode_codepoints_513" for i in issues)
+        if stage == "fact_proposal":assert any(i["path"] == "$/content" for i in issues)
+    role = c.app.config.inner_role if stage == "fact_proposal" else c.app.config.outer_role
+    system = build_payload(attempts[0], role, context_loader=c.app.web.model_context)["messages"][0]["content"]
+    if stage == "fact_proposal":assert "it has no per-field character limit" not in system
+    assert "maximum_unicode_codepoints" in system and "not UTF-8 bytes" in system
+    notices = [c.app.sessions.payload(r)["observation"].get("optional_conclusion_failure") for r in c.app.sessions.records()]
+    assert any(n and n["identity"] == "unreviewed_optional_format_failure" for n in notices)
+    snapshot = snapshot_v3_task_result(c.directory, c.declaration)
+    assert not snapshot["recovery"]["required"] and not snapshot["errors"], snapshot
+    assert "PRIVATE_REJECTED_TEXT" not in "".join(p.read_text(encoding="utf-8") for p in (c.directory/"d8-output").glob("*.json"))
+    before = len(c.app.store.list_d4_operations(c.task)), len(c.sends)
+    c.app.store.close(); c.app = c.create()
+    assert asyncio.run(c.app.resume(c.task,c.token)).stop_reason == "search_exhausted"
+    assert (len(c.app.store.list_d4_operations(c.task)),len(c.sends)) == before
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+@pytest.mark.parametrize("after_commit", [False, True])
+def test_optional_failure_recovers_observation_commit_without_reasking(http_case, monkeypatch, after_commit):
+    from test_chain_multi_turn import ProcessLoss
+    c = http_case
+    install(c, steps=2, stop="inconclusive")
+    invoke = c.models[1].invoke
+    attempts = []
+    def malformed(envelope,*args):
+        raw=invoke(envelope,*args)
+        if envelope.output_contract["stage"]=="fact_proposal" and len(c.sends)==1:
+            attempts.append(envelope.request.model_request_id)
+            return {**raw,"content":"x"*257}
+        return raw
+    c.models[1].invoke=malformed
+    complete=c.app.control.complete_plan
+    def lost(*args,**kwargs):
+        if args[1].outcome=="observed":
+            if after_commit:complete(*args,**kwargs)
+            raise ProcessLoss("optional format receipt saved; observation boundary")
+        return complete(*args,**kwargs)
+    monkeypatch.setattr(c.app.control,"complete_plan",lost)
+    with pytest.raises(ProcessLoss):asyncio.run(c.app.run(c.token))
+    assert len(attempts)==2 and len(c.sends)==1
+    c.app.store.close();c.app=c.create()
+    result=asyncio.run(c.app.resume(c.task,c.token))
+    assert result.stop_reason=="search_exhausted",result
+    assert len(attempts)==2 and len(c.sends)==2 and len(c.app.state.facts)==1
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+@pytest.mark.parametrize("malformed_proposal", [False, True])
+def test_generic_fact_format_failure_during_closure_does_not_loop_or_forge_verdict(http_case, monkeypatch, malformed_proposal):
+    import agent_core.intent_execution as execution
+    c=http_case
+    install(c,steps=100,stop="inconclusive")
+    inner,outer=c.models[1].invoke,c.models[0].invoke
+    candidates=[];reviews=[]
+    def choose(envelope,*args):
+        stage=envelope.output_contract["stage"]
+        if stage=="fact_proposal":
+            return dict(kind="working_record",content="Unreviewed intermediate observation.",evidence_refs=[envelope.request.observation.proof_id])
+        if stage=="inner_plan" and c.sends:
+            context=json.loads(envelope.request.history_context)
+            stop=context["intent_execution"]["stop_requested"]
+            if stop["fact_candidate_allowed"]:
+                candidates.append(envelope)
+                return dict(kind="fact_candidate",content="x"*257 if malformed_proposal else "A scoped response was observed.",reason="Original saved evidence only.",evidence_refs=[context["evidence_sources"][0]["ref"]],inferred=False)
+            return dict(kind="intent_resolution",outcome="inconclusive",reason="Legitimate bounded closure with unresolved formal support.",evidence_refs=[i["ref"] for i in context["items"]],fact_ids=[],next_intent_candidates=[])
+        return inner(envelope,*args)
+    def review(envelope,*args):
+        if envelope.output_contract["stage"]=="fact_review":
+            reviews.append(envelope)
+            return dict(decision="accept",reason="R"*513)
+        return outer(envelope,*args)
+    c.models[1].invoke,c.models[0].invoke=choose,review
+    prepare=execution.prepare_closure
+    def boundary(app,intent_id):
+        if c.sends and execution.closure_marker(app,intent_id) is None:
+            app.handoff.evidence.save("pause",app._id("budget-closure/"+intent_id),{"intent_id":intent_id,"checkpoint_sequence":app.state.latest_checkpoint.sequence})
+        return prepare(app,intent_id)
+    monkeypatch.setattr(execution,"prepare_closure",boundary)
+    result=asyncio.run(c.app.run(c.token))
+    assert result.stop_reason=="d22_closure_completed_budget_stop",result
+    assert len(c.sends)==1 and not c.app.state.facts
+    assert len(candidates)==(2 if malformed_proposal else 1) and len(reviews)==(0 if malformed_proposal else 2)
+    assert not c.app.store.list_d8_conclusions(c.task)
+    before=len(c.app.store.list_d4_operations(c.task))
+    c.app.store.close();c.app=c.create()
+    assert asyncio.run(c.app.resume(c.task,c.token)).stop_reason==result.stop_reason
+    assert len(c.app.store.list_d4_operations(c.task))==before and len(c.sends)==1
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_malformed_execution_proposal_still_stops_without_dispatch(http_case):
+    c=http_case
+    install(c,steps=1)
+    calls=[]
+    def malformed(envelope,*args):
+        calls.append(envelope)
+        return dict(kind="http_request",method="GET",path_query=123,headers={},body="")
+    c.models[1].invoke=malformed
+    result=asyncio.run(c.app.run(c.token))
+    assert result.recovery_required and len(calls)==2 and not c.sends
+    assert not any(c.app.conclusions.optional_failure(e.request.model_request_id) for e in calls)
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+@pytest.mark.parametrize("mode", ["once", "twice", "unknown"])
+def test_http_predispatch_constraint_feedback_uses_only_the_original_correction(http_case, monkeypatch, mode):
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.execution_feasibility import KEY
+    c=http_case
+    install(c,steps=1)
+    original=c.app.validator._allowed
+    checks=[];proposals=[]
+    inner=c.models[1].invoke
+    def capture(envelope,*args):
+        if envelope.output_contract["stage"]=="inner_plan":proposals.append(envelope)
+        return inner(envelope,*args)
+    c.models[1].invoke=capture
+    def guard(*args):
+        checks.append(args)
+        if mode=="unknown":raise D3RecoveryRequired("d4_operation_outcome_unknown")
+        if len(checks)==1 or mode=="twice":raise D3RecoveryRequired("d3_action_rejected_by_review_constraint")
+        return original(*args)
+    monkeypatch.setattr(c.app.validator,"_allowed",guard)
+    result=asyncio.run(c.app.run(c.token))
+    if mode=="unknown":
+        assert result.recovery_required and result.stop_reason=="d4_operation_outcome_unknown"
+        assert len(proposals)==1 and not c.sends
+    else:
+        corrected=next(e for e in proposals if e.request.correction_of_model_request_id)
+        root=corrected.request.correction_of_model_request_id
+        assert corrected.correction["reason"]=="d3_action_rejected_by_review_constraint"
+        assert corrected.correction[KEY]==json.loads(corrected.request.history_context)[KEY]
+        assert sum(e.request.model_request_id==root or e.request.correction_of_model_request_id==root for e in proposals)==2
+        if mode=="once":
+            assert not result.recovery_required and len(c.sends)==1,result
+        else:
+            assert result.recovery_required and not c.sends
+    before=len(c.app.store.list_d4_operations(c.task)),len(c.sends)
+    c.app.store.close();c.app=c.create()
+    # Keep the injected unresolved guard active after reopen; a synthetic exception alone is not durable state.
+    if mode=="unknown":monkeypatch.setattr(c.app.validator,"_allowed",guard)
+    asyncio.run(c.app.resume(c.task,c.token))
+    assert (len(c.app.store.list_d4_operations(c.task)),len(c.sends))==before
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_handled_optional_failure_is_not_reported_as_unresolved_format_error(http_case, monkeypatch):
+    from test_chain_multi_turn import ProcessLoss
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    c=http_case
+    install(c,steps=2,stop="inconclusive")
+    inner=c.models[1].invoke
+    def bad(envelope,*args):
+        raw=inner(envelope,*args)
+        if envelope.output_contract["stage"]=="fact_proposal" and len(c.sends)==1:
+            return {**raw,"content":"x"*257}
+        return raw
+    c.models[1].invoke=bad
+    reconcile=c.app.sessions.reconcile
+    def lost(*args,**kwargs):
+        result=reconcile(*args,**kwargs)
+        if any(r.disposition=="technical_failure" for r in c.app.sessions.records()):
+            raise ProcessLoss("handled failure recorded before the next model operation")
+        return result
+    monkeypatch.setattr(c.app.sessions,"reconcile",lost)
+    with pytest.raises(ProcessLoss):asyncio.run(c.app.run(c.token))
+    snapshot=snapshot_v3_task_result(c.directory,c.declaration)
+    assert not snapshot["errors"] and not snapshot["recovery"]["required"],snapshot
+    assert len(snapshot["model_format_diagnostics"])==2
+    before=len(c.sends)
+    c.app.store.close();c.app=c.create()
+    assert asyncio.run(c.app.resume(c.task,c.token)).stop_reason=="search_exhausted"
+    assert len(c.sends)==before+1
+
+
+def test_fact_length_contract_counts_unicode_and_rejects_without_truncation():
+    from uuid import uuid4
+    from agent_core.domain import MAX_FACT_CONTENT_LENGTH
+    from agent_core.conclusion_contracts import D8Candidate,MAX_CONCLUSION_REASON_LENGTH
+    from agent_core.evidence_conclusions import EvidenceCandidate
+    from agent_core.output_contracts import obj,text,shape_issues
+    ref=str(uuid4())
+    content="汉"*MAX_FACT_CONTENT_LENGTH
+    reason="理"*MAX_CONCLUSION_REASON_LENGTH
+    assert len(content.encode("utf-8"))==768
+    assert D8Candidate(content,reason,(ref,),None).content==content
+    assert EvidenceCandidate(content,reason,(ref,),False).content==content
+    schema=obj({"content":text(MAX_FACT_CONTENT_LENGTH),"reason":text(MAX_CONCLUSION_REASON_LENGTH)})
+    assert not shape_issues(dict(content=content,reason=reason),schema)
+    assert {i.path for i in shape_issues(dict(content=content+"汉",reason=reason+"理"),schema)}=={"$/content","$/reason"}
+    with pytest.raises(ValueError):D8Candidate(content+"汉",reason,(ref,),None)
+    with pytest.raises(ValueError):EvidenceCandidate(content+"汉",reason,(ref,),False)
+
+
+@pytest.mark.parametrize("output_case", ["rolling"], indirect=True)
+@pytest.mark.parametrize("stage", ["fact_proposal", "fact_review"])
+def test_attachment_optional_format_failure_preserves_fixed_observation(output_case, stage):
+    c=output_case
+    inner=c.models["inner"].invoke
+    attempts=[]
+    def choose(envelope,*args):
+        current=envelope.output_contract["stage"]
+        if current=="inner_plan" and c.app.state.plans and c.app.state.plans[0].status.value=="completed":
+            c.models["inner"].calls.append(envelope)
+            context=json.loads(envelope.request.history_context)
+            return dict(kind="intent_resolution",outcome="inconclusive",reason="Legitimate bounded closure after the saved file observation.",evidence_refs=[i["ref"] for i in context["items"]],fact_ids=[],next_intent_candidates=[])
+        raw=inner(envelope,*args)
+        if current=="fact_proposal" and stage=="fact_proposal":
+            attempts.append(envelope)
+            return {**raw,"content":"x"*257}
+        return raw
+    c.models["inner"].invoke=choose
+    review=c.models["fact"].invoke
+    def malformed_review(envelope,*args):
+        raw=review(envelope,*args)
+        if stage=="fact_review":
+            attempts.append(envelope)
+            return {**raw,"reason":"x"*513}
+        return raw
+    c.models["fact"].invoke=malformed_review
+    handoff=c.models["handoff"].invoke
+    def end(envelope,*args):
+        if envelope.output_contract["stage"]=="intent_evaluation":
+            c.models["handoff"].calls.append(envelope)
+            return dict(decision="inconclusive",reason="A legitimate scoped closure, not a technical fallback.",evidence_refs=[i.ref for i in envelope.request.history])
+        return handoff(envelope,*args)
+    c.models["handoff"].invoke=end
+    result=asyncio.run(c.app.run(c.token))
+    assert result.stop_reason=="search_exhausted",result
+    assert len(attempts)==2 and len(c.app.state.executions)==2 and not c.app.state.facts
+    assert c.app.store.load_d3_plan_result(c.app.state.plans[0].plan_id).outcome=="observed"
+    assert not c.app.store.list_d8_conclusions(c.task)
+    before=len(c.app.store.list_d4_operations(c.task))
+    c.app.store.close();c.app=c.create()
+    assert asyncio.run(c.app.resume(c.task,c.token)).stop_reason==result.stop_reason
+    assert len(c.app.store.list_d4_operations(c.task))==before
+
+
+def test_nonrolling_plan_rejection_does_not_require_optional_conclusion_services():
+    from types import SimpleNamespace
+    from agent_adapters.multi_turn_application import D3Application
+    from agent_core.dual_llm_modeling import D3ProposalRejected
+    error=D3ProposalRejected("known_pre_d8_rejection",model_request_id="known")
+    async def rejected(*args,**kwargs):raise error
+    app=SimpleNamespace(config=SimpleNamespace(intent_execution_policy=None),
+        conclusions=None,inner=SimpleNamespace(propose=rejected))
+    with pytest.raises(D3ProposalRejected) as caught:
+        asyncio.run(D3Application._propose_inner_plan(app,None,None,refresh=None,validate=None))
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+@pytest.mark.parametrize("stage", ["inner_plan", "fact_proposal"])
+@pytest.mark.parametrize("mode", ["success", "usage_missing", "repeated", "invalid_after", "invalid_before", "unknown"])
+def test_inner_length_limit_shares_one_correction_and_preserves_progress(http_case, stage, mode):
+    c = http_case
+    install(c, steps=2)
+    original = c.models[1].invoke
+    calls = []
+    def invoke(envelope, *args):
+        target = len(c.sends) == (1 if stage == "inner_plan" else 2)
+        if envelope.output_contract["stage"] == stage and target:
+            calls.append(envelope)
+            attempt = len(calls)
+            if attempt == 2 and mode in {"success", "usage_missing"}:return original(envelope, *args)
+            if mode == "invalid_before" and attempt == 1 or mode == "invalid_after" and attempt == 2:
+                return D8ModelResponse("{}", "stop")
+            identity = envelope.request.model_request_id
+            c.app.output_boundary.evidence.save("provider-request", identity, {"parameters": {}})
+            c.app.output_boundary.evidence.save("provider-result", identity, {"transport": {
+                "transport_end": "worker_lost" if mode == "unknown" else "response_received",
+                "usage": None if mode == "usage_missing" else {"completion_tokens": 65536, "completion_tokens_details": {"reasoning_tokens": 65536}}}})
+            return D8ModelResponse("", "length")
+        return original(envelope, *args)
+    c.models[1].invoke = invoke
+    result = asyncio.run(c.app.run(c.token))
+    assert len(calls) == (1 if mode == "unknown" else 2)
+    assert len(c.sends) == (2 if stage == "fact_proposal" or mode in {"success", "usage_missing"} else 1)
+    assert len(c.app.state.facts) >= 1
+    if mode in {"success", "usage_missing"}:
+        assert not result.recovery_required, result
+        assert calls[1].correction["reason"] == "output_length_limit"
+        assert "only regeneration opportunity" in calls[1].instruction
+        assert calls[1].request.correction_of_model_request_id == calls[0].request.model_request_id
+    else:
+        assert result.recovery_required
+        if mode in {"repeated", "invalid_before", "unknown"}:assert result.stop_reason == "d8_model_output_truncated"
+        assert c.app.state.task_run.status.value == "running"
+        assert any(i.status.value == "running" for i in c.app.state.intents)
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    snapshot = snapshot_v3_task_result(c.directory, c.declaration)
+    assert not snapshot["errors"], snapshot
+    if mode not in {"success", "usage_missing"}:assert snapshot["recovery"]["required"]
+    before = len(c.app.store.list_d4_operations(c.task)), len(c.sends), len(calls)
+    c.app.store.close(); c.app = c.create()
+    asyncio.run(c.app.resume(c.task, c.token))
+    assert (len(c.app.store.list_d4_operations(c.task)), len(c.sends), len(calls)) == before
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_known_inner_explicit_output_exhaustion_can_use_the_same_correction(http_case):
+    c = http_case
+    install(c, steps=1)
+    invoke = c.models[1].invoke
+    calls = []
+    def once(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan" and not c.sends:
+            calls.append(envelope)
+            if len(calls) == 1:
+                identity = envelope.request.model_request_id
+                c.app.output_boundary.evidence.save("provider-request", identity, {"parameters": {"max_tokens": 32768}})
+                c.app.output_boundary.evidence.save("provider-result", identity, {"transport": {
+                    "transport_end": "response_received", "usage": {"completion_tokens": 32768}}})
+                return D8ModelResponse("", "length")
+        return invoke(envelope, *args)
+    c.models[1].invoke = once
+    result = asyncio.run(c.app.run(c.token))
+    assert not result.recovery_required, result
+    assert len(calls) == 2 and len(c.sends) == 1 and len(c.app.state.facts) == 1
+    assert calls[1].correction["reason"] == "output_length_limit"
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+@pytest.mark.parametrize("stop", ["deadline", "cancel"])
+def test_inner_length_regeneration_still_obeys_deadline_and_cancel(http_case, stop):
+    c = http_case
+    install(c, steps=2)
+    invoke = c.models[1].invoke
+    calls = []
+    def ended(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan" and len(c.sends) == 1:
+            calls.append(envelope)
+            identity = envelope.request.model_request_id
+            c.app.output_boundary.evidence.save("provider-request", identity, {"parameters": {}})
+            c.app.output_boundary.evidence.save("provider-result", identity, {"transport": {"transport_end": "response_received"}})
+            if stop == "deadline":c.clock.now = c.app.state.task_run.deadline_at
+            else:c.token.is_cancelled = True
+            return D8ModelResponse("", "length")
+        return invoke(envelope, *args)
+    c.models[1].invoke = ended
+    asyncio.run(c.app.run(c.token))
+    assert len(calls) == 1 and len(c.sends) == 1 and len(c.app.state.facts) == 1

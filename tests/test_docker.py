@@ -85,8 +85,9 @@ def test_real18_public_assembly_cancel_without_model_key_and_status_without_dock
         def bind_runtime(self, *args):
             pass
     connections = []
-    def connect(configuration, directory):
-        connections.append(configuration)
+    def connect(configuration, directory, *, wait_for_ready=False):
+        connections.append(wait_for_ready)
+        if wait_for_ready:assert not (directory / "control.sqlite").exists()
         sandbox = _LocalDigestSandbox(directory)
         return sandbox, sandbox
     monkeypatch.setattr(deepseek_roles, "D8DeepSeekModel", Model)
@@ -99,13 +100,14 @@ def test_real18_public_assembly_cancel_without_model_key_and_status_without_dock
     result = task_cli.dispatch_run_task(args)
     assert not result["errors"] and not result["recovery"]["required"], result
     assert result["sandbox_backend"] == "docker" and result["contract_version"] == 18
-    assert len(result["verified_facts"]) == 1 and len(connections) == 1
+    assert len(result["verified_facts"]) == 1 and connections == [True]
     directory = args.state_dir / result["task_run_id"]
     declaration = immutable_read(directory / "run.json")
     assert immutable_read(directory / "d8-runtime.json")["sandbox_backend"] == "docker"
     env_file.unlink()
     monkeypatch.setattr(deepseek_roles, "D8DeepSeekModel", lambda *a: pytest.fail("cancel invoked model"))
     cancelled = simulation.run_simulated_task(directory, declaration, operation="cancel")
+    assert connections == [True, False]
     assert cancelled["cleanup_status"] == "confirmed", cancelled
     monkeypatch.setattr(docker_profile, "connect", lambda *a: pytest.fail("read or replay accessed Docker"))
     assert snapshot_v3_task_result(directory, declaration)["cleanup_status"] == "confirmed"
@@ -229,3 +231,60 @@ def test_new18_preserves_prior_trusted_gates(output_case, monkeypatch, scenario)
         test_known_binding_damage_pauses_without_another_model_call(output_case, "corrupt")
     else:
         test_governance_unknown_does_not_redispatch_on_reopen(output_case)
+
+
+@pytest.mark.parametrize("failures", [0, 3])
+def test_daemon_readiness_waits_only_until_ready(monkeypatch, failures):
+    from docker.errors import DockerException
+    now, sleeps, clients, calls = [0.0], [], [], []
+    monkeypatch.setattr(docker_profile.time,"monotonic",lambda:now[0])
+    def sleep(seconds):sleeps.append(seconds);now[0]+=seconds
+    monkeypatch.setattr(docker_profile.time,"sleep",sleep)
+    def connect(**kwargs):
+        calls.append(kwargs)
+        if len(calls)<=failures:raise DockerException("FileNotFoundError: Docker engine pipe unavailable")
+        client=SimpleNamespace(api=SimpleNamespace(trust_env=True),closed=False)
+        client.ping=lambda:True
+        client.close=lambda:setattr(client,"closed",True)
+        clients.append(client)
+        return client
+    monkeypatch.setattr(docker_profile.docker,"DockerClient",connect)
+    docker_profile._wait_ready(docker_profile.settings())
+    assert len(calls)==failures+1 and now[0]==0.25*failures
+    assert len(sleeps)==failures and clients[0].closed and clients[0].api.trust_env is False
+    assert calls[-1]["timeout"]==10.0-now[0]
+
+
+@pytest.mark.parametrize("failure", [PermissionError("access denied"), RuntimeError("bad configuration"),
+    docker_profile.DockerException("Docker unavailable: Permission denied")])
+def test_daemon_readiness_does_not_retry_permissions_or_configuration(monkeypatch, failure):
+    def connect(**kwargs):raise failure
+    monkeypatch.setattr(docker_profile.docker,"DockerClient",connect)
+    monkeypatch.setattr(docker_profile.time,"sleep",lambda _:pytest.fail("permanent error was retried"))
+    with pytest.raises(type(failure)):docker_profile._wait_ready(docker_profile.settings())
+
+
+def test_daemon_readiness_obeys_one_deadline_for_all_probes(monkeypatch):
+    from docker.errors import DockerException
+    from Sandbox.docker_runtime import DockerRuntimeError
+    now, timeouts = [0.0], []
+    monkeypatch.setattr(docker_profile.time,"monotonic",lambda:now[0])
+    monkeypatch.setattr(docker_profile.time,"sleep",lambda seconds:now.__setitem__(0,now[0]+seconds))
+    def connect(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        now[0]+=min(4,kwargs["timeout"])
+        raise DockerException("connection refused")
+    monkeypatch.setattr(docker_profile.docker,"DockerClient",connect)
+    with pytest.raises(DockerRuntimeError,match="docker_startup_not_ready"):
+        docker_profile._wait_ready(docker_profile.settings())
+    assert now[0]==10 and timeouts==[10.0,5.75,1.5]
+
+
+@pytest.mark.parametrize("wait", [True,False])
+def test_profile_only_probes_for_explicit_new_start(tmp_path,monkeypatch,wait):
+    probes=[]
+    monkeypatch.setattr(docker_profile,"_wait_ready",lambda settings:probes.append(True))
+    monkeypatch.setattr(docker_profile,"DockerRuntime",lambda *args,**kwargs:SimpleNamespace(settings=args[0]))
+    monkeypatch.setattr(docker_profile,"D8DockerWorkspace",lambda sandbox,directory:object())
+    docker_profile.connect(docker_profile.sandbox_config(),tmp_path,wait_for_ready=wait)
+    assert probes==([True] if wait else [])

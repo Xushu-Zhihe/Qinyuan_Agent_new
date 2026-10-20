@@ -28,7 +28,7 @@ class D8DecisionRecord:
         _sha(self.evidence_sha256, "evidence_sha256")
         if type(self.ordinal) is not int or self.ordinal < 1:
             raise ValueError("d8_decision_ordinal_invalid")
-        if self.disposition not in {"applied", "review_requested"}:
+        if self.disposition not in {"applied", "review_requested", "technical_failure"}:
             raise ValueError("d8_decision_disposition_invalid")
 
 
@@ -81,6 +81,9 @@ def _parse_progress_review_legacy(raw, request):
                "inconclusive": {"pause_current_intent"}}
     if json.loads(request.context_summary).get("d8_progress", {}).get("intent_execution_policy") == "rolling_v1":
         allowed["inconclusive"] = {"continue_current_intent", "pause_current_intent"}
+    if json.loads(request.context_summary).get("d8_progress", {}).get("intent_execution_policy") == "rolling_v1":
+        for values in allowed.values():
+            values.add("request_intent_resolution")
     if restricted_progress_request(request):
         allowed = {"meaningful": {"continue_current_intent"},
                    "repetitive": {"pause_current_intent"}, "inconclusive": {"pause_current_intent"}}
@@ -99,10 +102,10 @@ def _parse_progress_review_legacy(raw, request):
     summary.pop("d8_progress")
     base_request = replace(request, context_summary=json.dumps(summary))
     base = {k: v for k, v in raw.items() if k != "progress"}
-    if base["decision"] in {"pause_current_intent", "abandon_current_intent"}:
+    if base["decision"] in {"pause_current_intent", "abandon_current_intent", "request_intent_resolution"}:
         base["decision"] = "continue_current_intent"
     parsed = parse_d3_review_output(base, base_request)
-    if raw["decision"] == "pause_current_intent" and parsed.constraints:
+    if raw["decision"] in {"pause_current_intent", "request_intent_resolution"} and parsed.constraints:
         raise ValueError("d8_progress_pause_cannot_add_constraints")
     return D8ProgressReviewOutput(raw["decision"], parsed.rationale, parsed.source_ids,
                                   parsed.constraints,

@@ -8,11 +8,13 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import RLock
 
-from agent_core.review_contracts import D2ReviewOutput, D2ReviewRequest, d2_payload
+from agent_core.review_contracts import D2ReviewOutput, D2ReviewRequest, d2_payload, MAX_REVIEW_ATTEMPTS, LEGACY_REVIEW_CALL_LIMIT
 
 
 class FileD2ReviewLedger:
     """Persist a call before dispatch and retain immutable completed results."""
+
+    review_call_limit = LEGACY_REVIEW_CALL_LIMIT
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory
@@ -138,14 +140,14 @@ class FileD2ReviewLedger:
                     raise ValueError("d2_review_attempt_identity_mismatch")
                 return
             used = root["attempts_used"]
-            if used >= 2 or request.review_attempt != used + 1:
+            if used >= MAX_REVIEW_ATTEMPTS or request.review_attempt != used + 1:
                 raise ValueError("review_retry_exhausted")
             if (
-                sum(
+                self.review_call_limit is not None and sum(
                     call["request"]["task_run_id"] == request.task_run_id
                     for call in data["review_calls"]
                 )
-                >= 8
+                >= self.review_call_limit
             ):
                 raise ValueError("review_budget_exhausted")
             call = {

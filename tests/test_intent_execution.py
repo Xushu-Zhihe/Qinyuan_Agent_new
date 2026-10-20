@@ -165,6 +165,7 @@ def test_public_simulated_rolling_file_path(tmp_path, monkeypatch):
     from test_public_simulation import request
     raw = request(tmp_path)
     raw.update(execution_profile="d8_v22", d8_config=simulation_config(rolling=True))
+    raw["d8_config"]["intent_execution_policy"] = "rolling_v1"  # This test exercises the original finite runner.
     from test_public_simulation import start
     result, args = start(tmp_path, monkeypatch, raw)
     assert result["errors"] == [], result
@@ -322,6 +323,7 @@ def test_public_file_intent_can_continue_three_plans(tmp_path, monkeypatch):
     monkeypatch.setattr(SimulationModel, "invoke", model)
     raw = request(tmp_path)
     raw.update(execution_profile="d8_v22", d8_config=simulation_config(rolling=True))
+    raw["d8_config"]["intent_execution_policy"] = "rolling_v1"  # This test exercises the original finite runner.
     result, args = start(tmp_path, monkeypatch, raw)
     assert result["errors"] == [], result
     assert len(result["verified_facts"]) == 1
@@ -919,3 +921,603 @@ def test_specific_business_rejection_is_bound_and_reaches_the_one_correction(htt
     projected = snapshot_v3_task_result(c.directory, c.declaration)
     assert not projected["recovery"]["required"], projected
     assert any(row["stage"] == "intent_evaluation" and row["diagnostic_version"] == 2 and row["issues"] == [issue] for row in projected["business_diagnostics"])
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_meaningful_progress_can_request_goal_resolution_without_forced_failure(http_case):
+    c = http_case
+    calls = install(c, steps=100)
+    outer, inner = c.models[0].invoke, c.models[1].invoke
+    requested = []
+    def review(envelope, *args):
+        if envelope.output_contract["stage"] == "progress_review":
+            context = json.loads(envelope.request.context_summary)
+            requested.append(envelope)
+            return dict(decision="request_intent_resolution", rationale="The local goal is already covered; another request would explore a different goal.",
+                source_ids=list(envelope.request.source_versions), constraints=[],
+                progress=dict(classification="meaningful", reason="Useful observations suffice for the current bounded goal.",
+                              evidence_refs=[context["d8_progress"]["recent"][-1]["ref"]]))
+        return outer(envelope, *args)
+    def choose(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan":
+            context = json.loads(envelope.request.history_context)
+            stop = context["intent_execution"].get("stop_requested")
+            if stop and stop["decision"] == "request_intent_resolution":
+                return dict(kind="intent_resolution", outcome="succeeded", reason="Saved formal observations cover this local goal.",
+                    evidence_refs=[i["ref"] for i in context["items"]],
+                    fact_ids=[i["fact_id"] for i in context["intent_execution"]["facts"]], next_intent_candidates=[])
+        return inner(envelope, *args)
+    c.models[0].invoke, c.models[1].invoke = review, choose
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "d9_awaiting_external_feedback", result
+    assert len(c.sends) == 2 and len(requested) == calls["reviews"] == 1
+    assert c.app.state.intents[0].status.value == "succeeded"
+    assert any(r.decision == "request_intent_resolution" for r in c.app.store.list_d3_review_applications(c.task))
+
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    assert not snapshot_v3_task_result(c.directory,c.declaration)["recovery"]["required"]
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_long_intent_reaches_bounded_budget_closure_after_more_than_eight_reviews(http_case):
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    c = http_case
+    install(c, steps=100, no_fact=True, stop="inconclusive")
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "d22_closure_completed_budget_stop", result
+    assert c.app.review_ledger.review_call_count(c.task) > 8 and len(c.sends) > 16
+    assert c.app.state.intents[0].status.value == "inconclusive" and not c.app.state.facts
+    usage = c.app.store.d4_budget_usage(c.task)
+    assert usage.total_used <= c.app.config.d4_budget.total
+    assert all(n <= c.app.config.d4_budget.category_limits[k] for k, n in usage.category_counts)
+    before = len(c.app.store.list_d4_operations(c.task)), len(c.sends)
+    assert not c.app.store.list_d4_unresolved_operations(c.task)
+    projected = snapshot_v3_task_result(c.directory, c.declaration)
+    assert projected["recovery"]["reason"] == "d22_closure_completed_budget_stop", projected
+    c.app.store.close()
+    c.app = c.create()
+    resumed = asyncio.run(c.app.resume(c.task, c.token))
+    assert resumed.stop_reason == result.stop_reason, resumed
+    assert (len(c.app.store.list_d4_operations(c.task)), len(c.sends)) == before
+
+
+@pytest.mark.parametrize("available,has_fact,source,closing", [(6,True,False,False),(5,True,False,True),(8,False,True,False),(6,False,False,True),(7,False,True,True),(4,False,True,True)])
+def test_budget_reserve_boundary_keeps_one_bounded_end_path(monkeypatch,available,has_fact,source,closing):
+    from types import SimpleNamespace
+    import agent_core.intent_execution as execution
+    from agent_core.operation_accounting import D8HandoffBudgetPolicy
+    saved = {}
+    evidence = SimpleNamespace(read=lambda kind, identity: saved.get(identity), save=lambda kind, identity, value: saved.setdefault(identity,value))
+    budget = D8HandoffBudgetPolicy()
+    counts = {"action": budget.action - available}
+    app = SimpleNamespace(config=SimpleNamespace(intent_execution_policy="rolling_v1",d4_budget=budget,authorization=SimpleNamespace(attachment_indices=())),
+        state=SimpleNamespace(task_run=SimpleNamespace(task_run_id="controlled"),latest_checkpoint=SimpleNamespace(sequence=1),plans=[]),
+        handoff=SimpleNamespace(evidence=evidence),web=object(),_id=lambda name:name,
+        sessions=SimpleNamespace(records=lambda _:[]),
+        evidence_conclusions=SimpleNamespace(catalog=lambda _: ["source"] if source else []),
+        store=SimpleNamespace(d4_budget_usage=lambda _:SimpleNamespace(category_counts=tuple(counts.items())),
+            list_d4_operations=lambda _:[],list_d8_conclusions=lambda _:[],list_d3_review_applications=lambda _:[]))
+    monkeypatch.setattr(execution,"facts",lambda *args:["fact"] if has_fact else [])
+    required=execution.closure_requirements(app,"intent")
+    assert required=={"action":2 if has_fact or not source else 4,"review":2,"handoff_summary":2,**({"fact_review":2} if source and not has_fact else {})}
+    execution.prepare_closure(app,"intent")
+    assert bool(execution.closure_marker(app,"intent")) is closing
+    if closing:
+        stop=execution.stop_request(app,"intent")
+        assert stop["decision"]=="request_intent_resolution"
+        assert stop["history_reads_allowed"] is (available >= required["action"] + 2)
+        # Closure remains latched even if a formal Fact subsequently reduces the reserve requirement.
+        monkeypatch.setattr(execution,"facts",lambda *args:["new-fact"])
+        execution.prepare_closure(app,"intent")
+        assert execution.closure_marker(app,"intent")
+
+
+def test_insufficient_closure_budget_pauses_without_inventing_an_intent_result(monkeypatch):
+    from types import SimpleNamespace
+    import agent_core.intent_execution as execution
+    saved={}
+    app=SimpleNamespace(config=SimpleNamespace(intent_execution_policy="rolling_v1"),
+        state=SimpleNamespace(task_run=SimpleNamespace(task_run_id="controlled")),
+        handoff=SimpleNamespace(evidence=SimpleNamespace(save=lambda kind,identity,value:saved.setdefault(identity,value))),
+        store=SimpleNamespace(list_d4_operations=lambda _:[]),_id=lambda name:name)
+    monkeypatch.setattr(execution,"closure_marker",lambda *args:None)
+    monkeypatch.setattr(execution,"closure_requirements",lambda *args:dict(action=2,review=2,handoff_summary=2))
+    monkeypatch.setattr(execution,"remaining_budget",lambda *args:dict(action=1,review=2,handoff_summary=2))
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    with pytest.raises(D3RecoveryRequired,match="d22_closure_budget_unavailable"):
+        execution.prepare_closure(app,"intent")
+    assert saved=={"budget-stop/intent":{"intent_id":"intent","reason":"d22_closure_budget_unavailable"}}
+
+
+@pytest.mark.parametrize("http_case",["rolling"],indirect=True)
+def test_budget_closure_continue_pauses_instead_of_forcing_a_business_end(http_case,monkeypatch):
+    import agent_core.intent_execution as execution
+    c=http_case
+    calls=install(c,steps=100,continue_once=True)
+    prepare=execution.prepare_closure
+    def at_boundary(app,intent_id):
+        if c.sends and execution.closure_marker(app,intent_id) is None:
+            app.handoff.evidence.save("pause",app._id("budget-closure/"+intent_id),{"intent_id":intent_id,"checkpoint_sequence":app.state.latest_checkpoint.sequence})
+        prepare(app,intent_id)
+    monkeypatch.setattr(execution,"prepare_closure",at_boundary)
+    result=asyncio.run(c.app.run(c.token))
+    assert result.stop_reason=="d22_closure_requires_more_budget",result
+    assert len(c.sends)==len(c.app.state.facts)==calls["reviews"]==1
+    assert c.app.state.intents[0].status.value=="running"
+    assert not any(r.kind in {"succeeded","failed","inconclusive"} for r in c.app.store.list_d8_tree_records(c.task))
+    before=len(c.app.store.list_d4_operations(c.task))
+    c.app.store.close();c.app=c.create()
+    assert asyncio.run(c.app.resume(c.task,c.token)).stop_reason==result.stop_reason
+    assert len(c.app.store.list_d4_operations(c.task))==before and len(c.sends)==1
+
+
+@pytest.mark.parametrize("http_case",["rolling"],indirect=True)
+@pytest.mark.parametrize("accept",[True,False])
+def test_closure_can_nominate_one_formal_fact_from_saved_evidence(http_case,monkeypatch,accept):
+    import agent_core.intent_execution as execution
+    from agent_core.evidence_conclusions import EvidenceReviewRequest
+    c=http_case
+    install(c,steps=100,no_fact=True,stop="inconclusive")
+    prepare=execution.prepare_closure
+    def at_boundary(app,intent_id):
+        if c.sends and execution.closure_marker(app,intent_id) is None:
+            app.handoff.evidence.save("pause",app._id("budget-closure/"+intent_id),{"intent_id":intent_id,"checkpoint_sequence":app.state.latest_checkpoint.sequence})
+        prepare(app,intent_id)
+    monkeypatch.setattr(execution,"prepare_closure",at_boundary)
+    inner,outer=c.models[1].invoke,c.models[0].invoke
+    candidates=[]
+    def choose(envelope,*args):
+        if envelope.output_contract["stage"]=="inner_plan":
+            context=json.loads(envelope.request.history_context)
+            stop=context["intent_execution"].get("stop_requested")
+            if stop:
+                if stop.get("fact_candidate_allowed"):
+                    candidates.append(envelope)
+                    return dict(kind="fact_candidate",content="The recorded request returned a scoped HTTP observation.",reason="Use the original saved request and response.",evidence_refs=[context["evidence_sources"][0]["ref"]],inferred=False)
+                return dict(kind="intent_resolution",outcome="succeeded" if accept else "inconclusive",reason="The accepted scoped evidence suffices." if accept else "The bounded exploration has unresolved support and is strategically closed.",evidence_refs=[i["ref"] for i in context["items"]],fact_ids=[i["fact_id"] for i in context["intent_execution"]["facts"]],next_intent_candidates=[])
+        return inner(envelope,*args)
+    def review(envelope,*args):
+        if isinstance(envelope.request,EvidenceReviewRequest):return dict(decision="accept" if accept else "reject",reason="Controlled conclusion review.")
+        if envelope.output_contract["stage"]=="intent_evaluation":return dict(decision="succeeded" if accept else "inconclusive",reason="The bounded reviewed scope supports this disposition.",evidence_refs=[i.ref for i in envelope.request.history])
+        return outer(envelope,*args)
+    c.models[1].invoke,c.models[0].invoke=choose,review
+    result=asyncio.run(c.app.run(c.token))
+    assert result.stop_reason=="d22_closure_completed_budget_stop",result
+    assert len(c.sends)==len(candidates)==1 and len(c.app.state.facts)==int(accept)
+    assert c.app.state.intents[0].status.value==("succeeded" if accept else "inconclusive")
+
+
+@pytest.mark.parametrize("output_case",["rolling"],indirect=True)
+def test_goal_resolution_request_finishes_the_admitted_file_plan_before_handoff(output_case):
+    c=output_case
+    inner=c.models["inner"].invoke;handoff=c.models["handoff"].invoke
+    notes=[];reviews=[]
+    def choose(envelope,*args):
+        if envelope.output_contract["stage"]=="inner_plan":
+            context=json.loads(envelope.request.history_context)
+            stop=context["intent_execution"].get("stop_requested")
+            if stop:
+                c.models["inner"].calls.append(envelope)
+                return dict(kind="intent_resolution",outcome="inconclusive",reason="The requested scoped end summary retains the completed observation.",evidence_refs=[i["ref"] for i in context["items"]],fact_ids=[],next_intent_candidates=[])
+            if len(notes)<2:
+                notes.append(envelope.request.model_request_id)
+                c.models["inner"].calls.append(envelope)
+                return dict(kind="working_record",content="Unreviewed preparation hypothesis.",evidence_refs=[context["items"][0]["ref"]])
+        return inner(envelope,*args)
+    def progress(envelope,raw):
+        if envelope.output_contract["stage"]=="progress_review":
+            reviews.append(envelope)
+            return {**raw,"decision":"request_intent_resolution","constraints":[],"progress":{**raw["progress"],"classification":"meaningful","reason":"Collect an end proposal after the admitted observation finishes."}}
+        return raw
+    def end(envelope,*args):
+        if envelope.output_contract["stage"]=="intent_evaluation":return dict(decision="inconclusive",reason="Legitimate bounded closure retaining the saved observation.",evidence_refs=[i.ref for i in envelope.request.history])
+        return handoff(envelope,*args)
+    c.models["inner"].invoke=choose;c.models["review"].transform=progress;c.models["handoff"].invoke=end
+    result=asyncio.run(c.app.run(c.token))
+    assert result.stop_reason=="search_exhausted",result
+    assert len(reviews)==1 and len(c.app.state.plans)==1 and len(c.app.state.executions)==2
+    assert c.app.store.load_d3_plan_result(c.app.state.plans[0].plan_id).outcome=="observed"
+    assert not c.app.state.facts and not c.models["fact"].calls
+
+
+@pytest.mark.parametrize("accepted",[True,False])
+def test_known_current_decision_is_reconciled_before_recomputing_budget_reserve(monkeypatch,accepted):
+    from types import SimpleNamespace
+    import agent_core.intent_execution as execution
+    call=SimpleNamespace(completion=object(),application_ref=None,start=SimpleNamespace(operation_id="known",role="inner_action",base_checkpoint_sequence=7))
+    app=SimpleNamespace(config=SimpleNamespace(intent_execution_policy="rolling_v1"),state=SimpleNamespace(task_run=SimpleNamespace(task_run_id="controlled"),latest_checkpoint=SimpleNamespace(sequence=7)),
+        store=SimpleNamespace(list_d4_operations=lambda _:[call]),
+        sessions=SimpleNamespace(evidence=SimpleNamespace(read=lambda *args:{"intent_id":"intent","request":{"stage":"inner_plan"}})),
+        model_evidence=SimpleNamespace(read=lambda _:SimpleNamespace(outcome="accepted" if accepted else "invalid_structure")))
+    monkeypatch.setattr(execution,"closure_requirements",lambda *args:pytest.fail("known result must reach its original bounded recovery before a fresh reserve gate"))
+    execution.prepare_closure(app,"intent")
+
+
+@pytest.mark.parametrize("http_case",["rolling"],indirect=True)
+def test_budget_summary_commit_recovers_without_redispatch(http_case,monkeypatch):
+    import agent_core.intent_execution as execution
+    from test_chain_multi_turn import ProcessLoss
+    c=http_case
+    calls=install(c,steps=100,no_fact=True,stop="inconclusive")
+    prepare=execution.prepare_closure
+    def at_boundary(app,intent_id):
+        if c.sends and execution.closure_marker(app,intent_id) is None:
+            app.handoff.evidence.save("pause",app._id("budget-closure/"+intent_id),{"intent_id":intent_id,"checkpoint_sequence":app.state.latest_checkpoint.sequence})
+        prepare(app,intent_id)
+    monkeypatch.setattr(execution,"prepare_closure",at_boundary)
+    summarize=c.app.handoff.summarize
+    async def lost(turn_id,token):
+        result=await summarize(turn_id,token)
+        if any(r.kind=="inconclusive" for r in c.app.store.list_d8_tree_records(c.task)):
+            raise ProcessLoss("summary committed before resource pause receipt")
+        return result
+    monkeypatch.setattr(c.app.handoff,"summarize",lost)
+    with pytest.raises(ProcessLoss):asyncio.run(c.app.run(c.token))
+    assert c.app.state.intents[0].status.value=="inconclusive"
+    before=len(c.app.store.list_d4_operations(c.task)),len(c.sends)
+    c.app.store.close();c.app=c.create()
+    result=asyncio.run(c.app.resume(c.task,c.token))
+    assert result.stop_reason=="d22_closure_completed_budget_stop",result
+    assert (len(c.app.store.list_d4_operations(c.task)),len(c.sends))==before
+    assert calls["reviews"]==1
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_replan_progress_cannot_skip_summary_before_next_inner_request(http_case):
+    c = http_case
+    install(c, steps=5, stop="inconclusive", no_fact=True)
+    outer, inner = c.models[0].invoke, c.models[1].invoke
+    seen = {"reviews": 0, "summaries": 0, "compacted": 0}
+    def review(envelope, *args):
+        raw = outer(envelope, *args)
+        if envelope.output_contract["stage"] == "progress_review":
+            seen["reviews"] += 1
+            return {**raw, "decision": "replan_current_intent",
+                    "progress": {**raw["progress"], "classification": "repetitive"}}
+        if envelope.output_contract["stage"] == "handoff_summary":seen["summaries"] += 1
+        return raw
+    def choose(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan" and seen["reviews"]:
+            assert seen["summaries"] >= seen["reviews"]
+            session = json.loads(envelope.request.session_context)
+            if "compaction" in session:
+                seen["compacted"] += 1
+                assert session["compaction"]["raw_decisions_retained"]
+                assert len(session["messages"]) <= 12
+        return inner(envelope, *args)
+    c.models[0].invoke, c.models[1].invoke = review, choose
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "search_exhausted", result
+    assert seen["reviews"] >= 2 and seen["compacted"] >= 1
+    assert len(c.sends) == 5 and len(c.app.sessions.records()) >= 10
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_technical_siblings_get_one_neighbor_revisit_and_same_session(http_case):
+    from agent_core.output_contracts import D8ModelResponse
+    c = http_case
+    outer, inner = c.models[0].invoke, c.models[1].invoke
+    calls, sessions = [], {}
+    roots = []
+    def plan(envelope, *args):
+        if envelope.output_contract["stage"] == "tree_planning" and envelope.request.turn_id is None:
+            roots.append(envelope)
+            if len(roots) > 1:return dict(kind="exhausted", reason="No new authorized route remains.", evidence_refs=[])
+            return dict(kind="candidates", intents=[dict(description="Independent approach "+str(n), intent_type=None, dependency_refs=[]) for n in range(3)])
+        return outer(envelope, *args)
+    def fail(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan":
+            actor = envelope.request.context.intent_id
+            packet = json.loads(envelope.request.session_context)
+            sessions.setdefault(actor, set()).add(packet["session_id"])
+            calls.append((actor, envelope.request.model_request_id, envelope.request.correction_of_model_request_id))
+            return D8ModelResponse("{}", "stop")
+        return inner(envelope, *args)
+    c.models[0].invoke, c.models[1].invoke = plan, fail
+    waits = []
+    run_once = c.app._run_once
+    results = []
+    async def observe_once(token):
+        result = await run_once(token)
+        results.append(result.stop_reason)
+        return result
+    c.app._run_once = observe_once
+    async def end_at_deadline(token):
+        waits.append([(i.description, i.status.value) for i in c.app.state.intents])
+        c.clock.now = c.app.state.task_run.deadline_at
+    c.app._wait_continuation = end_at_deadline
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "task_run_deadline_exceeded", result
+    ids = [i.intent_id for i in sorted(c.app.state.intents, key=lambda i: i.priority)]
+    attempts = [calls[n][0] for n in range(0, len(calls), 2)]
+    assert attempts == [ids[0], ids[1], ids[0], ids[2], ids[1]], (attempts, results, waits, [(r.kind,r.intent_id) for r in c.app.store.list_d8_tree_records(c.task)])
+    assert len(calls) == 10 and len({i[1] for i in calls}) == 10
+    assert all(calls[n+1][2] == calls[n][1] for n in range(0, len(calls), 2))
+    assert all(len(values) == 1 for values in sessions.values())
+    assert len(roots) == 2 and waits and not c.sends
+    assert all(i.status.value == "suspended" for i in c.app.state.intents)
+    rows = c.app.store.list_d8_tree_records(c.task)
+    assert sum(r.kind == "resumed" for r in rows) == 2
+    assert not any(r.kind in {"failed", "inconclusive"} for r in rows)
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_one_continuation_root_preserves_original_declarations(http_case):
+    from agent_core.output_contracts import D8ModelResponse
+    c = http_case
+    outer = c.models[0].invoke
+    roots = []
+    def plan(envelope, *args):
+        if envelope.output_contract["stage"] == "tree_planning" and envelope.request.turn_id is None:
+            roots.append(envelope.request)
+            return dict(kind="candidates", intents=[dict(description="Independent root approach " + str(len(roots)), intent_type=None, dependency_refs=[])])
+        return outer(envelope, *args)
+    c.models[0].invoke = plan
+    c.models[1].invoke = lambda *args: D8ModelResponse("{}", "stop")
+    waiting = []
+    async def finish(token):
+        waiting.append(True)
+        c.clock.now = c.app.state.task_run.deadline_at
+    c.app._wait_continuation = finish
+    result = asyncio.run(c.app.run(c.token))
+    assert result.stop_reason == "task_run_deadline_exceeded"
+    assert len(roots) == 2 and waiting
+    turns = sorted(c.app.state.turns, key=lambda t: t.sequence)
+    assert len(turns) == 2 and all(t.parent_turn_id is None for t in turns)
+    assert turns[0].intent_ids != turns[1].intent_ids
+    assert len(turns[0].intent_ids) == len(turns[1].intent_ids) == 1
+    assert all(t.turn_target == c.app.state.task_run.request.goal for t in turns)
+    assert all(i.status.value == "suspended" for i in c.app.state.intents)
+    assert not c.sends
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+@pytest.mark.parametrize("stage", ["inner_plan", "review", "intent_evaluation"])
+def test_known_transient_provider_response_shares_one_retry(http_case, stage):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    from agent_core.review_contracts import D2ModelFailure
+    from agent_core.output_contracts import D8ModelResponse
+    c = http_case
+    install(c, steps=1, stop="failed", no_fact=True)
+    outer, inner = c.models[0].invoke, c.models[1].invoke
+    calls = []
+    def invoke(original, envelope, *args):
+        if envelope.output_contract["stage"] == "tree_planning" and c.app.state.turns:
+            return dict(kind="exhausted", reason="No further route.", evidence_refs=[])
+        if envelope.output_contract["stage"] == stage:
+            request = envelope.request
+            identity = getattr(request, "model_request_id", None) or request.review_id
+            calls.append(identity)
+            c.app.output_boundary.evidence.save("provider-result", identity,
+                {"transport": {"transport_end": "http_error", "http_status": 503}})
+            return D2ModelFailure("provider_failure", "http_503") if stage == "review" else ModelError(ModelErrorKind.PROVIDER_FAILURE, "http_503")
+        return original(envelope, *args)
+    c.models[0].invoke = lambda envelope,*args:invoke(outer,envelope,*args)
+    c.models[1].invoke = lambda envelope,*args:invoke(inner,envelope,*args)
+    reasons = []
+    once = c.app._run_once
+    async def capture(token):
+        result = await once(token)
+        reasons.append(result.stop_reason)
+        return result
+    c.app._run_once = capture
+    async def finish(token):c.clock.now = c.app.state.task_run.deadline_at
+    c.app._wait_continuation = finish
+    asyncio.run(c.app.run(c.token))
+    assert len(calls) == 2 and len(set(calls)) == 2, (stage, calls, reasons)
+    assert c.app.state.intents[0].status.value == "suspended", (stage, reasons)
+    assert len(c.sends) == (1 if stage == "intent_evaluation" else 0)
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+@pytest.mark.parametrize("fault", ["timeout", "payment"])
+def test_unknown_model_result_blocks_siblings_without_redispatch(http_case, fault):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    c = http_case
+    outer = c.models[0].invoke
+    def plan(envelope, *args):
+        if envelope.output_contract["stage"] == "tree_planning":
+            return dict(kind="candidates", intents=[dict(description="Unknown approach " + str(n), intent_type=None, dependency_refs=[]) for n in range(2)])
+        return outer(envelope,*args)
+    calls = []
+    def unknown(envelope,*args):
+        calls.append(envelope.request.model_request_id)
+        if fault == "payment":
+            c.app.output_boundary.evidence.save("provider-result", envelope.request.model_request_id,
+                {"transport":{"transport_end":"http_error","http_status":402}})
+            return ModelError(ModelErrorKind.PROVIDER_FAILURE,"deepseek_http_402")
+        return ModelError(ModelErrorKind.TIMED_OUT,"transport_timeout")
+    c.models[0].invoke, c.models[1].invoke = plan, unknown
+    waits = []
+    async def finish(token):
+        waits.append(True)
+        if len(waits) == 2:c.clock.now = c.app.state.task_run.deadline_at
+    c.app._wait_continuation = finish
+    result = asyncio.run(c.app.run(c.token))
+    assert len(calls) == 1 and len(waits) == 2
+    assert not c.sends and not any(r.kind in {"suspended","resumed"} for r in c.app.store.list_d8_tree_records(c.task))
+    assert result.stop_reason == "task_run_deadline_exceeded"
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_continuous_counts_are_audit_only_but_deadline_still_blocks(http_case):
+    from agent_core.operation_accounting import D4OperationStart, D4OperationCompletion, D4OperationConflict
+    from agent_core.turn_modeling import stable_id, digest
+    c = http_case
+    def start(n):
+        return D4OperationStart(stable_id(c.task, "audit/" + str(n)), c.task, "action", c.clock.now,
+            c.app.state.latest_checkpoint.sequence, digest({"n":n}), "test-audit",
+            c.app.config.d4_budget.budget_policy_ref, "inner_action", c.app.config.inner_role.role_config_ref)
+    for n in range(c.app.config.d4_budget.total + 1):
+        call = start(n)
+        c.app.store.begin_d4_operation(call)
+        c.app.store.complete_d4_operation(D4OperationCompletion(call.operation_id,c.clock.now,"failed",call.operation_id,digest({"n":n})))
+    usage = c.app.store.d4_budget_usage(c.task)
+    assert usage.total_used == c.app.config.d4_budget.total + 1
+    assert dict(usage.category_counts)["action"] > c.app.config.d4_budget.category_limits["action"]
+    c.clock.now = c.app.state.task_run.deadline_at
+    with pytest.raises(D4OperationConflict):c.app.store.begin_d4_operation(start(999))
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_waiting_restart_never_replans_root_again(http_case):
+    from agent_core.output_contracts import D8ModelResponse
+    from test_chain_multi_turn import ProcessLoss
+    c = http_case
+    outer = c.models[0].invoke
+    roots, inner = [], []
+    def plan(envelope,*args):
+        if envelope.output_contract["stage"] == "tree_planning":
+            roots.append(envelope.request.model_request_id)
+            if len(roots) > 1:return dict(kind="exhausted",reason="No new direction.",evidence_refs=[])
+        return outer(envelope,*args)
+    def fail(envelope,*args):
+        inner.append(envelope.request.model_request_id)
+        return D8ModelResponse("{}","stop")
+    c.models[0].invoke,c.models[1].invoke = plan,fail
+    async def interrupt(token):raise ProcessLoss("process stopped while waiting")
+    c.app._wait_continuation = interrupt
+    with pytest.raises(ProcessLoss):asyncio.run(c.app.run(c.token))
+    before = len(c.app.store.list_d4_operations(c.task)),list(roots),list(inner)
+    c.app.store.close()
+    c.app = c.create()
+    async def finish(token):c.clock.now = c.app.state.task_run.deadline_at
+    c.app._wait_continuation = finish
+    result = asyncio.run(c.app.resume(c.task,c.token))
+    assert result.stop_reason == "task_run_deadline_exceeded"
+    assert (len(c.app.store.list_d4_operations(c.task)),roots,inner) == before
+    assert len(roots) == 2 and len(inner) == 2
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_parked_child_backtracks_to_parent_sibling_without_business_revisit(http_case):
+    from agent_core.output_contracts import D8ModelResponse
+    c = http_case
+    async def no_final_candidate(*args):return False
+    c.app.answers.after_success = no_final_candidate  # Isolate tree routing from external final-answer feedback.
+    outer, inner = c.models[0].invoke, c.models[1].invoke
+    root_calls, explored = [], []
+    def plan(envelope,*args):
+        request, stage = envelope.request,envelope.output_contract["stage"]
+        if stage == "tree_planning":
+            if request.turn_id is None:
+                root_calls.append(request.model_request_id)
+                if len(root_calls)>1:return dict(kind="exhausted",reason="No new authorized direction.",evidence_refs=[])
+                names=["Parent success", "Parent alternative"]
+            else:names=["Child technical"]
+            return dict(kind="candidates",intents=[dict(description=n,intent_type=None,dependency_refs=[]) for n in names])
+        if stage == "fact_review":
+            return dict(decision="accept",reason="Scoped observation.",refined_content="A saved observation for "+request.intent_description)
+        if stage == "intent_evaluation":
+            actor=next(i for i in c.app.state.intents if i.intent_id==request.intent_id)
+            return dict(decision="succeeded" if actor.description=="Parent success" else "failed",reason="Bounded local scope reviewed.",evidence_refs=[i.ref for i in request.history])
+        return outer(envelope,*args)
+    def choose(envelope,*args):
+        if envelope.output_contract["stage"] != "inner_plan":return inner(envelope,*args)
+        request=envelope.request
+        actor=next(i for i in c.app.state.intents if i.intent_id==request.context.intent_id)
+        explored.append(actor.description)
+        if actor.description=="Child technical":return D8ModelResponse("{}","stop")
+        context=json.loads(request.history_context)
+        plans=[p for p in c.app.state.plans if p.intent_id==actor.intent_id]
+        if not plans:return dict(kind="http_request",method="GET",path_query="/?actor="+str(actor.priority),headers={},body="")
+        return dict(kind="intent_resolution",outcome="succeeded" if actor.description=="Parent success" else "failed",
+            reason="Finite local scope tested.",evidence_refs=[i["ref"] for i in context["items"]],
+            fact_ids=[i["fact_id"] for i in context["intent_execution"]["facts"]],next_intent_candidates=[])
+    c.models[0].invoke,c.models[1].invoke=plan,choose
+    async def finish(token):c.clock.now=c.app.state.task_run.deadline_at
+    c.app._wait_continuation=finish
+    result=asyncio.run(c.app.run(c.token))
+    assert result.stop_reason=="task_run_deadline_exceeded"
+    statuses={i.description:i.status.value for i in c.app.state.intents}
+    assert statuses=={"Parent success":"succeeded","Parent alternative":"failed","Child technical":"suspended"},(statuses,explored)
+    assert explored.index("Child technical") < explored.index("Parent alternative")
+    assert explored.count("Child technical")==2 and len(c.sends)==2
+    assert not any(r.kind=="resumed" for r in c.app.store.list_d8_tree_records(c.task))
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_continuation_root_rejects_unchanged_direction_using_shared_correction(http_case):
+    from agent_core.output_contracts import D8ModelResponse
+    c = http_case
+    outer=c.models[0].invoke
+    roots=[]
+    def plan(envelope,*args):
+        if envelope.output_contract["stage"] == "tree_planning":
+            roots.append(envelope.request)
+            name="Old direction" if len(roots)<3 else "Different solution chain"
+            return dict(kind="candidates",intents=[dict(description=name,intent_type=None,dependency_refs=[])])
+        return outer(envelope,*args)
+    c.models[0].invoke=plan
+    c.models[1].invoke=lambda *args:D8ModelResponse("{}","stop")
+    async def finish(token):c.clock.now=c.app.state.task_run.deadline_at
+    c.app._wait_continuation=finish
+    asyncio.run(c.app.run(c.token))
+    assert len(roots)==3 and roots[2].correction_of_model_request_id==roots[1].model_request_id
+    assert len(c.app.state.turns)==2
+    assert {i.description for i in c.app.state.intents}=={"Old direction","Different solution chain"}
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_end_review_process_loss_recovers_local_suspension_without_call_replay(http_case):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    from test_chain_multi_turn import ProcessLoss
+    c=http_case
+    install(c,steps=1,stop="failed",no_fact=True)
+    outer=c.models[0].invoke
+    reviews=[]
+    def fail(envelope,*args):
+        if envelope.output_contract["stage"]=="tree_planning" and c.app.state.turns:
+            return dict(kind="exhausted",reason="No further direction.",evidence_refs=[])
+        if envelope.output_contract["stage"]=="intent_evaluation":
+            request=envelope.request
+            reviews.append(request.model_request_id)
+            c.app.output_boundary.evidence.save("provider-result",request.model_request_id,
+                {"transport":{"transport_end":"http_error","http_status":503}})
+            return ModelError(ModelErrorKind.PROVIDER_FAILURE,"http_503")
+        return outer(envelope,*args)
+    c.models[0].invoke=fail
+    original=c.app.handoff.call
+    async def lose(request,token):
+        result=await original(request,token)
+        if request.stage=="intent_evaluation":raise ProcessLoss("ended review before suspension commit")
+        return result
+    c.app.handoff.call=lose
+    with pytest.raises(ProcessLoss):asyncio.run(c.app.run(c.token))
+    assert len(reviews)==2 and c.app.state.intents[0].status.value=="running"
+    c.app.store.close();c.app=c.create()
+    async def finish(token):c.clock.now=c.app.state.task_run.deadline_at
+    c.app._wait_continuation=finish
+    result=asyncio.run(c.app.resume(c.task,c.token))
+    assert result.stop_reason=="task_run_deadline_exceeded" and len(reviews)==2 and len(c.sends)==1
+    assert c.app.state.intents[0].status.value=="suspended"
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_local_suspension_public_view_keeps_diagnostics_without_global_recovery(http_case):
+    from agent_core.output_contracts import D8ModelResponse
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    c=http_case
+    outer=c.models[0].invoke
+    def plan(envelope,*args):
+        if envelope.output_contract["stage"]=="tree_planning" and c.app.state.turns:
+            return dict(kind="exhausted",reason="No further direction.",evidence_refs=[])
+        return outer(envelope,*args)
+    c.models[0].invoke=plan
+    c.models[1].invoke=lambda *args:D8ModelResponse("{}","stop")
+    commit=c.app.handoff._commit
+    views=[]
+    def capture(operation,*args,**kwargs):
+        result=commit(operation,*args,**kwargs)
+        if operation=="suspend_d8_intent":views.append(snapshot_v3_task_result(c.directory,c.declaration))
+        return result
+    c.app.handoff._commit=capture
+    async def finish(token):c.clock.now=c.app.state.task_run.deadline_at
+    c.app._wait_continuation=finish
+    asyncio.run(c.app.run(c.token))
+    assert len(views)==1
+    view=views[0]
+    assert view["errors"]==[] and not view["recovery"]["required"],view
+    assert view["task_run"]["status"]=="running" and view["model_format_diagnostics"]
+    assert view["budget"]["total_limit"] is None
+    assert all(v is None for v in view["budget"]["category_limits"].values())

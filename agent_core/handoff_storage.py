@@ -1,4 +1,4 @@
-﻿"""SQLite-owned D8-2 metadata and atomic admission helpers."""
+"""SQLite-owned D8-2 metadata and atomic admission helpers."""
 
 import json
 from dataclasses import asdict
@@ -56,7 +56,8 @@ CREATE TABLE d8_decisions (
 D8_CHANGES = (D8HandoffVersion, D8CapacityVersion, D8TreeRecord, D8RevisionRecord, D8DecisionRecord)
 D8_OPERATIONS = {"append_d8_handoff", "append_d8_capacity", "register_d8_tree_turn",
                  "select_d8_tree_intent", "evaluate_d8_tree_intent", "exhaust_d8_expansion",
-                 "exhaust_d8_tree_turn", "append_d8_revision", "append_d8_decision"}
+                 "exhaust_d8_tree_turn", "append_d8_revision", "append_d8_decision",
+                 "suspend_d8_intent", "resume_d8_intent"}
 
 
 def load_records(store, table, task_id):
@@ -178,6 +179,10 @@ def validate_handoff_mutation(store, mutation):
         raise StorageError("D8-2 tree operation differs from its metadata")
     if mutation.operation in {"register_d8_tree_turn", "exhaust_d8_expansion", "evaluate_d8_tree_intent"} and not record.model_request_id:
         raise StorageError("D8-2 model decision requires its known model result")
+    if mutation.operation in {"suspend_d8_intent", "resume_d8_intent"}:
+        from agent_core.intent_execution import validate_local_transition
+        validate_local_transition(store, mutation, before)
+        return True
     if record.model_request_id:
         call = store.load_d4_operation(record.model_request_id)
         expected = "review" if mutation.operation == "evaluate_d8_tree_intent" else "planning"
@@ -203,7 +208,10 @@ def validate_handoff_mutation(store, mutation):
                 or tuple(i for i, _ in record.dependencies) != turns[0].intent_ids):
             raise StorageError("D8-2 tree registration binding changed")
         if turns[0].parent_turn_id is None and before.turns:
-            raise StorageError("D8-2 cannot register another root Turn")
+            if (config.intent_execution_policy != "continuous_v1"
+                    or sum(t.parent_turn_id is None for t in before.turns) != 1
+                    or any(i.status in {IntentStatus.PENDING, IntentStatus.RUNNING} for i in before.intents)):
+                raise StorageError("D8-2 cannot register another root Turn")
     elif mutation.operation == "select_d8_tree_intent":
         old = store.load_control_state_rows(record.task_run_id)
         item = next((i for i in old.intents if i.intent_id == record.intent_id), None)
@@ -215,10 +223,13 @@ def validate_handoff_mutation(store, mutation):
                 or len(turns) != 1 or turns[0].turn_id != record.turn_id or turns[0].status is not TurnStatus.RUNNING):
             raise StorageError("D8-2 selection is not a pending sibling")
         active = [t for t in old.turns if t.status in {TurnStatus.RUNNING, TurnStatus.PENDING}]
+        if config.intent_execution_policy == "continuous_v1":
+            from agent_core.intent_execution import runnable_turns
+            active = runnable_turns(store, old)
         if not active or max(active, key=lambda t: t.sequence).turn_id != record.turn_id:
             raise StorageError("D8-2 must dispatch the active leaf before parent siblings")
     elif mutation.operation == "evaluate_d8_tree_intent":
-        rolling = config.intent_execution_policy == "rolling_v1"
+        rolling = bool(config.intent_execution_policy)
         if record.kind not in ({"succeeded", "failed", "inconclusive", "evaluation_continued"} if rolling else {"succeeded", "failed", "inconclusive"}) or len(intents) != 1:
             raise StorageError("D8-2 evaluation has no exact Intent transition")
         before = store.load_control_state_rows(record.task_run_id)
@@ -233,7 +244,7 @@ def validate_handoff_mutation(store, mutation):
         rows = store.load_control_state_rows(record.task_run_id)
         if (len(turns) != 1 or turns[0].turn_id != record.turn_id
                 or turns[0].status is not TurnStatus.COMPLETED
-                or any(i.status in {IntentStatus.RUNNING, IntentStatus.PENDING}
+                or any(i.status in {IntentStatus.RUNNING, IntentStatus.PENDING, IntentStatus.SUSPENDED}
                        for i in rows.intents if i.turn_id == record.turn_id)
                 or any(t.parent_turn_id == record.turn_id and t.status is not TurnStatus.COMPLETED for t in rows.turns)):
             raise StorageError("D8-2 Turn is not exhausted")
@@ -262,7 +273,7 @@ def save_handoff_mutation(store, mutation, sequence):
             store._connection.execute("INSERT INTO d8_tree_records VALUES (?,?,?,?,?,?,?)",
                                       (record.record_id, record.task_run_id, record.turn_id, record.intent_id,
                                        record.kind, metadata, sequence))
-            for request_id in (record.model_request_id, record.inner_request_id):
+            for request_id in (() if record.kind in {"suspended", "resumed"} else (record.model_request_id, record.inner_request_id)):
                 if request_id:
                     store._mark_d4_operation_applied(request_id, record.record_id)
                     if store.load_d3_operation(request_id) is not None:

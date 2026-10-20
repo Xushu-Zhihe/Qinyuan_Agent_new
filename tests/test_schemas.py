@@ -214,32 +214,21 @@ class TestD8SandboxAdapter:
         assert D8SandboxAdapter is not None
 
     def test_sandbox_adapter_methods(self):
-        """Verify D8SandboxAdapter has required SandboxService methods"""
+        """The MCP adapter can access only its already-owned TaskRun container."""
+        from types import SimpleNamespace
         from agent_adapters.sandbox_adapter import D8SandboxAdapter
+        from Sandbox.service import SandboxNotFoundError
 
-        adapter = D8SandboxAdapter()
-
-        # Verify SandboxService interface methods exist
-        assert hasattr(adapter, "bind_task_run")
-        assert hasattr(adapter, "unbind_agent")
-        assert hasattr(adapter, "get_session")
-        assert hasattr(adapter, "execute")
-        assert hasattr(adapter, "interrupt_for_agent")
-
-        # Verify they're callable
-        assert callable(adapter.bind_task_run)
-        assert callable(adapter.unbind_agent)
-        assert callable(adapter.get_session)
-        assert callable(adapter.execute)
-        assert callable(adapter.interrupt_for_agent)
-
-        # Test basic binding/unbinding
-        agent_id = "test_agent_001"
-        result = adapter.get_session(agent_id)
-        assert result is None  # Not bound yet
-
-        # Test unbind on non-existent agent (should not raise)
-        adapter.unbind_agent(agent_id)
+        interrupted = []
+        sandbox = SimpleNamespace(_settings=SimpleNamespace(maximum_timeout_seconds=60),
+                                  interrupt=lambda identity: interrupted.append(identity))
+        adapter = D8SandboxAdapter(sandbox, "owned-task", "owned-container")
+        assert adapter.get_session("another-task") is None
+        assert adapter.get_session("owned-task").sandbox_id == "owned-container"
+        with pytest.raises(SandboxNotFoundError):adapter.interrupt_for_agent("another-task")
+        assert not interrupted
+        assert adapter.interrupt_for_agent("owned-task") == "owned-container"
+        assert interrupted == ["owned-container"]
 
 
 

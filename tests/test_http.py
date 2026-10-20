@@ -91,17 +91,18 @@ def http_case(tmp_path,monkeypatch,request):
     from agent_adapters.deepseek_roles import role_config,EstimatedCapacity
     from agent_adapters.simulation import real_config
     requested=getattr(request,'param',20)
-    rolling=requested == 'rolling'
+    rolling=requested in {'rolling', 'continuous'}
     version=22 if rolling else requested
     outer=role_config('outer_planning',version=version-5)
     inner=role_config('inner_action',version=version-5)
     public_config=real_config(contract_version=version,http=True,rolling=rolling)
+    if rolling:public_config['intent_execution_policy']='continuous_v1' if requested=='continuous' else 'rolling_v1'
     authorization_id=str(uuid4())
     config=D3RunConfig(outer,inner,D3Authorization(authorization_id,()),outer.role_config_ref,
         contract_version=version,d4_budget=D8HandoffBudgetPolicy(),d5_enabled=True,d5_sensitive_requirements=(),
         d8_enabled=True,handoff_config=D8HandoffConfig.from_dict(public_config['handoff_config']),
         web_authorization=D7WebAuthorization(authorization_id,ORIGIN,('GET','HEAD','OPTIONS')),http_timeout_seconds=60,
-        intent_execution_policy="rolling_v1" if rolling else None)
+        intent_execution_policy=public_config.get("intent_execution_policy"))
     models=[Model(outer),Model(inner)]
     clock,token,sandbox=Clock(),Token(),WebSandbox()
     directory=tmp_path/'run'

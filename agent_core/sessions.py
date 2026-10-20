@@ -47,6 +47,10 @@ class IntentSessions:
             if result is None or result["outcome"] != "valid":
                 raise D3RecoveryRequired("d8_session_repair_result_unavailable")
             return result["raw"]
+        notice = self.app.conclusions.optional_failure(request_id)
+        if notice is not None and notice["failed_request_id"] == request_id:
+            return {"kind": "technical_result", "reason": "optional_format_exhausted",
+                    "identity": "unreviewed_optional_format_failure"}
         if request["stage"] == "fact_proposal":
             result = self.app.conclusions.evidence.read_result(request_id)
             if result is None or result["outcome"] != "valid":
@@ -124,8 +128,10 @@ class IntentSessions:
             self._safe(value)
             length = len(request.session_context) + len(getattr(request, "history_context", ""))
             capacity = self.app.handoff.capacity()
-            if length > capacity.capacity.visible_history:
+            if length > capacity.capacity.visible_history and self.app.config.intent_execution_policy != "continuous_v1":
                 self.app.handoff._pause("visible_history", (), capacity.capacity.visible_history, length)
+            # Continuous mode admits the actual shared provider payload below;
+            # duplicated pre-projection sections are not an independent hard stop.
             self.app.handoff.check_role_request_capacity(request)
             self.evidence.save("request", request.model_request_id, value)
             if isinstance(request, D8SessionExecutionRequest):
@@ -138,9 +144,12 @@ class IntentSessions:
         reconcile_working(self.app)
         known = {r.root_request_id for r in self.records()}
         for call in self.store.list_d4_operations(self.app.state.task_run.task_run_id):
-            if (call.start.role != "inner_action" or call.completion is None
-                    or call.application_ref is None and call.start.operation_id != review_signal):
+            if call.start.role != "inner_action" or call.completion is None:
                 continue
+            optional = self.app.conclusions.finish_optional_failure(call.start.operation_id)
+            if not optional and call.application_ref is None and call.start.operation_id != review_signal:
+                continue
+            call = self.store.load_d4_operation(call.start.operation_id)
             snapshot = self.evidence.read("request", call.start.operation_id)
             if snapshot is None:
                 raise D3RecoveryRequired("d8_session_applied_request_missing")
@@ -153,7 +162,7 @@ class IntentSessions:
             record = D8DecisionRecord(self._id("decision/" + root), call.start.task_run_id,
                                       snapshot["turn_id"], snapshot["intent_id"], len(rows) + 1,
                                       root, call.start.operation_id, "0" * 64,
-                                      "review_requested" if call.application_ref is None else "applied")
+                                      "technical_failure" if optional else "review_requested" if call.application_ref is None else "applied")
             safe_request = {k: v for k, v in request.items()
                             if k not in {"session_context", "history_context", "process_facts"}}
             plan_id = (request.get("observation", {}).get("plan_id")
@@ -175,6 +184,9 @@ class IntentSessions:
                 reviewed=self.app.conclusions.evidence.read_result(conclusion.review_request_id)
                 observed["conclusion_review"]={"outcome":conclusion.outcome,"fact_id":conclusion.fact_id,
                     "decision":reviewed["raw"]["decision"],"reason":reviewed["raw"]["reason"]}
+            notice = self.app.conclusions.optional_failure(call.start.operation_id)
+            if notice is not None:
+                observed["optional_conclusion_failure"] = notice
             data = {"metadata": asdict(record) | {"evidence_sha256": ""},
                     "request": safe_request, "response": raw, "observation": observed}
             frozen = self.evidence.read("decision", record.record_id)
@@ -194,8 +206,11 @@ class IntentSessions:
         request = self.evidence.read("request", record.model_request_id)
         root = request["request"].get("correction_of_model_request_id") or record.model_request_id if request else None
         signal = record.disposition == "review_requested"
+        technical = record.disposition == "technical_failure"
+        if technical and not self.app.conclusions.optional_ready(record.model_request_id):
+            raise D3RecoveryRequired("d22_optional_failure_binding_changed")
         if (call is None or call.start.task_run_id != record.task_run_id or call.completion is None
-                or call.application_ref is None and not signal or call.start.role != "inner_action"
+                or call.application_ref is None and not signal and not technical or call.start.role != "inner_action"
                 or request is None or root != record.root_request_id
                 or (request["turn_id"], request["intent_id"]) != (record.turn_id, record.intent_id)
                 or not signal and data["observation"]["application_ref"] != call.application_ref
@@ -255,6 +270,9 @@ class IntentSessions:
 
     async def before_decision(self, intent_id, receipts, token, *, restricted=False):
         self.reconcile()
+        from agent_core.intent_execution import stop_request
+        if self.app.config.intent_execution_policy and stop_request(self.app, intent_id) is not None:
+            return False
         reviews = self.reviews(intent_id)
         if reviews and reviews[-1][2]["response"]["decision"] == "pause_current_intent":
             raise D3RecoveryRequired("d8_progress_" + reviews[-1][2]["response"]["progress"]["classification"])
@@ -289,10 +307,10 @@ class IntentSessions:
             if output.decision == "pause_current_intent":
                 raise D3RecoveryRequired("d8_progress_" + output.progress.classification)
             return False
-        routed = await self.app._route(review_id, output, intent_id, receipts, token)
-        if self.app.config.intent_execution_policy and not routed:
+        # Organize before routing: replan may immediately assemble another inner request.
+        if self.app.config.intent_execution_policy and output.decision != "pause_current_intent":
             await self.app.handoff.summarize(intent.turn_id, token)
-        return routed
+        return await self.app._route(review_id, output, intent_id, receipts, token)
 
     @staticmethod
     def visible(request):

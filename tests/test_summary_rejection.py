@@ -36,8 +36,9 @@ def test_overlong_summary_completes_rejection_and_corrects_once(s5_case, field):
     root, corrected = calls[:2]
     identity = root.request.model_request_id
     assert corrected.request.correction_of_model_request_id == identity
+    limit = getattr(root.request.capacity, field)
     assert corrected.correction["issues"] == [{"code": "string_too_long", "path": "$/" + field,
-        "expected": "allowed_length", "actual": "string"}]
+        "expected": "unicode_codepoints_le_" + str(limit), "actual": "unicode_codepoints_" + str(limit + len(marker))}]
     saved = c.app.handoff.evidence.read("result", identity)
     assert saved["outcome"] == "invalid" and saved["raw"] is None
     assert c.app.output_boundary.evidence.read("selection-binding", identity) is None

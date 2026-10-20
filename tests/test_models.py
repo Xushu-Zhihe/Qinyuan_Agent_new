@@ -59,7 +59,8 @@ def test_stage_schema_rule_and_role_binding(stage):
     assert env.output_contract["schema"] == json.loads(payload["messages"][0]["content"].split("output_contract=")[1].split(" correction=")[0])["schema"]
     assert deepseek_roles.RULES[stage] in payload["messages"][0]["content"]
     assert payload["thinking"] == {"type": "enabled"}
-    assert payload["max_tokens"] == 32768 and payload["reasoning_effort"] == "high"
+    assert "max_tokens" not in payload and payload["reasoning_effort"] == "high"
+    assert "max_tokens" not in dict(role.parameters)
     assert "tools" not in payload and "temperature" not in payload and "top_p" not in payload
     with pytest.raises(ValueError, match="role_binding"):
         deepseek_roles.build_payload(env, deepseek_roles.role_config("outer_planning" if role.role == "inner_action" else "inner_action"))
@@ -417,7 +418,7 @@ def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_p
     result = persisted.read("provider-result", business.review_id)
     assert sent["model_request_id"] == business.review_id and sent["task_run_id"] == business.task_run_id
     assert sent["parameters"] == {"model": role.model, "response_format": {"type": "json_object"},
-        "stream": False, "thinking": {"type": "enabled"}, "reasoning_effort": "high", "max_tokens": 32768}
+        "stream": False, "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
     assert sent["timeout_seconds"] == 90 and result["request_sha256"] == digest(sent)
     if failure == "length":
         assert result["transport"]["usage"]["completion_tokens"] == 32768

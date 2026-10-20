@@ -1,4 +1,4 @@
-﻿"""Durable D4 start accounting and its compatibility with D3 records."""
+"""Durable D4 start accounting and its compatibility with D3 records."""
 
 from __future__ import annotations
 
@@ -667,3 +667,31 @@ def test_schema13_readonly_is_unchanged_and_upgrade_does_not_backfill_d4(
         assert upgraded.list_d4_operations(source.task_run_id) == ()
         assert upgraded.load_d3_operation(d3_start.operation_id) is not None
     case[1].destroyed = True
+
+
+def test_d4_review_admission_is_single_authority_past_eight(tmp_path):
+    from agent_adapters.budgeted_review_ledger import D4ReviewLedger
+    from agent_core.review import D2ReviewCoordinator
+    from test_review import _request, _accepted, Model
+    case = make_d4_scenario(tmp_path)
+    app = case[0]
+    task = app.state.task_run.task_run_id
+    try:
+        ledger = D4ReviewLedger(tmp_path / "quota-reviews", store=app.store, config=app.config, clock=app.clock)
+        coordinator = D2ReviewCoordinator(ledger)
+        limit = app.config.d4_budget.review
+        model = Model([_accepted() for _ in range(limit)])
+        for index in range(limit):
+            request = replace(_request(tmp_path), task_run_id=task, checkpoint_id=app.state.latest_checkpoint.sequence)
+            result = coordinator.review(request, model)
+            assert result.outcome == "accepted"
+        assert len(model.requests) == ledger.review_call_count(task) == limit > 8
+        usage = app.store.d4_budget_usage(task)
+        assert dict(usage.category_counts)["review"] == limit
+        reopened = D4ReviewLedger(tmp_path / "quota-reviews", store=app.store, config=app.config, clock=app.clock)
+        with pytest.raises(D4BudgetExhausted, match="review budget"):
+            D2ReviewCoordinator(reopened).review(replace(_request(tmp_path), task_run_id=task,
+                checkpoint_id=app.state.latest_checkpoint.sequence), Model([_accepted()]))
+        assert reopened.review_call_count(task) == limit
+    finally:
+        app.store.close()

@@ -1227,7 +1227,12 @@ class D3AuditedModel:
                     if validate is not None:
                         try:
                             validate(current, proposal)
-                        except D3ProposalRejected as exc:
+                        except (D3ProposalRejected, D3RecoveryRequired) as exc:
+                            if isinstance(exc, D3RecoveryRequired):
+                                if str(exc) != "d3_action_rejected_by_review_constraint":
+                                    raise
+                                # Only this known pre-application proposal rejection can use the existing correction.
+                                exc = D3ProposalRejected(str(exc))
                             self.reject(
                                 current.model_request_id,
                                 exc.code,
@@ -1237,6 +1242,9 @@ class D3AuditedModel:
                             retryable = exc.retryable
                     if rejection_code is None:
                         return current.model_request_id, proposal
+            elif (evidence.outcome == "model_error" and self.output_boundary is not None
+                    and self.output_boundary.retryable_technical_failure(current)):
+                retryable = True
             elif evidence.outcome in {"invalid_structure", "rejected"}:
                 try:
                     self._parse(current, evidence.raw)

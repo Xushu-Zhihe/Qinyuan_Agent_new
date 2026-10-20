@@ -41,6 +41,7 @@ D3ReviewDecision = Literal[
     "replan_current_intent",
     "adjust_turn_target",
     "acknowledge_turn_end",
+    "request_intent_resolution",
 ]
 D3EntityKind = Literal["turn", "intent", "plan"]
 D3_CATEGORY_LIMITS: dict[str, int | None] = {
@@ -179,7 +180,7 @@ class D3RunConfig:
 
     def __post_init__(self) -> None:
         if self.intent_execution_policy is not None and (
-                self.intent_execution_policy != "rolling_v1" or self.contract_version != 22):
+                self.intent_execution_policy not in {"rolling_v1", "continuous_v1"} or self.contract_version != 22):
             raise ValueError("d22_intent_execution_policy_invalid")
         if self.web_authorization is not None and (
                 self.contract_version not in {20,21,22} or not isinstance(self.web_authorization, D7WebAuthorization)
@@ -544,6 +545,7 @@ class D3ReviewApplication:
             "acknowledge_turn_end",
             "pause_current_intent",
             "abandon_current_intent",
+            "request_intent_resolution",
         }:
             raise ValueError("invalid D3 review decision")
         if self.review_scope == "turn_end" and (
@@ -589,6 +591,7 @@ class D3ReviewOutput:
             "acknowledge_turn_end",
             "pause_current_intent",
             "abandon_current_intent",
+            "request_intent_resolution",
         }:
             raise ValueError("invalid D3 review decision")
         _text(self.rationale, "rationale")

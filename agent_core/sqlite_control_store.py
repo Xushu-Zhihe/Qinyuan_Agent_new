@@ -3273,7 +3273,8 @@ class SqliteControlStore:
         if self.list_d4_unresolved_operations(start.task_run_id):
             raise D4RecoveryRequired("an earlier operation result remains unknown")
         records = self.list_d4_operations(start.task_run_id)
-        if start.charged:
+        config = self.load_d3_run_config(start.task_run_id)
+        if start.charged and config.intent_execution_policy != "continuous_v1":
             if sum(record.start.charged for record in records) >= budget.total:
                 raise D4BudgetExhausted("D4 total operation-start budget exhausted")
             if sum(record.start.category == start.category for record in records) >= getattr(budget, start.category):
@@ -4599,7 +4600,7 @@ class SqliteControlStore:
                     or self._connection.execute("SELECT 1 FROM d4_audit_events WHERE task_run_id=? AND category='cancellation_requested'", (start.task_run_id,)).fetchone()):
                 raise StorageError("D8 read admission is stopped or stale")
             count = self._connection.execute("SELECT COUNT(*) FROM d8_history_reads WHERE task_run_id=?", (start.task_run_id,)).fetchone()[0]
-            if count >= 8:
+            if count >= 8 and config.intent_execution_policy != "continuous_v1":
                 raise StorageError("d8_read_budget_exhausted")
             if start.capacity_version != len(self.list_d8_capacities(start.task_run_id)):
                 raise StorageError("D8 read capacity is stale")

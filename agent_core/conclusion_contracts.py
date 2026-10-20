@@ -8,7 +8,11 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Literal
 
+from agent_core.domain import MAX_FACT_CONTENT_LENGTH
 from agent_core.operation_accounting import _sha, _text, _time, _uuid
+
+
+MAX_CONCLUSION_REASON_LENGTH = 512
 
 
 class EvidenceStrength(Enum):
@@ -65,8 +69,8 @@ class D8Candidate:
     def __post_init__(self) -> None:
         _text(self.content, "content")
         # 与 domain.MAX_FACT_CONTENT_LENGTH 对齐：候选正文超长必须拒绝，不能悄悄截断。
-        _bounded(self.content, "content", 256)
-        _bounded(self.reason, "reason", 512)
+        _bounded(self.content, "content", MAX_FACT_CONTENT_LENGTH)
+        _bounded(self.reason, "reason", MAX_CONCLUSION_REASON_LENGTH)
         if not isinstance(self.evidence_refs, tuple) or not 1 <= len(self.evidence_refs) <= 8:
             raise ValueError("d8_candidate_sources_invalid")
         if len(set(self.evidence_refs)) != len(self.evidence_refs):
@@ -109,7 +113,7 @@ class FactCandidate:
         if not isinstance(self.inferred, bool):
             raise ValueError("fact_candidate_inferred_must_be_bool")
         if self.reason:
-            _bounded(self.reason, "reason", 512)
+            _bounded(self.reason, "reason", MAX_CONCLUSION_REASON_LENGTH)
         if self.evidence_refs:
             if not isinstance(self.evidence_refs, tuple) or not all(isinstance(r, str) for r in self.evidence_refs):
                 raise ValueError("fact_candidate_evidence_refs_invalid")
@@ -137,7 +141,7 @@ class D8ReviewRequestAction:
     reason: str
 
     def __post_init__(self) -> None:
-        _bounded(self.reason, "reason", 512)
+        _bounded(self.reason, "reason", MAX_CONCLUSION_REASON_LENGTH)
 
 
 def parse_d8_proposal(raw: object) -> D8Candidate | D8ReviewRequestAction:
@@ -160,7 +164,7 @@ class D8ReviewDecision:
     def __post_init__(self) -> None:
         if self.decision not in {"accept", "reject", "insufficient", "reuse", "no_new_information"}:
             raise ValueError("d8_review_decision_invalid")
-        _bounded(self.reason, "reason", 512)
+        _bounded(self.reason, "reason", MAX_CONCLUSION_REASON_LENGTH)
         if self.decision == "reuse":
             _uuid(self.reuse_fact_id, "reuse_fact_id")
         elif self.reuse_fact_id is not None:
@@ -282,7 +286,7 @@ class D8Feedback:
         _uuid(self.record_id, "record_id")
         if self.outcome not in {"verified_fact", "reviewed_inference", "rejected", "insufficient", "no_new_information"}:
             raise ValueError("d8_feedback_outcome_invalid")
-        _bounded(self.reason, "reason", 512)
+        _bounded(self.reason, "reason", MAX_CONCLUSION_REASON_LENGTH)
         _text(self.content, "content")
 
 

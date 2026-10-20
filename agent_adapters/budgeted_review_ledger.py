@@ -34,6 +34,8 @@ _KNOWN_FAILURES: dict[str, D4OperationResult] = {
 class D4ReviewLedger(FileD2ReviewLedger):
     """Keep D2's root ledger while making D4's SQLite ledger authoritative for starts."""
 
+    review_call_limit = None  # D4 SQLite operation admission is authoritative.
+
     def __init__(
         self,
         directory: Path,
@@ -207,10 +209,9 @@ class D4ReviewLedger(FileD2ReviewLedger):
                 attempts = root.get("attempts_used")
                 if type(attempts) is not int or attempts < 0:
                     raise D4RecoveryRequired("d4_review_attempt_count_invalid")
-                if attempts >= 2:
+                from agent_core.review_contracts import MAX_REVIEW_ATTEMPTS
+                if attempts >= MAX_REVIEW_ATTEMPTS:
                     raise ValueError("review_retry_exhausted")
-            if self.review_call_count(request.task_run_id) >= 8:
-                raise ValueError("review_budget_exhausted")
         if prior is not None and call is None:
             raise D4RecoveryRequired("d4_review_evidence_missing")
         if call is not None and call.get("outcome") not in {"started", "unknown"}:

@@ -10,6 +10,9 @@ from dataclasses import asdict, dataclass
 from typing import Literal, Protocol, cast
 from uuid import UUID
 
+MAX_REVIEW_ATTEMPTS = 2
+LEGACY_REVIEW_CALL_LIMIT = 8
+
 D2ReviewScope = Literal["turn_start", "action", "turn_end"]
 D2ReviewDecision = Literal["continue_current_intent", "acknowledge_turn_end"]
 D2ReviewOutcome = Literal[
@@ -139,7 +142,7 @@ class D2ReviewRequest:
         if self.review_scope != "action" and self.action_candidate_id is not None:
             raise ValueError("turn review must not have action_candidate_id")
         _finite_int(self.review_generation, "review_generation", 1, 2**31 - 1)
-        _finite_int(self.review_attempt, "review_attempt", 1, 2)
+        _finite_int(self.review_attempt, "review_attempt", 1, MAX_REVIEW_ATTEMPTS)
         _finite_int(self.checkpoint_id, "checkpoint_id", 1, 2**63 - 1)
         _finite_int(self.constraint_version, "constraint_version", 0, 2**31 - 1)
         _text(self.context_version, "context_version")

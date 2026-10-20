@@ -15,10 +15,14 @@ PAUSE = "pause_current_intent"
 def decisions(mode, sibling, replan, *, rolling=False):
     if mode == "restricted_repair":
         return {"meaningful": ["continue_current_intent"], "repetitive": [PAUSE], "inconclusive": [PAUSE]}
-    return {"meaningful": ["continue_current_intent"] + (["replan_current_intent"] if replan else []),
+    result = {"meaningful": ["continue_current_intent"] + (["replan_current_intent"] if replan else []),
             "repetitive": (["replan_current_intent"] if replan else [])
                 + (["switch_sibling_intent"] if sibling else []) + ["abandon_current_intent"],
             "inconclusive": ["continue_current_intent", PAUSE] if rolling else [PAUSE]}
+    if rolling:
+        for values in result.values():
+            values.append("request_intent_resolution")
+    return result
 
 
 def freeze_policy(app, context, turn_id, intent_id, scope, actions, timeout):
@@ -96,6 +100,10 @@ def progress_schema(request):
         from agent_core.execution_feasibility import constrain_schema
         constrained = constrain_schema(branch, request)
         branches.extend(constrained['anyOf'] if 'anyOf' in constrained else [constrained])
+    if p["mode"] == "ordinary" and json.loads(request.context_summary)["d8_progress"].get("intent_execution_policy"):
+        for branch in branches:
+            if branch["properties"]["decision"].get("enum") == ["request_intent_resolution"]:
+                branch["properties"]["constraints"]["maxItems"] = 0
     return {"anyOf": branches}
 
 

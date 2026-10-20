@@ -7,7 +7,7 @@ import threading
 from dataclasses import asdict, replace
 
 from agent_core.conclusion_contracts import (
-    D22FactReviewRequest, D8Candidate, D8Conclusion, D8Feedback, D8InferenceView, D8ModelRequest, D8Observation,
+    MAX_FACT_CONTENT_LENGTH, D22FactReviewRequest, D8Candidate, D8Conclusion, D8Feedback, D8InferenceView, D8ModelRequest, D8Observation,
     D8ReviewDecision, D8ReviewRequestAction, conclusion_digest, parse_d8_proposal, fact_evidence_matches,
 )
 from agent_core.runtime import TaskRunStatus
@@ -17,6 +17,13 @@ from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.operation_accounting import D4OperationCompletion, D4OperationStart
 from agent_core.turn_modeling import stable_id
 from agent_core.evidence_conclusions import EvidenceReviewRequest, EvidenceObservation, resource
+
+
+class OptionalConclusionFormatError(D3RecoveryRequired):
+    """A known complete optional output exhausted its one correction."""
+    def __init__(self, request_id, proposal_id=None):
+        self.request_id, self.proposal_id = request_id, proposal_id or request_id
+        super().__init__("d22_optional_conclusion_format_exhausted")
 
 
 class ConclusionReview:
@@ -334,7 +341,9 @@ class ConclusionReview:
         boundary = getattr(self, "output_boundary", None)
         if boundary is not None and result["outcome"] != "stale":
             boundary.terminal_check(request)
-        if result["outcome"] == "invalid" and request.correction_of_model_request_id is None:
+        technical_retry = (result["outcome"] == "model_error" and boundary is not None
+                           and boundary.retryable_technical_failure(request))
+        if (result["outcome"] == "invalid" or technical_retry) and request.correction_of_model_request_id is None:
             self._scope(request.observation)
             correction_id = stable_id(request.task_run_id, f"d8/correction/{request.model_request_id}")
             correction = self.evidence.read_request(correction_id) or replace(
@@ -344,9 +353,129 @@ class ConclusionReview:
                 rejection_code=result.get("rejection_code", "d8_response_contract_invalid"))
             return await self._call(correction, token)
         if result["outcome"] != "valid":
+            if self.optional_format(request.model_request_id) is not None:
+                raise OptionalConclusionFormatError(request.model_request_id)
             raise D3RecoveryRequired(result.get("rejection_code", f"d8_model_{result['outcome']}"))
         self._scope(request.observation)
         return request.model_request_id, self._parse(request, result["raw"])
+
+    def optional_format(self, identity):
+        if not self.config.intent_execution_policy:
+            return None
+        diagnostic = self.app.output_boundary.diagnostic(identity)
+        if (diagnostic is None or diagnostic["terminal"] is not None
+                or diagnostic["correction_of_model_request_id"] is None
+                or any(i["code"] in {"output_truncated", "completion_invalid", "output_size_exceeded", "output_depth_exceeded"}
+                       for i in diagnostic["issues"])):
+            return None
+        root_diagnostic = self.app.output_boundary.diagnostic(diagnostic["correction_of_model_request_id"])
+        if root_diagnostic is not None and any(i["code"] == "output_truncated" for i in root_diagnostic["issues"]):
+            # A failed regeneration cannot become a handled optional-format failure.
+            return None
+        request = self.evidence.read_request(identity)
+        if diagnostic["stage"] == "inner_plan":
+            if diagnostic.get("optional_output_kind") != "fact_candidate":
+                return None
+            saved = self.app.sessions.evidence.read("request", identity)
+            evidence = self.app.model_evidence.read(identity)
+            operation = self.store.load_d3_operation(identity)
+            contract = self.app.output_boundary.evidence.read("contract", identity)
+            if (saved is None or evidence is None or operation is None or operation.completion is None
+                    or evidence.outcome != "invalid_structure" or evidence.raw is not None
+                    or evidence.task_run_id != self.controller.control_state.task_run.task_run_id
+                    or evidence.stage != "inner_plan" or evidence.role_config_ref != self.config.inner_role.role_config_ref
+                    or contract["source_request_sha256"] != conclusion_digest(saved["request"])
+                    or contract["model_audit"] != {k: getattr(evidence, k) for k in
+                        ("stage", "resource_ref", "base_checkpoint_sequence", "context_sha256", "role_config_ref", "correction_of_model_request_id")}
+                    or operation.start.context_sha256 != evidence.context_sha256
+                    or operation.completion.evidence_sha256 != conclusion_digest(asdict(evidence))
+                    or operation.completion.evidence_ref != identity or operation.completion.result_kind != "rejected"):
+                raise D3RecoveryRequired("d22_optional_failure_binding_changed")
+            root = self.store.load_d3_operation(diagnostic["correction_of_model_request_id"])
+            original = self.app.model_evidence.read(diagnostic["correction_of_model_request_id"])
+            if (root is None or root.completion is None or original is None
+                    or original.task_run_id != evidence.task_run_id or original.stage != evidence.stage
+                    or original.correction_of_model_request_id is not None
+                    or original.role_config_ref != evidence.role_config_ref
+                    or original.resource_ref != evidence.resource_ref
+                    or root.completion.evidence_sha256 != conclusion_digest(asdict(original))):
+                raise D3RecoveryRequired("d22_optional_failure_binding_changed")
+            return diagnostic
+        if request is None or request.stage not in {"fact_proposal", "fact_review"}:
+            return None
+        result = self._known(request, repair=False)
+        if result is None or result["outcome"] != "invalid":
+            return None
+        root = self.evidence.read_request(request.correction_of_model_request_id)
+        known = self._known(root, repair=False) if root is not None else None
+        if (root is None or known is None or known["outcome"] != "invalid"
+                or root.stage != request.stage or root.observation != request.observation
+                or root.correction_of_model_request_id is not None):
+            raise D3RecoveryRequired("d22_optional_failure_binding_changed")
+        return diagnostic
+
+    def optional_failure(self, proposal_id):
+        notice = self.app.sessions.evidence.read("pause", self._id("optional-format/" + proposal_id))
+        if notice is None:
+            return None
+        if (set(notice) != {"proposal_request_id", "failed_request_id", "identity"}
+                or notice["proposal_request_id"] != proposal_id
+                or notice["identity"] != "unreviewed_optional_format_failure"
+                or self.optional_format(notice["failed_request_id"]) is None):
+            raise D3RecoveryRequired("d22_optional_failure_binding_changed")
+        request = self.evidence.read_request(notice["failed_request_id"])
+        if request is None or request.stage == "fact_proposal":
+            if notice["failed_request_id"] != proposal_id:
+                raise D3RecoveryRequired("d22_optional_failure_binding_changed")
+        elif isinstance(request, EvidenceReviewRequest):
+            candidate = self.app.validator._known_model(request.task_run_id, proposal_id, "inner_plan")
+            if (request.correction_of_model_request_id != self.app.evidence_conclusions._id("evidence-review/" + proposal_id)
+                    or candidate != request.candidate):
+                raise D3RecoveryRequired("d22_optional_failure_binding_changed")
+        else:
+            proposal = self.evidence.read_request(proposal_id)
+            known = self._known(proposal, repair=False) if proposal is not None else None
+            if (proposal is None or known is None or known["outcome"] != "valid"
+                    or request.correction_of_model_request_id != self._id("review/" + proposal_id)
+                    or proposal.observation != request.observation or self._parse(proposal, known["raw"]) != request.candidate):
+                raise D3RecoveryRequired("d22_optional_failure_binding_changed")
+        return notice
+
+    def record_optional_failure(self, proposal_id, failed_id):
+        self.app._check_dispatch()
+        notice = dict(proposal_request_id=proposal_id, failed_request_id=failed_id,
+                      identity="unreviewed_optional_format_failure")
+        self.app.sessions.evidence.save("pause", self._id("optional-format/" + proposal_id), notice)
+        self.optional_failure(proposal_id)
+        from qinyuan_core import get_logger
+        get_logger("ctrl").info("fact.optional_format_exhausted", run=self.controller.control_state.task_run.task_run_id,
+            request=failed_id, proposal=proposal_id, category="technical_result")
+
+    def optional_ready(self, proposal_id):
+        notice = self.optional_failure(proposal_id)
+        if notice is None:
+            return False
+        request = self.evidence.read_request(notice["failed_request_id"])
+        if request is not None and request.observation.plan_id is not None:
+            result = self.store.load_d3_plan_result(request.observation.plan_id)
+            if result is None:
+                return False  # Let the original observation owner commit first.
+            if result.outcome != "observed" or result.proof_id != request.observation.proof_id:
+                raise D3RecoveryRequired("d22_optional_failure_observation_changed")
+        return True
+
+    def finish_optional_failure(self, proposal_id):
+        if not self.optional_ready(proposal_id):
+            return False
+        # A rejected operation stays rejected/unapplied. Only a valid candidate can be consumed.
+        operation = self.store.load_d4_operation(proposal_id)
+        if operation.completion.result_kind == "completed":
+            reference = self._id("optional-format/" + proposal_id)
+            if operation.application_ref is None:
+                self.store.mark_d4_operation_applied(proposal_id, reference)
+            elif operation.application_ref != reference:
+                raise D3RecoveryRequired("d22_optional_failure_binding_changed")
+        return True
 
     def _feedback(self, plan_id):
         result = []
@@ -398,10 +527,10 @@ class ConclusionReview:
         - Otherwise, preserve inner layer's candidate.content verbatim
 
         Strict about output boundaries:
-        - refined_content must not exceed 2048 characters (enforced in D8ReviewDecision.__post_init__)
+        - Current output Schema uses the Fact ceiling; legacy decisions may contain longer refinement.
         - merged_sources tracked separately for traceability
         """
-        if decision.refined_content is not None and len(decision.refined_content) <= 256:
+        if decision.refined_content is not None and len(decision.refined_content) <= MAX_FACT_CONTENT_LENGTH:
             return decision.refined_content
         # A refinement longer than the Fact ceiling cannot be stored; fall back
         # to the accepted candidate, which the proposal schema already bounds.
@@ -479,8 +608,12 @@ class ConclusionReview:
             allowance = max(allowance, budget.category_limits.get("fact_review", 0))
         # One extra ordinal so the paying budget is always the authority that
         # stops the loop; the allowance only guards a misconfigured budget.
-        for ordinal in range(1, allowance + 2):
-            root_id = self._id(f"proposal/{source.plan_id}/{ordinal}")
+        from itertools import count
+        from agent_core.intent_execution import visits, continuous
+        visit = visits(self.store, source.task_run_id, source.intent_id) if continuous(self.config) else 0
+        for ordinal in (count(1) if continuous(self.config) else range(1, allowance + 2)):
+            if self.stopped() or token.is_cancelled:raise D3RecoveryRequired("d8_proposal_stopped")
+            root_id = self._id(f"proposal/{source.plan_id}/{ordinal}" + (f"/revisit/{visit}" if visit else ""))
             correction_id = stable_id(source.task_run_id, f"d8/correction/{root_id}")
             records = (self.store.load_d4_operation(root_id), self.store.load_d4_operation(correction_id))
             if any(item is not None and item.application_ref is not None for item in records):
@@ -511,7 +644,10 @@ class ConclusionReview:
                 from dataclasses import fields
                 review = D22FactReviewRequest(**{f.name: getattr(review, f.name) for f in fields(review)},
                                               existing_facts=self.reusable_facts(source))
-            actual_id, decision = await self._call(review, token)
+            try:
+                actual_id, decision = await self._call(review, token)
+            except OptionalConclusionFormatError as exc:
+                raise OptionalConclusionFormatError(exc.request_id, proposal_id) from exc
             outcome = ("no_new_information" if decision.decision == "no_new_information" else
                        "verified_fact" if decision.decision == "reuse" else self._outcome(candidate, source, decision))
             fact_id = self.fact_choice(review, candidate, decision) if outcome in {"verified_fact", "no_new_information"} else None

@@ -60,7 +60,10 @@ def validate_mutation(store,mutation,config):
         prior=[p for p in rows.plans if p.intent_id==binding.intent_id]
         previous=store.load_d3_plan_result(prior[-1].plan_id) if prior else None
         continuation=(config.contract_version==22 and previous is not None
-                      and previous.outcome=='no_new_information')
+                      and previous.outcome=='no_new_information'
+                      and any(r.plan_id==prior[-1].plan_id and r.outcome=='no_new_information'
+                              and r.review_request_id==binding.replan_review_id
+                              for r in store.list_d8_conclusions(mutation.task_run_id)))
         rolling = bool(config.intent_execution_policy and prior and prior[-1].status is PlanStatus.COMPLETED and binding.replan_review_id is None)
         plan=plans[-1]
         turn=store.load_d3_turn_binding(binding.turn_id)
