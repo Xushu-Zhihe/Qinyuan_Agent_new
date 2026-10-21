@@ -22,34 +22,113 @@ function statusLabel(task) {
   const labels = { draft: ["draft", "草稿"], starting: ["running", "启动中"], running: ["running", "运行中"], cancelling: ["running", "取消中"], cleaning: ["running", "清理中"], cleanup_confirmed: ["finished", "资源已清理"], paused: ["cancelled", "已暂停"], recovery_required: ["cancelled", "需恢复"], cancelled: ["cancelled", "已取消"], deadline_exceeded: ["cancelled", "总时限已到"], finished: ["finished", "已结束"], failed: ["cancelled", "已停止"] };
   return labels[task.status] || ["draft", task.status || "草稿"];
 }
+const LIVE_STATUSES = ["starting", "running", "cancelling", "cleaning"];
+const PIPE_FIELDS = [["turns", "Turn"], ["intents", "Intent"], ["execs", "执行"], ["facts", "Fact"]];
+
+function runCounts(task) {
+  const report = task.run && task.run.result;
+  if (!report) return null;
+  const turns = report.turns || [];
+  return {
+    turns: turns.length,
+    intents: turns.reduce((sum, turn) => sum + ((turn.intents || []).length), 0),
+    execs: (report.executions || []).length,
+    facts: (report.verified_facts || []).length,
+  };
+}
+
+function renderBoardStats() {
+  const host = $("board-stats"); if (!host) return;
+  const tasks = state.tasks.filter((task) => !task.archived);
+  const running = tasks.filter((task) => LIVE_STATUSES.includes(task.run?.status)).length;
+  const facts = tasks.reduce((sum, task) => sum + (runCounts(task)?.facts || 0), 0);
+  const recovering = tasks.filter((task) => task.run?.status === "recovery_required" || task.run?.result?.recovery?.required).length;
+  const cards = [
+    { tone: "info", label: "题目", value: String(tasks.length), hint: `${state.tasks.length - tasks.length} 个归档` },
+    { tone: running ? "live" : "", label: "运行中", value: String(running), hint: running ? "Agent 进程持有 Sandbox" : "当前没有活动运行" },
+    { tone: "info", label: "已验证 Fact", value: String(facts), hint: "外层复核通过后写入" },
+    { tone: recovering ? "warn" : "", label: "待恢复", value: String(recovering), hint: recovering ? "需要显式恢复后才能继续" : "无未知操作" },
+  ];
+  host.replaceChildren(...cards.map((item) => {
+    const card = document.createElement("div");
+    card.className = "stat-card";
+    if (item.tone) card.dataset.tone = item.tone;
+    const label = document.createElement("span"); label.className = "stat-label"; label.textContent = item.label;
+    const value = document.createElement("strong"); value.className = "stat-value"; value.textContent = item.value;
+    const hint = document.createElement("span"); hint.className = "stat-hint"; hint.textContent = item.hint;
+    card.append(label, value, hint);
+    return card;
+  }));
+}
+
 function renderTaskList() {
   const list = $("task-list"); list.replaceChildren();
   const tasks = state.tasks.filter((task) => state.showArchived || !task.archived);
-  if (!tasks.length) { const empty = document.createElement("div"); empty.className = "empty-state"; empty.textContent = "还没有题目，先创建一个准备任务。"; list.append(empty); return; }
+  renderBoardStats();
+  if (!tasks.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "还没有题目。创建一道题，选择运行模式后即可启动 Agent。";
+    list.append(empty);
+    $("batch-cleanup").hidden = true;
+    return;
+  }
   tasks.forEach((task) => {
     const [kind, label] = statusLabel(task);
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = `task-row${state.selected === task.id ? " selected" : ""}${state.selectMode && state.selectedTasks.has(task.id) ? " multi-selected" : ""}`;
-    row.addEventListener("click", () => {
-      if (state.selectMode) {
-        toggleTaskSelection(task.id);
-      } else {
-        selectTask(task.id);
-      }
+    const live = LIVE_STATUSES.includes(task.run?.status);
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = [
+      "task-card",
+      state.selected === task.id ? "selected" : "",
+      state.selectMode && state.selectedTasks.has(task.id) ? "multi-selected" : "",
+      state.selectMode ? "checking" : "",
+      live ? "is-live" : "",
+    ].filter(Boolean).join(" ");
+    if (task.archived) card.style.opacity = "0.62";
+    card.addEventListener("click", () => {
+      if (state.selectMode) toggleTaskSelection(task.id);
+      else selectTask(task.id);
     });
+
+    const top = document.createElement("div"); top.className = "task-card-top";
+    const chip = document.createElement("span"); chip.className = "cat-chip"; chip.textContent = task.category || "unknown";
+    const pill = document.createElement("span"); pill.className = `status-pill ${kind}`;
+    const dot = document.createElement("i"); pill.append(dot, document.createTextNode(label));
+    top.append(chip, pill);
+
+    const title = document.createElement("strong"); title.className = "task-card-title"; title.textContent = task.title;
+    const target = document.createElement("p");
+    target.className = `task-card-target${task.endpoint ? "" : " is-empty"}`;
+    target.textContent = task.endpoint || "无远程目标 · 仅附件观察";
+
+    const counts = runCounts(task);
+    const pipe = document.createElement("div"); pipe.className = "task-pipe";
+    for (const [key, text] of PIPE_FIELDS) {
+      const item = document.createElement("span");
+      item.className = `pipe-item${key === "facts" && counts ? " accent" : ""}${counts ? "" : " idle"}`;
+      const num = document.createElement("b"); num.textContent = counts ? String(counts[key]) : "—";
+      item.append(num, document.createTextNode(text));
+      pipe.append(item);
+    }
+
+    const foot = document.createElement("div"); foot.className = "task-card-foot";
+    const attachmentText = document.createElement("span");
+    attachmentText.textContent = counts ? `${task.attachments.length} 附件 · ${task.deadline_minutes || 60} 分钟时限` : `${task.attachments.length} 附件 · 尚未运行`;
+    const go = document.createElement("span"); go.className = "go"; go.textContent = task.archived ? "查看" : counts ? "进入 →" : "准备运行 →";
+    foot.append(attachmentText, go);
+
+    card.append(top, title, target, pipe, foot);
+
     if (state.selectMode) {
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.className = "task-checkbox";
       checkbox.checked = state.selectedTasks.has(task.id);
-      checkbox.addEventListener("click", (e) => e.stopPropagation());
-      row.prepend(checkbox);
+      checkbox.addEventListener("click", (event) => event.stopPropagation());
+      card.prepend(checkbox);
     }
-    const title = document.createElement("strong"); title.textContent = task.title;
-    const meta = document.createElement("small"); meta.textContent = `${task.category.toUpperCase()} · ${task.attachments.length} 个附件 · ${task.endpoint || "无远程目标"}`;
-    const badge = document.createElement("span"); badge.className = `status-badge ${kind}`; badge.textContent = label;
-    row.append(title, meta, badge); list.append(row);
+    list.append(card);
   });
   $("batch-cleanup").hidden = !state.selectMode || state.selectedTasks.size === 0;
 }
@@ -162,7 +241,7 @@ function showView(name, updateHistory = true) {
   document.body.classList.toggle("detail-open", name === "detail");
   document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === (name === "detail" ? "tasks" : name)));
   document.querySelectorAll(".view").forEach((view) => { const active = view.id === `${name}-view`; view.hidden = !active; view.classList.toggle("active", active); });
-  $("current-view").textContent = name === "model" ? "模型配置" : name === "detail" ? "题目详情" : "题目管理";
+  $("current-view").textContent = name === "model" ? "模型角色" : name === "detail" ? "题目详情" : "任务与运行";
   if (name === "model") loadModel();
   if (updateHistory) {
     const route = name === "detail" ? (state.selected ? `#task/${state.selected}` : "#new") : `#${name}`;
@@ -178,7 +257,7 @@ function syncRoute() {
   if (route === "#new") { resetForm(); showView("detail", false); return; }
   showView(route === "#model" ? "model" : "tasks", false);
 }
-async function health() { try { const value = await request("/api/health"); state.executionProfile = value.capabilities?.execution_profile; $("http-methods-control").hidden = !["d8_v20", "d8_v21"].includes(state.executionProfile); $("run-mode").querySelector('option[value="real"]').textContent = value.capabilities?.real_sandbox_backend === "docker" ? "真实模型＋Docker Sandbox" : "真实模型＋本地模拟 Sandbox"; $("run-mode-control").hidden = !["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"].includes(state.executionProfile); if (["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"].includes(state.executionProfile)) { $("run-mode").value = value.capabilities.d7_mode || ""; $("run-mode").disabled = !!value.capabilities.d7_mode; } $("service-status").textContent = value.status === "ready" ? "服务已连接" : "服务状态异常"; $("connection-text").textContent = "回环服务"; } catch (_) { $("service-status").textContent = "服务未连接"; $("connection-text").textContent = "未连接"; } }
+async function health() { try { const value = await request("/api/health"); state.executionProfile = value.capabilities?.execution_profile; $("profile-pill").textContent = state.executionProfile ? `profile ${state.executionProfile}` : `协议 v${value.capabilities?.protocol_version || 3}`; $("http-methods-control").hidden = !["d8_v20", "d8_v21"].includes(state.executionProfile); $("run-mode").querySelector('option[value="real"]').textContent = value.capabilities?.real_sandbox_backend === "docker" ? "真实模型＋Docker Sandbox" : "真实模型＋本地模拟 Sandbox"; $("run-mode-control").hidden = !["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"].includes(state.executionProfile); if (["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"].includes(state.executionProfile)) { $("run-mode").value = value.capabilities.d7_mode || ""; $("run-mode").disabled = !!value.capabilities.d7_mode; } $("service-status").textContent = value.status === "ready" ? "服务已连接" : "服务状态异常"; $("connection-text").textContent = "回环服务"; } catch (_) { $("service-status").textContent = "服务未连接"; $("connection-text").textContent = "未连接"; $("profile-pill").textContent = "离线"; } }
 function toggleTaskSelection(taskId) {
   if (state.selectedTasks.has(taskId)) {
     state.selectedTasks.delete(taskId);

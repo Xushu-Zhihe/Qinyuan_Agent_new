@@ -21,6 +21,75 @@ const RunView = (() => {
   function detail(key, title) { const el = node("details", undefined, "run-event"); el.dataset.key = key; el.append(node("summary", title)); return el; }
   function badge(status) { const el = node("span", label(status), "run-badge"); if (Object.hasOwn(labels, status)) el.dataset.status = status; return el; }
   function metric(title, value) { const el = node("div", undefined, "run-metric"); el.append(node("span", title), node("strong", value)); return el; }
+
+  // 把「一次运行走到哪」摊平成五个阶段。只做投影，不推断成功。
+  function stageStates(progress, live) {
+    const turns = progress.turns || [];
+    const intents = turns.flatMap((turn) => turn.intents || []);
+    const executions = progress.executions || [];
+    const facts = progress.verified_facts || [];
+    const recovery = progress.recovery || {};
+    const reason = String(recovery.reason || "");
+    const goal = progress.goal_evaluation;
+    const goalDone = goal && goal !== "not_evaluated";
+    const bad = (fragment) => reason.includes(fragment);
+    return [
+      {
+        n: 1, name: "冻结根",
+        detail: progress.task_run_id ? `${progress.mode || "unknown"} · ${progress.sandbox_backend || "unknown"}` : "等待运行",
+        state: live ? "done" : progress.task_run_id ? "done" : "idle",
+      },
+      {
+        n: 2, name: "外层规划",
+        detail: turns.length ? `${turns.length} Turn · ${intents.length} Intent` : "尚未提交 Turn",
+        state: turns.length ? "done" : bad("tree") || bad("planning") ? "alert" : live ? "active" : "idle",
+      },
+      {
+        n: 3, name: "内层执行",
+        detail: executions.length ? `${executions.length} 次执行 · ${(progress.plans || []).length} Plan` : "当前 Intent 尚无动作",
+        state: executions.length ? (executions.some((item) => ["pending", "running"].includes(item.status)) ? "active" : "done") : live && turns.length ? "active" : "idle",
+      },
+      {
+        n: 4, name: "取证与复核",
+        detail: `${facts.length} 条 verified · ${(progress.retrospective || []).length} 次复盘`,
+        state: facts.length ? "done" : live && executions.length ? "active" : bad("fact") || bad("review") ? "alert" : "idle",
+      },
+      {
+        n: 5, name: "结论边界",
+        detail: recovery.required ? reason || "需要显式恢复" : goalDone ? label(goal) : live ? "运行中，尚未判定" : label(progress.task_run?.status) || "已结束",
+        state: recovery.required ? "alert" : goalDone ? "done" : "idle",
+      },
+    ];
+  }
+
+  function renderStages(progress, live) {
+    const host = get("run-stages"); if (!host) return;
+    host.replaceChildren(...stageStates(progress, live).map((stage) => {
+      const cell = node("div", undefined, "stage");
+      cell.dataset.state = stage.state;
+      const top = node("div", undefined, "stage-top");
+      top.append(node("span", String(stage.n), "stage-num"), node("span", stage.name, "stage-name"));
+      cell.append(top, node("span", stage.detail, "stage-detail"));
+      return cell;
+    }));
+  }
+
+  function renderFocus(progress, run, live) {
+    const host = get("run-focus"); if (!host) return;
+    host.replaceChildren();
+    const executions = progress.executions || [];
+    const running = executions.find((item) => ["pending", "running"].includes(item.status));
+    const activeIntent = (progress.turns || []).flatMap((turn) => turn.intents || []).find((item) => item.status === "running");
+    let state = "idle";
+    let text;
+    if (running) { state = "live"; text = `执行中 · step ${running.step_index ?? "—"} · ${short(running.plan_id)}`; }
+    else if (live && activeIntent) { state = "live"; text = `Intent ${activeIntent.priority} · ${activeIntent.description || "（无描述）"}`; }
+    else if (live) { state = "live"; text = "等待外层下一步决策"; }
+    else if (progress.recovery?.required) { state = "warn"; text = `已停止 · ${progress.recovery.reason || "需要恢复"}`; }
+    else { text = `已结束 · ${label(progress.task_run?.status) || label(run?.status)}`; }
+    host.append(node("span", "", "focus-dot"), node("span", text, "focus-text"));
+    host.firstChild.dataset.state = state;
+  }
   function reset() { generation += 1; current = null; filter = null; cache = new Map(); validationQueries.clear(); graphZoom = null; setTab("detail"); get("run-read-error").hidden = true; }
   function render(data) {
     if (current?.run?.run_id !== data.run?.run_id) { generation += 1; cache.clear(); filter = null; }
@@ -43,11 +112,16 @@ const RunView = (() => {
       remaining = progress.task_run.finished_at ? "已结束" : `${Math.floor(seconds / 60)}分 ${seconds % 60}秒`;
     }
     const goal = progress.protocol_version === 3 ? `${progress.mode === "simulated" ? "模拟：" : ""}${label(progress.goal_evaluation)}` : "未验证";
-    const metrics = [metric("当前阶段", phase), metric("剩余总时限", remaining), metric("已验证观察", String(progress.verified_facts?.length || 0)), metric("待验证候选", String(progress.pending_candidates?.length || 0)), metric("目标评估", goal)];
+    const metrics = [metric("当前阶段", phase), metric("剩余总时限", remaining), metric("已验证 Fact", String(progress.verified_facts?.length || 0)), metric("待验证候选", String(progress.pending_candidates?.length || 0)), metric("目标评估", goal)];
     if (progress.protocol_version === 3) {
       metrics.push(metric("已提交 Checkpoint", String(progress.checkpoint?.sequence ?? "—")));
       if (progress.budget?.status === "available") metrics.push(metric("操作预算", progress.budget.total_limit == null ? `${progress.budget.total_used} 次（按 deadline）` : `${progress.budget.total_used} / ${progress.budget.total_limit}`));
     }
+    renderStages(progress, live);
+    renderFocus(progress, run, live);
+    get("run-stages").hidden = !run;
+    get("run-summary").hidden = !run;
+    get("run-summary").style.setProperty("--cols", String(metrics.length));
     get("run-summary").classList.toggle("v3", progress.protocol_version === 3);
     get("run-summary").replaceChildren(...metrics);
     get("run-result").textContent = JSON.stringify({ ...data, challengeId: undefined }, null, 2);
@@ -202,9 +276,11 @@ const RunView = (() => {
       item.append(node("p", action.model_request_id, "run-ref"));
       entries.push({ at: action.started_at, el: item });
     }
-    for (const execution of progress.executions || []) {
+    for (const [index, execution] of (progress.executions || []).entries()) {
       if (!fits(execution.plan_id)) continue;
-      const item = detail(`execution-${execution.execution_id}`, `${time(execution.started_at)} · ${progress.protocol_version === 3 ? "受控动作" : "Bash"} · ${execution.status === "succeeded" ? "执行已结束" : label(execution.status)}${execution.exit_code !== undefined && execution.exit_code !== null ? ` · exit ${execution.exit_code}` : ""}`);
+      const stamp = execution.started_at ? time(execution.started_at) : `执行 #${index + 1}`;
+      const outcome = execution.status === "succeeded" ? "执行已结束" : label(execution.status);
+      const item = detail(`execution-${execution.execution_id}`, `${stamp} · ${progress.protocol_version === 3 ? "受控动作" : "Bash"} · ${outcome}${execution.exit_code !== undefined && execution.exit_code !== null ? ` · exit ${execution.exit_code}` : ""}`);
       item.append(node("p", `Plan ${short(execution.plan_id)} · step ${execution.step_index} · ${execution.execution_id}`, "run-ref"));
       const body = node("div"); item.append(body);
       const key = `${execution.execution_id}:${execution.status}`;
@@ -235,7 +311,7 @@ const RunView = (() => {
       };
       item.addEventListener("toggle", load);
       if (opened.has(item.dataset.key)) { item.open = true; load(); }
-      entries.push({ at: execution.started_at || Number.MAX_SAFE_INTEGER, el: item });
+      entries.push({ at: execution.started_at ?? (Number.MIN_SAFE_INTEGER + index), el: item });
     }
     if (!filter || filter.type === "task") for (const event of current.events || []) {
       const item = detail(`event-${event.sequence}`, `${time(event.timestamp)} · ${event.details?.operation || event.type} · ${label(event.status)}`);

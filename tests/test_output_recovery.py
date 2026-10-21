@@ -495,3 +495,70 @@ def test_inner_length_regeneration_still_obeys_deadline_and_cancel(http_case, st
     c.models[1].invoke = ended
     asyncio.run(c.app.run(c.token))
     assert len(calls) == 1 and len(c.sends) == 1 and len(c.app.state.facts) == 1
+
+
+@pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
+def test_cache_order_keeps_policy_priority_evidence_and_correction(http_case):
+    from collections import Counter
+    from dataclasses import replace
+    from agent_adapters.deepseek_roles import build_payload, _shared_schema
+
+    c = http_case
+    install(c, steps=2)
+    captured = []
+    for model in c.models:
+        invoke = model.invoke
+        def capture(envelope, *args, invoke=invoke):
+            captured.append(envelope)
+            return invoke(envelope, *args)
+        model.invoke = capture
+    result = asyncio.run(c.app.run(c.token))
+    assert not result.recovery_required, result
+
+    def sections(text):
+        values = {}
+        for name in ("plan_policy", "review_policy", "fixed_probe_policy", "planning_policy",
+                     "progress_policy", "Current branch limits", "output_contract", "correction"):
+            marker = " " + name + "="
+            if marker in text:
+                before, after = text.split(marker, 1)
+                value, end = json.JSONDecoder().raw_decode(after)
+                values[name] = value
+                text = before + after[end:]
+        return values, text
+
+    seen = set()
+    fact_prefixes = [[], []]
+    for envelope in captured:
+        stage = envelope.output_contract["stage"]
+        role = c.app.config.inner_role if stage in {"inner_plan", "fact_proposal", "inner_candidate"} else c.app.config.outer_role
+        original_contract = json.dumps(envelope.output_contract)
+        original_request = repr(envelope.request)
+        payload = build_payload(envelope, role, context_loader=c.app.web.model_context)
+        legacy = build_payload(replace(envelope, output_contract={k: v for k, v in envelope.output_contract.items()
+            if k != "input_projection"}), role, context_loader=c.app.web.model_context)
+        assert [m["role"] for m in payload["messages"]] == ["system", "user"]
+        assert {k: v for k, v in payload.items() if k != "messages"} == {k: v for k, v in legacy.items() if k != "messages"}
+        values, guidance = sections(payload["messages"][0]["content"])
+        old_values, old_guidance = sections(legacy["messages"][0]["content"])
+        assert values["output_contract"] == {**envelope.output_contract, "schema": _shared_schema(envelope.output_contract["schema"])}
+        assert {k: v for k, v in values.items() if k != "output_contract"} == {k: v for k, v in old_values.items() if k != "output_contract"}
+        shared_start = guidance.index(" Shared input references use JSON Pointer:")
+        shared_end = guidance.index("never substitute a $ref object.", shared_start) + len("never substitute a $ref object.")
+        assert Counter((guidance[:shared_start] + guidance[shared_end:]).split()) == Counter(old_guidance.split())
+        assert payload["messages"][0]["content"].index("Shared input references") < payload["messages"][0]["content"].index(" output_contract=")
+        assert json.dumps(envelope.output_contract) == original_contract and repr(envelope.request) == original_request
+
+        correction = {"issues": [{"code": "output_truncated"}]}
+        corrected = build_payload(replace(envelope, correction=correction), role, context_loader=c.app.web.model_context)
+        assert corrected["messages"][1] == payload["messages"][1]
+        assert corrected["messages"][0]["content"].split(" correction=", 1)[0] == payload["messages"][0]["content"].split(" correction=", 1)[0]
+        assert sections(corrected["messages"][0]["content"])[0]["correction"] == correction
+        if stage == "fact_proposal":
+            fact_prefixes[0].append(legacy["messages"][0]["content"])
+            fact_prefixes[1].append(payload["messages"][0]["content"])
+        seen.add(stage)
+    assert {"inner_plan", "fact_proposal", "fact_review", "intent_evaluation", "handoff_summary"} <= seen
+    from os.path import commonprefix
+    assert len(fact_prefixes[0]) >= 2
+    assert len(commonprefix(fact_prefixes[1])) > len(commonprefix(fact_prefixes[0]))
