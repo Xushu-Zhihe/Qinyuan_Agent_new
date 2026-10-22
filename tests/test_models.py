@@ -546,7 +546,7 @@ def test_outer_watchdog_waits_for_adapter_or_keeps_result_unknown(cooperative):
         seen.append(token.is_timed_out)
         if not cooperative:release.wait(5)
         return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
-    model = SimpleNamespace(adapter=SimpleNamespace(invoke=invoke), output_boundary=None, clock=time.time,
+    model = SimpleNamespace(adapter=SimpleNamespace(invoke=invoke), output_boundary=None, clock=time.time, active_calls={},
         controller=SimpleNamespace(control_state=SimpleNamespace(task_run=SimpleNamespace(
             status=SimpleNamespace(value="running"), deadline_at=time.time()+60))))
     req = SimpleNamespace(task_run_id="run", model_request_id="call", stage="inner_plan")
@@ -572,7 +572,7 @@ def test_user_cancel_waits_for_model_adapter_acknowledgement():
         time.sleep(.02)  # Transport cleanup is still in flight.
         assert not invocation.is_timed_out
         return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
-    model = SimpleNamespace(adapter=SimpleNamespace(invoke=invoke), output_boundary=None, clock=time.time,
+    model = SimpleNamespace(adapter=SimpleNamespace(invoke=invoke), output_boundary=None, clock=time.time, active_calls={},
         controller=SimpleNamespace(control_state=SimpleNamespace(task_run=SimpleNamespace(
             status=SimpleNamespace(value="running"), deadline_at=time.time()+60))))
     req = SimpleNamespace(task_run_id="run", model_request_id="call", stage="inner_plan")

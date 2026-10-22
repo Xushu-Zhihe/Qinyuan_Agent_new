@@ -629,6 +629,8 @@ class D3Application:
         """Repair SQLite operation completions from already-persisted evidence only."""
         if self.config.d4_budget is None:
             return
+        if self.sessions is not None:
+            self.supervision.poll()
         if self.mcp is not None:
             self.mcp.reconcile()
         if self.web is not None:

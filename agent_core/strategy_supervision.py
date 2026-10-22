@@ -34,7 +34,11 @@ COMPARISON_GUIDANCE = (
     "model-selected experiment issued many of them. Use original decisions, working records and "
     "observations for the hypothesis; statistics are not verified knowledge. Explain the new judgment "
     "and its decisive refs concisely instead of repeating the full history. An optional alternative can "
-    "be preferable without the current Intent being completed or invalid. Suggestions remain voluntary."
+    "be preferable without the current Intent being completed or invalid. Suggestions remain voluntary. "
+    "Meaningful finite enumeration needs an explicit tested domain and increasing coverage or a "
+    "discriminating next check; an endlessly growing list is not a closure criterion. Separate success "
+    "coverage from scoped negative findings and review checkpoints. A request for resolution opens a "
+    "review of the latest evidence, including the inner's disagreement; it is not a required failure verdict."
 )
 
 
@@ -202,7 +206,7 @@ class StrategySupervision:
 
     def start(self, intent_id):
         self.poll()
-        if self.pending or not self.enabled:
+        if self.pending or not self.enabled or self.stop(intent_id) is not None:
             return
         app = self.app
         app._check_role()
@@ -223,6 +227,10 @@ class StrategySupervision:
                       latest_decision_ref=latest.ref,
                       scope_ref=self.epoch(intent_id),
                       knowledge_version=self.knowledge_version(intent_id),
+                      strategy_resolution_policy="review_latest_evidence",
+                      knowledge_refs=sorted(i.ref for i in app.handoff.history() if i.intent_id == intent_id
+                          and i.record_type in {"verified_fact", "reviewed_inference"}
+                          and i.source_status == "available" and not i.conflict),
                       observation_signatures=self.observation_signatures(intent_id),
                       d8_progress=app.sessions.review_context(intent_id, compact=True),
                       exploration_progress=self.exploration_progress(intent_id),
@@ -304,49 +312,62 @@ class StrategySupervision:
         finally:
             self.polling = False
 
-    def applicable(self, request, result):
+    def validity(self, request, result):
+        """Hard changes invalidate authority; appended evidence requests a current review."""
         app = self.app
         if app.state.task_run.status.value != "running":
-            return False
+            return "task_not_running"
         intent = next((i for i in app.state.intents if i.intent_id == request.intent_id), None)
         if intent is None or intent.status.value != "running":
-            return False
+            return "intent_not_running"
         frozen = json.loads(request.prior_summary)
         if self.epoch(request.intent_id) != frozen["scope_ref"]:
-            return False
+            return "selection_changed"
         current = {i.ref: i for i in app.handoff.history()}
         cited = set(result["raw"]["evidence_refs"]) | set((result["raw"].get("suggestion") or {}).get("evidence_refs", ()))
-        if any(i.ref not in current or current[i.ref].source_status != "available" or current[i.ref].conflict
-               for i in request.history if i.ref in cited):
-            return False
+        if any(ref not in current or current[ref].source_status != "available" or current[ref].conflict for ref in cited):
+            return "cited_source_unavailable"
         version = max((r.constraint_version for r in app.store.list_d3_review_applications(request.task_run_id)), default=0)
         if version != frozen["constraint_version"]:
-            return False
-        # New knowledge or a changed observation requires a fresh judgment.
-        # Unreviewed notes alone cannot veto supervision by continually appending.
-        if result["raw"]["decision"] != "continue_current_intent":
+            return "constraints_changed"
+        if result["raw"]["decision"] == "continue_current_intent":
+            return "current"
+        observations = self.observation_signatures(request.intent_id)
+        original = frozen["observation_signatures"]
+        if frozen.get("strategy_resolution_policy") == "review_latest_evidence":
+            if any(ref not in current or current[ref].source_status != "available" or current[ref].conflict
+                   for ref in frozen["knowledge_refs"]):
+                return "knowledge_invalidated"
+            if any(observations.get(identity) != signature for identity, signature in original.items()):
+                return "observation_changed"
+            if (set(observations) - set(original)
+                    or self.knowledge_version(request.intent_id) != frozen["knowledge_version"]):
+                return "new_evidence"
+        else:
             if self.knowledge_version(request.intent_id) != frozen["knowledge_version"]:
-                return False
-            original = frozen["observation_signatures"]
-            if any(identity not in original and signature not in original.values()
-                   for identity, signature in self.observation_signatures(request.intent_id).items()):
-                return False
-        return True
+                return "legacy_knowledge_changed"
+            if any(identity not in original and signature not in original.values() for identity, signature in observations.items()):
+                return "legacy_observation_added"
+        return "current"
+
+    def applicable(self, request, result):
+        return self.validity(request, result) in {"current", "new_evidence"}
 
     def apply(self, request, result):
         identity = request.model_request_id
         effect = self.app.handoff.evidence.read("strategy-effect", identity)
         created = effect is None
         if effect is None:
-            effect = {"request_sha256": request.context_sha256,
-                      "outcome": "applied" if result["outcome"] == "valid" and self.applicable(request, result) else "stale" if result["outcome"] == "valid" else "unavailable"}
+            reason = self.validity(request, result) if result["outcome"] == "valid" else result.get("reason")
+            effect = {"request_sha256": request.context_sha256, "validity_reason": reason,
+                      "outcome": "applied" if reason in {"current", "new_evidence"} else "stale" if result["outcome"] == "valid" else "unavailable"}
             self.app.handoff.evidence.save("strategy-effect", identity, effect)
         if result["outcome"] == "valid":
             self.app.store.mark_d4_operation_applied(identity, identity)
         if effect["request_sha256"] != request.context_sha256:
             raise D3RecoveryRequired("d22_strategy_effect_binding_changed")
         if created:
-            self._log("strategy.finished", request, outcome=effect["outcome"], code=result.get("reason"),
+            self._log("strategy.finished", request, outcome=effect["outcome"], code=effect.get("validity_reason", result.get("reason")),
                       decision=(result.get("raw") or {}).get("decision"),
                       suggestion_intent=((result.get("raw") or {}).get("suggestion") or {}).get("intent_id"),
                       category="technical_failure" if effect["outcome"] == "unavailable" else "strategy")
@@ -391,7 +412,22 @@ class StrategySupervision:
                     context = json.loads(saved["request"]["history_context"]) if saved else {}
                     if (context.get("intent_execution", {}).get("stop_requested") or {}).get("review_id") == request.model_request_id:
                         return None
-            return {"review_id": request.model_request_id, "decision": "request_intent_resolution", "reason": result["raw"]["reason"]}
+                    # A retained end proposal can predate the stop. Its committed
+                    # outer review still consumes this exact resolution request.
+                    evaluated = self.app.handoff.evidence.read("request", row.model_request_id)
+                    policy = json.loads(evaluated["prior_summary"]).get("s4_evaluation_policy", {}) if evaluated else {}
+                    if policy.get("strategy_review", {}).get("review_id") == request.model_request_id:
+                        return None
+            stop = {"review_id": request.model_request_id, "decision": "request_intent_resolution", "reason": result["raw"]["reason"]}
+            frozen = json.loads(request.prior_summary)
+            if frozen.get("strategy_resolution_policy") == "review_latest_evidence":
+                added = set(self.observation_signatures(intent_id)) - set(frozen["observation_signatures"])
+                history = self.app.handoff.history()
+                stop.update(review_latest_evidence=True, evidence_refs=result["raw"]["evidence_refs"],
+                    new_evidence_refs=[i.ref for i in history if i.record_id in added
+                        or i.intent_id == intent_id and i.record_type in {"verified_fact", "reviewed_inference"}
+                        and i.ref not in frozen["knowledge_refs"] and i.source_status == "available" and not i.conflict])
+            return stop
         return None
 
     def advice(self, intent_id):

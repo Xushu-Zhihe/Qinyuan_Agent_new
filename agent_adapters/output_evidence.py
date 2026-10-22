@@ -10,7 +10,7 @@ SAFE_EXCEPTION_TYPES = frozenset({
     "BrokenPipeError", "OSError", "PermissionError", "FileNotFoundError", "TypeError",
     "ValueError", "RuntimeError", "APIError", "DockerException", "HTTPError",
     "ReadTimeout", "ConnectTimeout", "SSLError", "gaierror", "OtherError",
-    "AttributeError", "KeyError", "UnboundLocalError", "ProgrammingError",
+    "AttributeError", "KeyError", "IndexError", "CancelledError", "UnboundLocalError", "ProgrammingError",
     "OperationalError", "IntegrityError", "D5EvidenceError", "D5SensitiveDataError", "T6TargetNetworkError",
     "StorageError", "T6EvidenceError", "JSONDecodeError", "IncompleteRead",
 })
@@ -31,10 +31,13 @@ SAFE_HTTP_ERROR_CODES = frozenset({
     "d20_http_cookie_snapshot_invalid", "d8_frozen_configuration_mismatch",
     "d20_http_failure_diagnostic_invalid",
     "docker_unavailable", "docker_permission_denied",
+    "sandbox_experiment_start_unknown", "sandbox_experiment_stop_unknown",
     "docker_address_pool_exhausted", "docker_network_in_use", "docker_resource_conflict", "docker_resource_outcome_unknown",
 })
 SAFE_MODEL_ERROR_CODES = SAFE_HTTP_ERROR_CODES | frozenset({
     "d3_review_provider_failure", "d3_review_call_outcome_unknown", "d4_review_dispatch_stopped",
+    "d3_model_call_outcome_unknown", "d3_model_call_interrupted", "d22_strategy_result_processing_failed",
+    "d8_output_cancelled_call_binding_changed", "d8_output_interruption_binding_changed", "d8_output_model_audit_changed",
     "d8_model_context_rejected", "d8_provider_envelope_invalid", "provider_envelope_invalid",
     "provider_content_invalid", "provider_refused", "d8_transport_outcome_unknown",
     "http_transport_failure", "model_worker_lost", "d8_output_request_not_frozen",
@@ -87,6 +90,11 @@ def safe_failure_details(error, *, include_chain=False):
         seen.add(id(current))
         name = type(current).__name__
         kinds.append(name if name in SAFE_EXCEPTION_TYPES else "OtherError")
+        if name == "TaskRunSandboxError" and getattr(current, "outcome", None) == "outcome_unknown":
+            code = {"experiment_start": "sandbox_experiment_start_unknown",
+                    "experiment_stop": "sandbox_experiment_stop_unknown"}.get(getattr(current, "phase", None))
+            if code is not None and code not in codes:
+                codes.append(code)
         resource_code = getattr(current, "code", None)
         if resource_code in SAFE_HTTP_ERROR_CODES and resource_code not in codes:
             codes.append(resource_code)
@@ -134,7 +142,11 @@ class FileD8OutputEvidence(FileD8HandoffEvidence):
     # Session envelopes reuse this immutable evidence store, not new tables.
     KINDS = {"provider-request", "provider-result", "input-measurement", "mcp-registry", "mcp-catalog", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "review-failure"}
 
-    KINDS = KINDS | {"experiment-session", "experiment-process", "experiment-result"}
+    KINDS = KINDS | {"experiment-session", "experiment-process", "experiment-result", "experiment-stop", "call-interruption"}
+
+    @staticmethod
+    def describe_failure(error):
+        return safe_failure_details(error, include_chain=True)
 
     def save_review_failure(self, request, *, error=None, failure=None):
         from dataclasses import asdict

@@ -116,7 +116,7 @@ def test_stop_retains_completed_knowledge_for_original_review(http_case, kind, d
     install(c, steps=4, stop="inconclusive", decision=decision)
     outer, inner = c.models[0].invoke, c.models[1].invoke
     started, stopped = threading.Event(), threading.Event()
-    retained, later = [], []
+    retained, later, evaluated_positions = [], [], []
     apply = c.app.supervision.apply
     def applied(request, result):
         apply(request, result)
@@ -127,6 +127,12 @@ def test_stop_retains_completed_knowledge_for_original_review(http_case, kind, d
             assert started.wait(3)
             return dict(decision="request_intent_resolution", reason="Review scope before further execution.",
                         evidence_refs=[envelope.request.history[-1].ref], suggestion=None)
+        if kind == "intent_resolution" and envelope.output_contract["stage"] == "intent_evaluation":
+            policy = json.loads(envelope.request.prior_summary)["s4_evaluation_policy"]
+            evaluated_positions.append(policy)
+            if len(evaluated_positions) == 1:
+                return dict(decision="continue", reason="The retained independent position leaves a useful check.",
+                    evidence_refs=[i.ref for i in envelope.request.history])
         return outer(envelope, *args)
     def choose(envelope, *args):
         if envelope.output_contract["stage"] == "inner_plan" and len(c.sends) >= 4:
@@ -152,6 +158,11 @@ def test_stop_retains_completed_knowledge_for_original_review(http_case, kind, d
     assert identity == retained[0] and note["disposition"] == "retained_for_processing"
     assert any(r.model_request_id == identity for r in c.app.sessions.records())
     assert len(c.app.state.facts) == (1 if kind == "fact_candidate" and decision == "accept" else 0)
+    if kind == "intent_resolution":
+        assert evaluated_positions[0]["strategy_review"]["review_latest_evidence"]
+        assert evaluated_positions[0]["inner_request_id"] == retained[0]
+        assert sum(bool(p.get("strategy_review")) for p in evaluated_positions) == 1
+        assert not later[0]["intent_execution"].get("stop_requested")
     if later:
         assert any(i["identity"] == "strategy_interruption_not_execution_or_fact" for i in later[0]["items"])
     # Reopening uses the same source identities; it must not replay tools or reviews.
@@ -348,32 +359,117 @@ def test_optional_advice_can_be_ignored_without_forcing_a_switch(http_case):
 
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
-def test_new_response_invalidates_an_old_stop_without_blocking_exploration(http_case):
+@pytest.mark.parametrize("continue_review,restart", [(False, False), (True, False), (True, True)])
+def test_added_evidence_gets_one_current_review_and_inner_can_disagree(http_case, continue_review, restart):
+    from dataclasses import replace
     from agent_adapters.web.http_adapter import D7HttpWireResponse
+    from agent_core.output_contracts import output_schema, decode_response
+    from agent_core.handoff_contracts import handoff_json
+    from test_chain_multi_turn import ProcessLoss
     c = http_case
-    install(c, steps=6)
+    install(c, steps=6, stop=None if continue_review else "inconclusive")
     fifth = threading.Event()
-    outer = c.models[0].invoke
+    outer, inner = c.models[0].invoke, c.models[1].invoke
+    ended, positions, legacy, continued = [], [], [], []
     class Transport:
         def send(self, **kwargs):
             c.sends.append(kwargs)
             if len(c.sends) == 5:
                 fifth.set()
             return D7HttpWireResponse(200, (("Content-Type", "text/plain"),),
-                                     b"new discriminating response" if len(c.sends) >= 5 else b"same old response")
+                b"new discriminating response" if len(c.sends) >= 5 else b"same old response")
     c.app.web.transport_factory = lambda _: Transport()
+    async def finish_wait(token):
+        c.clock.now = c.app.state.task_run.deadline_at
+    c.app._wait_continuation = finish_wait
+    apply = c.app.supervision.apply
+    def apply_review(request, result):
+        if result["outcome"] == "valid" and result["raw"]["decision"] == "request_intent_resolution":
+            old = json.loads(request.prior_summary)
+            old.pop("strategy_resolution_policy")
+            previous = replace(request, prior_summary=handoff_json(old))
+            legacy.append(c.app.supervision.validity(previous, result))
+        return apply(request, result)
+    c.app.supervision.apply = apply_review
     def review(envelope, *args):
-        if envelope.output_contract["stage"] == "strategy_supervision":
+        stage, request = envelope.output_contract["stage"], envelope.request
+        if stage == "strategy_supervision":
             assert fifth.wait(8)
             return dict(decision="request_intent_resolution", reason="The frozen observations repeat.",
-                        evidence_refs=[envelope.request.history[-1].ref], suggestion=None)
+                        evidence_refs=[request.history[-1].ref], suggestion=None)
+        if stage == "intent_evaluation":
+            policy = json.loads(request.prior_summary)["s4_evaluation_policy"]
+            if policy.get("strategy_review"):
+                ended.append(policy)
+                assert policy["strategy_review"]["new_evidence_refs"]
+                assert set(policy["strategy_review"]["new_evidence_refs"]) <= {i.ref for i in request.history}
+                assert set(policy["strategy_review"]["new_evidence_refs"]) <= set(policy["required_observation_refs"])
+                return dict(decision="continue" if continue_review else "inconclusive",
+                    reason="The new control justifies one discriminating comparison." if continue_review else "Close only this tested scope.",
+                    evidence_refs=[i.ref for i in request.history])
         return outer(envelope, *args)
-    c.models[0].invoke = review
-    result = asyncio.run(c.app._run_once(c.token))
-    assert result.stop_reason == "d9_awaiting_external_feedback", result
+    def choose(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan" and len(c.sends) >= 5:
+            if c.app.supervision.pending:
+                assert c.app.supervision.pending[1].wait(3)
+                c.app.supervision.poll()
+            context = json.loads(envelope.request.history_context)
+            stop = context["intent_execution"].get("stop_requested")
+            if stop and stop.get("review_latest_evidence"):
+                positions.append(context)
+                assert set(stop["new_evidence_refs"]) <= {i["ref"] for i in context["items"]}
+                proposal = dict(kind="intent_resolution", outcome="review" if continue_review else "inconclusive",
+                    reason="I disagree: the new control enables a discriminating experiment." if continue_review else "The observed scope supports closure.",
+                    evidence_refs=[i["ref"] for i in context["items"]], fact_ids=[], next_intent_candidates=[])
+                assert not decode_response(proposal, output_schema(envelope.request, contract_version=22)[1])[1]
+                # A previously frozen stop did not permit an independent review position.
+                if continue_review:
+                    old = json.loads(envelope.request.history_context)
+                    old["intent_execution"]["stop_requested"].pop("review_latest_evidence")
+                    assert decode_response(proposal, output_schema(replace(envelope.request, history_context=handoff_json(old)), contract_version=22)[1])[1]
+                # A second app sees the persisted pending review without dispatching anything.
+                loaders = [m.context_loader for m in c.models]
+                reopened = c.create()
+                try:
+                    reopened.controller.attach(c.task)
+                    assert reopened.supervision.stop(request_intent := envelope.request.context.intent_id)["review_id"] == stop["review_id"]
+                    assert reopened.supervision.stop(request_intent)["review_latest_evidence"]
+                finally:
+                    reopened.store.close()
+                    # The fixture shares fake model objects across app instances.
+                    for model, loader in zip(c.models, loaders):
+                        model.context_loader = loader
+                return proposal
+        return inner(envelope, *args)
+    commit = c.app.handoff._commit
+    def commit_review(operation, record, *args, **kwargs):
+        value = commit(operation, record, *args, **kwargs)
+        if operation == "evaluate_d8_tree_intent" and record.kind == "evaluation_continued":
+            continued.append(record)
+            if restart:
+                raise ProcessLoss("lost owner after committing current-evidence continue")
+        return value
+    c.models[0].invoke, c.models[1].invoke = review, choose
+    c.app.handoff._commit = commit_review
+    if restart:
+        with pytest.raises(ProcessLoss):
+            asyncio.run(c.app._run_once(c.token))
+        c.app.store.close()
+        c.app = c.create()
+        c.app._wait_continuation = finish_wait
+        result = asyncio.run(c.app.resume(c.task, c.token))
+    else:
+        result = asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required, result
+    assert len(positions) == len(ended) == 1
+    assert legacy == ["legacy_observation_added"]
     requests = list(c.app.supervision.calls())
-    assert len(requests) == 1 and len(c.sends) == 6
-    assert c.app.handoff.evidence.read("strategy-effect", requests[0][1].model_request_id)["outcome"] == "stale"
+    assert len(requests) == 1
+    effect = c.app.handoff.evidence.read("strategy-effect", requests[0][1].model_request_id)
+    assert effect["outcome"] == "applied" and effect["validity_reason"] == "new_evidence"
+    assert len(c.sends) == (6 if continue_review else 5)
+    assert c.app.supervision.stop(requests[0][1].intent_id) is None
+    assert len(continued) == int(continue_review)
 
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
@@ -633,3 +729,217 @@ def test_supervision_input_is_losslessly_shared_and_old_frozen_shape_is_unchange
     assert report["counts"]["calls"] == len(captured)
     assert report["counts"]["applied"] >= 1 and report["counts"]["stops_applied"] == 0
     assert report["counts"]["voluntary_yields"] == 0
+
+
+@pytest.mark.parametrize("change,expected", [
+    ("none", "current"), ("append", "new_evidence"), ("observation_change", "observation_changed"),
+    ("knowledge_lost", "knowledge_invalidated"), ("source_lost", "cited_source_unavailable"),
+    ("selection", "selection_changed"), ("constraint", "constraints_changed"),
+    ("intent_ended", "intent_not_running"), ("task_ended", "task_not_running")])
+def test_supervision_validity_separates_hard_changes_from_appends(change, expected):
+    from types import SimpleNamespace as NS
+    from agent_core.strategy_supervision import StrategySupervision
+    items = [NS(ref="source", source_status="available", conflict=False),
+             NS(ref="fact", source_status="available", conflict=False)]
+    app = NS(state=NS(task_run=NS(status=NS(value="running")), intents=[NS(intent_id="intent", status=NS(value="running"))]),
+        handoff=NS(history=lambda: items), store=NS(list_d3_review_applications=lambda _: []))
+    supervisor = StrategySupervision(app)
+    supervisor.epoch = lambda _: "epoch"
+    observations = {"observation": "original"}
+    supervisor.observation_signatures = lambda _: observations
+    supervisor.knowledge_version = lambda _: "knowledge"
+    frozen = dict(scope_ref="epoch", constraint_version=0, observation_signatures=dict(observations),
+        knowledge_version="knowledge", knowledge_refs=["fact"], strategy_resolution_policy="review_latest_evidence")
+    if change == "append": observations["new"] = "new signature"
+    elif change == "observation_change": observations["observation"] = "changed"
+    elif change == "knowledge_lost": items.pop()
+    elif change == "source_lost": items[0].source_status = "unavailable"
+    elif change == "selection": supervisor.epoch = lambda _: "other"
+    elif change == "constraint": app.store.list_d3_review_applications = lambda _: [NS(constraint_version=1)]
+    elif change == "intent_ended": app.state.intents[0].status.value = "inconclusive"
+    elif change == "task_ended": app.state.task_run.status.value = "deadline_exceeded"
+    request = NS(intent_id="intent", task_run_id="task", prior_summary=json.dumps(frozen))
+    result = {"raw": {"decision": "request_intent_resolution", "evidence_refs": ["source"]}}
+    assert supervisor.validity(request, result) == expected
+    assert supervisor.applicable(request, result) == (expected in {"current", "new_evidence"})
+
+
+def test_nullable_object_diagnostics_keep_acceptance_and_report_actual_fields():
+    from agent_core.output_contracts import obj, text, shape_issues
+    schema = {"anyOf": [{"type": "null"}, obj({"reason": text(), "evidence_refs": {"type": "array", "items": text()}})]}
+    assert not shape_issues(None, schema)
+    assert not shape_issues({"reason": "scoped reason", "evidence_refs": []}, schema)
+    issues = shape_issues({"reason": 7}, schema)
+    assert {i.path for i in issues} == {"$/reason", "$/evidence_refs"}
+    assert all(i.expected != "null" for i in issues)
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+@pytest.mark.parametrize("boundary",["normal","commit_gap","unconfirmed","unexpected","known_response"])
+def test_supervision_poll_failure_settles_cancelled_inner_before_technical_wait(http_case,monkeypatch,boundary):
+    import time
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.modeling import ModelError,ModelErrorKind
+    c=http_case
+    install(c,steps=6)
+    outer,inner=c.models[0].invoke,c.models[1].invoke
+    entered,exited,failed=threading.Event(),threading.Event(),threading.Event()
+    release=threading.Event()
+    if boundary=='unconfirmed':monkeypatch.setattr('agent_core.dual_llm_modeling.MODEL_CANCEL_GRACE_SECONDS',0.03)
+    cancelled=[]
+    save=c.app.model_evidence.save
+    injected=[]
+    def persist(evidence):
+        if boundary=='commit_gap' and evidence.reason=='model_cancelled' and not injected:
+            injected.append(True)
+            raise D3RecoveryRequired('d8_handoff_evidence_write_recovery_required')
+        return save(evidence)
+    monkeypatch.setattr(c.app.model_evidence,'save',persist)
+    def review(envelope,*args):
+        if envelope.output_contract['stage']=='strategy_supervision':
+            if envelope.request.correction_of_model_request_id is None:return {'bad':'format'}
+            assert entered.wait(3)
+            return continue_review(envelope.request)
+        return outer(envelope,*args)
+    def choose(envelope,*args):
+        if envelope.output_contract['stage']=='inner_plan' and len(c.sends)>=4 and not entered.is_set() and boundary!='known_response':
+            cancelled.append(envelope.request.model_request_id)
+            entered.set()
+            until=time.monotonic()+5
+            while not args[-1].is_cancelled and time.monotonic()<until:time.sleep(0.002)
+            assert args[-1].is_cancelled
+            if boundary=='unconfirmed':assert release.wait(5)
+            exited.set()
+            return ModelError(ModelErrorKind.CANCELLED,'model_cancelled')
+        return inner(envelope,*args)
+    poll,start=c.app.supervision.poll,c.app.supervision.start
+    def start_correction(intent):
+        start(intent)
+        pending=c.app.supervision.pending
+        if pending and pending[0].correction_of_model_request_id is None:
+            assert pending[1].wait(3)
+            poll()
+            poll()
+    monkeypatch.setattr(c.app.supervision,'start',start_correction)
+    def interrupted_poll():
+        pending=c.app.supervision.pending
+        if (pending and pending[1].is_set() and pending[0].correction_of_model_request_id
+                and entered.is_set() and not failed.is_set()):
+            failed.set()
+            if boundary=='unexpected':raise RuntimeError('private first failure must not be saved')
+            raise D3RecoveryRequired('d8_handoff_evidence_write_recovery_required')
+        return poll()
+    c.models[0].invoke,c.models[1].invoke=review,choose
+    if boundary=='known_response':
+        adapter=c.app.inner.adapter.invoke
+        def completed_before_interrupt(request,timeout,token):
+            value=adapter(request,timeout,token)
+            if request.stage=='inner_plan' and len(c.sends)>=4 and not entered.is_set():
+                cancelled.append(request.model_request_id)
+                entered.set()
+                until=time.monotonic()+5
+                while not token.is_cancelled and time.monotonic()<until:time.sleep(0.002)
+                assert token.is_cancelled
+                exited.set()
+            return value
+        monkeypatch.setattr(c.app.inner.adapter,'invoke',completed_before_interrupt)
+    monkeypatch.setattr(c.app.supervision,'poll',interrupted_poll)
+    result=asyncio.run(c.app._run_once(c.token))
+    assert result.recovery_required and failed.is_set(),result
+    assert len(cancelled)==1
+    identity=cancelled[0]
+    diagnostic=c.app.output_boundary.evidence.read('call-interruption',identity)
+    assert diagnostic['phase']=='supervision_poll'
+    assert diagnostic['failure']['exception_types'][0]==('RuntimeError' if boundary=='unexpected' else 'D3RecoveryRequired')
+    assert 'private' not in json.dumps(diagnostic)
+    if boundary=='unexpected':assert result.stop_reason=='d22_strategy_result_processing_failed'
+    if boundary=='unconfirmed':
+        try:
+            assert diagnostic['adapter_exit_confirmed'] is False and diagnostic['outcome']=='unknown'
+            c.app._reconcile_known_d4_operations()
+            assert c.app.store.load_d3_operation(identity).completion is None
+            assert c.app.store.load_d4_operation(identity).completion is None
+            assert len(c.sends)==4
+        finally:
+            release.set()
+            assert exited.wait(1)
+            assert c.app.inner.active_calls[identity][0].wait(1)
+        return
+    assert exited.wait(1) and diagnostic['adapter_exit_confirmed'] is True
+    assert (c.app.store.load_d3_operation(identity).completion is None)==(boundary=='commit_gap')
+    c.app._reconcile_known_d4_operations()
+    assert c.app.store.load_d3_operation(identity).completion is not None
+    assert c.app.store.load_d4_operation(identity).completion is not None
+    evidence=c.app.model_evidence.read(identity)
+    if boundary=='known_response':assert evidence.outcome=='accepted' and evidence.raw['kind']=='http_request_saved'
+    else:assert evidence.outcome=='model_error' and evidence.reason=='model_cancelled'
+    assert c.app.supervision.pending is None
+    assert not c.app.store.list_d4_unresolved_operations(c.task)
+    assert len(c.sends)==4
+    resumed=asyncio.run(c.app._run_once(c.token))
+    assert not resumed.recovery_required,resumed
+    assert len(c.sends)==6
+    corrections=[c.app.model_evidence.read(o.start.operation_id) for o in c.app.store.list_d3_operations(c.task)
+        if o.start.category=='inner_model']
+    assert sum(e is not None and e.correction_of_model_request_id==identity for e in corrections)==(0 if boundary=='known_response' else 1)
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+@pytest.mark.parametrize("state",["cancelled","response","unconfirmed","wrong_binding","active_adapter","bound_decision"])
+def test_repair_only_bound_cancelled_provider_result_never_replays(http_case,monkeypatch,state):
+    from copy import deepcopy
+    from types import SimpleNamespace as NS
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.turn_modeling import digest
+    c=http_case
+    install(c,steps=1)
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required,result
+    op=next(o for o in c.app.store.list_d3_operations(c.task) if o.start.category=='inner_model')
+    identity=op.start.operation_id
+    boundary=c.app.output_boundary
+    contract=boundary.evidence.read('contract',identity)
+    frozen=boundary.evidence.read('selection-request',identity)
+    envelope=dict(request=frozen['request'],output_contract=contract['output_contract'],
+        instruction=contract['instruction'],correction=contract['correction'])
+    sent=dict(model_request_id=identity,task_run_id=c.task,stage=contract['stage'],role_config_ref=op.start.role_config_ref,
+        envelope_sha256=digest(envelope))
+    provider=dict(model_request_id=identity,request_sha256=digest(sent),
+        error=dict(kind='cancelled',code='model_cancelled'),
+        transport=dict(transport_end='cancelled',worker_exit_confirmed=True))
+    if state in {'response','bound_decision'}:provider.update(error=None,transport=dict(transport_end='response_received',worker_exit_confirmed=True))
+    if state=='unconfirmed':provider['transport']['worker_exit_confirmed']=False
+    if state=='wrong_binding':provider['request_sha256']='0'*64
+    live=threading.Event()
+    if state=='active_adapter':c.app.inner.active_calls[identity]=(live,[])
+    read=boundary.evidence.read
+    def saved(kind,key):
+        if key==identity:
+            if kind=='provider-request':return deepcopy(sent)
+            if kind=='provider-result':return deepcopy(provider)
+            if kind=='diagnostic':return None
+            if kind=='call-interruption' and state=='bound_decision':
+                return dict(task_run_id=c.task,model_request_id=identity,request_sha256=contract['source_request_sha256'],
+                    adapter_exit_confirmed=True,outcome='cancelled',finished_at=c.clock())
+        return read(kind,key)
+    monkeypatch.setattr(boundary.evidence,'read',saved)
+    native=c.app.model_evidence.read
+    if state=='bound_decision':
+        original=native(identity)
+        monkeypatch.setattr(c.app.selection_bindings,'read',lambda key:
+            dict(canonical_response=original.raw,finished_at=original.finished_at) if key==identity else None)
+    captured=[]
+    monkeypatch.setattr(c.app.model_evidence,'read',lambda key:None if key==identity else native(key))
+    monkeypatch.setattr(c.app.model_evidence,'save',lambda evidence:captured.append(evidence))
+    before=len(c.sends),len(c.models[1].calls)
+    if state=='wrong_binding':
+        with pytest.raises(D3RecoveryRequired,match='cancelled_call_binding_changed'):boundary.reconcile_formats()
+    else:boundary.reconcile_formats()
+    if state=='cancelled':
+        assert len(captured)==1 and captured[0].reason=='model_cancelled'
+        assert captured[0].outcome=='model_error'
+    elif state=='bound_decision':
+        assert len(captured)==1 and captured[0].outcome=='accepted' and captured[0].raw==original.raw
+    else:assert not captured
+    assert (len(c.sends),len(c.models[1].calls))==before
+    c.app.inner.active_calls.pop(identity,None)

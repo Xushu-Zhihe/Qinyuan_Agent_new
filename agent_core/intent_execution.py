@@ -74,8 +74,10 @@ def resolution_schema(request):
     allowed = context["execution_feasibility"]["allowed_action_kinds"]
     if facts and "complete_intent" in allowed:
         choices.insert(0, (["succeeded"], 1))
-    if context["intent_execution"].get("stop_requested"):
-        choices = [(["failed", "inconclusive"], 0)] + ([(["succeeded"], 1)] if closure_only(request) and facts and "complete_intent" in allowed else [])
+    stop = context["intent_execution"].get("stop_requested")
+    if stop:
+        outcomes = ["failed", "inconclusive", "review"] if stop.get("review_latest_evidence") else ["failed", "inconclusive"]
+        choices = [(outcomes, 0)] + ([(["succeeded"], 1)] if closure_only(request) and facts and "complete_intent" in allowed else [])
     return {"anyOf": [obj({"kind": {"type": "string", "const": "intent_resolution"},
         "outcome": {"type": "string", "enum": outcomes}, "reason": text(),
         "evidence_refs": {**array(source, 1), "uniqueItems": True},
@@ -99,7 +101,8 @@ def facts(app, intent_id):
 
 def validate_resolution(app, request, proposal):
     from agent_core.dual_llm_modeling import D3ProposalRejected
-    if packet(request)["intent_execution"].get("stop_requested") and not closure_only(request) and proposal.outcome not in {"failed", "inconclusive"}:
+    stop = packet(request)["intent_execution"].get("stop_requested")
+    if stop and not stop.get("review_latest_evidence") and not closure_only(request) and proposal.outcome not in {"failed", "inconclusive"}:
         raise D3ProposalRejected("d22_strategy_stop_summary_required")
     available = visible_items(request)
     selected = checked_refs(list(proposal.evidence_refs), set(available))
@@ -189,8 +192,17 @@ def make_request(app, intent_id, inner_id, proposal):
     validate_resolution(app, frozen["request"], proposal)
     intent = next(i for i in app.state.intents if i.intent_id == intent_id)
     chosen, _, context = app.handoff.select("execution", intent.turn_id, intent_id)
+    stop = packet(frozen["request"])["intent_execution"].get("stop_requested") or {}
+    if not stop.get("review_latest_evidence"):
+        # A completed end proposal may race with the background result; retain it
+        # while still reviewing the outer reason and newest observations.
+        stop = stop_request(app, intent_id) or stop
+    review = stop if stop.get("review_latest_evidence") else None
+    observations = list(dict.fromkeys((*proposal.evidence_refs, *(review["new_evidence_refs"] if review else ()))))
     by_ref = {i.ref: i for i in app.handoff.history()}
-    required = set(context["required_refs"]) | set(proposal.evidence_refs)
+    required = set(context["required_refs"]) | set(observations)
+    if review:
+        required.update(review["evidence_refs"])  # Outer-only sibling comparison stays out of the inner view.
     all_items = {i.ref: i for i in chosen}
     for ref in required:
         if ref not in by_ref or by_ref[ref].source_status != "available" or by_ref[ref].conflict:
@@ -202,9 +214,11 @@ def make_request(app, intent_id, inner_id, proposal):
         local_goal=intent.description, inner_request_id=inner_id, proposal=asdict(proposal),
         goal_ref=next(i.ref for i in selected if i.record_id == intent_id),
         support_fact_ref=fact_refs[0] if fact_refs else None, support_fact_refs=fact_refs,
-        required_observation_refs=list(proposal.evidence_refs),
+        required_observation_refs=observations,
         history_sha256=digest([asdict(i) for i in selected]),
         goal_interpretation="Judge evidence coverage of the local goal. Insufficient evidence normally means continue. Only a bounded complete test domain supports a universal negative. Strategy closure is not proof of impossibility.")
+    if review:
+        policy["strategy_review"] = review
     context.update(items=[i.visible() for i in selected], required_refs=sorted(required), s4_evaluation_policy=policy)
     version = app.handoff.capacity()
     identity = app._id("resolution/" + inner_id)

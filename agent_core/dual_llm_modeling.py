@@ -25,6 +25,7 @@ from agent_core.dual_llm_contracts import (
     D3PlanBinding,
     D3PlanResult,
     D3RecoveryRequired,
+    D3BudgetExhausted,
     D3RunConfig,
     D3TurnBinding,
 )
@@ -38,6 +39,7 @@ from agent_core.modeling import (
 )
 from agent_core.turn_contracts import D1RoleConfig
 from agent_core.turn_modeling import digest, stable_id
+from agent_core.operation_accounting import D4RecoveryRequired, D4BudgetExhausted
 
 D3ModelStage = Literal[
     "outer_turn",
@@ -554,6 +556,7 @@ class D3AuditedModel:
         self.request_capacity_check = None
         self.change_response_sensitive = None
         self.output_boundary = None
+        self.active_calls = {}
 
     def _parse(self, request: D3ModelRequest, raw: object):
         if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22} and request.stage in {'inner_plan', 'inner_size', 'inner_sha256', 'inner_complete'}:
@@ -1086,6 +1089,7 @@ class D3AuditedModel:
                 stopped.set()
                 log.warning("call.cancel_requested", **ids, code="model_total_timeout")
 
+        self.active_calls[request.model_request_id] = (finished, values)
         watchdog = threading.Timer(timeout, expire)
         watchdog.daemon = True
         threading.Thread(target=invoke, daemon=True, name="d3-model-call").start()
@@ -1094,6 +1098,8 @@ class D3AuditedModel:
         expires = asyncio.get_running_loop().time() + timeout
         # 轮询退避：模型通常几毫秒返回，固定 25ms 会让每次调用白等一整拍
         delay = 0.001
+        phase = "wait"
+        cleanup_end = None
         try:
             while not finished.is_set():
                 state = self.controller.control_state
@@ -1117,7 +1123,9 @@ class D3AuditedModel:
                         raise D3RecoveryRequired("d3_model_call_outcome_unknown")
                     break
                 if self.output_boundary is not None and self.output_boundary.app.sessions is not None:
+                    phase = "supervision_poll"
                     self.output_boundary.app.supervision.poll()
+                    phase = "wait"
                 await asyncio.sleep(delay)
                 delay = min(0.025, delay * 2)
             succeeded, raw = values[0]
@@ -1131,9 +1139,59 @@ class D3AuditedModel:
                        else ModelError(ModelErrorKind.CANCELLED, "model_cancelled"))
             log.info("call.returned", **ids, outcome="model_error" if isinstance(raw, ModelError) else "response")
             return raw
+        except BaseException as error:
+            # An exception in the dispatch thread must not orphan its model call.
+            # Drain only this adapter; never ask the provider again here.
+            watchdog.cancel()
+            stopped.set()
+            if cleanup_end is None:
+                cleanup_end = asyncio.get_running_loop().time() + MODEL_CANCEL_GRACE_SECONDS
+            while not finished.is_set() and asyncio.get_running_loop().time() < cleanup_end:
+                await asyncio.sleep(0.01)
+            failure = (self.output_boundary.evidence.describe_failure(error) if self.output_boundary is not None
+                       else {"exception_types": [type(error).__name__], "error_codes": []})
+            known = (finished.is_set() and values and values[0][0]
+                     and not (isinstance(values[0][1], ModelError)
+                              and values[0][1].short_reason == "d8_transport_outcome_unknown"))
+            if self.output_boundary is not None:
+                self.output_boundary.evidence.save("call-interruption", request.model_request_id, {
+                    "task_run_id": request.task_run_id, "model_request_id": request.model_request_id,
+                    "request_sha256": digest(asdict(request)), "phase": phase,
+                    "adapter_exit_confirmed": finished.is_set(),
+                    "outcome": "cancelled" if known else "unknown",
+                    "finished_at": self.clock(), "failure": failure})
+                if known:
+                    # A normalization binding may already contain a complete
+                    # decision. Preserve it; the ordinary dispatch guard decides
+                    # whether it can still be used after supervision.
+                    app = self.output_boundary.app
+                    if app.web is not None:
+                        app.web.reconcile()
+                    if app.selection_bindings is not None:
+                        app.selection_bindings.repair_request(request)
+                    if (request.stage in {"inner_size", "inner_sha256"}
+                            and self.output_boundary.evidence.read("fixed-probe-binding", request.model_request_id) is not None):
+                        app.fixed_probe_bindings.known(request.model_request_id, repair=True)
+                    if self.evidence.read(request.model_request_id) is None:
+                        cancelled = ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
+                        self.evidence.save(D3ModelEvidence(request.model_request_id, request.task_run_id,
+                            request.stage, request.role_config_ref, request.resource_ref,
+                            request.base_checkpoint_sequence, request.context_sha256,
+                            request.correction_of_model_request_id, "model_error", cancelled.to_dict(),
+                            cancelled.short_reason, self.clock()))
+                    self._saved(request)
+            log.error("call.interrupted", **ids, phase=phase,
+                code="d3_model_call_interrupted" if known else "d3_model_call_outcome_unknown",
+                adapter_exit_confirmed=finished.is_set(), **failure)
+            if phase == "supervision_poll" and isinstance(error, Exception) and not isinstance(error, (
+                    D3RecoveryRequired, D3BudgetExhausted, D3ProposalRejected, D4RecoveryRequired, D4BudgetExhausted)):
+                raise D3RecoveryRequired("d22_strategy_result_processing_failed") from error
+            raise
         finally:
             watchdog.cancel()
             stopped.set()
+            if finished.is_set():
+                self.active_calls.pop(request.model_request_id, None)
 
     async def propose(
         self,

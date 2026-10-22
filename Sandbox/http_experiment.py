@@ -141,19 +141,45 @@ class HttpExperimentProcess:
         return value
 
     def close(self):
+        self.stop_diagnostic = dict(phase='inspect', process_stopped=False)
         try:
-            if self.pid is not None and self.api.exec_inspect(self.exec_id).get('Running'):
-                # Fixed argv and exact per-session PID, never a shell/global kill.
+            status = self.api.exec_inspect(self.exec_id)
+            if status.get('Running') is True and self.pid is not None:
+                # Use the existing interpreter: external kill is not an image contract.
+                # Only this session's confirmed PID, never a shell/global kill.
+                self.stop_diagnostic['phase'] = 'signal'
                 self.sandbox._verify_active(self.task_id, self.sandbox_id)
                 with self.sandbox._admit(self.binding):
                     kill = self.api.exec_create(container=self.sandbox_id,
-                        cmd=['kill','-KILL',str(self.pid)], stdout=False, stderr=False,
+                        cmd=['python3','-I','-c',
+                             'import os,signal,sys\ntry: os.kill(int(sys.argv[1]),signal.SIGKILL)\nexcept ProcessLookupError: pass',
+                             str(self.pid)], stdout=False, stderr=False,
                         tty=False, privileged=False, user='10001:10001')
                     self.api.exec_start(kill['Id'])
+                signal_status = self.api.exec_inspect(kill['Id'])
+                if type(signal_status.get('ExitCode')) is int:
+                    self.stop_diagnostic['signal_exit_code'] = signal_status['ExitCode']
+                status = self.api.exec_inspect(self.exec_id)
+            self.stop_diagnostic['phase'] = 'wait_exit'
             until = time.monotonic() + 3
-            while self.api.exec_inspect(self.exec_id).get('Running') and time.monotonic() < until:
+            while status.get('Running') is True and time.monotonic() < until:
                 time.sleep(0.025)
-            if self.api.exec_inspect(self.exec_id).get('Running') is not False:
+                status = self.api.exec_inspect(self.exec_id)
+            if status.get('Running') is not False:
                 raise TaskRunSandboxError('experiment_stop','outcome_unknown',self.task_id,(self.sandbox_id,))
+            self.stop_diagnostic['process_stopped'] = True
+            if type(status.get('ExitCode')) is int:
+                self.stop_diagnostic['process_exit_code'] = status['ExitCode']
+        except TaskRunSandboxError:
+            raise
+        except Exception as error:
+            raise TaskRunSandboxError('experiment_stop','outcome_unknown',self.task_id,
+                (self.sandbox_id,),original_error=error) from error
         finally:
-            self.socket.close()
+            # A stream-close error cannot undo a confirmed process exit or mask
+            # the primary failure. The caller retains this bounded receipt.
+            try:
+                self.socket.close()
+                self.stop_diagnostic['stream_closed'] = True
+            except Exception:
+                self.stop_diagnostic['stream_closed'] = False

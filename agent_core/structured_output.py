@@ -127,10 +127,13 @@ class StructuredOutput:
                  "reason": "output_format_invalid" if diagnostic is not None else "proposal_rejected",
                  "issues": diagnostic["issues"] if diagnostic is not None else []}
         contract = self.evidence.read("contract", correction)
+        interruption = self.evidence.read("call-interruption", correction)
         if diagnostic is None and self.evidence.read("provider-result", correction) is not None:
             error["reason"] = "previous_model_call_failed"
             if ended_transport_failure(self.evidence.read("provider-result", correction).get("transport", {})):
                 error["reason"] = "previous_model_transport_failed_no_usable_decision"
+        if diagnostic is None and interruption is not None and interruption.get("outcome") == "cancelled":
+            error["reason"] = "previous_model_call_interrupted_no_usable_decision"
         if (diagnostic is not None and contract is not None
                 and contract["role_config_ref"] == self.app.config.inner_role.role_config_ref
                 and any(issue["code"] == "output_truncated" for issue in diagnostic["issues"])):
@@ -316,11 +319,27 @@ class StructuredOutput:
             if self.app.model_evidence.read(identity) is not None:
                 continue
             failure = self.diagnostic(identity)
-            if failure is None:
+            interruption = self.evidence.read("call-interruption", identity)
+            provider = self.evidence.read("provider-result", identity)
+            transport = (provider or {}).get("transport", {})
+            cancelled = ((provider or {}).get("error") == {"kind":"cancelled", "code":"model_cancelled"}
+                         and transport.get("transport_end") == "cancelled"
+                         and transport.get("worker_exit_confirmed") is True)
+            retained = interruption is not None and interruption.get("outcome") == "cancelled"
+            if failure is None and not cancelled and not retained:
                 continue
+            engine = self.app.outer if record.start.category == "outer_model" else self.app.inner
+            active = engine.active_calls.get(identity)
+            if active is not None:
+                if not active[0].is_set():
+                    continue
+                engine.active_calls.pop(identity)
             contract = self.evidence.read("contract", identity)
+            if contract is None or contract.get("model_request_id") != identity:
+                raise D3RecoveryRequired("d8_output_model_audit_changed")
             audit = contract["model_audit"]
             if (audit is None or contract["task_run_id"] != task
+                    or contract["stage"] != audit["stage"] or contract["role_config_ref"] != audit["role_config_ref"]
                     or audit["stage"] not in {"outer_turn", "inner_plan", "inner_size", "inner_sha256", "inner_complete", "inner_candidate"}
                     or record.start.category != ("outer_model" if audit["stage"] == "outer_turn" else "inner_model")
                     or record.start.role != ("outer_planning" if audit["stage"] == "outer_turn" else "inner_action")
@@ -330,13 +349,38 @@ class StructuredOutput:
                     or audit["resource_ref"] != record.start.resource_ref):
                 raise D3RecoveryRequired("d8_output_model_audit_changed")
             raw, outcome, reason = None, "invalid_structure", "d8_output_format_invalid"
-            if failure["terminal"]:
+            finished_at = failure["finished_at"] if failure is not None else self.app.clock()
+            if cancelled or retained:
+                if interruption is not None and (interruption.get("task_run_id") != task
+                        or interruption.get("model_request_id") != identity
+                        or interruption.get("request_sha256") != contract["source_request_sha256"]
+                        or retained and interruption.get("adapter_exit_confirmed") is not True):
+                    raise D3RecoveryRequired("d8_output_interruption_binding_changed")
+                if cancelled:
+                    frozen, _ = self.app.selection_bindings._request(identity)
+                    expected_envelope = dict(request=frozen["request"], output_contract=contract["output_contract"],
+                        instruction=contract["instruction"], correction=contract["correction"])
+                    sent = self.evidence.read("provider-request", identity)
+                    if (sent is None or sent.get("envelope_sha256") != digest(expected_envelope) or sent.get("model_request_id") != identity or sent.get("task_run_id") != task
+                            or sent.get("stage") != audit["stage"] or sent.get("role_config_ref") != audit["role_config_ref"]
+                            or provider.get("model_request_id") != identity or provider.get("request_sha256") != digest(sent)):
+                        raise D3RecoveryRequired("d8_output_cancelled_call_binding_changed")
+                binding = self.app.selection_bindings.read(identity) if retained else None
+                if binding is not None:
+                    raw, outcome, reason = binding["canonical_response"], "accepted", None
+                    finished_at = binding["finished_at"]
+                else:
+                    error = ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
+                    raw, outcome, reason = error.to_dict(), "model_error", error.short_reason
+                    if retained:
+                        finished_at = interruption["finished_at"]
+            elif failure["terminal"]:
                 error = ModelError(ModelErrorKind.INVALID_RESPONSE, "d8_" + failure["terminal"])
                 raw, outcome, reason = error.to_dict(), "model_error", error.short_reason
             self.app.model_evidence.save(D3ModelEvidence(identity, task, audit["stage"],
                 audit["role_config_ref"], audit["resource_ref"], audit["base_checkpoint_sequence"],
                 audit["context_sha256"], audit["correction_of_model_request_id"], outcome,
-                raw, reason, failure["finished_at"]))
+                raw, reason, finished_at))
 
     def failure(self, request):
         task, identity = self.identity(request)
@@ -354,6 +398,14 @@ class StructuredOutput:
         _, identity = self.identity(request)
         _, correction = self._correction(request, identity)
         if correction is not None:return False
+        interruption = self.evidence.read("call-interruption", identity)
+        if interruption is not None and interruption.get("outcome") == "cancelled" and interruption.get("phase") == "supervision_poll":
+            contract = self.evidence.read("contract", identity)
+            if (interruption.get("task_run_id") != request.task_run_id or interruption.get("model_request_id") != identity
+                    or interruption.get("request_sha256") != contract["source_request_sha256"]
+                    or interruption.get("adapter_exit_confirmed") is not True):
+                raise D3RecoveryRequired("d8_output_interruption_binding_changed")
+            return True
         return transient_provider_result(self.evidence, identity)
 
     def terminal_check(self, request):

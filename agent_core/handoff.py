@@ -397,6 +397,12 @@ class HandoffContext:
                 (self.app.revisions is None or self.app.revisions.reliable(i)))
             required.update(i.ref for i in items if i.intent_id == intent_id
                             and i.identity == "strategy_interruption_not_execution_or_fact")
+        if phase == "execution" and intent_id and getattr(self.app, "supervision", None):
+            stop = self.app.supervision.stop(intent_id)
+            if stop and stop.get("review_latest_evidence"):
+                review_refs = set((*stop["evidence_refs"], *stop["new_evidence_refs"]))
+                required.update(i.ref for i in items if i.ref in review_refs
+                    and not (i.record_type == "intent" and i.turn_id == turn_id and i.record_id != intent_id))
         evaluation = None
         by_ref = {i.ref: i for i in items}
         by_id = {i.record_id: i for i in items}
@@ -534,6 +540,7 @@ class HandoffContext:
                 result['intent_planning'] = {'version': 1, 'directions_are_solution_chains': True}
                 if phase in {'tree_planning', 'execution'}:
                     result['intent_planning']['order'] = 'execution_priority'
+                    result['intent_planning']['criteria'] = 'scoped_outcomes'
                 if phase == 'tree_planning':
                     result['active_intent_frontier'] = [
                         {'intent_id': i.intent_id, 'turn_id': i.turn_id, 'status': i.status.value,

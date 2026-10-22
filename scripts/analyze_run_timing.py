@@ -225,7 +225,7 @@ def summarize_supervision(task, operations, decisions, tree, handoff, sessions):
         note = handoff.read("strategy-discard", op.start.operation_id)
         if note:
             intercepted[note["review_id"]] += note["disposition"] == "not_dispatched"
-    calls, totals = [], Counter()
+    calls, totals, validity_reasons = [], Counter(), Counter()
     for op in operations:
         if op.start.role is None:
             continue
@@ -241,6 +241,8 @@ def summarize_supervision(task, operations, decisions, tree, handoff, sessions):
         raw = (result or {}).get("raw") or {}
         outcome = effect["outcome"] if effect else "pending_or_unapplied"
         totals[outcome] += 1
+        validity = (effect or {}).get("validity_reason", "legacy_unclassified")
+        validity_reasons[validity] += 1
         if raw.get("suggestion"):
             totals["suggestions_proposed"] += 1
             totals["suggestions_applied"] += outcome == "applied"
@@ -248,13 +250,13 @@ def summarize_supervision(task, operations, decisions, tree, handoff, sessions):
         totals["stops_proposed"] += raw.get("decision") == "request_intent_resolution"
         totals["stops_applied"] += stop
         totals["continues_applied"] += outcome == "applied" and raw.get("decision") == "continue_current_intent"
-        calls.append(dict(model_request_id=identity, outcome=outcome, decision=raw.get("decision"),
+        calls.append(dict(model_request_id=identity, outcome=outcome, validity_reason=validity, decision=raw.get("decision"),
             suggestion_intent=(raw.get("suggestion") or {}).get("intent_id"),
             advice_delivered=identity in delivered, voluntary_yields=yields[identity],
             intercepted_proposals=intercepted[identity], subsequent_decision_kinds=dict(choices[identity])))
     return dict(basis="observable events; no-switch is not uselessness; decisions do not prove causal benefit",
                 counts={**dict(totals), "calls": len(calls), "advice_delivered": len(delivered),
-                        "voluntary_yields": sum(yields.values())}, calls=calls)
+                        "voluntary_yields": sum(yields.values())}, validity_reasons=dict(validity_reasons), calls=calls)
 
 
 def analyze(directory, task_run_id=None, *, probe_path=None):

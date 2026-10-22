@@ -136,9 +136,20 @@ class HttpExperiments:
                     raise D3RecoveryRequired('d22_experiment_process_reconciliation_required') from error
                 if status.get('ContainerID') != process['sandbox_id'] or status.get('Running') is not False:
                     raise D3RecoveryRequired('d22_experiment_process_reconciliation_required')
-                self.evidence.save('experiment-result',identity,dict(session_sha256=digest(session),
-                    requests=[r.start.operation_id for r in rows],status='interrupted',
-                    code='d22_experiment_process_lost',output=''))
+                stopped = self.evidence.read('experiment-stop',identity)
+                if stopped is not None:
+                    if (stopped['session_sha256'] != digest(session)
+                            or stopped['requests'] != [r.start.operation_id for r in rows]):
+                        raise D3RecoveryRequired('d22_experiment_session_changed')
+                    # Reuse the retained intent to stop and observations. The
+                    # fresh inspection above, not the failed close, proves exit.
+                    restored = {**stopped, 'stop_diagnostic':{**stopped.get('stop_diagnostic',{}),
+                        'process_stopped':True, 'phase':'reconciled_exit'}}
+                else:
+                    restored = dict(session_sha256=digest(session),
+                        requests=[r.start.operation_id for r in rows],status='interrupted',
+                        code='d22_experiment_process_lost',output='')
+                self.evidence.save('experiment-result',identity,restored)
             self.app.store.mark_d3_operation_applied(identity,identity)
 
     async def _event(self, runner, token, expires, intent_id=None):
@@ -241,6 +252,7 @@ class HttpExperiments:
         self.live = parent
         runner = None
         finished = dict(status='failed',code='d22_experiment_environment_error',output='')
+        primary_error = None
         expires = time.monotonic()+timeout
         try:
             runner = await asyncio.to_thread(self.runner_factory,app.http_sandbox,session['task_run_id'],
@@ -289,13 +301,15 @@ class HttpExperiments:
                     if app.sessions.due(intent_id):
                         app.supervision.start(intent_id)
                     await asyncio.to_thread(runner.send,result)
-        except D3RecoveryRequired:
+        except D3RecoveryRequired as error:
+            primary_error = error
             raise
         except _StrategyStop:
             finished = dict(status='stopped',code='d22_experiment_strategy_stop',output='')
         except TaskRunSandboxError as error:
             if error.outcome == 'outcome_unknown':
-                raise D3RecoveryRequired('d22_experiment_process_outcome_unknown') from error
+                primary_error = D3RecoveryRequired('d22_experiment_process_outcome_unknown')
+                raise primary_error from error
             finished['code'] = 'd22_experiment_environment_error'
         except (TimeoutError,InterruptedError) as error:
             finished = dict(status='stopped',code='d22_experiment_timeout' if isinstance(error,TimeoutError) else 'd22_experiment_cancelled',output='')
@@ -306,7 +320,27 @@ class HttpExperiments:
         finally:
             try:
                 if runner is not None:
-                    await asyncio.to_thread(runner.close)
+                    try:
+                        await asyncio.to_thread(runner.close)
+                    except Exception as error:
+                        from agent_adapters.output_evidence import safe_failure_details
+                        failure = safe_failure_details(error,include_chain=True)
+                        diagnostic = dict(getattr(runner,'stop_diagnostic',dict(phase='close',process_stopped=False)))
+                        if isinstance(error,TaskRunSandboxError):
+                            diagnostic.update(sandbox_phase=error.phase,sandbox_outcome=error.outcome)
+                        retained = dict(session_sha256=digest(session),
+                            requests=[r.start.operation_id for r in self.records(parent)],
+                            **finished,stop_diagnostic=diagnostic,stop_failure=failure)
+                        self.evidence.save('experiment-stop',parent,retained)
+                        self.log.error('experiment.stop_unknown',run=session['task_run_id'],intent=intent_id,
+                            request=parent,category='unknown',code='d22_experiment_process_outcome_unknown',
+                            stop_diagnostic=diagnostic,**failure)
+                        if primary_error is None:
+                            raise D3RecoveryRequired('d22_experiment_process_outcome_unknown') from error
+                    else:
+                        diagnostic = getattr(runner,'stop_diagnostic',None)
+                        if diagnostic is not None:
+                            finished['stop_diagnostic'] = diagnostic
             finally:
                 self.live = None
         result = dict(session_sha256=digest(session),requests=[r.start.operation_id for r in self.records(parent)],**finished)

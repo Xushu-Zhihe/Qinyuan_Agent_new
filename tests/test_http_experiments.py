@@ -300,11 +300,11 @@ def test_container_bridge_frames_use_existing_container_and_close_exact_process(
         running=True
         def exec_create(self,**kwargs):
             calls.append(kwargs)
-            return {'Id':'kill' if kwargs['cmd'][0]=='kill' else 'worker'}
+            return {'Id':'worker' if kwargs['cmd'][0]=='timeout' else 'kill'}
         def exec_start(self,identity,**kwargs):
             if identity=='kill':self.running=False;return b''
             return raw
-        def exec_inspect(self,identity):return {'Running':self.running}
+        def exec_inspect(self,identity):return {'Running':False,'ExitCode':0} if identity=='kill' else {'Running':self.running,'ExitCode':137 if not self.running else None}
     api=API()
     sandbox=NS(_runtime=NS(client=NS(api=api)),_binding=lambda identity:object(),
         _verify_active=lambda *args:None,_admit=lambda binding:nullcontext())
@@ -318,7 +318,9 @@ def test_container_bridge_frames_use_existing_container_and_close_exact_process(
     process.close()
     assert calls[0]['container']=='same-container' and calls[0]['user']=='10001:10001'
     assert calls[0]['environment']=={'PATH':'/usr/bin:/bin'} and calls[0]['privileged'] is False
-    assert calls[-1]['cmd']==['kill','-KILL','4321'] and not api.running
+    assert calls[-1]['cmd'][:3]==['python3','-I','-c'] and calls[-1]['cmd'][-1]=='4321'
+    assert not api.running and process.stop_diagnostic['signal_exit_code']==0
+    assert process.stop_diagnostic['process_stopped'] is True
     assert b'"script": "print(1)"' in raw.sent
 
 
@@ -346,3 +348,191 @@ def test_supervision_counts_individual_batch_requests_and_keeps_script_outcome(h
     monkeypatch.setattr(c.app.mcp.evidence, 'read', lambda kind, identity: None if kind == 'mcp-result' else read(kind, identity))
     with pytest.raises(D3RecoveryRequired, match='mcp.result_binding_changed'):
         c.app.supervision.exploration_progress(intent)
+
+
+@pytest.mark.parametrize('http_case', ['continuous'], indirect=True)
+def test_current_review_drains_inflight_response_and_blocks_next_experiment_request(http_case):
+    from agent_adapters.web.http_adapter import D7HttpWireResponse
+    c = http_case
+    calls = setup(c, "for i in range(6):\n    request('GET', '/variant?i='+str(i))")
+    fifth_started, review_applied = threading.Event(), threading.Event()
+    outer, apply = c.models[0].invoke, c.app.supervision.apply
+    def applied(request, result):
+        value = apply(request, result)
+        if result['outcome'] == 'valid' and result['raw']['decision'] == 'request_intent_resolution':
+            review_applied.set()
+        return value
+    class Transport:
+        def send(self, **kwargs):
+            c.sends.append(kwargs)
+            if len(c.sends) == 5:
+                fifth_started.set()
+                assert review_applied.wait(5)
+            return D7HttpWireResponse(200, (), b'new control result' if len(c.sends) == 5 else b'baseline')
+    def review(envelope, *args):
+        if envelope.output_contract['stage'] == 'strategy_supervision':
+            assert fifth_started.wait(5)
+            return dict(decision='request_intent_resolution', reason='Review the diminishing value against the pending control.',
+                evidence_refs=[envelope.request.history[-1].ref], suggestion=None)
+        return outer(envelope, *args)
+    c.models[0].invoke, c.app.supervision.apply = review, applied
+    c.app.web.transport_factory = lambda _: Transport()
+    result = asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required, result
+    report = c.app.mcp.experiments.result(calls[0])
+    assert report['status'] == 'stopped'
+    assert len(c.sends) == len(report['requests']) == 5
+    assert all(c.app.store.load_d4_operation(ref).completion is not None for ref in report['requests'])
+    last = c.app.mcp.feedback(report['requests'][-1])
+    assert last['http_response']['body_bytes'] == len(b'new control result')
+    reviews = list(c.app.supervision.calls())
+    assert len(reviews) == 1
+    assert not c.app.store.list_d4_unresolved_operations(c.task)
+
+
+@pytest.mark.parametrize('scenario',[
+    'stopped','already_exited','signal_failed','signal_failed_but_exited',
+    'inspect_failed','signal_inspect_failed','missing_running','stream_failed',
+])
+def test_experiment_close_classifies_signal_and_final_process_state(monkeypatch,scenario):
+    from contextlib import nullcontext
+    from types import SimpleNamespace as NS
+    from Sandbox.http_experiment import HttpExperimentProcess
+    from Sandbox.task_run_sandbox import TaskRunSandboxError
+    from agent_adapters.output_evidence import safe_failure_details
+    import Sandbox.http_experiment as bridge
+    ticks=iter(range(100))
+    monkeypatch.setattr(bridge.time,'monotonic',lambda:next(ticks))
+    monkeypatch.setattr(bridge.time,'sleep',lambda _:None)
+    calls=[]
+    class API:
+        running=scenario!='already_exited'
+        def exec_inspect(self,identity):
+            if scenario=='inspect_failed' or identity=='signal' and scenario=='signal_inspect_failed':
+                raise ConnectionError('private Docker response must not be saved')
+            if identity=='signal':
+                return dict(Running=False,ExitCode=1 if scenario.startswith('signal_failed') else 0)
+            return {} if scenario=='missing_running' else dict(Running=self.running,ExitCode=None if self.running else 137)
+        def exec_create(self,**kwargs):calls.append(kwargs);return dict(Id='signal')
+        def exec_start(self,identity):
+            if scenario not in {'signal_failed','signal_inspect_failed'}:self.running=False
+            return b''
+    closed=[]
+    def close_stream():
+        closed.append(True)
+        if scenario=='stream_failed':raise OSError('private stream error')
+    process=HttpExperimentProcess.__new__(HttpExperimentProcess)
+    process.api=API()
+    process.exec_id='original-exec'
+    process.pid=4321
+    process.task_id='task'
+    process.sandbox_id='sandbox'
+    process.binding=object()
+    process.socket=NS(close=close_stream)
+    process.sandbox=NS(_verify_active=lambda *args:None,_admit=lambda _:nullcontext())
+    unknown=scenario in {'signal_failed','inspect_failed','signal_inspect_failed','missing_running'}
+    if unknown:
+        with pytest.raises(TaskRunSandboxError) as caught:process.close()
+        assert caught.value.phase=='experiment_stop' and caught.value.outcome=='outcome_unknown'
+        diagnostic=safe_failure_details(caught.value,include_chain=True)
+        assert 'sandbox_experiment_stop_unknown' in diagnostic['error_codes']
+        assert 'private' not in json.dumps(diagnostic)
+    else:process.close()
+    assert process.stop_diagnostic['process_stopped'] is (not unknown)
+    assert process.stop_diagnostic['stream_closed'] is (scenario!='stream_failed')
+    assert closed==[True]
+    if scenario=='already_exited':assert not calls
+    if scenario.startswith('signal_failed'):assert process.stop_diagnostic['signal_exit_code']==1
+    if calls:
+        assert calls[0]['cmd'][:3]==['python3','-I','-c'] and calls[0]['cmd'][-1]=='4321'
+        assert calls[0]['user']=='10001:10001' and calls[0]['privileged'] is False
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+@pytest.mark.parametrize('closure',['completed','strategy_stop'])
+def test_stop_failure_retains_progress_and_requires_exit_confirmation_without_replay(http_case,closure):
+    from types import SimpleNamespace as NS
+    from Sandbox.task_run_sandbox import TaskRunSandboxError
+    c=http_case
+    script="request('GET','/once')\nprint('Retained progress, not a verified Fact.')" if closure=='completed' else "for i in range(6):\n    request('GET','/repeat')"
+    calls=setup(c,script)
+    if closure=='strategy_stop':
+        outer,start=c.models[0].invoke,c.app.supervision.start
+        def review(envelope,*args):
+            if envelope.output_contract['stage']=='strategy_supervision':
+                return dict(decision='request_intent_resolution',reason='Review the recorded repetitions.',
+                    evidence_refs=[envelope.request.history[-1].ref],suggestion=None)
+            return outer(envelope,*args)
+        def wait_review(intent):
+            start(intent)
+            assert c.app.supervision.pending[1].wait(3)
+            c.app.supervision.poll()
+        c.models[0].invoke,c.app.supervision.start=review,wait_review
+    class StopFailed(ScriptProcess):
+        def close(self):
+            super().close()
+            self.stop_diagnostic=dict(phase='wait_exit',process_stopped=False,signal_exit_code=1,stream_closed=True)
+            raise TaskRunSandboxError('experiment_stop','outcome_unknown',c.task,(c.app.state.task_run.sandbox_id,))
+    c.app.mcp.experiments.runner_factory=StopFailed
+    result=asyncio.run(c.app._run_once(c.token))
+    assert result.recovery_required,result
+    parent=calls[0]
+    experiments=c.app.mcp.experiments
+    retained=experiments.evidence.read('experiment-stop',parent)
+    expected=1 if closure=='completed' else 4
+    assert len(retained['requests'])==expected and len(c.sends)==expected
+    if closure=='completed':
+        assert retained['status']=='completed' and 'Retained progress' in retained['output']
+    else:
+        assert retained['status']=='stopped' and retained['code']=='d22_experiment_strategy_stop'
+    assert retained['stop_diagnostic']['signal_exit_code']==1
+    assert retained['stop_diagnostic']['sandbox_phase']=='experiment_stop'
+    assert retained['stop_diagnostic']['sandbox_outcome']=='outcome_unknown'
+    assert 'sandbox_experiment_stop_unknown' in retained['stop_failure']['error_codes']
+    assert experiments.result(parent) is None and experiments.live is None
+    assert c.app.store.load_d3_operation(parent).application_ref is None
+    def unavailable(_):raise ConnectionError('private Docker inspection failure')
+    c.app.http_sandbox._runtime=NS(client=NS(api=NS(exec_inspect=unavailable)))
+    with pytest.raises(D3RecoveryRequired,match='process_reconciliation_required'):c.app.mcp.reconcile()
+    assert experiments.result(parent) is None
+    status=dict(ContainerID=c.app.state.task_run.sandbox_id,Running=True)
+    c.app.http_sandbox._runtime=NS(client=NS(api=NS(exec_inspect=lambda _:status)))
+    with pytest.raises(D3RecoveryRequired,match='process_reconciliation_required'):c.app.mcp.reconcile()
+    status['Running']=False
+    c.app.mcp.reconcile()
+    restored=experiments.result(parent)
+    assert restored['requests']==retained['requests'] and restored['output']==retained['output']
+    assert restored['stop_diagnostic']['phase']=='reconciled_exit'
+    assert c.app.store.load_d3_operation(parent).application_ref==parent
+    c.app.mcp.reconcile()
+    assert len(c.sends)==expected and len(calls)==1
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+def test_request_unknown_is_not_masked_by_stop_failure_or_replayed(http_case):
+    from types import SimpleNamespace as NS
+    c=http_case
+    calls=setup(c,"request('GET','/first')\nrequest('GET','/unknown')")
+    class StopFailed(ScriptProcess):
+        def close(self):
+            super().close()
+            raise ConnectionError('private stop failure')
+    class Transport:
+        def send(self,**kwargs):
+            from agent_adapters.web.http_adapter import D7HttpWireResponse
+            c.sends.append(kwargs)
+            if len(c.sends)==2:raise ConnectionResetError('private request failure')
+            return D7HttpWireResponse(200,(),b'first')
+    c.app.web.transport_factory=lambda _:Transport()
+    c.app.mcp.experiments.runner_factory=StopFailed
+    result=asyncio.run(c.app._run_once(c.token))
+    assert result.recovery_required,result
+    parent=calls[0]
+    experiments=c.app.mcp.experiments
+    retained=experiments.evidence.read('experiment-stop',parent)
+    assert len(retained['requests'])==2 and 'private' not in json.dumps(retained)
+    assert experiments.result(parent) is None
+    c.app.http_sandbox._runtime=NS(client=NS(api=NS(exec_inspect=lambda _:
+        dict(ContainerID=c.app.state.task_run.sandbox_id,Running=False))))
+    with pytest.raises(D3RecoveryRequired,match='request_outcome_unknown'):c.app.mcp.reconcile()
+    assert len(c.sends)==2 and len(calls)==1

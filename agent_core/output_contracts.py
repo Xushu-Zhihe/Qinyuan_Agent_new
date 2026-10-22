@@ -334,7 +334,13 @@ def shape_issues(value, schema, path="$"):
             if matched:
                 branches = matched
         options = [shape_issues(value, s, path) for s in branches]
-        return min(options, key=len)
+        if any(not issues for issues in options):
+            return []
+        # Preserve acceptance; diagnose an invalid object against object branches,
+        # rather than letting a nullable branch hide its actionable field errors.
+        matching = [issues for branch, issues in zip(branches, options)
+                    if json_type(value) in (branch.get("type") if isinstance(branch.get("type"), list) else [branch.get("type")])]
+        return min(matching or options, key=len)
     actual = json_type(value)
     expected = schema["type"]
     allowed = expected if isinstance(expected, list) else [expected]
