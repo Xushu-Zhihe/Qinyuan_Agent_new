@@ -327,6 +327,40 @@ def test_single_argument_review_has_runtime_timeout_cancel_and_failure_mapping(t
     assert response.kind == ("unknown" if failure in {ModelErrorKind.TIMED_OUT, ModelErrorKind.CANCELLED, ModelErrorKind.PROVIDER_FAILURE} else failure.value)
 
 
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_review_timeout_requires_explicit_worker_exit_receipt(confirmed):
+    from agent_core.review_contracts import D2ReviewRequest
+    role = deepseek_roles.role_config("outer_planning")
+    uid = lambda: str(uuid4())
+    business = D2ReviewRequest(uid(), uid(), 1, 1, "turn_start", uid(), uid(), uid(), None, 1, "v1", (), 0, "{}")
+    stage, schema = output_schema(business)
+    env = D8OutputRequest(business, {"version": 1, "stage": stage, "schema": schema}, "Return JSON", None)
+    def invoke(payload, timeout, token, *, diagnostic):
+        diagnostic.update(transport_end="timeout", worker_exit_confirmed=confirmed)
+        return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
+    adapter = deepseek_roles.D8DeepSeekModel(role, deepseek_model.DeepSeekSettings(role.model, "offline-private-key"),
+        transport=SimpleNamespace(_invoke_payload=invoke))
+    adapter.bind_runtime(SimpleNamespace(is_cancelled=False), time.time() + 30)
+    assert adapter.invoke(env).kind == ("provider_failure" if confirmed else "unknown")
+
+
+@pytest.mark.parametrize("http_error", [False, True])
+def test_provider_response_cannot_override_unconfirmed_worker_exit(http_error):
+    from agent_core.structured_output import transient_provider_result
+    env, role = envelope()
+    def invoke(payload, timeout, token, *, diagnostic):
+        diagnostic.update(transport_end="http_error" if http_error else "response_received",
+                          http_status=503 if http_error else 200, worker_exit_confirmed=False)
+        return (ModelError(ModelErrorKind.PROVIDER_FAILURE, "deepseek_http_503") if http_error
+                else {"content": "{}", "finish_reason": "stop"})
+    adapter = deepseek_roles.D8DeepSeekModel(role, deepseek_model.DeepSeekSettings(role.model, "offline-private-key"),
+        transport=SimpleNamespace(_invoke_payload=invoke))
+    assert adapter.invoke(env, 30, SimpleNamespace(is_cancelled=False)).kind is ModelErrorKind.TIMED_OUT
+    evidence = SimpleNamespace(read=lambda *args: {"transport": {"transport_end": "http_error",
+        "http_status": 503, "worker_exit_confirmed": False}})
+    assert not transient_provider_result(evidence, "call")
+
+
 def test_workbench_real_emits_frozen_roles_and_keeps_credentials_private(tmp_path, monkeypatch):
     from unittest.mock import patch
     from agent_adapters.workbench import Workbench
@@ -480,6 +514,69 @@ def test_parent_transport_retains_metadata_on_result_error_and_lost_worker(case)
     if case == "result":assert result["finish_reason"] == "length"
     else:assert isinstance(result, ModelError)
     assert detail["transport_end"] == ("worker_lost" if case == "lost" else "response_received")
+    assert detail["worker_exit_confirmed"] is True
+
+
+def stalled_model_worker(connection, settings, payload, timeout):
+    connection.send({"connected": True})
+    connection.send({"diagnostic": {"http_status": 200}})
+    time.sleep(30)
+
+
+def test_model_timeout_confirms_child_exit_without_http():
+    adapter = deepseek_model.DeepSeekModelAdapter(
+        deepseek_model.DeepSeekSettings("offline", "offline-private-key"), worker=stalled_model_worker)
+    detail = {}
+    result = adapter._invoke_payload({}, 1.5, SimpleNamespace(is_cancelled=False), diagnostic=detail)
+    assert result.kind is ModelErrorKind.TIMED_OUT
+    assert detail["transport_end"] == "timeout" and detail["worker_exit_confirmed"] is True
+
+
+@pytest.mark.parametrize("cooperative", [True, False])
+def test_outer_watchdog_waits_for_adapter_or_keeps_result_unknown(cooperative):
+    import asyncio
+    import threading
+    from agent_core.dual_llm_modeling import D3AuditedModel
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    release = threading.Event()
+    seen = []
+    def invoke(request, timeout, token):
+        while not token.is_cancelled:
+            time.sleep(.001)
+        seen.append(token.is_timed_out)
+        if not cooperative:release.wait(5)
+        return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
+    model = SimpleNamespace(adapter=SimpleNamespace(invoke=invoke), output_boundary=None, clock=time.time,
+        controller=SimpleNamespace(control_state=SimpleNamespace(task_run=SimpleNamespace(
+            status=SimpleNamespace(value="running"), deadline_at=time.time()+60))))
+    req = SimpleNamespace(task_run_id="run", model_request_id="call", stage="inner_plan")
+    try:
+        call = D3AuditedModel._invoke(model, req, .02, SimpleNamespace(is_cancelled=False))
+        if cooperative:
+            assert asyncio.run(call).kind is ModelErrorKind.TIMED_OUT
+        else:
+            with pytest.raises(D3RecoveryRequired, match="d3_model_call_outcome_unknown"):
+                asyncio.run(call)
+        assert seen == [True]
+    finally:
+        release.set()
+
+
+def test_user_cancel_waits_for_model_adapter_acknowledgement():
+    import asyncio
+    from agent_core.dual_llm_modeling import D3AuditedModel
+    token = SimpleNamespace(is_cancelled=False)
+    def invoke(request, timeout, invocation):
+        token.is_cancelled = True
+        while not invocation.is_cancelled:time.sleep(.001)
+        time.sleep(.02)  # Transport cleanup is still in flight.
+        assert not invocation.is_timed_out
+        return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
+    model = SimpleNamespace(adapter=SimpleNamespace(invoke=invoke), output_boundary=None, clock=time.time,
+        controller=SimpleNamespace(control_state=SimpleNamespace(task_run=SimpleNamespace(
+            status=SimpleNamespace(value="running"), deadline_at=time.time()+60))))
+    req = SimpleNamespace(task_run_id="run", model_request_id="call", stage="inner_plan")
+    assert asyncio.run(D3AuditedModel._invoke(model, req, 30, token)).kind is ModelErrorKind.CANCELLED
 
 
 def test_shared_schema_preserves_all_enum_constraints_without_mutating_source():

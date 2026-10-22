@@ -104,6 +104,7 @@ def test_exact_join_unknown_usage_offsets_and_action_changes(tmp_path, monkeypat
     assert second["previous_model_request_id"] == first["model_request_id"]
     assert second["first_difference_from_contract_json_chars"] == len('{"version": ')
     assert second["since_previous_attempt_seconds"] == 165
+    assert second["first_changed_message"] == 0 and len(second["messages"]) == 2
     assert not second["user_prefix_follows_identical_system"]
     assert second["prompt_tokens"] is None and not second["operation_completed"]
     assert result["stages"]["inner_plan"]["cache_usage_observations"] == 1
@@ -134,6 +135,36 @@ def test_probe_is_disabled_without_configuration(tmp_path, monkeypatch):
     monkeypatch.delenv("QINYUAN_CACHE_PROBE", raising=False)
     cache_probe.record(payload={}, sent={}, role="inner_action")
     assert not list(tmp_path.iterdir())
+
+
+def test_segmented_messages_report_exact_prefix_without_content(tmp_path, monkeypatch):
+    path = tmp_path / "segmented.jsonl"
+    monkeypatch.setenv("QINYUAN_CACHE_PROBE", str(path))
+    messages = [{"role": "system", "content": "fixed rules"},
+                {"role": "user", "content": "PRIVATE_历史证据"},
+                {"role": "assistant", "content": "PRIVATE_旧决策"},
+                {"role": "user", "content": "dynamic state 1"}]
+    sent = dict(task_run_id=str(uuid4()), role_config_ref="role", stage="inner_plan", parameters={})
+    for n in (1, 2):
+        sent["model_request_id"] = str(uuid4())
+        messages[-1]["content"] = f"dynamic state {n}"
+        cache_probe.record(payload={"messages": messages}, sent=sent, role="inner_action")
+    raw = path.read_text(encoding="utf-8")
+    first, second = map(json.loads, raw.splitlines())
+    assert len(second["messages"]) == 4 and second["first_changed_message"] == 3
+    assert second["previous_request_id"] == first["request_id"]
+    assert second["messages_prefix_utf8_bytes"] > second["messages_prefix_chars"] > 0
+    assert "PRIVATE_" not in raw and "旧决策" not in raw
+
+
+def test_probe_failure_is_classified_without_failing_call(tmp_path, monkeypatch):
+    import qinyuan_core
+    calls = []
+    monkeypatch.setenv("QINYUAN_CACHE_PROBE", str(tmp_path))
+    monkeypatch.setattr(qinyuan_core, "get_logger", lambda _: SimpleNamespace(warning=lambda *a, **kw: calls.append(kw)))
+    cache_probe.record(payload={"messages": []}, sent={"task_run_id": "run", "model_request_id": "call", "parameters": {},
+        "role_config_ref": "role", "stage": "inner_plan"}, role="inner_action")
+    assert calls[0]["code"] == "cache_probe_unavailable" and calls[0]["request"] == "call"
 
 
 @pytest.mark.parametrize("boundary", ["task", "parameters", "restart"])

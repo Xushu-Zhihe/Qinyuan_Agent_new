@@ -128,16 +128,18 @@ class D7AnswerCandidate:
     candidate_id: str
     turn_id: str
     intent_id: str
-    plan_id: str
-    execution_id: str
+    plan_id: str | None
+    execution_id: str | None
     evidence_version: str
     source_ref: str
     source_kind: str = "d3"
     web_execution_binding: D7WebExecutionBinding | None = None
 
     def __post_init__(self) -> None:
-        for name in ("task_run_id", "candidate_id", "plan_id", "execution_id"):
+        for name in ("task_run_id", "candidate_id"):
             _uuid4(getattr(self, name), name)
+        if self.source_kind != "mcp":
+            for name in ("plan_id", "execution_id"):_uuid4(getattr(self,name),name)
         for name in ("turn_id", "intent_id"):
             _uuid4_or5(getattr(self, name), name)
         if (
@@ -164,12 +166,17 @@ class D7AnswerCandidate:
                 or binding.response_evidence_id != self.source_ref
             ):
                 raise ValueError("Web candidate provenance does not match its binding")
+        elif self.source_kind == "mcp":
+            if self.plan_id is not None or self.execution_id is not None or self.web_execution_binding is not None:
+                raise ValueError("MCP candidate cannot carry a Plan or Execution")
+            if not self.source_ref.startswith("mcp-result/"):raise ValueError("MCP source reference invalid")
+            _uuid4(self.source_ref.removeprefix("mcp-result/"), "MCP operation")
         else:
-            raise ValueError("source_kind must be d3 or web")
+            raise ValueError("source_kind must be d3, web or mcp")
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
-            "schema_version": 1 if self.source_kind == "d3" else 2,
+            "schema_version": 3 if self.source_kind == "mcp" else 1 if self.source_kind == "d3" else 2,
             "task_run_id": self.task_run_id,
             "candidate_id": self.candidate_id,
             "turn_id": self.turn_id,
@@ -179,6 +186,7 @@ class D7AnswerCandidate:
             "evidence_version": self.evidence_version,
             "source_ref": self.source_ref,
         }
+        if self.source_kind == "mcp":result["source_kind"] = "mcp"
         if self.source_kind == "web":
             result["source_kind"] = "web"
             assert self.web_execution_binding is not None
@@ -195,13 +203,17 @@ class D7AnswerCandidate:
         if not isinstance(value, Mapping):
             raise TypeError("D7 answer candidate must be an object")
         schema_version = value.get("schema_version")
-        if type(schema_version) is not int or schema_version not in {1, 2}:
+        if type(schema_version) is not int or schema_version not in {1, 2, 3}:
             raise ValueError("unsupported D7 answer candidate schema")
         source_kind = "d3"
         web_execution_binding = None
         if schema_version == 1:
             if set(value) != common_fields:
                 raise ValueError("D7 answer candidate fields are invalid")
+        elif schema_version == 3:
+            if value.get("source_kind") != "mcp" or set(value) != common_fields | {"source_kind"}:
+                raise ValueError("MCP candidate fields are invalid")
+            source_kind = "mcp"
         else:
             if value.get("source_kind") != "web" or set(value) != {
                 *common_fields,

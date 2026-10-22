@@ -139,6 +139,10 @@ def validate_resolution(app, request, proposal):
 
 
 def pending_stop(app, intent_id):
+    supervisor = getattr(app, "supervision", None)
+    stop = supervisor.stop(intent_id) if supervisor else None
+    if stop is not None:
+        return stop
     reviews = [r for r in app.store.list_d3_review_applications(app.state.task_run.task_run_id)
                if r.intent_id == intent_id and not r.paused_gate
                and r.decision in {"switch_sibling_intent", "abandon_current_intent", "request_intent_resolution"}]
@@ -158,14 +162,18 @@ def pending_stop(app, intent_id):
 
 def execution_context(app, intent_id):
     notes = []
+    strategy = []
     if continuous(app.config):
         for row in app.store.list_d8_tree_records(app.state.task_run.task_run_id):
             if row.intent_id == intent_id and row.kind == "suspended":
                 note = app.handoff.evidence.read("pause", row.record_id)
                 if note is not None:notes.append(note)
+            if row.intent_id == intent_id and row.kind == "strategy_yielded":
+                strategy.append(app.handoff.evidence.read("strategy-yield", row.record_id))
     return {**({"technical_history": notes, "revisit_count": visits(app.store, app.state.task_run.task_run_id, intent_id)} if notes else {}), "policy": POLICY, "review_contract": "candidate_subset_v1", "facts": [{"fact_id": f["fact_id"], "ref": f["ref"]}
                                       for f in facts(app, intent_id)],
         "stop_requested": stop_request(app, intent_id),
+        **({"strategy_history": strategy, "strategy_identity": "voluntary_yield_not_technical_retry_or_business_failure"} if strategy else {}),
         "goal_rule": "A local goal with observable completion criteria and explicit scope, not a predetermined action list.",
         "next_decision": "Continue with a Plan/tool, request a review, or propose an evidence-bound Intent resolution.",
         "stop_rule": "No new Fact and repeated responses do not prove saturation. Negative observations may increase coverage; prerequisites may enable later progress.",
@@ -297,6 +305,9 @@ def close_stop_observation(app, intent_id):
     plan = running[-1]
     binding = app.store.load_d3_plan_binding(plan.plan_id)
     if getattr(binding, "kind", None) == "http_request":
+        if (stop_request(app, intent_id)["decision"] == "request_intent_resolution"
+                and app.store.load_d4_operation(binding.execution_id) is None):
+            return  # Registered is not dispatched: preserve this Plan for a continued verdict.
         proof = app.web.observation(binding.execution_id)
     else:
         proof = app.proof_store.read(app._id("proof/" + plan.plan_id))
@@ -692,6 +703,9 @@ def retry_candidate(store, state, turn_id):
     rows = store.list_d8_tree_records(state.task_run.task_run_id)
     siblings = sorted((i for i in state.intents if i.turn_id == turn_id), key=lambda i: i.priority)
     for index, item in enumerate(siblings[:-1]):
+        latest = next((r for r in reversed(rows) if r.intent_id == item.intent_id and r.kind in {"suspended", "resumed", "strategy_yielded", "strategy_resumed"}), None)
+        if latest is not None and latest.kind == "strategy_yielded":
+            continue
         if item.status is not IntentStatus.SUSPENDED or visits(store, state.task_run.task_run_id, item.intent_id):
             continue
         next_item = siblings[index + 1]
@@ -704,10 +718,12 @@ def retry_candidate(store, state, turn_id):
     return None
 
 
-def runnable_turns(store, state):
+def runnable_turns(store, state, supervision=None):
     from agent_core.domain import IntentStatus, TurnStatus
     rows = store.list_d8_tree_records(state.task_run.task_run_id)
     def work(turn):
+        if supervision is not None and supervision.resume_candidate(turn.turn_id) is not None:
+            return True
         if retry_candidate(store, state, turn.turn_id) is not None:return True
         for item in state.intents:
             if item.turn_id != turn.turn_id:continue
@@ -768,7 +784,7 @@ def suspend_local(app, intent, error):
     from agent_core.handoff_contracts import D8TreeRecord
     from agent_core.review import D2ReviewPaused
     if not continuous(app.config) or intent.status is not IntentStatus.RUNNING:return False
-    if app.store.list_d4_unresolved_operations(app.state.task_run.task_run_id) or any(
+    if app.store.blocking_d4_operations(app.state.task_run.task_run_id) or any(
             e.status is ExecutionStatus.RUNNING for e in app.state.executions):return False
     code = getattr(error, "code", None) or str(error)
     context_failure = code.startswith("d8_context_paused:")
@@ -791,8 +807,11 @@ def suspend_local(app, intent, error):
             if (provider or {}).get("transport", {}).get("http_status") in {401, 402, 403}:return False
             model = app.model_evidence.read(key)
             raw = model.raw if model is not None and isinstance(model.raw, dict) else {}
-            if (transport_end in {"timeout", "cancelled", "transport_error", "incomplete_response", "worker_lost", "unknown"}
-                    or raw.get("kind") in {"timed_out", "cancelled", "authentication_failed"}
+            from agent_core.structured_output import ended_transport_failure
+            ended = ended_transport_failure((provider or {}).get("transport", {}))
+            if ((not ended and (transport_end in {"timeout", "cancelled", "transport_error", "incomplete_response", "worker_lost", "unknown"}
+                    or raw.get("kind") in {"timed_out", "cancelled"}))
+                    or raw.get("kind") == "authentication_failed"
                     or str(raw.get("short_reason", "")).endswith(("http_401", "http_402", "http_403"))):
                 return False  # Scope is not safe to advance while the call outcome is unknown.
             identity = key

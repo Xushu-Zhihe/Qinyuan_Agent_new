@@ -560,6 +560,7 @@ class D3Application:
             item.start.operation_id
             for item in operations
             if item.start.operation_id != exclude_operation_id
+            and not (self.sessions is not None and self.supervision.live(item.start.operation_id))
         )
 
     def _persist_cancel_intent(self) -> None:
@@ -1027,6 +1028,8 @@ class D3Application:
             unvalidated = True
             reason = "d8_controller_reload_required:" + reason
         sandbox_status = "retained"
+        if self.sessions is not None and not unvalidated and state.task_run.status is not TaskRunStatus.RUNNING:
+            self.supervision.retire()
         if self.config.d4_budget is not None and state.task_run.sandbox_id is not None:
             for event in self.store.list_d4_audit_events(state.task_run.task_run_id):
                 if event.evidence_ref != state.task_run.sandbox_id:
@@ -1587,7 +1590,14 @@ class D3Application:
                 name += f"/after-revision/{count}"
         if self.config.intent_execution_policy and stage == "inner_plan":
             name += f"/after-decision/{len(self.sessions.records(context.intent_id))}"
+            stop = self.supervision.stop(context.intent_id)
+            if stop:
+                name += "/after-strategy/" + stop["review_id"]
         if self.config.intent_execution_policy == "continuous_v1" and stage != "outer_turn":
+            discarded = sum(1 for op in self.store.list_d3_operations(task_id)
+                            if op.start.resource_ref == resource_ref and self.handoff.evidence.read("strategy-discard", op.start.operation_id))
+            if discarded:
+                name += f"/after-discard/{discarded}"
             from agent_core.intent_execution import visits
             actor = getattr(context, "intent_id", None) or getattr(getattr(context, "plan_binding", None), "intent_id", None)
             visit = visits(self.store, task_id, actor)
@@ -1883,6 +1893,10 @@ class D3Application:
             source = self.web.source(reference)
             if source is not None:
                 return source
+        if self.mcp is not None and self.mcp.feedback(reference) is not None:
+            claim = self.output_boundary.evidence.read("mcp-call", reference)
+            return {"kind": "mcp_execution", "task_run_id": self.state.task_run.task_run_id,
+                    "source": self.evidence_conclusions.source(reference, claim["intent_id"])}
         if reference.startswith("d8-decision:") and self.sessions is not None:
             record = next((r for r in self.sessions.records() if r.record_id == reference[12:]), None)
             if record is None:
@@ -2028,7 +2042,8 @@ class D3Application:
                         or progress["recent"][-1]["ref"] != "d8-decision:" + rows[-1].record_id
                         or progress["recent"][-1]["ordinal"] != rows[-1].ordinal):
                     raise D3RecoveryRequired("s3_latest_decision_unavailable")
-            source_ids = tuple(dict.fromkeys((*source_ids, *(r["ref"] for r in progress["recent"]))))
+            source_ids = tuple(dict.fromkeys((*source_ids, *(r["ref"] for r in progress["recent"]),
+                                              *progress.get("execution_refs", ())[-4:])))
         if binding is None or not source_ids:
             raise D3RecoveryRequired("d3_review_binding_or_sources_missing")
         if scope == "turn_start":
@@ -2654,8 +2669,22 @@ class D3Application:
         )
 
     async def _propose_inner_plan(self, request, token, *, refresh, validate):
+        from agent_core.strategy_supervision import StrategyYield
+        validate_original = validate
+        def validate(current, proposal):
+            if isinstance(proposal, StrategyYield):
+                return
+            return validate_original(current, proposal)
         try:
-            return await self.inner.propose(request, token, refresh=refresh, validate=validate)
+            result = await self.inner.propose(request, token, refresh=refresh, validate=validate)
+            if self.sessions is not None:
+                self.supervision.poll()
+                if self.supervision.guard_decision(request, result[0]):
+                    return None
+                if isinstance(result[1], StrategyYield):
+                    self.supervision.yield_intent(*result)
+                    return None
+            return result
         except D3ProposalRejected as exc:
             identity = exc.model_request_id
             if not self.config.intent_execution_policy or identity is None or self.conclusions.optional_format(identity) is None:
@@ -2695,6 +2724,9 @@ class D3Application:
         token: CancellationToken,
     ) -> bool:
         if self.sessions is not None and await self.sessions.before_decision(plan_binding.intent_id, receipts, token):
+            return True
+        if self.sessions is not None and self.supervision.stop(plan_binding.intent_id):
+            await self._new_plan(plan_binding.intent_id, token)
             return True
         artifact = self.workspace.read_artifact(plan_binding.artifact_version_id)
         path = artifact.claim.path
@@ -2808,9 +2840,12 @@ class D3Application:
             if self.config.d4_budget is None:
                 request_id, proposal = await self.inner.propose(request, token)
             else:
-                request_id, proposal = await self.inner.propose(
+                decision = await self._propose_inner_plan(
                     request, token, refresh=refresh, validate=validate
                 )
+                if decision is None:
+                    return True
+                request_id, proposal = decision
         except D3ProposalRejected as exc:
             if self.config.d4_budget is None:
                 raise
@@ -2961,6 +2996,11 @@ class D3Application:
             raise D3RecoveryRequired("d8_conclusion_persistence_recovery_required") from exc
 
     async def _review_d8_observation_impl(self, binding, proof, receipts, token):
+        if self.config.intent_execution_policy == "continuous_v1":
+            from agent_core.intent_execution import complete_observation
+            self._check_dispatch()
+            complete_observation(self, binding, proof)
+            return False
         while True:
             self._check_dispatch()
             if self.sessions is not None and await self.sessions.before_decision(binding.intent_id, receipts, token):
@@ -3361,7 +3401,7 @@ class D3Application:
             active = [t for t in self.state.turns if t.status in {TurnStatus.PENDING, TurnStatus.RUNNING}]
             if self.config.intent_execution_policy == "continuous_v1":
                 from agent_core.intent_execution import runnable_turns, retry_candidate, resume_local
-                active = runnable_turns(self.store, self.state)
+                active = runnable_turns(self.store, self.state, self.supervision)
             if not active:
                 if self.config.intent_execution_policy == "continuous_v1":
                     from agent_core.intent_execution import replan_root_once
@@ -3371,7 +3411,10 @@ class D3Application:
             turn = max(active, key=lambda t: t.sequence)
             if self.config.intent_execution_policy == "continuous_v1":
                 revisit = retry_candidate(self.store, self.state, turn.turn_id)
-                if revisit is not None:
+                strategy_resume = self.supervision.resume_candidate(turn.turn_id)
+                if strategy_resume is not None and not any(i.turn_id == turn.turn_id and i.status is IntentStatus.RUNNING for i in self.state.intents):
+                    self.supervision.resume(strategy_resume)
+                if revisit is not None and not any(i.turn_id == turn.turn_id and i.status is IntentStatus.RUNNING for i in self.state.intents):
                     resume_local(self, revisit)
             current = next((i for i in self.state.intents if i.turn_id == turn.turn_id and i.status is IntentStatus.RUNNING), None)
             if current is None:
@@ -3407,6 +3450,11 @@ class D3Application:
 
     async def _drive_tree_intent(self, current, receipts, token):
         turn = next(t for t in self.state.turns if t.turn_id == current.turn_id)
+        if self.sessions is not None and self.supervision.stop(current.intent_id) and not any(e.status.value == "running" for e in self.state.executions):
+            # Keep an already registered but unstarted Plan intact. A continued
+            # end review can return to it; no observation or failure is invented.
+            await self._new_plan(current.intent_id, token)
+            return
         plans = [p for p in self.state.plans if p.intent_id == current.intent_id]
         if not plans:
             turn_binding = self.store.load_d3_turn_binding(turn.turn_id)
@@ -3547,7 +3595,10 @@ class D3Application:
         # The per-dispatch lock is released while waiting for recovery/verification.
         import asyncio
         remaining = self.state.task_run.deadline_at - self.clock()
-        if remaining > 0 and not token.is_cancelled:await asyncio.sleep(min(1.0, remaining))
+        if remaining > 0 and not token.is_cancelled:
+            from qinyuan_core.logging import timed_phase
+            with timed_phase("ctrl", "scheduler_wait", run=self.state.task_run.task_run_id):
+                await asyncio.sleep(min(1.0, remaining))
 
     async def run(self, token: CancellationToken) -> D3Result:
         if self.config.intent_execution_policy != "continuous_v1":return await self._run_once(token)
@@ -3556,11 +3607,20 @@ class D3Application:
             result = await self._run_once(token)
             if self.state.task_run.status in TERMINAL_STATUSES or token.is_cancelled:return result
             if self.clock() >= self.state.task_run.deadline_at:
+                # Waiting is not a terminal transition. Settle the durable
+                # Deadline and owned resources once admitted results are known.
+                with run_lock(self.directory):
+                    stopped = self._settle_stoppage()
+                    if stopped is not None:
+                        return self.result(stopped, recovery_required=(
+                            stopped == "d4_operation_outcome_unknown" or stopped.endswith("cleanup_unknown")))
                 return replace(result, stop_reason="task_run_deadline_exceeded")
             if result.stop_reason != waiting_reason:
                 from qinyuan_core import get_logger
                 get_logger("ctrl").info("task.waiting", run=self.state.task_run.task_run_id,
-                    code=result.stop_reason, category="technical_wait" if result.recovery_required else "strategy_wait")
+                    code=result.stop_reason, category="technical_wait" if result.recovery_required else "strategy_wait",
+                    pending_operations=[op.start.operation_id for op in self.store.list_d4_operations(self.state.task_run.task_run_id)
+                                        if op.completion is None], deadline_at=self.state.task_run.deadline_at)
                 waiting_reason = result.stop_reason
             await self._wait_continuation(token)
             self.controller.reload_state()

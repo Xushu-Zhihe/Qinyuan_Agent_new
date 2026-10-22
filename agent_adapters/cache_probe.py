@@ -33,7 +33,11 @@ def record(*, payload, sent, role):
         return
     try:
         from agent_core.turn_modeling import digest
-        system, user = (message["content"] for message in payload["messages"])
+        messages = payload["messages"]
+        # Keep the original first-message fields for existing timing reports.
+        system = next((m["content"] for m in messages if m["role"] == "system"), "")
+        user = next((m["content"] for m in messages if m["role"] == "user"), "")
+        serialized = json.dumps(messages, ensure_ascii=False)
         parameters_sha = digest(sent["parameters"])
         key = (str(Path(path).resolve()), sent["task_run_id"], sent["role_config_ref"],
                parameters_sha, sent["stage"])
@@ -45,6 +49,11 @@ def record(*, payload, sent, role):
             "request_sha256": digest(sent), "parameters_sha256": parameters_sha,
             "payload_sha256": hashlib.sha256(wire).hexdigest(),
             "request_utf8_bytes": len(wire),
+            "messages": [{"index": index, "role": message["role"],
+                          "chars": len(message["content"]),
+                          "utf8_bytes": len(message["content"].encode("utf-8")),
+                          "sha256": hashlib.sha256(message["content"].encode("utf-8")).hexdigest()}
+                         for index, message in enumerate(messages)],
             "system_chars": len(system), "user_chars": len(user),
             "system_utf8_bytes": len(system.encode("utf-8")),
             "user_utf8_bytes": len(user.encode("utf-8")),
@@ -59,16 +68,25 @@ def record(*, payload, sent, role):
         with _LOCK:
             previous = _PREVIOUS.get(key)
             row.update(previous_request_id=None, system_prefix_chars=None, user_prefix_chars=None,
-                       user_prefix_follows_identical_system=None)
+                       user_prefix_follows_identical_system=None, messages_prefix_chars=None,
+                       messages_prefix_utf8_bytes=None, first_changed_message=None)
             if previous is not None:
-                identity, prev_system, prev_user = previous
+                identity, prev_system, prev_user, prev_serialized, prev_messages = previous
+                prefix = _common_prefix(prev_serialized, serialized)
+                changed = next((i for i, (a, b) in enumerate(zip(prev_messages, messages)) if a != b),
+                               min(len(prev_messages), len(messages)) if len(prev_messages) != len(messages) else None)
                 row.update(previous_request_id=identity,
                            system_prefix_chars=_common_prefix(prev_system, system),
                            user_prefix_chars=_common_prefix(prev_user, user),
-                           user_prefix_follows_identical_system=prev_system == system)
+                           user_prefix_follows_identical_system=prev_system == system,
+                           messages_prefix_chars=prefix,
+                           messages_prefix_utf8_bytes=len(serialized[:prefix].encode("utf-8")),
+                           first_changed_message=changed)
             with open(path, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(row, ensure_ascii=False) + "\n")
-            _PREVIOUS[key] = (sent["model_request_id"], system, user)
-    except Exception:
+            _PREVIOUS[key] = (sent["model_request_id"], system, user, serialized, json.loads(serialized))
+    except Exception as exc:
         # Opt-in diagnostic I/O is not an execution or recovery decision.
-        return
+        from qinyuan_core import get_logger
+        get_logger("model").warning("cache.probe_unavailable", run=sent.get("task_run_id"),
+            request=sent.get("model_request_id"), code="cache_probe_unavailable", exception_type=type(exc).__name__)

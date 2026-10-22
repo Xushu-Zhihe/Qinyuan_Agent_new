@@ -223,11 +223,14 @@ class ControlStateRepository:
         self,
         task_run_id: str,
     ) -> ControlStateSnapshot | None:
-        rows = self._store.load_control_state_rows(task_run_id)
+        from qinyuan_core.logging import timed_phase
+        with timed_phase("store", "state_read", run=task_run_id):
+            rows = self._store.load_control_state_rows(task_run_id)
         if rows is None:
             return None
         try:
-            self._validate_rows(rows)
+            with timed_phase("store", "state_and_evidence_validation", run=task_run_id):
+                self._validate_rows(rows)
         except StorageError:
             raise
         except Exception as exc:

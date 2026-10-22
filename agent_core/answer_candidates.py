@@ -25,24 +25,22 @@ class AnswerCandidates:
         return self.app._id('d9-4/candidate/' + intent_id)
 
     def _request(self, intent):
+        from agent_core.competition_candidates import MCPAnswerCandidateContext,provenance,validate_mcp_source
         identity = self._identity(intent.intent_id)
         saved = self.app.sessions.evidence.read('request', identity)
         if saved is not None:
             try:
                 data = dict(saved['request'])
                 context = dict(data['context'])
-                from agent_core.http_contracts import turn_binding_from_dict, plan_binding_from_dict
-                context['turn_binding'] = turn_binding_from_dict(context['turn_binding'])
-                context['plan_binding'] = plan_binding_from_dict(context['plan_binding'])
-                context['plan_result'] = D3PlanResult(**context['plan_result'])
-                data['context'] = AnswerCandidateContext(**context)
+                from agent_core.competition_candidates import restore_context
+                data['context'] = restore_context(context)
                 data['process_facts'] = tuple(data['process_facts'])
                 request = D8SessionExecutionRequest(**data)
             except (TypeError, ValueError, KeyError) as exc:
                 raise D3RecoveryRequired('d9_candidate_request_invalid') from exc
             if (request.model_request_id != identity or request.task_run_id != self.app.state.task_run.task_run_id
-                    or request.context.plan_binding.intent_id != intent.intent_id
-                    or request.context.plan_binding.turn_id != intent.turn_id
+                    or provenance(request.context)['intent_id'] != intent.intent_id
+                    or provenance(request.context)['turn_id'] != intent.turn_id
                     or request.context.goal != self.app.state.task_run.request.goal):
                 raise D3RecoveryRequired('d9_candidate_request_binding_changed')
             self.app.sessions.freeze(request)
@@ -55,15 +53,31 @@ class AnswerCandidates:
         execution = next((e for e in reversed(state.executions)
                           if e.plan_id in plans and e.status is ExecutionStatus.SUCCEEDED
                           and e.output_ref is not None), None)
-        if execution is None:
+        mcp = [r for r in self.store.list_d4_operations(state.task_run.task_run_id)
+               if (r.start.resource_ref or '').startswith('mcp/'+intent.intent_id+'/') and r.completion is not None
+               and r.completion.result_kind == 'completed'] if self.app.config.contract_version == 22 else []
+        latest = mcp[-1] if mcp else None
+        # Serialized execution order comes from the durable ledger, not an
+        # absent ExecutionSnapshot.finished_at or ambiguous equal timestamps.
+        order = {r.start.operation_id: n for n, r in enumerate(self.store.list_d4_operations(state.task_run.task_run_id))} if latest else {}
+        if latest is not None and execution is not None and execution.execution_id not in order:
             raise D3RecoveryRequired('d9_candidate_source_missing')
-        binding = self.store.load_d3_plan_binding(execution.plan_id)
-        result = self.store.load_d3_plan_result(execution.plan_id)
-        turn = plan_turn_binding(self.store,binding) if binding else None
-        if (binding is None or result is None or turn is None or result.outcome not in
-                ({'satisfied','no_new_information'} if self.app.config.contract_version==22 else {'satisfied'})):
-            raise D3RecoveryRequired('d9_candidate_source_not_satisfied')
-        context = AnswerCandidateContext(turn, binding, execution.execution_id, result, state.task_run.request.goal)
+        if latest is not None and (execution is None or order[latest.start.operation_id] > order[execution.execution_id]):
+            context=MCPAnswerCandidateContext(None,None,None,None,state.task_run.request.goal,
+                state.task_run.task_run_id,intent.turn_id,intent.intent_id,
+                latest.completion.evidence_ref,latest.completion.evidence_sha256)
+            from types import SimpleNamespace
+            validate_mcp_source(self.store,SimpleNamespace(**provenance(context)),self.evidence)
+        else:
+            if execution is None:
+                raise D3RecoveryRequired('d9_candidate_source_missing')
+            binding = self.store.load_d3_plan_binding(execution.plan_id)
+            result = self.store.load_d3_plan_result(execution.plan_id)
+            turn = plan_turn_binding(self.store,binding) if binding else None
+            if (binding is None or result is None or turn is None or result.outcome not in
+                    ({'satisfied','no_new_information','observed'} if self.app.config.contract_version==22 else {'satisfied'})):
+                raise D3RecoveryRequired('d9_candidate_source_not_satisfied')
+            context = AnswerCandidateContext(turn, binding, execution.execution_id, result, state.task_run.request.goal)
         role = self.app.config.inner_role
         request = D3ModelRequest(identity, state.task_run.task_run_id, state.latest_checkpoint.sequence,
             role.role, role.role_config_ref, 'answer-candidate/' + intent.intent_id, 'inner_candidate', context)
@@ -72,16 +86,6 @@ class AnswerCandidates:
     async def after_success(self, intent, token):
         if intent.status is not IntentStatus.SUCCEEDED:
             raise D3RecoveryRequired('d9_candidate_requires_local_success')
-        if self.app.config.contract_version==22 and self.app.evidence_conclusions is not None:
-            plans={p.plan_id for p in self.app.state.plans if p.intent_id==intent.intent_id and p.status is PlanStatus.COMPLETED}
-            eligible=any(e.plan_id in plans and e.status is ExecutionStatus.SUCCEEDED and e.output_ref is not None for e in self.app.state.executions)
-            records=[r for r in self.store.list_d8_conclusions(self.app.state.task_run.task_run_id)
-                     if r.intent_id==intent.intent_id and r.plan_id is None and r.outcome=="verified_fact"]
-            if not eligible and records:
-                from qinyuan_core import get_logger
-                get_logger("ctrl").info("candidate.skipped",run=self.app.state.task_run.task_run_id,
-                    intent=intent.intent_id,code="candidate_evidence_type_not_supported",category="business")
-                return False
         request = self._request(intent)
         identity, candidate = await self.app.inner.propose_candidate(request, token, self.protected_factory())
         if token.is_cancelled:
@@ -111,7 +115,7 @@ class AnswerCandidates:
                                                        candidate.evidence_version)
         projection = project_candidate_feedback(request.task_run_id, candidate.candidate_id,
                                                 candidate.evidence_version, rows)
-        return projection.state != 'rejected'
+        return projection.state not in {'rejected','partial'}
 
     async def reconcile_known(self, token):
         from agent_core.completion_evaluation import check_candidate_task
@@ -205,7 +209,7 @@ def check_no_candidate(config, output, sessions, native, operation):
         raise D3RecoveryRequired('d9_no_candidate_completion_changed')
     decision = output.read('answer-decision', identity)
     expected = {'version': 1, 'task_run_id': operation.start.task_run_id,
-                'intent_id': request['context']['plan_binding']['intent_id'],
+                'intent_id': request['context'].get('intent_id') or request['context']['plan_binding']['intent_id'],
                 'model_request_id': identity, 'request_sha256': digest(request),
                 'result_sha256': digest(asdict(native)), 'candidate': None}
     if decision is not None and decision != expected:

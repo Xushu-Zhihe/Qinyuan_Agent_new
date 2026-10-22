@@ -262,7 +262,7 @@ class TaskRunSandbox:
             # No retry: a timeout may have created the resource on the daemon.
             spec = {**self._spec(), "image": self._image()}
             container = self._runtime.client.containers.create(
-                **spec, name=f"qinyuan-task-{task_run_id}", labels=labels
+                **spec, name=f"Ayui-{task_run_id}", labels=labels
             )
             container.start()  # At most once; never start from attach/recovery.
             container.reload()

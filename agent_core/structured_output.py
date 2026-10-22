@@ -38,10 +38,18 @@ def format_stop_reason(diagnostic):
     return None
 
 
+def ended_transport_failure(transport):
+    """Only the model transport child is covered; no tool replay permission."""
+    return (transport.get("worker_exit_confirmed") is True and transport.get("transport_end") in {
+        "timeout", "transport_error", "incomplete_response", "worker_lost"})
+
+
 def transient_provider_result(evidence, identity):
     transport = (evidence.read("provider-result", identity) or {}).get("transport", {})
-    return (transport.get("transport_end") == "http_error"
-            and transport.get("http_status") in {429, 500, 502, 503})
+    return ((transport.get("transport_end") == "http_error"
+             and transport.get("http_status") in {429, 500, 502, 503}
+             and transport.get("worker_exit_confirmed") is not False)
+            or ended_transport_failure(transport))
 
 
 class StructuredOutput:
@@ -88,8 +96,11 @@ class StructuredOutput:
         safe = self.app.redactor.redact_model_input(request)
         shape = {"version": 1, "stage": stage, "schema": schema}
         prior = self.evidence.read("contract", identity) or (self.evidence.read("contract", correction) if correction else None)
-        if self.app.config.contract_version == 22 and (prior is None or prior["output_contract"].get("input_projection") == "shared_refs_v1"):
-            shape["input_projection"] = "shared_refs_v1"
+        if self.app.config.contract_version == 22:
+            projection = (prior["output_contract"].get("input_projection") if prior else
+                          "append_segments" if self.app.config.intent_execution_policy == "continuous_v1" else "shared_refs_v1")
+            if projection in {"shared_refs_v1", "stable_prefix", "append_segments"}:
+                shape["input_projection"] = projection
         envelope = D8OutputRequest(safe, shape, instruction, error)
         audit = ({"stage": request.stage, "resource_ref": request.resource_ref,
                   "base_checkpoint_sequence": request.base_checkpoint_sequence,
@@ -118,6 +129,8 @@ class StructuredOutput:
         contract = self.evidence.read("contract", correction)
         if diagnostic is None and self.evidence.read("provider-result", correction) is not None:
             error["reason"] = "previous_model_call_failed"
+            if ended_transport_failure(self.evidence.read("provider-result", correction).get("transport", {})):
+                error["reason"] = "previous_model_transport_failed_no_usable_decision"
         if (diagnostic is not None and contract is not None
                 and contract["role_config_ref"] == self.app.config.inner_role.role_config_ref
                 and any(issue["code"] == "output_truncated" for issue in diagnostic["issues"])):

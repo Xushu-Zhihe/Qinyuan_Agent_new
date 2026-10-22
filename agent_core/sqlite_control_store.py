@@ -172,7 +172,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 29
+CURRENT_SCHEMA_VERSION = 30
 
 MIGRATION_28 = """
 CREATE TABLE d8_conclusions_new (
@@ -391,6 +391,41 @@ CREATE TABLE d7_web_run_configs (
     config_json TEXT NOT NULL,
     created_event_sequence INTEGER NOT NULL
 );
+"""
+
+MIGRATION_30 = """
+CREATE TABLE d7_candidate_registry_c01 (
+    candidate_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('d3', 'web', 'mcp')),
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+    plan_id TEXT,
+    execution_id TEXT,
+    evidence_version TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    candidate_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL,
+    CHECK ((source_kind = 'mcp' AND plan_id IS NULL AND execution_id IS NULL) OR (source_kind != 'mcp' AND plan_id IS NOT NULL AND execution_id IS NOT NULL)),
+    UNIQUE(task_run_id, candidate_id)
+);
+INSERT INTO d7_candidate_registry_c01 SELECT * FROM d7_candidate_registry;
+DROP TABLE d7_candidate_registry;
+ALTER TABLE d7_candidate_registry_c01 RENAME TO d7_candidate_registry;
+CREATE INDEX idx_d7_candidate_registry_task_turn ON d7_candidate_registry(task_run_id,turn_id);
+CREATE TABLE d7_validation_feedback_c01 (
+    operation_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id),
+    candidate_id TEXT NOT NULL REFERENCES d7_candidate_registry(candidate_id),
+    evidence_version TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('accepted', 'rejected', 'unknown', 'partial')),
+    feedback_json TEXT NOT NULL,
+    created_event_sequence INTEGER NOT NULL
+);
+INSERT INTO d7_validation_feedback_c01 SELECT * FROM d7_validation_feedback;
+DROP TABLE d7_validation_feedback;
+ALTER TABLE d7_validation_feedback_c01 RENAME TO d7_validation_feedback;
+CREATE INDEX idx_d7_feedback_candidate_version ON d7_validation_feedback(task_run_id,candidate_id,evidence_version);
 """
 
 MIGRATION_19 = """
@@ -1301,6 +1336,9 @@ class SqliteControlStore:
                     self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES (?, ?)",
                                          (29, self._now()))
+            if version < 30:
+                for statement in _sql_statements(MIGRATION_30):self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)",(30,self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -2826,6 +2864,13 @@ class SqliteControlStore:
             raise StorageError("D4 operation disappeared while checking disposition")
         return row["unknown_disposition_json"] is not None
 
+    def blocking_d4_operations(self, task_run_id):
+        """Only a currently owned, read-only strategy worker may overlap commits."""
+        live = getattr(self, "live_strategy_operation", lambda identity: False)
+        return tuple(r for r in self.list_d4_unresolved_operations(task_run_id)
+                     if not (r.start.category == "review" and r.start.role == "outer_planning"
+                             and live(r.start.operation_id)))
+
     def list_d4_unresolved_operations(
         self, task_run_id: str
     ) -> tuple[D4OperationRecord, ...]:
@@ -3270,7 +3315,7 @@ class SqliteControlStore:
             or self._now() >= task.deadline_at
         ):
             raise D4OperationConflict("operation requires a running TaskRun before Deadline")
-        if self.list_d4_unresolved_operations(start.task_run_id):
+        if self.blocking_d4_operations(start.task_run_id):
             raise D4RecoveryRequired("an earlier operation result remains unknown")
         records = self.list_d4_operations(start.task_run_id)
         config = self.load_d3_run_config(start.task_run_id)
@@ -4083,7 +4128,7 @@ class SqliteControlStore:
             or review is None or review.paused_gate or fact.version != len(previous) + 1
         ):
             raise StorageError("Process_Fact requires accepted, unapplied, bound D5 evidence")
-        if self.list_d4_unresolved_operations(mutation.task_run_id):
+        if self.blocking_d4_operations(mutation.task_run_id):
             raise D4RecoveryRequired("D5 cannot apply while other outcomes are unknown")
 
     def _save_d5_mutation(self, mutation: ControlMutation, event_sequence: int) -> None:
@@ -4161,7 +4206,7 @@ class SqliteControlStore:
             or task_change.sandbox_id != state.task_run.sandbox_id
         ):
             raise StorageError("D7 lifecycle requires one immutable TaskRun update")
-        if self.list_d4_unresolved_operations(mutation.task_run_id):
+        if self.blocking_d4_operations(mutation.task_run_id):
             raise D4RecoveryRequired("D7 feedback cannot apply with unresolved operations")
 
         if mutation.operation == "register_d7_candidate":
@@ -4217,6 +4262,12 @@ class SqliteControlStore:
                     raise StorageError("D7 candidate source is not a completed owned D3 Execution")
                 if any(item.status is ExecutionStatus.RUNNING for item in state.executions):
                     raise StorageError("D7 candidate cannot be registered with a running Execution")
+            elif candidate.source_kind == "mcp":
+                from agent_core.competition_candidates import validate_mcp_source
+                try:validate_mcp_source(self,candidate)
+                except ValueError as exc:raise StorageError("MCP candidate source invalid") from exc
+                if d3_config is None or d3_config.contract_version != 22 or any(e.status is ExecutionStatus.RUNNING for e in state.executions):
+                    raise StorageError("MCP candidate requires idle contract22 run")
             elif candidate.source_kind == "web":
                 persisted_binding = self.load_d7_web_execution_binding(
                     candidate.execution_id
@@ -4335,6 +4386,7 @@ class SqliteControlStore:
                 expected_status = {
                     "accepted": TaskRunStatus.ACHIEVED,
                     "rejected": TaskRunStatus.RUNNING,
+                    "partial": TaskRunStatus.RUNNING,
                     "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
                     "conflict": previous_task.status,
                     "pending": previous_task.status,
@@ -4353,7 +4405,7 @@ class SqliteControlStore:
             feedback.evidence_version,
         )
         prior_determinate = any(
-            item.verdict in {"accepted", "rejected"} for item in prior
+            item.verdict in {"accepted", "rejected", "partial"} for item in prior
         )
         if prior_determinate:
             expected_status = state.task_run.status
@@ -4364,6 +4416,7 @@ class SqliteControlStore:
                 else {
                     "accepted": TaskRunStatus.ACHIEVED,
                     "rejected": TaskRunStatus.RUNNING,
+                    "partial": TaskRunStatus.RUNNING,
                     "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
                 }[feedback.verdict]
             )
@@ -4596,7 +4649,7 @@ class SqliteControlStore:
             latest = self._connection.execute("SELECT MAX(sequence) FROM checkpoints WHERE task_run_id=?", (start.task_run_id,)).fetchone()[0]
             if (config is None or config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} or task.status is not TaskRunStatus.RUNNING
                     or latest != start.checkpoint_sequence or not task.started_at <= start.started_at < task.deadline_at
-                    or self._now() >= task.deadline_at or self.list_d4_unresolved_operations(start.task_run_id)
+                    or self._now() >= task.deadline_at or self.blocking_d4_operations(start.task_run_id)
                     or self._connection.execute("SELECT 1 FROM d4_audit_events WHERE task_run_id=? AND category='cancellation_requested'", (start.task_run_id,)).fetchone()):
                 raise StorageError("D8 read admission is stopped or stale")
             count = self._connection.execute("SELECT COUNT(*) FROM d8_history_reads WHERE task_run_id=?", (start.task_run_id,)).fetchone()[0]

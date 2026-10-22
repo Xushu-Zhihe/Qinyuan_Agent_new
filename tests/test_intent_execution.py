@@ -16,6 +16,11 @@ def install(case, *, steps=3, stop="succeeded", continue_once=False, no_fact=Fal
             assert context["intent_execution"]["policy"] == "rolling_v1"
             closure = context["intent_execution"].get("stop_requested")
             if len(case.sends) >= steps or closure:
+                if (case.app.config.intent_execution_policy == "continuous_v1" and stop == "succeeded"
+                        and not no_fact and not closure and not context["intent_execution"]["facts"]):
+                    return dict(kind="fact_candidate", content="The bounded original observation supports this Intent.",
+                        reason="Review original evidence before resolving the Intent.",
+                        evidence_refs=[context["evidence_sources"][-1]["ref"]], inferred=False)
                 items = context["items"]
                 available = context["intent_execution"]["facts"]
                 return dict(kind="intent_resolution", outcome="inconclusive" if closure else stop,
@@ -1273,7 +1278,8 @@ def test_one_continuation_root_preserves_original_declarations(http_case):
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
 @pytest.mark.parametrize("stage", ["inner_plan", "review", "intent_evaluation"])
-def test_known_transient_provider_response_shares_one_retry(http_case, stage):
+@pytest.mark.parametrize("failure", ["http_503", "timeout", "worker_lost"])
+def test_known_transient_provider_response_shares_one_retry(http_case, stage, failure):
     from agent_core.modeling import ModelError, ModelErrorKind
     from agent_core.review_contracts import D2ModelFailure
     from agent_core.output_contracts import D8ModelResponse
@@ -1288,9 +1294,12 @@ def test_known_transient_provider_response_shares_one_retry(http_case, stage):
             request = envelope.request
             identity = getattr(request, "model_request_id", None) or request.review_id
             calls.append(identity)
+            transport = ({"transport_end": "http_error", "http_status": 503} if failure == "http_503"
+                         else {"transport_end": failure, "http_status": 200, "worker_exit_confirmed": True})
             c.app.output_boundary.evidence.save("provider-result", identity,
-                {"transport": {"transport_end": "http_error", "http_status": 503}})
-            return D2ModelFailure("provider_failure", "http_503") if stage == "review" else ModelError(ModelErrorKind.PROVIDER_FAILURE, "http_503")
+                {"transport": transport})
+            return (D2ModelFailure("provider_failure", failure) if stage == "review"
+                    else ModelError(ModelErrorKind.TIMED_OUT if failure == "timeout" else ModelErrorKind.PROVIDER_FAILURE, failure))
         return original(envelope, *args)
     c.models[0].invoke = lambda envelope,*args:invoke(outer,envelope,*args)
     c.models[1].invoke = lambda envelope,*args:invoke(inner,envelope,*args)
@@ -1310,7 +1319,7 @@ def test_known_transient_provider_response_shares_one_retry(http_case, stage):
 
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
-@pytest.mark.parametrize("fault", ["timeout", "payment"])
+@pytest.mark.parametrize("fault", ["timeout", "unconfirmed_exit", "payment"])
 def test_unknown_model_result_blocks_siblings_without_redispatch(http_case, fault):
     from agent_core.modeling import ModelError, ModelErrorKind
     c = http_case
@@ -1326,6 +1335,9 @@ def test_unknown_model_result_blocks_siblings_without_redispatch(http_case, faul
             c.app.output_boundary.evidence.save("provider-result", envelope.request.model_request_id,
                 {"transport":{"transport_end":"http_error","http_status":402}})
             return ModelError(ModelErrorKind.PROVIDER_FAILURE,"deepseek_http_402")
+        if fault == "unconfirmed_exit":
+            c.app.output_boundary.evidence.save("provider-result", envelope.request.model_request_id,
+                {"transport": {"transport_end": "timeout", "worker_exit_confirmed": False}})
         return ModelError(ModelErrorKind.TIMED_OUT,"transport_timeout")
     c.models[0].invoke, c.models[1].invoke = plan, unknown
     waits = []
@@ -1337,6 +1349,66 @@ def test_unknown_model_result_blocks_siblings_without_redispatch(http_case, faul
     assert len(calls) == 1 and len(waits) == 2
     assert not c.sends and not any(r.kind in {"suspended","resumed"} for r in c.app.store.list_d8_tree_records(c.task))
     assert result.stop_reason == "task_run_deadline_exceeded"
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_confirmed_model_timeout_suspends_and_explores_sibling(http_case):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    c = http_case
+    install(c, steps=1, stop="failed", no_fact=True)
+    outer, inner = c.models[0].invoke, c.models[1].invoke
+    calls = []
+    def plan(envelope, *args):
+        if envelope.output_contract["stage"] == "tree_planning":
+            return (dict(kind="exhausted", reason="No further route.", evidence_refs=[]) if c.app.state.turns else
+                    dict(kind="candidates", intents=[dict(description=name, intent_type=None, dependency_refs=[])
+                         for name in ("Technical route", "Independent sibling")]))
+        return outer(envelope, *args)
+    def execute(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan":
+            owner = next(i for i in c.app.state.intents if i.intent_id == envelope.request.context.intent_id)
+            calls.append(owner.description)
+            if owner.description == "Technical route":
+                c.app.output_boundary.evidence.save("provider-result", envelope.request.model_request_id,
+                    {"transport": {"transport_end": "timeout", "worker_exit_confirmed": True}})
+                return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
+        return inner(envelope, *args)
+    c.models[0].invoke, c.models[1].invoke = plan, execute
+    async def finish(token):c.clock.now = c.app.state.task_run.deadline_at
+    c.app._wait_continuation = finish
+    asyncio.run(c.app.run(c.token))
+    assert calls[:3] == ["Technical route", "Technical route", "Independent sibling"]
+    assert calls.count("Technical route") == 4  # One correction, then one sibling-triggered revisit.
+    assert c.sends and c.app.state.intents[0].status.value == "suspended"
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+@pytest.mark.parametrize("cleanup_unknown", [False, True])
+def test_deadline_at_wait_boundary_commits_terminal_before_resource_cleanup(http_case, cleanup_unknown):
+    c = http_case
+    install(c, steps=1, stop="failed", no_fact=True)
+    outer = c.models[0].invoke
+    def plan(envelope, *args):
+        if envelope.output_contract["stage"] == "tree_planning" and c.app.state.turns:
+            return dict(kind="exhausted", reason="No further route.", evidence_refs=[])
+        return outer(envelope, *args)
+    c.models[0].invoke = plan
+    removed = []
+    def destroy(task, binding):
+        assert c.app.store.load_task_run(task).status.value == "deadline_exceeded" and c.sandbox.destroyed
+        removed.append(task)
+        if cleanup_unknown:raise RuntimeError("controlled cleanup failure")
+    c.app.controller._target_network.destroy = destroy
+    once = c.app._run_once
+    async def boundary(token):
+        result = await once(token)
+        c.clock.now = c.app.state.task_run.deadline_at
+        return result
+    c.app._run_once = boundary
+    result = asyncio.run(c.app.run(c.token))
+    assert c.app.state.task_run.status.value == "deadline_exceeded"
+    assert removed == [c.task] and bool(result.recovery_required) == cleanup_unknown
+    assert result.stop_reason == ("task_run_deadline_cleanup_unknown" if cleanup_unknown else "task_run_deadline_exceeded")
 
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
@@ -1421,6 +1493,10 @@ def test_parked_child_backtracks_to_parent_sibling_without_business_revisit(http
         context=json.loads(request.history_context)
         plans=[p for p in c.app.state.plans if p.intent_id==actor.intent_id]
         if not plans:return dict(kind="http_request",method="GET",path_query="/?actor="+str(actor.priority),headers={},body="")
+        if actor.description=="Parent success" and not context["intent_execution"]["facts"]:
+            return dict(kind="fact_candidate",content="The bounded parent observation is supported.",
+                reason="Original observation within the parent scope.",
+                evidence_refs=[context["evidence_sources"][-1]["ref"]],inferred=False)
         return dict(kind="intent_resolution",outcome="succeeded" if actor.description=="Parent success" else "failed",
             reason="Finite local scope tested.",evidence_refs=[i["ref"] for i in context["items"]],
             fact_ids=[i["fact_id"] for i in context["intent_execution"]["facts"]],next_intent_candidates=[])

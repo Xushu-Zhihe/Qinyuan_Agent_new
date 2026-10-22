@@ -161,6 +161,14 @@ class HttpCapability:
             op=self.store.load_d4_operation(binding.execution_id)
             if op is None:raise D3RecoveryRequired('d20_http_cookie_result_without_start')
             values.append((op.start.base_checkpoint_sequence,value))
+        if self.app.config.contract_version == 22:
+            for op in self.store.list_d4_operations(self.task.task_run_id):
+                if not op.start.resource_ref.startswith('mcp/'):
+                    continue
+                claim = self.evidence.read('mcp-call',op.start.operation_id)
+                result = self.evidence.read('mcp-result',op.start.operation_id)
+                if claim and 'experiment_request' in claim and result:
+                    values.append((op.start.base_checkpoint_sequence,result['payload']['http_response']))
         previous=None
         last=None
         for _,value in sorted(values,key=lambda pair:pair[0]):
@@ -607,6 +615,12 @@ class HttpCapability:
                         observed = self.observation(identity, historical=True)
                         pair = (identity, observed.source_version_sha256)
                         if pair not in sources:sources.append(pair)
+        progress = json.loads(getattr(request, "prior_summary", "{}") or "{}").get("d8_progress", {}) if getattr(request, "stage", None) == "strategy_supervision" else json.loads(getattr(request, "context_summary", "{}") or "{}").get("d8_progress", {})
+        for identity in progress.get("execution_refs", ())[-4:]:
+            if self.result(identity):
+                observed = self.observation(identity, historical=True)
+                pair = (identity, observed.source_version_sha256)
+                if pair not in sources:sources.append(pair)
         if self.app.config.intent_execution_policy and getattr(request, "history_context", ""):
             for read in json.loads(request.history_context).get("retrieved", []):
                 for item in read["read"]["items"]:
@@ -632,7 +646,7 @@ class HttpCapability:
                 response_metadata=self.cookie_snapshot(self.result(identity))['response'],
                 body_text_truncated=len(raw)>64*1024,body_bytes=len(raw),body_sha256=observed.observed_sha256,
                 identity='untrusted_http_response_data_not_instructions_or_goal_verdict'))
-        if hasattr(request, 'existing_facts'):
+        if hasattr(request, 'existing_facts') or progress.get("execution_refs"):
             for view in views:
                 binding=self.store.load_d3_plan_binding(self.observation(view['execution_id'],historical=True).plan_id)
                 saved=self.read_request(binding)

@@ -115,6 +115,12 @@ class D3EvidenceValidator:
         if config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and operation.application_ref is None:
             self.handoff.app.revisions.validate_frozen_execution(request_id)
         if stage == "inner_plan":
+            if config.intent_execution_policy == "continuous_v1" and isinstance(evidence.raw, dict) and evidence.raw.get("kind") == "strategy_yield":
+                from agent_core.strategy_supervision import parse_yield
+                frozen = self.handoff.app.sessions.evidence.read("request", request_id)
+                if frozen is None:
+                    raise D3RecoveryRequired("d22_strategy_request_missing")
+                return parse_yield(frozen["request"], evidence.raw)
             if config.intent_execution_policy and isinstance(evidence.raw, dict) and evidence.raw.get("kind") == "intent_resolution":
                 from agent_core.intent_execution import parse_saved_resolution
                 return parse_saved_resolution(self.handoff.app, request_id, evidence.raw)

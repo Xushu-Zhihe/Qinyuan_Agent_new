@@ -663,6 +663,16 @@ class TaskRunController(LegacyTaskRunController):
                         original_error=exc,
                         cleanup_error=cleanup_exc,
                     ) from cleanup_exc
+            elif (getattr(exc, "outcome", None) == "creation_failed"
+                    and getattr(exc, "resource_ids", ())
+                    and callable(getattr(self._target_network, "cleanup_uncommitted", None))):
+                try:
+                    self._target_network.cleanup_uncommitted(task_run_id)
+                except Exception as cleanup_exc:
+                    raise SandboxCleanupError(
+                        task_run_id, "partial target network cleanup failed after start failure",
+                        original_error=exc, cleanup_error=cleanup_exc,
+                    ) from cleanup_exc
             raise
 
     def attach(self, task_run_id: str) -> ControlStateSnapshot:
@@ -950,13 +960,17 @@ class TaskRunController(LegacyTaskRunController):
             or now >= task.deadline_at
         ):
             raise InvalidTransition("D3 transition requires a running TaskRun before Deadline")
-        validator(mutation, state)
+        from qinyuan_core.logging import timed_phase
+        with timed_phase("store", "transition_evidence_validation", run=task.task_run_id, operation=operation):
+            validator(mutation, state)
         if state.latest_checkpoint.sequence != self.control_state.latest_checkpoint.sequence:
             raise StaleControlStateError("D3 state changed during evidence validation")
         if self._now_utc() >= task.deadline_at:
             raise InvalidTransition("D3 Deadline elapsed during evidence validation")
-        deps.repository.validate_candidate(state, mutation)
-        commit = deps.store.commit(mutation)
+        with timed_phase("store", "transition_state_validation", run=task.task_run_id, operation=operation):
+            deps.repository.validate_candidate(state, mutation)
+        with timed_phase("store", "state_commit", run=task.task_run_id, operation=operation):
+            commit = deps.store.commit(mutation)
         self._reload_after_commit(commit)
         return CommittedOperation.from_commit(commit)
 
@@ -1936,7 +1950,7 @@ class TaskRunController(LegacyTaskRunController):
             feedback.evidence_version,
         )
         prior_determinate = any(
-            item.verdict in {"accepted", "rejected"} for item in records
+            item.verdict in {"accepted", "rejected", "partial"} for item in records
         )
         if prior_determinate or task_run.status in TERMINAL_STATUSES:
             status = task_run.status
@@ -2044,6 +2058,7 @@ class TaskRunController(LegacyTaskRunController):
             status = {
                 "accepted": TaskRunStatus.ACHIEVED,
                 "rejected": TaskRunStatus.RUNNING,
+                    "partial": TaskRunStatus.RUNNING,
                 "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
                 "conflict": task_run.status,
                 "pending": task_run.status,
@@ -2080,6 +2095,7 @@ class TaskRunController(LegacyTaskRunController):
         return {
             "accepted": TaskRunStatus.ACHIEVED,
             "rejected": TaskRunStatus.RUNNING,
+                    "partial": TaskRunStatus.RUNNING,
             "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
         }[verdict]
 
@@ -2362,9 +2378,8 @@ class TaskRunController(LegacyTaskRunController):
             raise InvalidTransition("cannot change a terminal TaskRun")
         config = self._load_frozen_d4_config(deps.store, task_run.task_run_id)
         if config is not None:
-            list_unresolved = getattr(
-                deps.store, "list_d4_unresolved_operations", None
-            )
+            list_unresolved = getattr(deps.store, "blocking_d4_operations", None) or getattr(
+                deps.store, "list_d4_unresolved_operations", None)
             if not callable(list_unresolved):
                 raise D4RecoveryRequired("d4_operation_ledger_unavailable")
             unresolved = list_unresolved(task_run.task_run_id)
@@ -2551,6 +2566,10 @@ class TaskRunController(LegacyTaskRunController):
                 try:
                     self._cleanup_sandbox_resource(task_run, state)
                 except BaseException as exc:
+                    if task_run.target_network is not None:
+                        from qinyuan_core import get_logger
+                        get_logger("exec").error("target_network.cleanup_pending", run=task_run.task_run_id,
+                            code="sandbox_cleanup_unconfirmed")
                     if d4_attempt_id is not None:
                         self._record_d4_audit(
                             "cleanup_failed",
@@ -2593,6 +2612,9 @@ class TaskRunController(LegacyTaskRunController):
                 self._target_network.destroy(task_run.task_run_id, task_run.target_network)
                 self._target_network_destroyed = True
             except BaseException as exc:
+                from qinyuan_core import get_logger
+                get_logger("exec").error("target_network.cleanup_pending", run=task_run.task_run_id,
+                    code=getattr(exc, "code", "docker_resource_outcome_unknown"))
                 raise SandboxCleanupError(
                     task_run.sandbox_id,
                     "target network destroy failed",
@@ -2865,9 +2887,8 @@ class TaskRunController(LegacyTaskRunController):
             raise StorageError("close state belongs to another TaskRun")
         if state.task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK:
             config = self._load_frozen_d4_config(deps.store, task_run_id)
-            list_unresolved = getattr(
-                deps.store, "list_d4_unresolved_operations", None
-            )
+            list_unresolved = getattr(deps.store, "blocking_d4_operations", None) or getattr(
+                deps.store, "list_d4_unresolved_operations", None)
             if (
                 config is None
                 or getattr(config, "d4_budget", None) is None

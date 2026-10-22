@@ -6,7 +6,7 @@ import hashlib
 import json
 from uuid import UUID
 
-from docker.errors import NotFound
+from docker.errors import APIError, NotFound
 
 from agent_core.control_store import TargetNetworkBinding
 from Sandbox.target_address import TargetAddress
@@ -15,11 +15,25 @@ FORWARDER_IMAGE = "qinyuan/t6-target-forwarder:0.1.0"
 
 
 class T6TargetNetworkError(RuntimeError):
-    def __init__(self, phase: str, outcome: str, resource_ids: tuple[str, ...]) -> None:
+    def __init__(self, phase: str, outcome: str, resource_ids: tuple[str, ...], *, code="docker_resource_outcome_unknown") -> None:
         self.phase = phase
         self.outcome = outcome
         self.resource_ids = resource_ids
+        self.code = code
         super().__init__(f"T6 target network {phase}: {outcome}")
+
+
+def docker_error_code(error):
+    """Classify daemon explanations without putting raw target/config text in logs."""
+    explanation = str(getattr(error, "explanation", "")).lower()
+    if "fully subnetted" in explanation or ("address pool" in explanation and "available" in explanation):
+        return "docker_address_pool_exhausted"
+    if "active endpoints" in explanation:
+        return "docker_network_in_use"
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if status == 403:return "docker_permission_denied"
+    if status == 409:return "docker_resource_conflict"
+    return "docker_resource_outcome_unknown"
 
 
 class T6TargetNetwork:
@@ -73,13 +87,20 @@ class T6TargetNetwork:
         for collection, name in (
             (self.client.networks, self._egress_name(task_run_id)),
             (self.client.networks, self.private_name(task_run_id)),
-            (self.client.containers, "qinyuan-t6-forwarder-" + task_run_id),
+            (self.client.containers, "Ayui-forwarder-" + task_run_id),
         ):
             try:
                 resource = collection.get(name)
                 resource.reload()
             except NotFound:
                 resource = None
+                if collection is self.client.containers:
+                    # Failed old creations have no durable ID binding yet.
+                    try:
+                        resource = collection.get("qinyuan-t6-forwarder-" + task_run_id)
+                        resource.reload()
+                    except NotFound:
+                        pass
             resources.append(resource)
         return tuple(resources)
 
@@ -128,7 +149,7 @@ class T6TargetNetwork:
                 image=image_id,
                 command=[target_url],
                 network=external.name,
-                name="qinyuan-t6-forwarder-" + task_run_id,
+                name="Ayui-forwarder-" + task_run_id,
                 labels=labels,
                 read_only=True,
                 cap_drop=["ALL"],
@@ -165,7 +186,9 @@ class T6TargetNetwork:
                         "T6 resource discovery failed; reported IDs may be incomplete."
                     )
             raise T6TargetNetworkError(
-                "create", "outcome_unknown" if create_sent else "creation_failed", tuple(sorted(ids))
+                "create", "creation_failed" if not create_sent or (
+                    isinstance(exc, APIError) and getattr(exc.response, "status_code", None) in {400, 403, 404, 409}
+                ) else "outcome_unknown", tuple(sorted(ids)), code=docker_error_code(exc)
             ) from exc
 
     def bind(
@@ -250,6 +273,12 @@ class T6TargetNetwork:
                 if proxy.status not in {"created", "exited", "dead"}:
                     raise ValueError("forwarder_not_stopped")
                 proxy.remove(force=False)
+                try:
+                    self.client.containers.get(binding.forwarder_id).reload()
+                except NotFound:
+                    pass
+                else:
+                    raise ValueError("forwarder_removal_unconfirmed")
             for resource_id in (binding.private_network_id, binding.egress_network_id):
                 try:
                     network = self.client.networks.get(resource_id)
@@ -260,8 +289,14 @@ class T6TargetNetwork:
                 if any(labels.get(k) != v for k, v in self._labels(task_run_id).items()):
                     raise ValueError("network_ownership_mismatch")
                 network.remove()
+                try:
+                    self.client.networks.get(resource_id).reload()
+                except NotFound:
+                    pass
+                else:
+                    raise ValueError("network_removal_unconfirmed")
         except Exception as exc:
-            raise T6TargetNetworkError("destroy", "outcome_unknown", ids) from exc
+            raise T6TargetNetworkError("destroy", "outcome_unknown", ids, code=docker_error_code(exc)) from exc
 
     def cleanup_uncommitted(self, task_run_id: str) -> None:
         """Explicitly inspect a failed creation; only remove confirmed stopped resources."""
@@ -279,6 +314,8 @@ class T6TargetNetwork:
             for network in (private, external):
                 if network is not None:
                     network.remove()
+            if any(self._discover(task_run_id)):
+                raise ValueError("uncommitted_removal_unconfirmed")
         except Exception as exc:
             raise T6TargetNetworkError(
                 "cleanup_uncommitted", "outcome_unknown", locals().get("ids", ())

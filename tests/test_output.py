@@ -36,6 +36,9 @@ class EnvelopeModel:
     def invoke(self, envelope, *args):
         assert isinstance(envelope, D8OutputRequest)
         self.calls.append(envelope)
+        if envelope.output_contract['stage'] == 'strategy_supervision':
+            return dict(decision='continue_current_intent', reason='The controlled observation remains useful.',
+                        evidence_refs=[envelope.request.history[-1].ref], suggestion=None)
         raw = self.adapter.invoke(envelope.request, *args)
         from agent_core.fixed_probe import FixedProbeContext, fixed_probe_policy
         if (isinstance(getattr(envelope.request, "context", None), FixedProbeContext)
@@ -65,8 +68,8 @@ def output_case(tmp_path, request):
     inner_role = D1RoleConfig("inner_action", "fake", "same-model", "inner-d8-5-v1")
     policy = D8CapacityPolicy("fake-json-v1", "unicode_codepoints", 262144, 8192)
     config = D3RunConfig(outer_role, inner_role, D3Authorization(str(uuid4()), (0,)),
-        outer_role.role_config_ref, contract_version=22 if request.param == "rolling" else request.param, d4_budget=D8HandoffBudgetPolicy(),
-        intent_execution_policy="rolling_v1" if request.param == "rolling" else None,
+        outer_role.role_config_ref, contract_version=22 if request.param in {"rolling", "continuous"} else request.param, d4_budget=D8HandoffBudgetPolicy(),
+        intent_execution_policy="continuous_v1" if request.param == "continuous" else "rolling_v1" if request.param == "rolling" else None,
         d5_enabled=True, d5_sensitive_requirements=(), d8_enabled=True,
         handoff_config=D8HandoffConfig(policy, policy))
     sandbox, clock, token = Sandbox(), Clock(), Token()

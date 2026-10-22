@@ -183,6 +183,8 @@ class Workbench:
             """)
         from agent_adapters.workbench_runner import Runner
         self.runner = Runner(self)
+        from agent_adapters.competition import CompetitionConnections
+        self.competitions = CompetitionConnections(self)
 
     @staticmethod
     def error(code, status=HTTPStatus.BAD_REQUEST):
@@ -586,7 +588,7 @@ class Handler(BaseHTTPRequestHandler):
         self._trusted()
         parsed = urlsplit(self.path)
         parts = parsed.path.strip("/").split("/")
-        if self.command == "GET" and parsed.path in {"/", "/index.html", "/app.js", "/run-view.js", "/styles.css", "/run.css"}:
+        if self.command == "GET" and parsed.path in {"/", "/index.html", "/app.js", "/run-view.js", "/competition.js", "/styles.css", "/run.css"}:
             name = "index.html" if parsed.path == "/" else parsed.path[1:]
             mime = "text/html" if name.endswith(".html") else "text/javascript" if name.endswith(".js") else "text/css"
             self._send(HTTPStatus.OK, (FRONTEND / name).read_bytes(), mime + "; charset=utf-8")
@@ -618,6 +620,25 @@ class Handler(BaseHTTPRequestHandler):
                     "real_sandbox_backend": "docker" if self.server.workbench.execution_profile in {"d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} else "local_simulated"}
                    if self.server.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} else {}),
             }})
+            return
+        if parts == ["api", "competition", "profiles"]:
+            if self.command == "GET":
+                self._send(HTTPStatus.OK, self.server.workbench.competitions.list())
+            elif self.command == "POST":
+                self._send(HTTPStatus.CREATED, self.server.workbench.competitions.save(self._json()))
+            else:raise WorkbenchError("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+        if len(parts) in {4, 5} and parts[:3] == ["api", "competition", "profiles"]:
+            identity = canonical_id(parts[3])
+            service = self.server.workbench.competitions
+            if len(parts) == 4 and self.command == "PUT":
+                self._send(HTTPStatus.OK, service.save(self._json(), identity))
+            elif len(parts) == 5 and parts[4] == "credential" and self.command == "DELETE":
+                self._send(HTTPStatus.OK, service.clear(identity))
+            elif len(parts) == 5 and parts[4] == "check" and self.command == "POST":
+                if self._json():raise WorkbenchError("competition_check_fields_invalid")
+                self._send(HTTPStatus.OK, service.check(identity))
+            else:raise WorkbenchError("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
             return
         if parts == ["api", "model"]:
             if self.command == "GET":

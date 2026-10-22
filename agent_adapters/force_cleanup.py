@@ -59,27 +59,18 @@ def force_cleanup_task(workbench: Workbench, challenge_id: str) -> dict:
                 for agent_dir in agent_dirs:
                     task_run_id = agent_dir.name
 
-                    # Stop task container
-                    try:
-                        container = client.containers.get(f"qinyuan-task-{task_run_id}")
-                        container.stop(timeout=1)
-                        container.remove(force=True)
-                        cleanup_result["containers_stopped"].append(f"qinyuan-task-{task_run_id}")
-                    except docker.errors.NotFound:
-                        pass
-                    except Exception as e:
-                        cleanup_result["errors"].append(f"Error stopping task container: {e}")
-
-                    # Stop forwarder container
-                    try:
-                        forwarder = client.containers.get(f"qinyuan-t6-forwarder-{task_run_id}")
-                        forwarder.stop(timeout=1)
-                        forwarder.remove(force=True)
-                        cleanup_result["containers_stopped"].append(f"qinyuan-t6-forwarder-{task_run_id}")
-                    except docker.errors.NotFound:
-                        pass
-                    except Exception as e:
-                        cleanup_result["errors"].append(f"Error stopping forwarder: {e}")
+                    # Explicit force cleanup also recognizes historical names.
+                    for name in (f"Ayui-{task_run_id}", f"Ayui-forwarder-{task_run_id}",
+                                 f"qinyuan-task-{task_run_id}", f"qinyuan-t6-forwarder-{task_run_id}"):
+                        try:
+                            container = client.containers.get(name)
+                            container.stop(timeout=1)
+                            container.remove(force=True)
+                            cleanup_result["containers_stopped"].append(name)
+                        except docker.errors.NotFound:
+                            pass
+                        except Exception as e:
+                            cleanup_result["errors"].append(f"Error stopping container: {e}")
 
                     # Remove networks
                     for network_type in ["in", "out"]:

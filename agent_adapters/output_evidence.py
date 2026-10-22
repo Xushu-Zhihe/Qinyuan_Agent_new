@@ -11,7 +11,7 @@ SAFE_EXCEPTION_TYPES = frozenset({
     "ValueError", "RuntimeError", "APIError", "DockerException", "HTTPError",
     "ReadTimeout", "ConnectTimeout", "SSLError", "gaierror", "OtherError",
     "AttributeError", "KeyError", "UnboundLocalError", "ProgrammingError",
-    "OperationalError", "IntegrityError", "D5EvidenceError", "D5SensitiveDataError",
+    "OperationalError", "IntegrityError", "D5EvidenceError", "D5SensitiveDataError", "T6TargetNetworkError",
     "StorageError", "T6EvidenceError", "JSONDecodeError", "IncompleteRead",
 })
 SAFE_HTTP_ERROR_CODES = frozenset({
@@ -31,6 +31,7 @@ SAFE_HTTP_ERROR_CODES = frozenset({
     "d20_http_cookie_snapshot_invalid", "d8_frozen_configuration_mismatch",
     "d20_http_failure_diagnostic_invalid",
     "docker_unavailable", "docker_permission_denied",
+    "docker_address_pool_exhausted", "docker_network_in_use", "docker_resource_conflict", "docker_resource_outcome_unknown",
 })
 SAFE_MODEL_ERROR_CODES = SAFE_HTTP_ERROR_CODES | frozenset({
     "d3_review_provider_failure", "d3_review_call_outcome_unknown", "d4_review_dispatch_stopped",
@@ -50,6 +51,8 @@ SAFE_MODEL_ERROR_CODES = SAFE_HTTP_ERROR_CODES | frozenset({
     "d22_evidence_request_missing_or_changed", "d22_evidence_conclusion_binding_changed",
     "d22_evidence_decision_changed", "d22_reused_fact_not_effective",
     "d22_fact_approval_missing", "d22_fact_content_or_source_changed",
+    "d22_strategy_interruption_owner_changed", "d22_strategy_interruption_source_changed",
+    "d22_intent_selection_context_changed", "d22_intent_selection_source_missing",
 })
 
 
@@ -84,6 +87,9 @@ def safe_failure_details(error, *, include_chain=False):
         seen.add(id(current))
         name = type(current).__name__
         kinds.append(name if name in SAFE_EXCEPTION_TYPES else "OtherError")
+        resource_code = getattr(current, "code", None)
+        if resource_code in SAFE_HTTP_ERROR_CODES and resource_code not in codes:
+            codes.append(resource_code)
         if len(current.args) == 1 and isinstance(current.args[0], str):
             code = current.args[0]
             if code in SAFE_HTTP_ERROR_CODES and code not in codes:
@@ -125,7 +131,10 @@ def safe_failure_details(error, *, include_chain=False):
 
 
 class FileD8OutputEvidence(FileD8HandoffEvidence):
+    # Session envelopes reuse this immutable evidence store, not new tables.
     KINDS = {"provider-request", "provider-result", "input-measurement", "mcp-registry", "mcp-catalog", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "review-failure"}
+
+    KINDS = KINDS | {"experiment-session", "experiment-process", "experiment-result"}
 
     def save_review_failure(self, request, *, error=None, failure=None):
         from dataclasses import asdict

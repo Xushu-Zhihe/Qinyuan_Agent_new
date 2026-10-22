@@ -34,8 +34,8 @@ class D8FormatIssue:
 def matches_output_contract(value, stage, schema, contract_version):
     """Recognize only the frozen v22 presentation marker; keep every Schema check."""
     expected = {"version": 1, "stage": stage, "schema": schema}
-    if contract_version == 22 and isinstance(value, dict) and value.get("input_projection") == "shared_refs_v1":
-        expected["input_projection"] = "shared_refs_v1"
+    if contract_version == 22 and isinstance(value, dict) and value.get("input_projection") in {"shared_refs_v1", "stable_prefix", "append_segments"}:
+        expected["input_projection"] = value["input_projection"]
     return value == expected
 
 
@@ -140,11 +140,19 @@ def output_schema(request, *, contract_version=None):
         note = working_schema(request)
         if note is not None:
             schema = {"anyOf": [*schema.get("anyOf", [schema]), note]}
+    if contract_version == 22 and stage == "inner_plan":
+        from agent_core.strategy_supervision import yield_schema
+        choice = yield_schema(request)
+        if choice is not None:
+            schema = {"anyOf": [*schema.get("anyOf", [schema]), choice]}
     return stage, schema
 
 
 def _base_output_schema(request, *, contract_version=None):
     """Enumerate the existing internal stages; unknown stages never fall back."""
+    if getattr(request, "stage", None) == "strategy_supervision":
+        from agent_core.strategy_supervision import schema
+        return "strategy_supervision", schema(request)
     from agent_core.conclusion_revision_contracts import D8ChangeRequest
     from agent_core.process_facts import D5RefinementRequest
     from agent_core.review_contracts import D2ReviewRequest

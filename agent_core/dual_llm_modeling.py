@@ -49,6 +49,7 @@ D3ModelStage = Literal[
 ]
 
 MAX_D3_CANDIDATE_VALUE_BYTES = 16 * 1024
+MODEL_CANCEL_GRACE_SECONDS = 2.0
 
 # Rejection codes that already name the exact rule a proposal broke. Anything else
 # collapses to the stage-level code so an unexpected message never becomes a code.
@@ -232,7 +233,7 @@ def _candidate_text(value: object, *, code: str, nonblank: bool) -> str:
     return value
 
 
-def _parse_d3_candidate_action(raw: object) -> D3ActionProposal:
+def _parse_d3_candidate_action(raw: object, *, mcp=False) -> D3ActionProposal:
     envelope = _fields(raw, {"action", "review_requested"})
     review_requested = envelope["review_requested"]
     if type(review_requested) is not bool:
@@ -250,15 +251,15 @@ def _parse_d3_candidate_action(raw: object) -> D3ActionProposal:
     if len(value.encode("utf-8")) > MAX_D3_CANDIDATE_VALUE_BYTES:
         raise D3ProposalRejected("d3_candidate_value_too_large")
 
-    execution_id = _candidate_text(
-        action["execution_id"], code="d3_candidate_execution_id_invalid", nonblank=True
-    )
-    try:
-        parsed_execution_id = UUID(execution_id)
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise D3ProposalRejected("d3_candidate_execution_id_invalid") from exc
-    if parsed_execution_id.version != 4 or str(parsed_execution_id) != execution_id:
-        raise D3ProposalRejected("d3_candidate_execution_id_invalid")
+    execution_id = action["execution_id"]
+    if mcp:
+        if execution_id is not None:raise D3ProposalRejected("mcp_candidate_must_not_fabricate_execution")
+    else:
+        execution_id = _candidate_text(execution_id,code="d3_candidate_execution_id_invalid",nonblank=True)
+        try:parsed_execution_id = UUID(execution_id)
+        except (TypeError,ValueError,AttributeError) as exc:raise D3ProposalRejected("d3_candidate_execution_id_invalid") from exc
+        if parsed_execution_id.version != 4 or str(parsed_execution_id) != execution_id:
+            raise D3ProposalRejected("d3_candidate_execution_id_invalid")
 
     evidence_version = action["evidence_version"]
     if (
@@ -414,7 +415,7 @@ class D3CandidateContext:
             or self.plan_result.plan_id != self.plan_binding.plan_id
             or self.plan_result.artifact_version_id
             != self.plan_binding.artifact_version_id
-            or self.plan_result.outcome not in {"satisfied", "no_new_information"}
+            or self.plan_result.outcome not in {"satisfied", "no_new_information", "observed"}
         ):
             raise ValueError("D3 candidate provenance binding is inconsistent")
 
@@ -568,6 +569,13 @@ class D3AuditedModel:
             if change is not None:
                 return change
         if request.stage == "inner_plan":
+            from agent_core.strategy_supervision import parse_yield
+            try:
+                yielded = parse_yield(request, raw)
+            except ValueError as exc:
+                raise D3ProposalRejected(str(exc), structural=True) from exc
+            if yielded is not None:
+                return yielded
             from agent_core.intent_execution import parse_working
             try:
                 note = parse_working(request, raw)
@@ -666,6 +674,8 @@ class D3AuditedModel:
         self._check(request)
 
         context = request.context
+        from agent_core.competition_candidates import MCPAnswerCandidateContext, provenance
+        source = provenance(context)
         if self.config.contract_version in {19, 20, 21, 22} and self.evidence.read(request.model_request_id) is not None:
             evidence, record = self._saved(request)
             if evidence.outcome == "accepted" and evidence.raw == {"action": {"kind": "no_candidate"}}:
@@ -737,7 +747,7 @@ class D3AuditedModel:
                         request.model_request_id, evidence.finished_at, "completed",
                         request.model_request_id, checksum))
                     return request.model_request_id, None
-                proposal = parse_d3_action(raw, "inner_candidate")
+                proposal = _parse_d3_candidate_action(raw,mcp=isinstance(context,MCPAnswerCandidateContext))
                 action = proposal.action
                 if not isinstance(action, D3CandidateFlagAction):
                     raise D3ProposalRejected("d3_candidate_action_required")
@@ -745,8 +755,8 @@ class D3AuditedModel:
                     raise D3ProposalRejected("d3_candidate_review_not_supported")
                 if (
                     action.execution_id != context.execution_id
-                    or action.evidence_version != context.plan_result.evidence_sha256
-                    or action.source_ref != context.plan_binding.artifact_version_id
+                    or action.evidence_version != source["evidence_version"]
+                    or action.source_ref != source["source_ref"]
                 ):
                     raise D3ProposalRejected("d3_candidate_binding_rejected")
             except D3ProposalRejected as exc:
@@ -788,14 +798,7 @@ class D3AuditedModel:
                 ) from exc
 
             candidate = D7AnswerCandidate(
-                task_run_id=request.task_run_id,
-                candidate_id=str(uuid4()),
-                turn_id=context.plan_binding.turn_id,
-                intent_id=context.plan_binding.intent_id,
-                plan_id=context.plan_binding.plan_id,
-                execution_id=context.execution_id,
-                evidence_version=context.plan_result.evidence_sha256,
-                source_ref=context.plan_binding.artifact_version_id,
+                candidate_id=str(uuid4()), **source,
             )
             if self.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.completion_evaluation import candidate_binding
@@ -961,20 +964,17 @@ class D3AuditedModel:
         context = request.context
         if not isinstance(context, D3CandidateContext):
             raise D3RecoveryRequired("d3_candidate_context_invalid")
+        from agent_core.competition_candidates import provenance
+        source=provenance(context)
         if (
             not isinstance(candidate, D7AnswerCandidate)
             or candidate.task_run_id != request.task_run_id
-            or candidate.turn_id != context.plan_binding.turn_id
-            or candidate.intent_id != context.plan_binding.intent_id
-            or candidate.plan_id != context.plan_binding.plan_id
-            or candidate.execution_id != context.execution_id
-            or candidate.evidence_version != context.plan_result.evidence_sha256
-            or candidate.source_ref != context.plan_binding.artifact_version_id
+            or any(getattr(candidate,key) != value for key,value in source.items())
             or metadata.get("model_request_id") != request.model_request_id
             or metadata.get("candidate_id") != candidate.candidate_id
             or metadata.get("task_run_id") != request.task_run_id
             or metadata.get("execution_id") != context.execution_id
-            or metadata.get("evidence_version") != context.plan_result.evidence_sha256
+            or metadata.get("evidence_version") != source["evidence_version"]
         ):
             raise D3RecoveryRequired("d3_candidate_protected_binding_changed")
 
@@ -1055,12 +1055,20 @@ class D3AuditedModel:
     ):
         finished = threading.Event()
         stopped = threading.Event()
+        timed_out = threading.Event()
         values = []
+        from qinyuan_core import get_logger
+        log = get_logger("model")
+        ids = {"run": request.task_run_id, "request": request.model_request_id, "stage": request.stage}
 
         class InvocationToken:
             @property
             def is_cancelled(self) -> bool:
                 return stopped.is_set() or token.is_cancelled
+
+            @property
+            def is_timed_out(self) -> bool:
+                return timed_out.is_set()
 
         def invoke() -> None:
             try:
@@ -1072,20 +1080,44 @@ class D3AuditedModel:
             finally:
                 finished.set()
 
+        def expire():
+            if not finished.is_set():
+                timed_out.set()
+                stopped.set()
+                log.warning("call.cancel_requested", **ids, code="model_total_timeout")
+
+        watchdog = threading.Timer(timeout, expire)
+        watchdog.daemon = True
         threading.Thread(target=invoke, daemon=True, name="d3-model-call").start()
+        watchdog.start()
+        log.info("call.started", **ids, timeout_seconds=timeout)
         expires = asyncio.get_running_loop().time() + timeout
         # 轮询退避：模型通常几毫秒返回，固定 25ms 会让每次调用白等一整拍
         delay = 0.001
         try:
             while not finished.is_set():
                 state = self.controller.control_state
-                if (
+                dispatch_stopped = (
                     token.is_cancelled
                     or state.task_run.status.value != "running"
                     or self.clock() >= state.task_run.deadline_at
-                    or asyncio.get_running_loop().time() >= expires
-                ):
-                    raise D3RecoveryRequired("d3_model_call_outcome_unknown")
+                )
+                if dispatch_stopped or timed_out.is_set() or asyncio.get_running_loop().time() >= expires:
+                    if dispatch_stopped:
+                        stopped.set()
+                        log.warning("call.cancel_requested", **ids, code="d3_model_dispatch_stopped")
+                    elif not timed_out.is_set():expire()
+                    # The transport needs at most two 0.5s joins to stop its child.
+                    # Wait a bounded grace period for its result and exit receipt.
+                    cleanup_end = asyncio.get_running_loop().time() + MODEL_CANCEL_GRACE_SECONDS
+                    while not finished.is_set() and asyncio.get_running_loop().time() < cleanup_end:
+                        await asyncio.sleep(0.01)
+                    if not finished.is_set():
+                        log.error("call.exit_unconfirmed", **ids, code="d3_model_call_outcome_unknown")
+                        raise D3RecoveryRequired("d3_model_call_outcome_unknown")
+                    break
+                if self.output_boundary is not None and self.output_boundary.app.sessions is not None:
+                    self.output_boundary.app.supervision.poll()
                 await asyncio.sleep(delay)
                 delay = min(0.025, delay * 2)
             succeeded, raw = values[0]
@@ -1093,8 +1125,14 @@ class D3AuditedModel:
                 if isinstance(raw, BaseException):
                     raise D3RecoveryRequired("d3_model_call_outcome_unknown") from raw
                 raise D3RecoveryRequired("d3_model_call_outcome_unknown")
+            if stopped.is_set() and not isinstance(raw, ModelError):
+                # A late decision must not be applied after cancellation.
+                raw = (ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout") if timed_out.is_set()
+                       else ModelError(ModelErrorKind.CANCELLED, "model_cancelled"))
+            log.info("call.returned", **ids, outcome="model_error" if isinstance(raw, ModelError) else "response")
             return raw
         finally:
+            watchdog.cancel()
             stopped.set()
 
     async def propose(
@@ -1154,7 +1192,7 @@ class D3AuditedModel:
                 ] = "accepted"
                 reason = None
                 change_response = (self.config.contract_version in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and isinstance(raw, dict)
-                                   and raw.get("kind") in {"conclusion_change", "fact_candidate", "working_record"})
+                                   and raw.get("kind") in {"conclusion_change", "fact_candidate", "working_record", "strategy_yield"})
                 if change_response and self.change_response_sensitive is not None and self.change_response_sensitive(raw):
                     raw = None
                     outcome, reason = "rejected", "d8_change_sensitive_rejected"
@@ -1210,6 +1248,9 @@ class D3AuditedModel:
                         checksum,
                     )
                 )
+                from qinyuan_core import get_logger
+                get_logger("model").info("call.recorded", run=current.task_run_id,
+                    request=current.model_request_id, stage=current.stage, outcome=outcome, code=reason)
 
             if self.output_boundary is not None and evidence.outcome != "stale":
                 self.output_boundary.terminal_check(current)

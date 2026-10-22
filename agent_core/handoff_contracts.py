@@ -239,7 +239,7 @@ class D8TreeRecord:
         for n in ("turn_id", "intent_id", "model_request_id", "support_fact_id", "inner_request_id"):
             if getattr(self, n) is not None:
                 _uuid(getattr(self, n), n)
-        if self.kind not in {"registration", "succeeded", "failed", "inconclusive", "expansion_exhausted", "turn_exhausted", "selection", "evaluation_continued", "suspended", "resumed"}:
+        if self.kind not in {"registration", "succeeded", "failed", "inconclusive", "expansion_exhausted", "turn_exhausted", "selection", "evaluation_continued", "suspended", "resumed", "strategy_yielded", "strategy_resumed"}:
             raise ValueError("d8_tree_record_kind_invalid")
 
 
@@ -265,7 +265,7 @@ class D8HandoffRequest:
         _uuid(self.model_request_id, "model_request_id")
         _uuid(self.task_run_id, "task_run_id")
         _text(self.role_config_ref, "role_config_ref")
-        if self.stage not in {"handoff_summary", "tree_planning", "intent_evaluation"}:
+        if self.stage not in {"handoff_summary", "tree_planning", "intent_evaluation", "strategy_supervision"}:
             raise ValueError("d8_handoff_stage_invalid")
         if any(i.task_run_id != self.task_run_id for i in self.history):
             raise ValueError("d8_history_cross_task")

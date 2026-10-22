@@ -60,7 +60,7 @@ def summarize(task, operations, evidence):
         for groups, key in ((stages, row["stage"]), (roles, start.role)):
             total = groups.setdefault(key, dict(calls=0, completed_intervals=0, seconds=0.0,
                 corrections=0, finish_reasons={}, prompt_tokens=0, completion_tokens=0,
-                reasoning_tokens=0, usage_observations=0))
+                reasoning_tokens=0, usage_observations=0, max_prompt_tokens=None))
             total["calls"] += 1
             total["corrections"] += row["correction_of"] is not None
             if row["seconds"] is not None:
@@ -70,6 +70,8 @@ def summarize(task, operations, evidence):
                 reasons = total["finish_reasons"]
                 reasons[row["finish_reason"]] = reasons.get(row["finish_reason"], 0) + 1
             total["usage_observations"] += bool(usage)
+            if row["prompt_tokens"] is not None:
+                total["max_prompt_tokens"] = max(total["max_prompt_tokens"] or 0, row["prompt_tokens"])
             for name in ("prompt_tokens", "completion_tokens", "reasoning_tokens"):
                 total[name] += row[name] or 0
     endpoint = max(observed_end, task.finished_at or observed_end)
@@ -140,7 +142,7 @@ def summarize_cache(task, operations, evidence, probe_path):
             item["probe_status"] = "matched" if bound else "binding_mismatch"
             if bound:
                 item.update(system_chars=row["system_chars"], user_chars=row["user_chars"],
-                            output_contract_keys=row.get("output_contract_keys"))
+                            output_contract_keys=row.get("output_contract_keys"), messages=row.get("messages"))
                 prev = previous.get(key)
                 if prev is None:
                     item["prefix_status"] = "first_observed_attempt" if row.get("previous_request_id") is None else "unmatched_predecessor"
@@ -150,6 +152,9 @@ def summarize_cache(task, operations, evidence, probe_path):
                                 system_prefix_chars=row["system_prefix_chars"],
                                 user_prefix_chars=row["user_prefix_chars"],
                                 user_prefix_follows_identical_system=row["user_prefix_follows_identical_system"],
+                                messages_prefix_chars=row.get("messages_prefix_chars"),
+                                messages_prefix_utf8_bytes=row.get("messages_prefix_utf8_bytes"),
+                                first_changed_message=row.get("first_changed_message"),
                                 output_contract_key_order_changed=prev.get("output_contract_keys") != row.get("output_contract_keys"))
                     offset = row.get("markers", {}).get("output_contract=")
                     if offset is not None and not row["user_prefix_follows_identical_system"]:
@@ -190,6 +195,68 @@ def summarize_cache(task, operations, evidence, probe_path):
                 stages=totals, calls=calls)
 
 
+def summarize_supervision(task, operations, decisions, tree, handoff, sessions):
+    """Observable effects only: continuing is not evidence of wasted review."""
+    from collections import Counter, defaultdict
+    delivered, choices = set(), defaultdict(Counter)
+    for row in decisions:
+        frozen = sessions.read("request", row.model_request_id)
+        if frozen is None:
+            continue
+        advice = json.loads(frozen["request"].get("history_context", "{}") or "{}").get("strategy_advice")
+        if not advice:
+            continue
+        review = advice["review_id"]
+        if "reason" in advice:
+            delivered.add(review)
+        saved = sessions.read("decision", row.record_id)
+        if saved is not None:
+            if digest(saved) != row.evidence_sha256:
+                raise ValueError("timing_strategy_decision_binding_changed")
+            choices[review][saved["response"].get("kind", "other")] += 1
+    yields = Counter()
+    for row in tree:
+        if row.kind == "strategy_yielded":
+            note = handoff.read("strategy-yield", row.record_id)
+            if note is not None:
+                yields[note["review_id"]] += 1
+    intercepted = Counter()
+    for op in operations:
+        note = handoff.read("strategy-discard", op.start.operation_id)
+        if note:
+            intercepted[note["review_id"]] += note["disposition"] == "not_dispatched"
+    calls, totals = [], Counter()
+    for op in operations:
+        if op.start.role is None:
+            continue
+        request = handoff.read("request", op.start.operation_id)
+        if not request or request.get("stage") != "strategy_supervision":
+            continue
+        if request["task_run_id"] != task.task_run_id or digest(request) != op.start.context_sha256:
+            raise ValueError("timing_strategy_request_binding_changed")
+        identity = op.start.operation_id
+        result, effect = handoff.read("result", identity), handoff.read("strategy-effect", identity)
+        if any(v is not None and v["request_sha256"] != digest(request) for v in (result, effect)):
+            raise ValueError("timing_strategy_result_binding_changed")
+        raw = (result or {}).get("raw") or {}
+        outcome = effect["outcome"] if effect else "pending_or_unapplied"
+        totals[outcome] += 1
+        if raw.get("suggestion"):
+            totals["suggestions_proposed"] += 1
+            totals["suggestions_applied"] += outcome == "applied"
+        stop = outcome == "applied" and raw.get("decision") == "request_intent_resolution"
+        totals["stops_proposed"] += raw.get("decision") == "request_intent_resolution"
+        totals["stops_applied"] += stop
+        totals["continues_applied"] += outcome == "applied" and raw.get("decision") == "continue_current_intent"
+        calls.append(dict(model_request_id=identity, outcome=outcome, decision=raw.get("decision"),
+            suggestion_intent=(raw.get("suggestion") or {}).get("intent_id"),
+            advice_delivered=identity in delivered, voluntary_yields=yields[identity],
+            intercepted_proposals=intercepted[identity], subsequent_decision_kinds=dict(choices[identity])))
+    return dict(basis="observable events; no-switch is not uselessness; decisions do not prove causal benefit",
+                counts={**dict(totals), "calls": len(calls), "advice_delivered": len(delivered),
+                        "voluntary_yields": sum(yields.values())}, calls=calls)
+
+
 def analyze(directory, task_run_id=None, *, probe_path=None):
     directory = Path(directory)
     with SqliteControlStore.open_readonly(directory / "control.sqlite") as store:
@@ -204,6 +271,12 @@ def analyze(directory, task_run_id=None, *, probe_path=None):
         operations = store.list_d4_operations(task_run_id)
         evidence = FileD8OutputEvidence(directory / "d8-output", create=False)
         report = summarize(task, operations, evidence)
+        if (directory / "d8-handoff").is_dir() and (directory / "d8-sessions").is_dir():
+            from agent_adapters.handoff_evidence import FileD8HandoffEvidence
+            report["supervision"] = summarize_supervision(task, operations,
+                store.list_d8_decisions(task_run_id), store.list_d8_tree_records(task_run_id),
+                FileD8HandoffEvidence(directory / "d8-handoff", create=False),
+                FileD8HandoffEvidence(directory / "d8-sessions", create=False))
         if probe_path is not None:
             report["cache"] = summarize_cache(task, operations, evidence, probe_path)
         return report

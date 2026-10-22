@@ -187,6 +187,9 @@ class SimulationModel:
                 }
             return result
         stage = request.stage
+        if stage == "strategy_supervision":
+            return {"decision": "continue_current_intent", "reason": "The bounded simulated observation remains useful.",
+                    "evidence_refs": [request.history[-1].ref], "suggestion": None}
         if stage == "tree_planning":
             if request.turn_id is not None:
                 return {"kind": "exhausted", "reason": "No further simulation branch is proposed.",
@@ -227,6 +230,11 @@ class SimulationModel:
         context = request.context
         if stage == "inner_plan":
             rolling = json.loads(getattr(request, "history_context", "{}") or "{}").get("intent_execution")
+            sources = json.loads(getattr(request, "history_context", "{}") or "{}").get("evidence_sources", [])
+            if rolling and sources and not rolling["facts"]:
+                return dict(kind="fact_candidate", content="The saved copy digest matches the frozen import.",
+                    reason="Original saved copy evidence supports this scoped observation.",
+                    evidence_refs=[sources[-1]["ref"]], inferred=False)
             if rolling and rolling["facts"]:
                 return dict(kind="intent_resolution", outcome="succeeded",
                     reason="The authorized local observation meets the local criteria; overall goal remains unverified.",

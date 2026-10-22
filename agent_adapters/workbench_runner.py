@@ -642,7 +642,8 @@ class Runner:
                     task_run_id = agent_dir.name
 
                     # Stop containers
-                    for container_name in [f"qinyuan-task-{task_run_id}", f"qinyuan-t6-forwarder-{task_run_id}"]:
+                    for container_name in [f"Ayui-{task_run_id}", f"Ayui-forwarder-{task_run_id}",
+                                           f"qinyuan-task-{task_run_id}", f"qinyuan-t6-forwarder-{task_run_id}"]:
                         try:
                             container = client.containers.get(container_name)
                             container.stop(timeout=1)

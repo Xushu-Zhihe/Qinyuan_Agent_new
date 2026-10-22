@@ -174,6 +174,9 @@ class EvidenceConclusions:
                     or (op.completion.evidence_ref != 'mcp-result/' + ref)
                     or (result['payload']['status'] not in {'completed', 'failed', 'rejected'})):
                 raise D3RecoveryRequired('d22_evidence_source_unavailable')
+            if 'experiment_request' in claim:
+                return dict(ref=ref,kind='mcp',version=conclusion_digest(dict(claim=claim,result=result)),source_ref=ref,
+                    data=app.mcp.experiments.projection(op,claim,result))
             return dict(ref=ref, kind='mcp', version=conclusion_digest(dict(claim=claim, result=result)), source_ref=ref, data=app.redactor.redact_value(dict(call=claim['call'], result=result['payload'])))
         observed = app.conclusions.observation(ref, historical=True)
         if observed.task_run_id != task or observed.intent_id != intent_id:

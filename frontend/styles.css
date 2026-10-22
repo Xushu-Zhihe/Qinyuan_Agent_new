@@ -686,3 +686,19 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
+
+/* C01-1: original competition connection workspace, reusing workbench tokens. */
+.competition-layout { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 22px; align-items: start; }
+.competition-settings, .competition-preview-panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 24px; display: grid; gap: 20px; min-width: 0; }
+.competition-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.competition-heading h2 { font-size: 17px; }
+.competition-fields { margin: 0; padding: 0; border: 0; display: grid; gap: 18px; min-width: 0; }
+.competition-status { color: var(--accent); background: var(--accent-soft); border-radius: var(--radius-sm); padding: 14px 16px; overflow-wrap: anywhere; }
+.competition-note { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.competition-summary { display: flex; gap: 12px; flex-wrap: wrap; color: var(--blue); font-family: var(--mono); font-size: 12px; }
+.competition-preview { display: grid; gap: 14px; color: var(--muted); }
+.competition-question { border: 1px solid var(--line); background: var(--panel-2); padding: 18px; border-radius: var(--radius-sm); display: grid; gap: 10px; min-width: 0; }
+.competition-question h3 { color: var(--text); font-size: 15px; overflow-wrap: anywhere; }
+.competition-description, .competition-addresses { white-space: pre-wrap; overflow-wrap: anywhere; }
+.competition-addresses { color: var(--blue); font: 12px/1.7 var(--mono); margin: 0; }
+@media (max-width: 1050px) { .competition-layout { grid-template-columns: 1fr; } }

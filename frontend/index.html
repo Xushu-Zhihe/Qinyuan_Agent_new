@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="./run.css">
     <script src="./run-view.js" defer></script>
     <script src="./app.js" defer></script>
+    <script src="./competition.js" defer></script>
   </head>
   <body>
     <div class="shell">
@@ -19,6 +20,7 @@
         </div>
 
         <nav class="nav">
+          <button class="nav-item" type="button" data-view="competition"><span class="nav-icon" aria-hidden="true">◈</span>比赛连接</button>
           <button class="nav-item active" type="button" data-view="tasks">
             <span class="nav-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="7" height="7" rx="1.6"/><rect x="14" y="4" width="7" height="7" rx="1.6"/><rect x="3" y="14" width="7" height="7" rx="1.6"/><rect x="14" y="14" width="7" height="7" rx="1.6"/></svg>
@@ -46,6 +48,37 @@
             <button id="refresh" class="quiet-button" type="button" title="刷新任务列表">↻ 刷新</button>
           </div>
         </header>
+
+        <section id="competition-view" class="view" hidden>
+          <div class="page-head">
+            <div><p class="eyebrow">COMPETITION CONNECTIONS · C01-1</p><h1>比赛连接</h1><p class="subheading">选择比赛配置，验证认证并预览平台题目。连接检查仅执行读取。</p></div>
+            <span class="section-meta">当前阶段：只读连接</span>
+          </div>
+          <div class="competition-layout">
+            <section class="competition-settings">
+              <div class="competition-heading"><h2>比赛配置</h2><button id="competition-new" class="quiet-button" type="button">＋ 新建</button></div>
+              <label class="field"><span>已保存配置</span><select id="competition-profile"><option value="">新建配置</option></select></label>
+              <form id="competition-form">
+                <fieldset id="competition-fields" class="competition-fields">
+                  <label class="field"><span>配置名称</span><input id="competition-name" maxlength="80" required placeholder="例如：训练场 Arena"></label>
+                  <label class="field"><span>平台协议</span><select id="competition-adapter"><option value="arena">NSSCTF Agent Arena</option><option value="benchmark">Benchmark</option></select></label>
+                  <label class="field"><span>平台根地址</span><input id="competition-url" type="url" required maxlength="2048" placeholder="https://www.nssctf.cn"><small>仅根地址；切换地址或协议会清除原凭据。</small></label>
+                  <label class="field"><span>读取超时（秒）</span><input id="competition-timeout" type="number" min="1" max="60" value="10" required></label>
+                  <label class="field"><span id="competition-credential-label">Agent Token（不含 Bearer 前缀）</span><input id="competition-credential" type="password" autocomplete="new-password" maxlength="8192" placeholder="只发送给本地服务；留空保留同配置凭据"><small>凭据仅保存在服务进程内存，重启后需重新输入。</small></label>
+                </fieldset>
+                <div class="form-actions"><button id="competition-save" class="secondary-button" type="submit">保存配置</button><button id="competition-clear" class="quiet-button" type="button" disabled>清除凭据</button></div>
+              </form>
+            </section>
+            <section class="competition-preview-panel">
+              <div class="competition-heading"><div><p class="eyebrow">READ-ONLY PREVIEW</p><h2>连接与题目预览</h2></div><button id="competition-check" class="primary-button" type="button" disabled>测试连接 / 刷新题目</button></div>
+              <p id="competition-status" class="competition-status" role="status" aria-live="polite">保存配置后即可检查连接。</p>
+              <p class="competition-note">Arena 读取当前题目；Benchmark 读取题目列表。不领取新题、不启动或关闭靶场、不查看扣分提示、不提交 Flag。</p>
+              <div id="competition-summary" class="competition-summary"></div>
+              <div id="competition-preview" class="competition-preview"><p>尚未连接平台。</p></div>
+              <p class="competition-note">自动串行答题、立即暂停、本题结束后停止和单题 / 整体延时将在后续阶段接入；本页不会启动 Agent。VPN 地址保持平台原值，不猜测连接协议。</p>
+            </section>
+          </div>
+        </section>
 
         <!-- ============ 任务板 ============ -->
         <section id="tasks-view" class="view active">

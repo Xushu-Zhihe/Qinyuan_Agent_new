@@ -194,6 +194,8 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict, *, read_store=N
         intent_by_turn: dict[str, list[dict[str, object]]] = {
             item.turn_id: [] for item in rows.turns
         }
+        local_states = {r.intent_id: r.kind for r in store.list_d8_tree_records(task_id)
+                        if r.kind in {"suspended", "resumed", "strategy_yielded", "strategy_resumed"}}
         for intent in rows.intents:
             if intent.turn_id not in intent_by_turn:
                 return _empty_result(task_id, result["mode"], error="intent_ownership_invalid", recovery=True)
@@ -203,6 +205,8 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict, *, read_store=N
                     "description": intent.description,
                     "priority": intent.priority,
                     "status": intent.status.value,
+                    **({"suspension_kind": "strategy"} if intent.status.value == "suspended"
+                       and local_states.get(intent.intent_id) == "strategy_yielded" else {}),
                 }
             )
         result["turns"] = [

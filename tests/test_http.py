@@ -63,6 +63,9 @@ class Model:
                 result['progress']=dict(classification='meaningful',reason='New saved evidence.',
                     evidence_refs=[context['d8_progress']['recent'][-1]['ref']])
             return result
+        if stage == 'strategy_supervision':
+            return dict(decision='continue_current_intent', reason='The bounded experiment remains useful.',
+                        evidence_refs=[request.history[-1].ref], suggestion=None)
         if stage=='inner_plan':
             return dict(kind='http_request',method='GET',path_query='/',headers={},body='')
         if stage=='fact_proposal':
@@ -143,6 +146,52 @@ def http_case(tmp_path,monkeypatch,request):
     case.declaration,case.raw=declaration,raw
     yield case
     case.app.store.close()
+
+
+@pytest.mark.parametrize("known", [True, False])
+def test_partial_start_failure_only_compensates_confirmed_creation(http_case, known):
+    from Sandbox.target_network import T6TargetNetworkError
+    c = http_case
+    app = c.create()
+    cleaned = []
+    class FailedNetwork(Network):
+        def create(self, task, url):
+            raise T6TargetNetworkError("create", "creation_failed" if known else "outcome_unknown", ("1" * 64,))
+        def cleanup_uncommitted(self, task):cleaned.append(task)
+    from agent_adapters.target_network_cleanup import RecordedTargetNetwork
+    app.controller._target_network = RecordedTargetNetwork(FailedNetwork(), c.directory)
+    task = str(uuid4())
+    try:
+        with pytest.raises(T6TargetNetworkError):app.start(c.app.state.task_run.request, c.directory, task_run_id=task)
+        assert cleaned == ([task] if known else [])
+        assert app.store.load_task_run(task) is None
+    finally:
+        app.store.close()
+
+
+@pytest.mark.parametrize("fault", [None, "network", "sandbox"])
+def test_terminal_network_cleanup_follows_sandbox_and_retains_unknown(http_case, monkeypatch, fault):
+    from Sandbox.target_network import T6TargetNetworkError
+    from agent_adapters.target_network_cleanup import RecordedTargetNetwork
+    c = http_case
+    order = []
+    destroy = c.sandbox.destroy
+    def sandbox_destroy(identity):
+        assert c.app.store.load_task_run(c.task).status.value == "cancelled"
+        order.append("sandbox")
+        if fault == "sandbox":raise RuntimeError("controlled cleanup failure")
+        destroy(identity)
+    class CleanupNetwork(Network):
+        def destroy(self, task, binding):
+            assert task == c.task and c.sandbox.destroyed
+            order.append("network")
+            if fault == "network":raise T6TargetNetworkError("destroy", "outcome_unknown", (binding.forwarder_id,))
+    monkeypatch.setattr(c.sandbox, "destroy", sandbox_destroy)
+    c.app.controller._target_network = RecordedTargetNetwork(CleanupNetwork(), c.directory)
+    result = c.app.cancel(c.task)
+    assert order == (["sandbox"] if fault == "sandbox" else ["sandbox", "network"])
+    assert (c.directory / "target-network-cleanup.json").exists() == (fault is None)
+    assert bool(result.recovery_required) == (fault is not None)
 
 
 def test_http_d8_tree_fact_and_candidate_wait(http_case):

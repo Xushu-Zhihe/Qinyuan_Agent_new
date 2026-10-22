@@ -21,6 +21,7 @@ import logging
 import sys
 import time
 from contextvars import ContextVar
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -155,3 +156,20 @@ def configure(
         logger.addHandler(handler)
     if not logger.handlers:
         logger.addHandler(logging.NullHandler())
+
+
+@contextmanager
+def timed_phase(channel: str, phase: str, **ids):
+    """Inclusive local phase timing; nested intervals must not be added as wall time."""
+    started_at, started = time.time(), time.perf_counter()
+    outcome, error_type = "completed", None
+    try:
+        yield
+    except BaseException as exc:
+        outcome, error_type = "failed", type(exc).__name__
+        raise
+    finally:
+        get_logger(channel).info("phase.finished", phase=phase, category="performance",
+            started_at=started_at, finished_at=time.time(),
+            seconds=round(time.perf_counter()-started, 6), timing_basis="inclusive",
+            outcome=outcome, error_type=error_type, **ids)

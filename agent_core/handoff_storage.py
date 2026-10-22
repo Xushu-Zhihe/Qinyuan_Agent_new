@@ -57,7 +57,7 @@ D8_CHANGES = (D8HandoffVersion, D8CapacityVersion, D8TreeRecord, D8RevisionRecor
 D8_OPERATIONS = {"append_d8_handoff", "append_d8_capacity", "register_d8_tree_turn",
                  "select_d8_tree_intent", "evaluate_d8_tree_intent", "exhaust_d8_expansion",
                  "exhaust_d8_tree_turn", "append_d8_revision", "append_d8_decision",
-                 "suspend_d8_intent", "resume_d8_intent"}
+                 "suspend_d8_intent", "resume_d8_intent", "yield_d8_strategy", "resume_d8_strategy"}
 
 
 def load_records(store, table, task_id):
@@ -183,6 +183,10 @@ def validate_handoff_mutation(store, mutation):
         from agent_core.intent_execution import validate_local_transition
         validate_local_transition(store, mutation, before)
         return True
+    if mutation.operation in {"yield_d8_strategy", "resume_d8_strategy"}:
+        from agent_core.strategy_supervision import validate_transition
+        validate_transition(store, mutation, before)
+        return True
     if record.model_request_id:
         call = store.load_d4_operation(record.model_request_id)
         expected = "review" if mutation.operation == "evaluate_d8_tree_intent" else "planning"
@@ -273,7 +277,7 @@ def save_handoff_mutation(store, mutation, sequence):
             store._connection.execute("INSERT INTO d8_tree_records VALUES (?,?,?,?,?,?,?)",
                                       (record.record_id, record.task_run_id, record.turn_id, record.intent_id,
                                        record.kind, metadata, sequence))
-            for request_id in (() if record.kind in {"suspended", "resumed"} else (record.model_request_id, record.inner_request_id)):
+            for request_id in (() if record.kind in {"suspended", "resumed", "strategy_resumed"} else (record.model_request_id, record.inner_request_id)):
                 if request_id:
                     store._mark_d4_operation_applied(request_id, record.record_id)
                     if store.load_d3_operation(request_id) is not None:

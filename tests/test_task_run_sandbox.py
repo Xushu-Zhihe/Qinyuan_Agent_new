@@ -257,6 +257,7 @@ def test_task_run_sandbox_creates_once_and_reuses_state_for_fixed_scripts():
     assert first.sandbox_id == second.sandbox_id == sandbox_id
     assert second.stdout == task_run_id
     assert effects(runtime) == ["create", "start", "execute", "execute"]
+    assert ("create", "Ayui-" + task_run_id) in runtime.client.events
     assert len(runtime.execute_calls) == 2
     with pytest.raises(TaskRunSandboxError, match="already_attempted"):
         adapter.create(task_run_id)

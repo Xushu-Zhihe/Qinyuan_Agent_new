@@ -70,6 +70,10 @@ def check_evidence_conclusions(directory, store, config, task_run_id):
     if is_http(config):
         from agent_adapters.http_capability import readonly_capability
         http=readonly_capability(directory,store,config)
+        from agent_adapters.http_experiments import HttpExperiments
+        app.web=http
+        native=SimpleNamespace(app=app,evidence=app.output_boundary.evidence)
+        app.mcp=SimpleNamespace(experiments=HttpExperiments(native))
     proofs=FileD3ProofStore(directory/'d3-proofs',create=False)
     workspace=FileD3WorkspaceEvidence(directory/'d3-workspace',create=False)
     def sources(observation):

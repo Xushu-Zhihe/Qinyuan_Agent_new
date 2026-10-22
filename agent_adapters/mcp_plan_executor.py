@@ -76,6 +76,8 @@ class MCPPlanExecutor:
         self.client = None
         self.service = getattr(manager, 'sandbox_service', None)
         self.tools = []
+        from agent_adapters.http_experiments import HttpExperiments
+        self.experiments = HttpExperiments(self)
         self._log = get_logger("exec")
 
     @property
@@ -124,6 +126,9 @@ class MCPPlanExecutor:
             names = [m.qualified_name for m in self.manager.list_registered_tools()]
             self.client = self.manager.bind_agent(task.task_run_id, allowed_tools=names)
             self.tools = self.client.list_tool_specs()
+            if self.experiments.enabled:
+                from agent_adapters.http_experiments import SPEC
+                self.tools = [*self.tools, SPEC]
             if not self.tools:
                 raise D3RecoveryRequired("mcp.no_tools_available")
             # Drift is rejected on recovery; no silent replacement of a frozen catalog.
@@ -157,6 +162,9 @@ class MCPPlanExecutor:
         visible = json.loads(request.history_context).get("mcp_tools", [])
         if call.tool_name not in {t["qualified_name"] for t in visible}:
             raise ValueError("mcp.tool_not_available")
+        from agent_adapters.http_experiments import TOOL
+        if call.tool_name == TOOL:
+            self.experiments.validate(call)
 
     def feedback(self, operation_id):
         # An application reference is not always a D4 operation id: reviews use
@@ -164,6 +172,9 @@ class MCPPlanExecutor:
         # carry no MCP tool result, so they must not be treated as a bad UUID.
         if not _is_operation_id(operation_id):
             return None
+        session = self.experiments.result(operation_id)
+        if session is not None:
+            return session
         result = self.evidence.read("mcp-result", operation_id)
         if result is None:
             return None
@@ -173,6 +184,8 @@ class MCPPlanExecutor:
                 or operation.start.context_sha256 != digest(claim)
                 or result["request_sha256"] != digest(claim)):
             raise D3RecoveryRequired("mcp.result_binding_changed")
+        if 'experiment_request' in claim:
+            self.experiments.validate_receipt(operation,claim,result)
         return result["payload"]
 
     def _apply(self, operation, claim, result):
@@ -181,6 +194,8 @@ class MCPPlanExecutor:
         payload = result["payload"]
         if payload["status"] not in {"completed", "failed", "rejected"}:
             raise D3RecoveryRequired("mcp.outcome_unknown")
+        if 'experiment_request' in claim:
+            self.experiments.validate_receipt(operation,claim,result)
         completion = D4OperationCompletion(
             operation.start.operation_id, result["finished_at"],
             "completed" if payload["status"] == "completed" else
@@ -190,7 +205,8 @@ class MCPPlanExecutor:
             self.app.store.complete_d4_operation(completion)
         elif operation.completion != completion:
             raise D3RecoveryRequired("mcp.completion_binding_changed")
-        self.app.store.mark_d3_operation_applied(claim["model_request_id"], operation.start.operation_id)
+        if 'experiment_request' not in claim:
+            self.app.store.mark_d3_operation_applied(claim["model_request_id"], operation.start.operation_id)
         if payload["status"] == "completed":
             self.app.store.mark_d4_operation_applied(operation.start.operation_id, operation.start.operation_id)
 
@@ -203,10 +219,15 @@ class MCPPlanExecutor:
                 if claim is None:
                     raise D3RecoveryRequired("mcp.call_evidence_missing")
                 self._apply(operation, claim, result)
+        self.experiments.reconcile()
 
     async def execute(self, request_id, intent_id, call, token):
         from MCPs.Mcp_client.client import MCPCommandPlanError
         from Sandbox.service import SandboxPolicyError
+        from agent_adapters.http_experiments import TOOL
+        if call.tool_name == TOOL:
+            await self.experiments.run(request_id,intent_id,call,token)
+            return
         self.app._check_dispatch()
         identity = self.app._id("mcp/" + request_id)
         claim = {"task_run_id": self.app.state.task_run.task_run_id,

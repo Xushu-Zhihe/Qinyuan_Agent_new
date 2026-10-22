@@ -51,11 +51,11 @@ def freeze_planning_policy(app):
 
 def planning_schema(request):
     from agent_core.output_contracts import tagged, obj, array, INTENT, REFS, text
-    from agent_core.intent_planning import candidate_limit
+    from agent_core.intent_planning import candidate_limit, candidate_schema
     policy = planning_policy(request)
     rule = obj({"rule_id": {"type": "string", "enum": [policy["rule_id"]]},
                 "parameters": obj({"attachment_index": {"type": "integer", "enum": policy["attachment_indices"]}})})
-    return {"anyOf": [tagged("candidates", {"completion_rule": rule, "intents": array(INTENT, 1, candidate_limit(request))}),
+    return {"anyOf": [candidate_schema(request, {"completion_rule": rule, "intents": array(INTENT, 1, candidate_limit(request))}),
                       tagged("exhausted", {"reason": text(512), "evidence_refs": REFS})]}
 
 

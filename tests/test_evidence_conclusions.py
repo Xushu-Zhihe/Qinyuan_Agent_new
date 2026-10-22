@@ -273,11 +273,11 @@ def test_schema29_failure_rolls_back_and_retry_migrates_once(tmp_path,monkeypatc
     from agent_core.control_store import StorageError
     path=tmp_path/"schema28.sqlite"
     original=module._sql_statements
-    # Build the actual schema28 table set, then remove only its synthetic fixture marker.
-    monkeypatch.setattr(module,"_sql_statements",lambda script:[] if script==module.MIGRATION_29 else original(script))
+    # Build schema28 tables: skip all later DDL as well as their fixture markers.
+    monkeypatch.setattr(module,"_sql_statements",lambda script:[] if script in (module.MIGRATION_29,module.MIGRATION_30) else original(script))
     with module.SqliteControlStore.open(path):pass
     with sqlite3.connect(path) as db:
-        db.execute("DELETE FROM schema_versions WHERE version=29")
+        db.execute("DELETE FROM schema_versions WHERE version>=29")
         assert next(r for r in db.execute("PRAGMA table_info(d8_conclusions)") if r[1]=="plan_id")[3]==1
         assert any(r[3]=="source_ref" and r[2]=="executions" for r in db.execute("PRAGMA foreign_key_list(facts)"))
     monkeypatch.setattr(module,"_sql_statements",lambda script:[original(script)[0],"INVALID SQL"] if script==module.MIGRATION_29 else original(script))
@@ -287,7 +287,7 @@ def test_schema29_failure_rolls_back_and_retry_migrates_once(tmp_path,monkeypatc
         assert not store._connection.execute("SELECT name FROM sqlite_master WHERE name IN ('facts_new','d8_conclusions_new')").fetchall()
     monkeypatch.setattr(module,"_sql_statements",original)
     with module.SqliteControlStore.open(path) as store:
-        assert store._schema_version==29 and store._connection.execute("PRAGMA foreign_key_check").fetchone() is None
+        assert store._schema_version==module.CURRENT_SCHEMA_VERSION and store._connection.execute("PRAGMA foreign_key_check").fetchone() is None
 
 @pytest.mark.parametrize("output_case",[14],indirect=True)
 def test_old_contract_cannot_gain_fact_candidate_action(output_case):

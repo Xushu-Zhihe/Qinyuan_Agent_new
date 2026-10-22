@@ -222,6 +222,11 @@ class HandoffContext:
             add("review/" + record.record_id, "progress", record.turn_id, record.intent_id, None,
                 handoff_json({"kind": "conclusion_review", "outcome": record.outcome,
                               "fact_id": record.fact_id}), (record.review_request_id,), asdict(record))
+        if getattr(self.app, "supervision", None) is not None and self.app.supervision.enabled:
+            for identity, turn_id, note in self.app.supervision.interruptions():
+                add("interruption/" + identity, "progress", turn_id, note["intent_id"], None,
+                    handoff_json(note), (identity, *([note["review_id"]] if note.get("review_id") else [])),
+                    note, "strategy_interruption_not_execution_or_fact")
         if self.app.config.intent_execution_policy and self.app.sessions is not None:
             for record in self.app.sessions.records():
                 data = self.app.sessions.payload(record)
@@ -229,12 +234,30 @@ class HandoffContext:
                     handoff_json({"decision": data["response"], "observation": data["observation"],
                                   "identity": "unreviewed_working_record" if data["response"].get("kind") == "working_record" else "historical_decision_not_verified"}),
                     (record.model_request_id,), asdict(record), "unreviewed_working_record" if data["response"].get("kind") == "working_record" else "historical_decision_not_verified")
+        if self.app.mcp is not None:
+            for operation in self.app.mcp.records():
+                claim = self.app.output_boundary.evidence.read('mcp-call',operation.start.operation_id)
+                if not claim or 'experiment_request' not in claim or operation.completion is None:
+                    continue
+                owner = intents[claim['intent_id']]
+                result = self.app.mcp.feedback(operation.start.operation_id)
+                add(operation.start.operation_id,'progress',owner.turn_id,owner.intent_id,None,
+                    handoff_json({'observation':result,'identity':'recorded_http_experiment_observation_not_fact'}),
+                    (claim['model_request_id'],),{'claim':claim,'result':result},'execution_observation')
         for record in self.store.list_d8_tree_records(task_id):
             if record.turn_id not in turns:
                 continue
             owner_intent = record.intent_id if record.intent_id in intents and intents[record.intent_id].turn_id == record.turn_id else None
             content = {"kind": record.kind, "support_fact_id": record.support_fact_id,
                        "local_goal_decision_is_not_a_fact": True}
+            if record.kind == "selection":
+                selection = self.evidence.read("decision", record.record_id)
+                if selection is not None:
+                    from agent_core.intent_planning import selection_context
+                    turn = turns[record.turn_id]
+                    if selection != selection_context(self.app, turn, intents[record.intent_id]):
+                        raise D3RecoveryRequired("d22_intent_selection_context_changed")
+                    content["selection"] = selection
             if self.app.config.intent_execution_policy and record.inner_request_id:
                 from agent_core.intent_execution import result_summary
                 summary = result_summary(self.app, record)
@@ -272,7 +295,7 @@ class HandoffContext:
                         'candidate_id': candidate.candidate_id, 'verdict': feedback.verdict,
                         'operation_id': feedback.operation_id, 'source_ref': feedback.source_ref,
                         'evidence_version': candidate.evidence_version}),
-                    (candidate.execution_id,), asdict(feedback),
+                    (candidate.source_ref,) if candidate.execution_id is None else (candidate.execution_id,), asdict(feedback),
                     'trusted_final_answer_feedback_not_local_goal_verdict', conflict=projection == 'conflict')
         if apply_revisions and self.app.revisions is not None:
             items = self.app.revisions.project(items)
@@ -354,6 +377,12 @@ class HandoffContext:
         return ()
 
     def select(self, phase, turn_id=None, intent_id=None, support_fact_id=None):
+        from qinyuan_core.logging import timed_phase
+        with timed_phase("model", "history_selection", run=self.state.task_run.task_run_id,
+                         turn=turn_id, intent=intent_id, stage=phase):
+            return self._select(phase, turn_id, intent_id, support_fact_id)
+
+    def _select(self, phase, turn_id=None, intent_id=None, support_fact_id=None):
         items, required = self.history(), set()
         active = []
         if self.app.config.contract_version == 22 and phase == 'tree_planning':
@@ -366,6 +395,8 @@ class HandoffContext:
         if self.app.config.intent_execution_policy and intent_id:
             required.update(i.ref for i in items if i.intent_id == intent_id and i.record_type == "verified_fact" and i.source_status == "available" and not i.conflict and
                 (self.app.revisions is None or self.app.revisions.reliable(i)))
+            required.update(i.ref for i in items if i.intent_id == intent_id
+                            and i.identity == "strategy_interruption_not_execution_or_fact")
         evaluation = None
         by_ref = {i.ref: i for i in items}
         by_id = {i.record_id: i for i in items}
@@ -495,8 +526,14 @@ class HandoffContext:
             if self.app.config.intent_execution_policy:
                 result["unresolved_conclusions"] = [i.visible() for i in items if i.conflict]
                 result["intent_execution_policy"] = "rolling_v1"
+            if intent_id and phase == "execution" and getattr(self.app, "supervision", None):
+                advice = self.app.supervision.advice(intent_id)
+                if advice:
+                    result["strategy_advice"] = advice
             if self.app.config.contract_version == 22:
                 result['intent_planning'] = {'version': 1, 'directions_are_solution_chains': True}
+                if phase in {'tree_planning', 'execution'}:
+                    result['intent_planning']['order'] = 'execution_priority'
                 if phase == 'tree_planning':
                     result['active_intent_frontier'] = [
                         {'intent_id': i.intent_id, 'turn_id': i.turn_id, 'status': i.status.value,
@@ -521,6 +558,12 @@ class HandoffContext:
         return result
 
     def _parse(self, request, raw):
+        if request.stage == "strategy_supervision":
+            from agent_core.strategy_supervision import parse
+            return parse(request, raw)
+        if request.stage == "tree_planning":
+            from agent_core.intent_planning import without_order_reason
+            raw = without_order_reason(request, raw)
         if self.app.web is not None and request.stage == 'tree_planning':
             from agent_core.http_policy import planning
             return self._new_root_directions(request, planning(request, raw, self.app.revisions))
@@ -669,6 +712,8 @@ class HandoffContext:
 
     def reconcile(self):
         for operation in self.store.list_d4_operations(self.state.task_run.task_run_id):
+            if getattr(self.app, "supervision", None) and self.app.supervision.live(operation.start.operation_id):
+                continue
             request = self.evidence.read("request", operation.start.operation_id)
             known_format = (self.app.output_boundary is not None
                             and self.app.output_boundary.diagnostic(operation.start.operation_id) is not None)
@@ -693,6 +738,9 @@ class HandoffContext:
         if raw is None:
             return False
         request = D8HandoffRequest.from_dict(raw)
+        if request.stage == "strategy_supervision":
+            self.app.supervision.reconcile(request)
+            return True
         start = operation.start
         if (request.stage != "intent_evaluation" or start.category != "review"
                 or request.model_request_id != start.operation_id
@@ -792,7 +840,9 @@ class HandoffContext:
                 business_issues = None
                 evaluation_issue = None
                 if isinstance(raw, ModelError):
-                    if raw.kind in {ModelErrorKind.TIMED_OUT, ModelErrorKind.CANCELLED}:
+                    from agent_core.structured_output import ended_transport_failure
+                    if (raw.kind in {ModelErrorKind.TIMED_OUT, ModelErrorKind.CANCELLED}
+                            and not ended_transport_failure((self.app.output_boundary.evidence.read("provider-result", current.model_request_id) or {}).get("transport", {}))):
                         raise D3RecoveryRequired("d8_model_outcome_unknown")
                     reason = _provider_billing_code(raw)
                     outcome, raw = "model_error", None
@@ -969,11 +1019,18 @@ class HandoffContext:
         self.select("execution", turn.turn_id, intent.intent_id)
         record = D8TreeRecord(self._id("selection/" + intent.intent_id), self.state.task_run.task_run_id,
                               turn.turn_id, intent.intent_id, "selection", None)
+        from agent_core.intent_planning import selection_context
+        selection = selection_context(self.app, turn, intent)
+        self.evidence.save("decision", record.record_id, selection)
         self._commit("select_d8_tree_intent", record,
                      (UpsertTurn(turn.turn_id, turn.task_run_id, turn.sequence, turn.turn_target,
                                  turn.intent_ids, TurnStatus.RUNNING),
                       UpsertIntent(intent.intent_id, intent.turn_id, intent.description,
                                    intent.priority, intent.intent_type, IntentStatus.RUNNING)))
+        from qinyuan_core import get_logger
+        get_logger("ctrl").info("intent.selected", run=record.task_run_id, turn=turn.turn_id, intent=intent.intent_id,
+            request=selection["model_request_id"], priority=intent.priority,
+            code="model_priority_order" if selection["reason_status"] == "provided" else "planning_order_reason_not_provided")
 
     def note_evaluation_fallback(self, code):
         """Count consecutive unreadable evaluation verdicts.
@@ -1093,6 +1150,12 @@ class HandoffContext:
             if frozen != self.history():
                 raise D3RecoveryRequired("d8_summary_source_snapshot_changed")
             return
+        if record.kind in {"strategy_yielded", "strategy_resumed"}:
+            from agent_core.strategy_supervision import validate_transition, validate_yield_note
+            validate_transition(self.store, mutation, state)
+            if record.kind == "strategy_yielded":
+                validate_yield_note(self.app, record, mutation)
+            return
         if record.kind in {"suspended", "resumed"}:
             from agent_core.intent_execution import validate_local_transition
             validate_local_transition(self.store, mutation, state)
@@ -1130,6 +1193,7 @@ class HandoffContext:
                     raise D3RecoveryRequired("d8_child_parent_binding_changed")
                 if (tuple((c.description, c.intent_type) for c in children)
                         != tuple((c.description, c.intent_type) for c in parsed.proposal.intents)
+                        or tuple(c.priority for c in children) != tuple(range(1, len(children) + 1))
                         or tuple(refs for _, refs in record.dependencies) != parsed.dependencies
                         or change.turn_target != state.task_run.request.goal):
                     raise D3RecoveryRequired("d8_candidate_or_dependencies_changed")

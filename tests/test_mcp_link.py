@@ -376,7 +376,8 @@ def test_public_real22_wires_mcp_and_closes_same_loop(tmp_path, monkeypatch):
     monkeypatch.setattr("agent_adapters.mcp_plan_executor.MCPPlanExecutor", Link)
     monkeypatch.setattr(deepseek_roles, "D8DeepSeekModel", Model)
     monkeypatch.setattr(simulation, "_Token", lambda directory: token)
-    def connect(configuration, directory):
+    def connect(configuration, directory, *, wait_for_ready=False):
+        assert wait_for_ready
         sandbox = _LocalDigestSandbox(directory)
         return sandbox, sandbox
     monkeypatch.setattr(docker_profile, "connect", connect)

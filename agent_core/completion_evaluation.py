@@ -166,8 +166,9 @@ def evaluation_schema(request):
 
 def candidate_schema(request, *, allow_none=False):
     from agent_core.output_contracts import obj, tagged, text
-    candidate = tagged("candidate_flag", {"value": text(),
-                "execution_id": {"type": "string", "enum": [request.context.execution_id]}})
+    from agent_core.competition_candidates import MCPAnswerCandidateContext
+    choice = {"source_ref": {"type":"string","enum":[request.context.source_ref]}} if isinstance(request.context,MCPAnswerCandidateContext) else {"execution_id":{"type":"string","enum":[request.context.execution_id]}}
+    candidate = tagged("candidate_flag", {"value": text(), **choice})
     return obj({"action": {"anyOf": [candidate, tagged("no_candidate", {})]}
                 if allow_none else candidate})
 
@@ -185,8 +186,10 @@ def materialize_candidate(request, wire, *, allow_none=False):
         if not body or '\x00' in body or len(body.encode('utf-8')) > 16 * 1024:
             from agent_core.dual_llm_modeling import D3ProposalRejected
             raise D3ProposalRejected('d9_candidate_value_invalid', structural=True)
-    return {"action": {**value["action"], "evidence_version": request.context.plan_result.evidence_sha256,
-                       "source_ref": request.context.plan_binding.artifact_version_id},
+    from agent_core.competition_candidates import provenance
+    source=provenance(request.context)
+    return {"action": {**value["action"], "execution_id": source["execution_id"], "evidence_version": source["evidence_version"],
+                       "source_ref": source["source_ref"]},
             "review_requested": False}
 
 
@@ -209,7 +212,7 @@ def candidate_binding(output, request, candidate, body_sha256, byte_size):
     return {"binding_version": 1, "contract_version": contract['contract_version'],
             "task_run_id": request.task_run_id, "model_request_id": request.model_request_id,
             "source_request_sha256": digest(asdict(request)), "contract_sha256": digest(contract),
-            "choice": {"execution_id": request.context.execution_id},
+            "choice": {"source_ref": candidate.source_ref} if candidate.source_kind == "mcp" else {"execution_id": request.context.execution_id},
             "canonical_provenance": candidate.to_dict(), "review_requested": False,
             "body_sha256": body_sha256, "byte_size": byte_size}
 
@@ -256,28 +259,20 @@ def check_candidate_task(config, output, sessions, models, store, task):
         try:
             value = dict(frozen["request"])
             context = dict(value["context"])
-            from agent_core.http_contracts import turn_binding_from_dict, plan_binding_from_dict
-            context["turn_binding"] = turn_binding_from_dict(context["turn_binding"])
-            context["plan_binding"] = plan_binding_from_dict(context["plan_binding"])
-            context["plan_result"] = D3PlanResult(**context["plan_result"])
-            if config.contract_version in {19, 20, 21, 22}:
-                from agent_core.answer_candidates import AnswerCandidateContext
-                value["context"] = AnswerCandidateContext(**context)
-            else:
-                value["context"] = D3CandidateContext(**context)
+            from agent_core.competition_candidates import restore_context
+            value["context"] = restore_context(context)
             value["process_facts"] = tuple(value["process_facts"])
             request = D8SessionExecutionRequest(**value)
             candidate = D7AnswerCandidate.from_dict(record["canonical_provenance"])
         except (KeyError, ValueError, TypeError) as exc:
             raise D3RecoveryRequired("s4_candidate_frozen_request_invalid") from exc
+        from agent_core.competition_candidates import provenance,validate_mcp_source
+        if candidate.source_kind == "mcp":
+            try:validate_mcp_source(store,candidate,output)
+            except ValueError as exc:raise D3RecoveryRequired("mcp_candidate_source_changed") from exc
         if (request.task_run_id != task or request.model_request_id != identity
                 or candidate.task_run_id != task
-                or candidate.turn_id != request.context.plan_binding.turn_id
-                or candidate.intent_id != request.context.plan_binding.intent_id
-                or candidate.plan_id != request.context.plan_binding.plan_id
-                or candidate.execution_id != request.context.execution_id
-                or candidate.evidence_version != request.context.plan_result.evidence_sha256
-                or candidate.source_ref != request.context.plan_binding.artifact_version_id
+                or any(getattr(candidate,key) != val for key,val in provenance(request.context).items())
                 or op.start != D3OperationStart(identity, task, 'inner_model', op.start.started_at,
                     request.base_checkpoint_sequence, request.context_sha256, request.resource_ref,
                     'inner_action', config.inner_role.role_config_ref)

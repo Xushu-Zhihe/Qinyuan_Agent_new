@@ -193,7 +193,7 @@ def _validate_decoded_candidate_body(body: bytes) -> str:
 
 
 def _candidate_source_projection(candidate: D7AnswerCandidate) -> dict[str, object]:
-    if candidate.source_kind == "d3":
+    if candidate.source_kind in {"d3","mcp"}:
         return {}
     binding = candidate.web_execution_binding
     if binding is None:
@@ -291,11 +291,15 @@ def _persisted_candidate(
                     or binding.artifact_version_id != candidate.source_ref
                     or result is None
                     or result.task_run_id != task_run_id
-                    or result.outcome not in ({"satisfied", "no_new_information"}
+                    or result.outcome not in ({"satisfied", "no_new_information", "observed"}
                         if ledger.load_d3_run_config(task_run_id).contract_version == 22 else {"satisfied"})
                     or result.evidence_sha256 != candidate.evidence_version
                 ):
                     raise ValueError("candidate_source_invalid")
+            elif candidate.source_kind == "mcp":
+                from agent_core.competition_candidates import validate_mcp_source
+                from agent_adapters.output_evidence import FileD8OutputEvidence
+                validate_mcp_source(ledger,candidate,FileD8OutputEvidence(run_dir / "d8-output"))
             elif candidate.source_kind == "web":
                 web_binding = candidate.web_execution_binding
                 persisted_binding = ledger.load_d7_web_execution_binding(

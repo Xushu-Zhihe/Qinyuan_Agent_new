@@ -12,7 +12,8 @@ const RunView = (() => {
   let generation = 0;
   let activeTab = "detail";
   let graphZoom = null;
-  const label = (value) => labels[value] || value || "—";
+  const label = (value) => value === "strategy_yielded" ? "策略让位 · 待续" : labels[value] || value || "—";
+  const intentStatus = (intent) => intent.status === "suspended" && intent.suspension_kind === "strategy" ? "strategy_yielded" : intent.status;
   const short = (value) => value ? value.slice(0, 8) : "—";
   const node = (tag, text, className) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el; };
   const empty = (container, text) => container.append(node("p", text, "run-empty"));
@@ -191,7 +192,7 @@ const RunView = (() => {
       const intentNodes = [];
       for (const intent of [...turn.intents].sort((a, b) => a.priority - b.priority)) {
         const plans = (progress.plans || []).filter((plan) => plan.intent_id === intent.intent_id);
-        const item = graphButton(`Intent ${intent.priority}`, intent.description, { id: intent.intent_id, type: "intent", title: `Turn ${turn.sequence} / Intent ${intent.priority}` }, intent.status, "intent");
+        const item = graphButton(`Intent ${intent.priority}`, intent.description, { id: intent.intent_id, type: "intent", title: `Turn ${turn.sequence} / Intent ${intent.priority}` }, intentStatus(intent), "intent");
         item.title = `${intent.description}\n${plans.length} 个短 Plan`;
         intents.append(item); intentNodes.push(item);
       }
@@ -232,7 +233,7 @@ const RunView = (() => {
       const executions = (progress.executions || []).filter((execution) => planIds.has(execution.plan_id));
       const executionIds = new Set(executions.map((execution) => execution.execution_id));
       const facts = (progress.verified_facts || []).filter((fact) => executionIds.has(fact.source_execution_id || fact.source_ref));
-      host.append(node("strong", `Turn ${selectedIntent.turn.sequence} / Intent ${selectedIntent.priority}`, "detail-title"), badge(selectedIntent.status), node("p", selectedIntent.description, "detail-description"));
+      host.append(node("strong", `Turn ${selectedIntent.turn.sequence} / Intent ${selectedIntent.priority}`, "detail-title"), badge(intentStatus(selectedIntent)), node("p", selectedIntent.description, "detail-description"));
       host.append(node("p", `${plans.length} 个短 Plan · ${executions.length} 次执行 · ${facts.length} 条已验证观察`, "run-meta"));
       for (const plan of plans) {
         const item = detail(`detail-${plan.plan_id}`, `Plan ${short(plan.plan_id)} · ${label(plan.status)}`);

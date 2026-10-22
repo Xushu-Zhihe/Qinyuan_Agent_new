@@ -513,6 +513,7 @@ class DeepSeekModelAdapter:
     def _invoke_payload(self, payload, timeout_seconds, cancellation_token, *, diagnostic=None):
         diagnostic = diagnostic if diagnostic is not None else {}
         diagnostic["transport_end"] = "not_dispatched"
+        diagnostic["worker_exit_confirmed"] = True
         if cancellation_token.is_cancelled:
             return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
         timeout = min(float(timeout_seconds), self.settings.timeout_seconds)
@@ -527,11 +528,15 @@ class DeepSeekModelAdapter:
         connect_end = time.monotonic() + min(CONNECT_TIMEOUT_SECONDS, timeout)
         connected = False
         try:
+            diagnostic["worker_exit_confirmed"] = False
             process.start()
             diagnostic["transport_end"] = "unknown"
             writer.close()
             while True:
                 if cancellation_token.is_cancelled:
+                    if getattr(cancellation_token, "is_timed_out", False):
+                        diagnostic["transport_end"] = "timeout"
+                        return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
                     diagnostic["transport_end"] = "cancelled"
                     return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
                 if time.monotonic() >= end:
@@ -543,6 +548,9 @@ class DeepSeekModelAdapter:
                 if reader.poll(min(0.025, max(0, end - time.monotonic()))):
                     result = reader.recv()
                     if cancellation_token.is_cancelled:
+                        if getattr(cancellation_token, "is_timed_out", False):
+                            diagnostic["transport_end"] = "timeout"
+                            return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
                         diagnostic["transport_end"] = "cancelled"
                         return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
                     if "diagnostic" in result:
@@ -588,7 +596,10 @@ class DeepSeekModelAdapter:
                     process.kill()
                     process.join(timeout=0.5)
                 if not process.is_alive():
+                    diagnostic["worker_exit_confirmed"] = True
                     process.close()
+            else:
+                diagnostic["worker_exit_confirmed"] = True
             reader.close()
             writer.close()
 

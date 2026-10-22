@@ -62,6 +62,10 @@ def policy_for(request):
                 or progress["window"] != 4 or progress["continue_decisions"] != 4
                 or not isinstance(progress["recent"], list) or len(progress["recent"]) != 4
                 or [r["ordinal"] for r in progress["recent"]] != list(range(p["decision_watermark"]-3, p["decision_watermark"]+1))
+                or "execution_refs" in progress and (not isinstance(progress["execution_refs"], list)
+                    or any(not isinstance(ref, str) for ref in progress["execution_refs"])
+                    or len(set(progress["execution_refs"])) != len(progress["execution_refs"])
+                    or not set(progress["execution_refs"][-4:]) <= set(request.source_versions))
                 or p["required_latest_decision_ref"] != progress["recent"][-1]["ref"]
                 or p["required_latest_decision_ref"] not in request.source_versions
                 or p["window_sha256"] != digest(progress)

@@ -15,9 +15,20 @@ from agent_core.turn_modeling import stable_id
 class IntentSessions:
     def __init__(self, app, evidence):
         self.app, self.store, self.evidence = app, app.store, evidence
+        from agent_core.strategy_supervision import StrategySupervision
+        app.supervision = StrategySupervision(app)
+        app.store.live_strategy_operation = app.supervision.live
 
     def _id(self, name):
         return stable_id(self.app.state.task_run.task_run_id, "d8-4/" + name)
+
+    @staticmethod
+    def history_request(request):
+        value = {k: v for k, v in request.items() if k not in {"session_context", "history_context", "process_facts"}}
+        advice = json.loads(request.get("history_context", "{}") or "{}").get("strategy_advice")
+        if advice and "reason" in advice:
+            value["strategy_advice"] = advice
+        return value
 
     def records(self, intent_id=None):
         rows = self.store.list_d8_decisions(self.app.state.task_run.task_run_id)
@@ -66,6 +77,12 @@ class IntentSessions:
             raise D3RecoveryRequired("d8_session_sensitive_content_rejected")
 
     def wrap(self, request):
+        from qinyuan_core.logging import timed_phase
+        with timed_phase("model", "session_assembly", run=self.app.state.task_run.task_run_id,
+                         request=request.model_request_id):
+            return self._wrap(request)
+
+    def _wrap(self, request):
         is_conclusion = isinstance(request, (D8ModelRequest, D8ChangeRequest))
         if not is_conclusion and request.role != "inner_action":
             return request
@@ -79,9 +96,18 @@ class IntentSessions:
             messages = []
             records = self.records(intent_id)
             summary_record, summary = self.app.handoff._latest_summary()
+            continuous = self.app.config.intent_execution_policy == "continuous_v1"
             compact = bool(self.app.config.intent_execution_policy and summary and summary_record.origin == "model_organized" and current["global_source_status"] == "available")
-            omitted = records[:-4] if compact else []
-            for record in (records[-4:] if compact else records):
+            segment_start = 1
+            if continuous and records:
+                prior = self.evidence.read("request", records[-1].model_request_id)
+                previous = json.loads(prior["request"].get("session_context", "{}")) if prior else {}
+                segment_start = previous.get("segment_start", 1)
+                compact = compact and len(handoff_json([self.payload(r) for r in records if r.ordinal >= segment_start])) > self.app.handoff.capacity().capacity.visible_history
+                if compact:
+                    segment_start = max(segment_start, records[-4].ordinal if len(records) >= 4 else 1)
+            omitted = [r for r in records if r.ordinal < segment_start] if continuous else records[:-4] if compact else []
+            for record in ([r for r in records if r.ordinal >= segment_start] if continuous else records[-4:] if compact else records):
                 data = self.payload(record)
                 messages.append({"role": "user", "content": data["request"],
                                  "identity": "historical_request_not_current_authorization"})
@@ -93,6 +119,8 @@ class IntentSessions:
             session_packet = {"messages": messages, "current_history": current,
                                     "session_scope": "intent", "session_id": session_id,
                                     "turn_id": turn_id, "intent_id": intent_id}
+            if continuous:
+                session_packet["segment_start"] = segment_start
             if self.app.config.intent_execution_policy:
                 session_packet["working_record_policy"] = "unreviewed_v1"
             if omitted:
@@ -146,6 +174,11 @@ class IntentSessions:
         for call in self.store.list_d4_operations(self.app.state.task_run.task_run_id):
             if call.start.role != "inner_action" or call.completion is None:
                 continue
+            interruption = self.app.handoff.evidence.read("strategy-discard", call.start.operation_id)
+            if interruption and interruption.get("disposition") != "retained_for_processing":
+                if call.application_ref is None:
+                    self.store.mark_d3_operation_applied(call.start.operation_id, call.start.operation_id)
+                continue
             optional = self.app.conclusions.finish_optional_failure(call.start.operation_id)
             if not optional and call.application_ref is None and call.start.operation_id != review_signal:
                 continue
@@ -163,10 +196,9 @@ class IntentSessions:
                                       snapshot["turn_id"], snapshot["intent_id"], len(rows) + 1,
                                       root, call.start.operation_id, "0" * 64,
                                       "technical_failure" if optional else "review_requested" if call.application_ref is None else "applied")
-            safe_request = {k: v for k, v in request.items()
-                            if k not in {"session_context", "history_context", "process_facts"}}
+            safe_request = self.history_request(request)
             plan_id = (request.get("observation", {}).get("plan_id")
-                       or request.get("context", {}).get("plan_binding", {}).get("plan_id"))
+                       or (request.get("context", {}).get("plan_binding") or {}).get("plan_id"))
             executions = [e for e in self.app.state.executions if e.plan_id == plan_id]
             observed = {"application_ref": call.application_ref,
                         "completed_kind": call.completion.result_kind,
@@ -217,8 +249,7 @@ class IntentSessions:
                 or signal and (data["request"]["stage"] != "fact_proposal"
                                or data["response"].get("kind") != "request_review")
                 or handoff_json(data["response"]) != handoff_json(self._result(record.model_request_id, request["request"]))
-                or data["request"] != {k: v for k, v in request["request"].items()
-                                       if k not in {"session_context", "history_context", "process_facts"}}):
+                or data["request"] != self.history_request(request["request"])):
             raise D3RecoveryRequired("d8_session_decision_binding_changed")
 
     def reviews(self, intent_id):
@@ -241,18 +272,53 @@ class IntentSessions:
                     from agent_core.review_contracts import D2ReviewRequest
                     request = D2ReviewRequest(**{**call["request"], "source_versions": tuple(call["request"]["source_versions"])})
                     watermark = policy_for(request)["decision_watermark"]
-                if (watermark < 4 or context["d8_progress"] != self.review_context(intent_id, watermark,
-                                                        mode=context["d8_progress"].get("mode", "ordinary"))):
+                progress = context["d8_progress"]
+                if (watermark < 4
+                        or progress != self.review_context(intent_id, watermark,
+                            mode=progress.get("mode", "ordinary"), execution_refs=progress.get("execution_refs"))):
                     raise D3RecoveryRequired("d8_progress_applied_window_changed")
                 result.append((watermark, application, call))
         return result
 
+    def execution_refs(self, intent_id):
+        """Known completed tools only; failed/duplicate observations still count."""
+        plans = {p.plan_id for p in self.app.state.plans if p.intent_id == intent_id}
+        executions = {e.execution_id for e in self.app.state.executions
+                      if e.plan_id in plans and e.status.value != "running"}
+        return [o.start.operation_id for o in self.store.list_d4_operations(self.app.state.task_run.task_run_id)
+                if o.completion is not None and o.start.category == "tool_dispatch"
+                and (o.start.operation_id in executions
+                     or o.start.resource_ref.startswith("mcp/" + intent_id + "/"))]
+
     def due(self, intent_id):
         reviews = self.reviews(intent_id)
-        count = len(self.records(intent_id))
-        return count >= (reviews[-1][0] if reviews else 0) + 4
+        rows = self.records(intent_id)
+        watermark = reviews[-1][0] if reviews else 0
+        if self.app.config.intent_execution_policy != "continuous_v1":
+            return len(rows) >= watermark + 4
+        previous = (json.loads(reviews[-1][2]["request"]["context_summary"])["d8_progress"]
+                    if reviews else {})
+        supervisor = getattr(self.app, "supervision", None)
+        attempts = supervisor.watermark(intent_id) if supervisor else []
+        if attempts:
+            previous = attempts[-1]
+            watermark = previous["decision_count"]
+        if len(set(self.execution_refs(intent_id)) - set(previous.get("execution_refs", ()))) >= 4:
+            return True
+        # Pure reasoning/history loops must not evade review by never executing.
+        idle = 0
+        for row in rows[watermark:]:
+            data = self.payload(row)
+            if data["request"]["stage"] != "inner_plan":
+                continue
+            kind = data["response"].get("kind")
+            if kind in {"http_request", "mcp_call", "attachment_observation"} or "template" in data["response"]:
+                idle = 0
+            elif kind in {"working_record", "history_query", "history_details", "conclusion_change"}:
+                idle += 1
+        return idle >= 4
 
-    def review_context(self, intent_id, through=None, *, mode="ordinary"):
+    def review_context(self, intent_id, through=None, *, mode="ordinary", execution_refs=None, compact=False):
         rows = self.records(intent_id)[:through]
         stages = {}
         executions = set()
@@ -261,15 +327,31 @@ class IntentSessions:
             stage = data["request"]["stage"]
             stages[stage] = stages.get(stage, 0) + 1
             executions.update(e["execution_id"] for e in data["observation"]["execution_records"])
-        return {**({"intent_execution_policy": "rolling_v1"} if self.app.config.intent_execution_policy else {}),
+        tools = {}
+        if (self.app.config.intent_execution_policy == "continuous_v1" and through is None) or execution_refs is not None:
+            current = self.execution_refs(intent_id)
+            refs = current if execution_refs is None else execution_refs
+            if current[:len(refs)] != refs:
+                raise D3RecoveryRequired("d22_progress_execution_window_changed")
+            tools = {"execution_refs": refs}
+            executions.update(refs)
+        recent = []
+        for row in rows[-4:]:
+            data = self.payload(row)
+            if compact:
+                # Retain decisions and observations, not a nested copy of their old input.
+                data = {**data, "request": {k: v for k, v in self.history_request(data["request"]).items()
+                                          if k != "context"}}
+            recent.append({"ref": "d8-decision:" + row.record_id, "ordinal": row.ordinal, "data": data})
+        return {**tools, **({"intent_execution_policy": "rolling_v1"} if self.app.config.intent_execution_policy else {}),
                 "decision_count": len(rows), "window": 4, "continue_decisions": 4, "mode": mode,
                 "cumulative": {"decision_stage_counts": stages, "saved_execution_count": len(executions),
                                "identity": "historical_progress_not_goal_verification"},
-                "recent": [{"ref": "d8-decision:" + r.record_id,
-                            "ordinal": r.ordinal, "data": self.payload(r)} for r in rows[-4:]]}
+                "recent": recent}
 
     async def before_decision(self, intent_id, receipts, token, *, restricted=False):
         self.reconcile()
+        self.app.supervision.poll()
         from agent_core.intent_execution import stop_request
         if self.app.config.intent_execution_policy and stop_request(self.app, intent_id) is not None:
             return False
@@ -277,7 +359,14 @@ class IntentSessions:
         if reviews and reviews[-1][2]["response"]["decision"] == "pause_current_intent":
             raise D3RecoveryRequired("d8_progress_" + reviews[-1][2]["response"]["progress"]["classification"])
         intent = next(i for i in self.app.state.intents if i.intent_id == intent_id)
-        if intent.status.value != "running" or not self.due(intent_id):
+        if intent.status.value != "running":
+            return False
+        if not self.due(intent_id):
+            await self.organize_if_needed(intent_id, token)
+            return False
+        if self.app.config.intent_execution_policy == "continuous_v1" and not restricted:
+            self.app.supervision.start(intent_id)
+            await self.organize_if_needed(intent_id, token)
             return False
         rows = self.records(intent_id)
         sources = (rows[-1].model_request_id,)
@@ -308,9 +397,25 @@ class IntentSessions:
                 raise D3RecoveryRequired("d8_progress_" + output.progress.classification)
             return False
         # Organize before routing: replan may immediately assemble another inner request.
-        if self.app.config.intent_execution_policy and output.decision != "pause_current_intent":
+        if self.app.config.intent_execution_policy == "continuous_v1":
+            await self.organize_if_needed(intent_id, token)
+        elif self.app.config.intent_execution_policy and output.decision != "pause_current_intent":
             await self.app.handoff.summarize(intent.turn_id, token)
         return await self.app._route(review_id, output, intent_id, receipts, token)
+
+    async def organize_if_needed(self, intent_id, token):
+        if self.app.config.intent_execution_policy != "continuous_v1":
+            return
+        rows = self.records(intent_id)
+        if len(rows) <= 4:
+            return
+        _, summary = self.app.handoff._latest_summary()
+        covered = {i["record_id"] for i in summary.get("all_items", ())} if summary else set()
+        if all("decision/" + r.record_id in covered for r in rows[:-4]):
+            return
+        if len(handoff_json([self.payload(r) for r in rows]).encode("utf-8")) > self.app.handoff.capacity().capacity.visible_history:
+            intent = next(i for i in self.app.state.intents if i.intent_id == intent_id)
+            await self.app.handoff.summarize(intent.turn_id, token)
 
     @staticmethod
     def visible(request):

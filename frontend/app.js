@@ -241,8 +241,9 @@ function showView(name, updateHistory = true) {
   document.body.classList.toggle("detail-open", name === "detail");
   document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === (name === "detail" ? "tasks" : name)));
   document.querySelectorAll(".view").forEach((view) => { const active = view.id === `${name}-view`; view.hidden = !active; view.classList.toggle("active", active); });
-  $("current-view").textContent = name === "model" ? "模型角色" : name === "detail" ? "题目详情" : "任务与运行";
+  $("current-view").textContent = name === "competition" ? "比赛连接" : name === "model" ? "模型角色" : name === "detail" ? "题目详情" : "任务与运行";
   if (name === "model") loadModel();
+  if (name === "competition") CompetitionPage.load();
   if (updateHistory) {
     const route = name === "detail" ? (state.selected ? `#task/${state.selected}` : "#new") : `#${name}`;
     if (location.hash !== route) history.pushState(null, "", route);
@@ -255,7 +256,7 @@ function syncRoute() {
     if (state.tasks.some((task) => task.id === id)) { selectTask(id, false); showView("detail", false); return; }
   }
   if (route === "#new") { resetForm(); showView("detail", false); return; }
-  showView(route === "#model" ? "model" : "tasks", false);
+  showView(route === "#competition" ? "competition" : route === "#model" ? "model" : "tasks", false);
 }
 async function health() { try { const value = await request("/api/health"); state.executionProfile = value.capabilities?.execution_profile; $("profile-pill").textContent = state.executionProfile ? `profile ${state.executionProfile}` : `协议 v${value.capabilities?.protocol_version || 3}`; $("http-methods-control").hidden = !["d8_v20", "d8_v21"].includes(state.executionProfile); $("run-mode").querySelector('option[value="real"]').textContent = value.capabilities?.real_sandbox_backend === "docker" ? "真实模型＋Docker Sandbox" : "真实模型＋本地模拟 Sandbox"; $("run-mode-control").hidden = !["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"].includes(state.executionProfile); if (["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21"].includes(state.executionProfile)) { $("run-mode").value = value.capabilities.d7_mode || ""; $("run-mode").disabled = !!value.capabilities.d7_mode; } $("service-status").textContent = value.status === "ready" ? "服务已连接" : "服务状态异常"; $("connection-text").textContent = "回环服务"; } catch (_) { $("service-status").textContent = "服务未连接"; $("connection-text").textContent = "未连接"; $("profile-pill").textContent = "离线"; } }
 function toggleTaskSelection(taskId) {

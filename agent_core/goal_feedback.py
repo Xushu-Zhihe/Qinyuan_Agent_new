@@ -9,14 +9,14 @@ from dataclasses import dataclass, field
 from typing import Literal, Protocol, TypeAlias
 from uuid import UUID
 
-ExternalValidationVerdict = Literal["accepted", "rejected", "unknown"]
-ReconciliationVerdict = Literal["accepted", "rejected"]
+ExternalValidationVerdict = Literal["accepted", "rejected", "unknown", "partial"]
+ReconciliationVerdict = Literal["accepted", "rejected", "partial"]
 ExternalValidationFeedbackKind = Literal["submission", "reconciliation"]
 FeedbackProjectionState = Literal[
-    "pending", "unknown", "accepted", "rejected", "conflict"
+    "pending", "unknown", "accepted", "rejected", "partial", "conflict"
 ]
-EXTERNAL_VALIDATION_VERDICTS = frozenset({"accepted", "rejected", "unknown"})
-RECONCILIATION_VERDICTS = frozenset({"accepted", "rejected"})
+EXTERNAL_VALIDATION_VERDICTS = frozenset({"accepted", "rejected", "unknown", "partial"})
+RECONCILIATION_VERDICTS = frozenset({"accepted", "rejected", "partial"})
 EXTERNAL_VALIDATION_FEEDBACK_SCHEMA_VERSION = 1
 MAX_EXTERNAL_VALIDATION_SOURCE_REF_BYTES = 4096
 MAX_EXTERNAL_VALIDATION_FEEDBACK_JSON_BYTES = 1024 * 1024
@@ -427,7 +427,7 @@ class ExternalValidationCheckCompletion:
         cls, result: ExternalValidationCheckResult
     ) -> ExternalValidationCheckCompletion:
         reconciliation = None
-        if result.verdict in {"accepted", "rejected"}:
+        if result.verdict in {"accepted", "rejected", "partial"}:
             request = result.request
             reconciliation = ExternalValidationReconciliation(
                 task_run_id=request.task_run_id,
@@ -602,9 +602,9 @@ def project_candidate_feedback(
     for record in by_operation.values():
         if isinstance(record, ExternalValidationReconciliation):
             if record.conflict_sources:
-                active = [item for item in seen.values() if item.operation_id not in resolved_decision_ids and item.verdict in {"accepted", "rejected"}]
+                active = [item for item in seen.values() if item.operation_id not in resolved_decision_ids and item.verdict in {"accepted", "rejected", "partial"}]
                 expected = tuple(ExternalValidationConflictSource.from_record(item) for item in sorted(active, key=lambda item: item.operation_id))
-                if {item.verdict for item in active} != {"accepted", "rejected"} or record.conflict_sources != expected:
+                if "rejected" not in {item.verdict for item in active} or not any(item.verdict in {"accepted","partial"} for item in active) or record.conflict_sources != expected:
                     raise ExternalValidationFeedbackConflict("conflict resolution must bind all active opposite decisions")
                 resolved_decision_ids.update(item.operation_id for item in active)
             else:
@@ -636,11 +636,12 @@ def project_candidate_feedback(
             and record.operation_id not in resolved_submission_ids
         )
     )
+    partial_ids = tuple(r.operation_id for r in by_operation.values() if r.verdict == "partial" and r.operation_id not in resolved_decision_ids)
     active_accepted_ids = tuple(item for item in accepted_ids if item not in resolved_decision_ids)
     active_rejected_ids = tuple(item for item in rejected_ids if item not in resolved_decision_ids)
     conflicts = (
-        tuple(sorted((*active_accepted_ids, *active_rejected_ids)))
-        if active_accepted_ids and active_rejected_ids
+        tuple(sorted((*active_accepted_ids, *partial_ids, *active_rejected_ids)))
+        if (active_accepted_ids or partial_ids) and active_rejected_ids
         else ()
     )
     state: FeedbackProjectionState
@@ -652,6 +653,8 @@ def project_candidate_feedback(
         state = "accepted"
     elif active_rejected_ids:
         state = "rejected"
+    elif partial_ids:
+        state = "partial"
     else:
         state = "pending"
     return ExternalValidationFeedbackProjection(
