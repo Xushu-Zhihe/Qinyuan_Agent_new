@@ -1,12 +1,11 @@
 """MCP candidate provenance without synthetic Plans or Executions."""
 from dataclasses import dataclass
 from uuid import UUID
-from agent_core.dual_llm_modeling import D3CandidateContext
 from agent_core.turn_modeling import digest
 
 
 @dataclass(frozen=True, slots=True)
-class MCPAnswerCandidateContext(D3CandidateContext):
+class MCPAnswerCandidateContext:
     goal: str
     task_run_id: str
     turn_id: str
@@ -15,8 +14,7 @@ class MCPAnswerCandidateContext(D3CandidateContext):
     evidence_version: str
 
     def __post_init__(self):
-        if any(value is not None for value in (self.turn_binding,self.plan_binding,self.execution_id,self.plan_result)):
-            raise ValueError("mcp_candidate_must_not_fabricate_execution")
+        if not isinstance(self.source_ref,str):raise ValueError("mcp_candidate_source_invalid")
         for value in (self.task_run_id,self.turn_id,self.intent_id,self.source_ref.removeprefix("mcp-result/")):
             parsed=UUID(value)
             if str(parsed)!=value or parsed.version not in {4,5}:raise ValueError("mcp_candidate_identity_invalid")
@@ -40,11 +38,18 @@ def restore_context(data):
     if "source_ref" in data:return MCPAnswerCandidateContext(**data)
     from agent_core.http_contracts import turn_binding_from_dict,plan_binding_from_dict
     from agent_core.dual_llm_contracts import D3PlanResult
+    from agent_core.dual_llm_modeling import D3CandidateContext
     from agent_core.answer_candidates import AnswerCandidateContext
     data["turn_binding"]=turn_binding_from_dict(data["turn_binding"])
     data["plan_binding"]=plan_binding_from_dict(data["plan_binding"])
     data["plan_result"]=D3PlanResult(**data["plan_result"])
     return AnswerCandidateContext(**data) if "goal" in data else D3CandidateContext(**data)
+
+
+def supports_mcp_candidate(operation, intent_id):
+    """The current candidate protocol supports ordinary calls, not experiment children."""
+    parts = (operation.start.resource_ref or "").split("/")
+    return operation.start.category == "tool_dispatch" and len(parts) == 3 and parts[:2] == ["mcp", intent_id]
 
 
 def validate_mcp_source(store,candidate,evidence=None):
@@ -53,17 +58,24 @@ def validate_mcp_source(store,candidate,evidence=None):
     operation=store.load_d4_operation(operation_id)
     if (not candidate.source_ref.startswith("mcp-result/") or candidate.plan_id is not None
         or candidate.execution_id is not None or operation is None
+        or operation.start.category!="tool_dispatch"
         or operation.start.task_run_id!=candidate.task_run_id
-        or not operation.start.resource_ref.startswith("mcp/"+candidate.intent_id+"/")
+        or not supports_mcp_candidate(operation,candidate.intent_id)
         or operation.completion is None or operation.completion.result_kind!="completed"
         or operation.completion.evidence_ref!=candidate.source_ref
         or operation.completion.evidence_sha256!=candidate.evidence_version):
         raise ValueError("mcp_candidate_source_invalid")
+    model_id=operation.start.resource_ref.split("/",2)[-1]
+    model=store.load_d3_operation(model_id)
+    if (model is None or model.start.task_run_id!=candidate.task_run_id or model.start.category!="inner_model"
+        or model.application_ref!=operation_id or model.completion is None or model.completion.result_kind!="completed"):
+        raise ValueError("mcp_candidate_model_binding_invalid")
     if evidence is not None:
         claim=evidence.read("mcp-call",operation_id); result=evidence.read("mcp-result",operation_id)
         if (claim is None or result is None or digest(result)!=candidate.evidence_version
             or digest(claim)!=operation.start.context_sha256 or result["request_sha256"]!=digest(claim)
             or claim["task_run_id"]!=candidate.task_run_id or claim["intent_id"]!=candidate.intent_id
+            or claim["model_request_id"]!=model_id
             or result["payload"]["status"]!="completed"):
             raise ValueError("mcp_candidate_evidence_invalid")
     return operation

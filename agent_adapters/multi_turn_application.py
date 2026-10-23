@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from agent_core.operator_controls import OperatorPaused
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -965,6 +966,9 @@ class D3Application:
     def _check_dispatch(
         self, *, allow_admitted_operation_id: str | None = None, allow_conclusion_repair: bool = False
     ) -> None:
+        from agent_core.operator_controls import check_admission
+        if allow_admitted_operation_id is None and self.clock() < self.state.task_run.deadline_at:
+            check_admission(self.store,self.state.task_run.task_run_id)
         if self.config.d4_budget is not None:
             stopped = self._settle_stoppage(
                 exclude_operation_id=allow_admitted_operation_id
@@ -3602,11 +3606,34 @@ class D3Application:
             with timed_phase("ctrl", "scheduler_wait", run=self.state.task_run.task_run_id):
                 await asyncio.sleep(min(1.0, remaining))
 
+    def _capacity_wait_key(self):
+        # No prompt/evidence assembly: only control and operation readiness.
+        task = self.state.task_run.task_run_id
+        pending = self.supervision.pending if self.supervision is not None else None
+        if pending is not None and pending[1].is_set():
+            return None  # A result arriving during failed assembly must be reconciled first.
+        # Rows are a change detector only. Full evidence validation still runs
+        # before scheduling whenever that detector changes.
+        rows = self.store.load_control_state_rows(task)
+        return (rows.latest_checkpoint.sequence if rows is not None else None, self.config,
+                tuple((r.start.operation_id, r.completion, r.application_ref)
+                      for r in self.store.list_d4_operations(task)))
+
     async def run(self, token: CancellationToken) -> D3Result:
         if self.config.intent_execution_policy != "continuous_v1":return await self._run_once(token)
         waiting_reason = None
+        capacity_blocked = None
         while True:
-            result = await self._run_once(token)
+            from agent_core.operator_controls import current,paused_result
+            control=current(self.store,self.state.task_run.task_run_id)
+            if control is not None and control["paused"] and self.clock()<self.state.task_run.deadline_at:
+                return await paused_result(self)
+            if (capacity_blocked is None or capacity_blocked != self._capacity_wait_key()
+                    or token.is_cancelled or self._has_cancel_intent(self.state.task_run.task_run_id)):
+                result = await self._run_once(token)
+                capacity_blocked = (self._capacity_wait_key() if result.stop_reason in {
+                    "d8_output_complete_request_capacity_paused", "d8_context_paused:complete_model_request"} else None)
+            if result.stop_reason == "operator_paused":return await paused_result(self)
             if self.state.task_run.status in TERMINAL_STATUSES or token.is_cancelled:return result
             if self.clock() >= self.state.task_run.deadline_at:
                 # Waiting is not a terminal transition. Settle the durable
@@ -3625,7 +3652,8 @@ class D3Application:
                                         if op.completion is None], deadline_at=self.state.task_run.deadline_at)
                 waiting_reason = result.stop_reason
             await self._wait_continuation(token)
-            self.controller.reload_state()
+            if capacity_blocked is None or capacity_blocked != self._capacity_wait_key():
+                self.controller.reload_state()
 
     async def _run_once(self, token: CancellationToken) -> D3Result:
         with run_lock(self.directory):
@@ -3647,6 +3675,8 @@ class D3Application:
                 if self.config.d5_enabled and not self._redaction_configured:
                     return self.result("d5_redaction_configuration_unavailable", recovery_required=True)
                 return await self._run(token)
+            except OperatorPaused:
+                return self.result("operator_paused",recovery_required=False)
             except (
                 D3RecoveryRequired,
                 D3BudgetExhausted,

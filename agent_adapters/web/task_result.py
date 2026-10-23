@@ -38,6 +38,7 @@ def _cleanup(directory: Path, task_run) -> tuple[dict[str, object], str]:
 def _candidate_projection(
     store, task_run_id: str, *, through_event_sequence: int | None = None,
 ) -> tuple[list[dict[str, object]], str, bool]:
+    from agent_adapters.competition_submission import feedback_progress
     candidates = store.list_d7_answer_candidates(task_run_id)
     projected: list[dict[str, object]] = []
     evaluations: list[str] = []
@@ -60,6 +61,7 @@ def _candidate_projection(
                 "operation_id": item.operation_id,
                 "verdict": item.verdict,
                 "feedback_kind": item.feedback_kind,
+                **feedback_progress(store.path.parent,item),
                 "resolves_operation_id": getattr(item, "resolves_operation_id", None),
             }
             for item in feedback
@@ -71,6 +73,8 @@ def _candidate_projection(
                 "intent_id": candidate.intent_id,
                 "plan_id": candidate.plan_id,
                 "execution_id": candidate.execution_id,
+                "source_kind": candidate.source_kind,
+                "source_ref": candidate.source_ref,
                 "evidence_version": candidate.evidence_version,
                 "validation_state": state.state,
                 "feedback": feedback_projection,
@@ -171,6 +175,9 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict, *, read_store=N
         rows = store.load_control_state_rows(task_id)
         if rows is None or rows.task_run.task_run_id != task_id:
             return _empty_result(task_id, result["mode"], error="task_run_state_unavailable", recovery=True)
+        from agent_core.operator_controls import current
+        operator=current(store,task_id)
+        if operator is not None:result["operator_control"]=operator
         task = rows.task_run
         task_status = task.status.value
         result["task_run"] = {
@@ -710,9 +717,18 @@ def snapshot_v3_task_result(directory: Path, declaration: dict) -> dict:
     result = _snapshot_once(directory, declaration)
     for attempt in range(2):
         if not _state_read_busy(result):
-            return result
+            break
         time.sleep(0.15 * (attempt + 1))
         result = _snapshot_once(directory, declaration)
+    path=Path(directory).parent.parent/"competition-binding.json"
+    if path.is_file():
+        from agent_adapters.competition_submission import frozen_binding
+        try:
+            binding=frozen_binding(path,declaration)
+            result["competition"]={"adapter":binding["profile"]["adapter"],"remote_ref":binding["question"]["remote_ref"]}
+        except (OSError,ValueError):
+            result.setdefault("errors",[]).append({"code":"competition_run_binding_invalid"})
+            result["recovery"]={"required":True,"reason":"competition_run_binding_invalid"}
     return result
 
 

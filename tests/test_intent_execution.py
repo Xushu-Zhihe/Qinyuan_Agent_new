@@ -1597,3 +1597,143 @@ def test_local_suspension_public_view_keeps_diagnostics_without_global_recovery(
     assert view["task_run"]["status"]=="running" and view["model_format_diagnostics"]
     assert view["budget"]["total_limit"] is None
     assert all(v is None for v in view["budget"]["category_limits"].values())
+
+
+
+def install_repeated_resolution(case,change='observation'):
+    from copy import deepcopy
+    from test_exploration_loop import install as exploration
+    exploration(case,steps=1,stop='inconclusive')
+    inner,outer=case.models[1].invoke,case.models[0].invoke
+    state=dict(proposals=[],reviews=0,changed=False,proposal=None)
+    def choose(envelope,*args):
+        if envelope.output_contract['stage']=='inner_plan' and case.sends:
+            h=json.loads(envelope.request.history_context)
+            if state['proposal'] is None:
+                ref=next(i['ref'] for i in h['items'] if i['record_id']==case.app.state.executions[0].execution_id)
+                state['proposal']=dict(kind='intent_resolution',outcome='review',reason='This bounded deliverable needs the outer judgment.',evidence_refs=[ref],fact_ids=[],next_intent_candidates=[])
+            if len(state['proposals'])>=2 and not state['changed']:
+                state['changed']=True
+                if change=='observation':return dict(kind='http_request',method='GET',path_query='/new-observation',headers={},body='')
+                if change=='read':return dict(kind='history_query',query={})
+                if change=='working':return dict(kind='working_record',content='Read additional source lines; local assumption is now bounded.',evidence_refs=state['proposal']['evidence_refs'])
+                if change=='fact':return dict(kind='fact_candidate',content='The saved request returned the scoped recorded response.',reason='Direct original observation, distinct from the unresolved causal hypothesis.',evidence_refs=[h['evidence_sources'][0]['ref']],inferred=False)
+                if change=='proposal':state['proposal']['reason']='The deliverable now includes a complete discriminator and explicit uncertainty.'
+            state['proposals'].append(envelope.request.model_request_id)
+            return deepcopy(state['proposal'])
+        return inner(envelope,*args)
+    def review(envelope,*args):
+        if envelope.output_contract['stage']=='intent_evaluation':
+            state['reviews']+=1
+            assert state['reviews']<=2,'Repeated unchanged input should reuse the existing continue'
+            return dict(decision='continue' if state['reviews']==1 else 'inconclusive',
+                reason='One concrete original-scope check remains.' if state['reviews']==1 else 'Close the tested scope with its limits.',
+                evidence_refs=[i.ref for i in envelope.request.history])
+        return outer(envelope,*args)
+    case.models[1].invoke,case.models[0].invoke=choose,review
+    return state
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+@pytest.mark.parametrize('change',['observation','working','fact','proposal','read'])
+def test_identical_continuation_is_reused_but_new_material_is_reviewed(http_case,change):
+    c=http_case
+    state=install_repeated_resolution(c,change)
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required,result
+    assert state['reviews']==2 and len(state['proposals'])==3
+    assert c.app.state.intents[0].status.value=='inconclusive'
+    assert len([r for r in c.app.store.list_d8_tree_records(c.task) if r.kind=='evaluation_continued'])==1
+    reused=c.app.store.load_d3_operation(state['proposals'][1])
+    assert reused.application_ref is not None
+    record=next(r for r in c.app.sessions.records() if r.model_request_id==state['proposals'][1])
+    assert c.app.sessions.payload(record)['observation']['intent_review']['reused'] is True
+    assert len(c.sends)==(2 if change=='observation' else 1)
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    snapshot=snapshot_v3_task_result(c.directory,c.declaration)
+    assert not snapshot['errors'],snapshot
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+@pytest.mark.parametrize('boundary',['receipt','decision'])
+def test_reused_continuation_receipt_recovers_before_apply_and_detects_tampering(http_case,monkeypatch,boundary):
+    from test_chain_multi_turn import ProcessLoss
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    c=http_case
+    state=install_repeated_resolution(c)
+    mark=c.app.store.mark_d3_operation_applied
+    interrupted=[]
+    def lost(identity,reference):
+        if boundary=='receipt' and len(state['proposals'])==2 and identity==state['proposals'][1] and not interrupted:
+            interrupted.append(identity)
+            raise ProcessLoss('cached continuation receipt saved before application marker')
+        return mark(identity,reference)
+    monkeypatch.setattr(c.app.store,'mark_d3_operation_applied',lost)
+    save=c.app.sessions.evidence.save
+    def save_then_lost(kind,key,value):
+        result=save(kind,key,value)
+        if (boundary=='decision' and kind=='decision' and len(state['proposals'])==2
+                and value['metadata']['model_request_id']==state['proposals'][1] and not interrupted):
+            interrupted.append(state['proposals'][1])
+            raise ProcessLoss('cached decision file saved before session control commit')
+        return result
+    monkeypatch.setattr(c.app.sessions.evidence,'save',save_then_lost)
+    with pytest.raises(ProcessLoss):asyncio.run(c.app._run_once(c.token))
+    assert state['reviews']==1 and len(c.sends)==1
+    c.app.store.close();c.app=c.create()
+    c.app.run=c.app._run_once
+    result=asyncio.run(c.app.resume(c.task,c.token))
+    assert not result.recovery_required,result
+    assert state['reviews']==2 and len(state['proposals'])==3 and len(c.sends)==2
+    row=next(r for r in c.app.sessions.records() if r.model_request_id==interrupted[0])
+    operation=c.app.store.load_d3_operation(interrupted[0])
+    read=c.app.handoff.evidence.read
+    def changed(kind,key):
+        data=read(kind,key)
+        return {**data,'intent_id':'changed'} if kind=='decision' and key==operation.application_ref else data
+    monkeypatch.setattr(c.app.handoff.evidence,'read',changed)
+    with pytest.raises(D3RecoveryRequired,match='d22_continuation_reuse_changed'):
+        c.app.sessions.validate_record(row,c.app.state)
+
+
+
+def test_continuation_scope_tracks_material_and_authority_not_bookkeeping():
+    from types import SimpleNamespace as NS
+    from agent_core.intent_execution import continuation_scope
+    item=NS(intent_id='actor',record_id='observation',ref='source:v1',source_status='available',conflict=False,identity='trusted_state')
+    history=[item]
+    reviews=[]
+    epoch=['selection-1']
+    read_count=[0]
+    app=NS(state=NS(task_run=NS(task_run_id='task')),handoff=NS(history=lambda:history,read_count=lambda actor:read_count[0]),
+        store=NS(list_d3_review_applications=lambda task:reviews),supervision=NS(epoch=lambda actor:epoch[0]))
+    before=continuation_scope(app,'actor')
+    for prefix in ('tree/','decision/'):
+        history.append(NS(intent_id='actor',record_id=prefix+'bookkeeping',ref='new-progress',source_status='available',conflict=False,identity='trusted_state'))
+    assert continuation_scope(app,'actor')==before
+    reviews.append(NS(constraint_version=2))
+    assert continuation_scope(app,'actor')!=before
+    reviews.clear()
+    read_count[0]=1
+    assert continuation_scope(app,'actor')!=before
+    read_count[0]=0
+    epoch[0]='selection-2'
+    assert continuation_scope(app,'actor')!=before
+    epoch[0]='selection-1'
+    item.source_status='unavailable'
+    assert continuation_scope(app,'actor')!=before
+    item.source_status='available';item.ref='source:v2'
+    assert continuation_scope(app,'actor')!=before
+
+
+def test_new_strategy_stop_cannot_be_overridden_by_cached_continue(monkeypatch):
+    from types import SimpleNamespace as NS
+    import agent_core.intent_execution as execution
+    writes=[]
+    app=NS(config=NS(intent_execution_policy='continuous_v1'),_id=lambda key:key,
+        handoff=NS(evidence=NS(read=lambda *args:None,save=lambda *args:writes.append(args))),
+        sessions=NS(evidence=NS(read=lambda *args:{'request':{'history_context':json.dumps(
+            {'intent_execution':{'last_review':{'record_id':'old'}}})}})))
+    monkeypatch.setattr(execution,'stop_request',lambda *args:{'review_id':'new-supervision'})
+    assert not execution.reuse_continuation(app,'request','actor',None)
+    assert not writes

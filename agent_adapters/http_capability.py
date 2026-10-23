@@ -552,7 +552,7 @@ class HttpCapability:
                 or not isinstance(proposal,AttachmentPlanProposal) or frozen is None or contract is None
                 or digest(frozen['request']['context'])!=digest(asdict(context))
                 or digest(frozen['request'])!=contract['source_request_sha256']
-                or evidence.context_sha256!=frozen['request']['context_sha256']
+                or evidence.context_sha256!=frozen.get('context_sha256')
                 or evidence.base_checkpoint_sequence!=state.latest_checkpoint.sequence
                 or intent is None or intent.status.value!='running' or intent.turn_id!=binding.turn_id
                 or binding.task_run_id!=self.task.task_run_id or binding.attachment_index!=proposal.attachment_index

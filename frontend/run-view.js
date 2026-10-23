@@ -357,10 +357,16 @@ const RunView = (() => {
     if (progress.protocol_version === 3) {
       for (const candidate of progress.answer_candidates || []) {
         const item = node("article", undefined, "run-candidate");
-        item.append(node("strong", label(candidate.validation_state)), node("p", `候选 ${candidate.candidate_id}\n证据版本 ${candidate.evidence_version}\nExecution ${candidate.execution_id}`, "run-ref"));
-        if ([19, 20].includes(progress.contract_version) && candidate.validation_state === 'pending') item.append(node('p', '等待可信验证反馈；候选尚未被确认。', 'run-meta'));
+        item.append(node("strong", candidate.validation_state === "partial" ? "候选正确 · 整题未完成" : label(candidate.validation_state)), node("p", `候选 ${candidate.candidate_id}\n证据版本 ${candidate.evidence_version}\n来源 ${candidate.source_ref || candidate.execution_id}`, "run-ref"));
+        if ([19, 20, 21, 22].includes(progress.contract_version) && candidate.validation_state === 'pending') item.append(node('p', '等待可信验证反馈；候选尚未被确认。', 'run-meta'));
+        if (progress.competition && !live && candidate.validation_state === "pending") {
+          const button=node("button","提交此候选到比赛平台","secondary-button");button.type="button";
+          button.addEventListener("click",()=>{button.disabled=true;window.dispatchEvent(new CustomEvent("competition-submit",{detail:{challengeId:current.challengeId}}));});
+          item.append(button);
+        }
+        for (const feedback of candidate.feedback || []) if (feedback.correct_flag_count !== undefined) item.append(node("p",`平台 Flag 进度：${feedback.correct_flag_count} / ${feedback.total_flag_count}`,"run-meta"));
         for (const feedback of candidate.feedback || []) item.append(node("p", `${progress.mode === "simulated" ? "模拟反馈" : "反馈"}：${label(feedback.verdict)} · ${feedback.operation_id}`, "run-ref"));
-        if ([19, 20].includes(progress.contract_version) && !live && candidate.checkable_submission_ids?.length) {
+        if ([19, 20, 21, 22].includes(progress.contract_version) && !live && candidate.checkable_submission_ids?.length) {
           const submission = candidate.checkable_submission_ids[0];
           const pending = (progress.external_validation_checks || []).find((check) => check.candidate_id === candidate.candidate_id && check.evidence_version === candidate.evidence_version && check.submission_operation_id === submission && check.status === "started");
           const key = `${progress.task_run_id}/${candidate.candidate_id}/${candidate.evidence_version}/${submission}`;

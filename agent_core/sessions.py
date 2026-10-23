@@ -90,55 +90,80 @@ class IntentSessions:
             return request
         turn_id, intent_id = self._scope(request)
         saved = self.evidence.read("request", request.model_request_id)
+        cls = (D8SessionChangeRequest if isinstance(request, D8ChangeRequest)
+               else D8SessionConclusionRequest if isinstance(request, D8ModelRequest) else D8SessionExecutionRequest)
+        values = {f.name: getattr(request, f.name) for f in fields(request)
+                  if f.name not in {"session_id", "session_context"}}
         if saved is None:
             phase = "conclusion_repair" if isinstance(request, D8ChangeRequest) else "execution"
             _, _, current = self.app.handoff.select(phase, turn_id, intent_id)
-            messages = []
             records = self.records(intent_id)
             summary_record, summary = self.app.handoff._latest_summary()
             continuous = self.app.config.intent_execution_policy == "continuous_v1"
             compact = bool(self.app.config.intent_execution_policy and summary and summary_record.origin == "model_organized" and current["global_source_status"] == "available")
             segment_start = 1
+            payloads = {}
+            def payload_for(record):
+                if record.record_id not in payloads:
+                    payloads[record.record_id] = self.payload(record)
+                return payloads[record.record_id]
+
+            target_start = segment_start
             if continuous and records:
                 prior = self.evidence.read("request", records[-1].model_request_id)
                 previous = json.loads(prior["request"].get("session_context", "{}")) if prior else {}
-                segment_start = previous.get("segment_start", 1)
-                compact = compact and len(handoff_json([self.payload(r) for r in records if r.ordinal >= segment_start])) > self.app.handoff.capacity().capacity.visible_history
-                if compact:
-                    segment_start = max(segment_start, records[-4].ordinal if len(records) >= 4 else 1)
-            omitted = [r for r in records if r.ordinal < segment_start] if continuous else records[:-4] if compact else []
-            for record in ([r for r in records if r.ordinal >= segment_start] if continuous else records[-4:] if compact else records):
-                data = self.payload(record)
-                messages.append({"role": "user", "content": data["request"],
-                                 "identity": "historical_request_not_current_authorization"})
-                messages.append({"role": "assistant", "content": data["response"],
-                                 "identity": "historical_model_result_not_verified"})
-                messages.append({"role": "tool", "content": data["observation"],
-                                 "identity": "historical_execution_projection_not_current_approval"})
+                segment_start = target_start = previous.get("segment_start", 1) if compact else 1
+                # Only the summary's exact source versions can replace older dialog.
+                covered = {(i["record_id"], i["source_version"]) for i in summary.get("all_items", ())} if compact else set()
+                recent_start = records[-4].ordinal if len(records) >= 4 else 1
+                for record in records:
+                    if record.ordinal < segment_start:
+                        continue
+                    if record.ordinal >= recent_start or ("decision/" + record.record_id, conclusion_digest(asdict(record))) not in covered:
+                        break
+                    target_start = record.ordinal + 1
+                history_bytes = len(handoff_json([payload_for(r) for r in records if r.ordinal >= segment_start]).encode("utf-8"))
+                if history_bytes > self.app.handoff.capacity().capacity.visible_history:
+                    segment_start = target_start
             session_id = self._id("session/" + intent_id)
-            session_packet = {"messages": messages, "current_history": current,
-                                    "session_scope": "intent", "session_id": session_id,
-                                    "turn_id": turn_id, "intent_id": intent_id}
-            if continuous:
-                session_packet["segment_start"] = segment_start
-            if self.app.config.intent_execution_policy:
-                session_packet["working_record_policy"] = "unreviewed_v1"
-            if omitted:
-                decision_refs = {i.record_id: i.ref for i in self.app.handoff.history()}
-                session_packet["compaction"] = {"identity": "summary_and_recent_dialog_not_full_history",
-                    "summary_id": summary_record.record_id,
-                    "omitted_decision_refs": [decision_refs["decision/" + r.record_id] for r in omitted],
-                    "details_via": "history_query/history_details", "raw_decisions_retained": True}
-            context = handoff_json(session_packet)
+
+            def context_for(start):
+                omitted = [r for r in records if r.ordinal < start] if continuous else records[:-4] if compact else []
+                visible = [r for r in records if r.ordinal >= start] if continuous else records[-4:] if compact else records
+                messages = []
+                for record in visible:
+                    data = payload_for(record)
+                    messages.extend([
+                        {"role": "user", "content": data["request"], "identity": "historical_request_not_current_authorization"},
+                        {"role": "assistant", "content": data["response"], "identity": "historical_model_result_not_verified"},
+                        {"role": "tool", "content": data["observation"], "identity": "historical_execution_projection_not_current_approval"}])
+                packet = {"messages": messages, "current_history": current,
+                          "session_scope": "intent", "session_id": session_id,
+                          "turn_id": turn_id, "intent_id": intent_id}
+                if continuous:
+                    packet["segment_start"] = start
+                if self.app.config.intent_execution_policy:
+                    packet["working_record_policy"] = "unreviewed_v1"
+                if omitted:
+                    decision_refs = {i.record_id: i.ref for i in self.app.handoff.history()}
+                    packet["compaction"] = {"identity": "summary_and_recent_dialog_not_full_history",
+                        "summary_id": summary_record.record_id,
+                        "omitted_decision_refs": [decision_refs["decision/" + r.record_id] for r in omitted],
+                        "details_via": "history_query/history_details", "raw_decisions_retained": True}
+                return handoff_json(packet)
+
+            context = context_for(segment_start)
+            if continuous and target_start > segment_start:
+                draft = cls(**values, session_id=session_id, session_context=context)
+                if not self.app.handoff._fits_complete_request(draft, self.app.config.handoff_config.inner_capacity):
+                    # Preflight is read-only. Freeze/measurement happens only after
+                    # this one bounded compaction, never twice under the same ID.
+                    context = context_for(target_start)
         else:
             if saved["turn_id"] != turn_id or saved["intent_id"] != intent_id:
                 raise D3RecoveryRequired("d8_session_request_owner_changed")
             session_id = saved["request"]["session_id"]
             context = saved["request"]["session_context"]
-        cls = (D8SessionChangeRequest if isinstance(request, D8ChangeRequest)
-               else D8SessionConclusionRequest if isinstance(request, D8ModelRequest) else D8SessionExecutionRequest)
-        values = {f.name: getattr(request, f.name) for f in fields(request)
-                  if f.name not in {"session_id", "session_context"}}
         result = cls(**values, session_id=session_id, session_context=context)
         self.freeze(result)
         return result
@@ -153,6 +178,9 @@ class IntentSessions:
                     or (packet.get("turn_id"), packet.get("intent_id")) != (turn_id, intent_id)):
                 raise D3RecoveryRequired("d8_session_scope_changed")
             value = {"turn_id": turn_id, "intent_id": intent_id, "request": asdict(request)}
+            context_sha256 = getattr(request, "context_sha256", None)
+            if isinstance(context_sha256, str):
+                value["context_sha256"] = context_sha256
             self._safe(value)
             length = len(request.session_context) + len(getattr(request, "history_context", ""))
             capacity = self.app.handoff.capacity()
@@ -210,6 +238,9 @@ class IntentSessions:
                 tool_result = self.app.mcp.feedback(call.application_ref)
                 if tool_result is not None:
                     observed["mcp_tool_result"] = tool_result
+            if raw.get("kind") == "intent_resolution" and call.application_ref == self.app._id("continuation-reuse/" + call.start.operation_id):
+                from agent_core.intent_execution import validate_continuation_reuse
+                observed["intent_review"] = validate_continuation_reuse(self.app, call.start.operation_id)
             conclusion=next((r for r in self.store.list_d8_conclusions(call.start.task_run_id)
                 if r.plan_id is None and r.proposal_request_id==call.start.operation_id),None)
             if conclusion is not None:
@@ -239,6 +270,10 @@ class IntentSessions:
         root = request["request"].get("correction_of_model_request_id") or record.model_request_id if request else None
         signal = record.disposition == "review_requested"
         technical = record.disposition == "technical_failure"
+        if call is not None and call.application_ref == self.app._id("continuation-reuse/" + record.model_request_id):
+            from agent_core.intent_execution import validate_continuation_reuse
+            if data["observation"].get("intent_review") != validate_continuation_reuse(self.app, record.model_request_id):
+                raise D3RecoveryRequired("d22_continuation_reuse_changed")
         if technical and not self.app.conclusions.optional_ready(record.model_request_id):
             raise D3RecoveryRequired("d22_optional_failure_binding_changed")
         if (call is None or call.start.task_run_id != record.task_run_id or call.completion is None
@@ -290,6 +325,42 @@ class IntentSessions:
                 and (o.start.operation_id in executions
                      or o.start.resource_ref.startswith("mcp/" + intent_id + "/"))]
 
+    def consolidation_context(self, intent_id):
+        """One optional reminder per existing four-tool window; no new calls or Facts."""
+        if self.app.config.intent_execution_policy != "continuous_v1":
+            return None
+        previous = ()
+        for row in reversed(self.records(intent_id)):
+            saved = self.evidence.read("request", row.model_request_id)
+            context = json.loads(saved["request"].get("history_context", "{}") or "{}") if saved else {}
+            marker = context.get("knowledge_checkpoint")
+            if marker is not None:
+                previous = marker["execution_refs"]
+                break
+        refs = self.execution_refs(intent_id)
+        if len(set(refs) - set(previous)) < 4:
+            return None
+        return {"identity": "optional_phase_consolidation_not_stop_or_fact", "execution_refs": refs}
+
+    def handoff_progress(self, intent_id):
+        """Reference known progress rather than invent a summary after a model failure."""
+        rows = self.records(intent_id)[-4:]
+        for row in rows:
+            self.payload(row)
+        order = {ref: n for n, ref in enumerate(self.execution_refs(intent_id))}
+        sources = self.app.evidence_conclusions.catalog(intent_id)
+        sources.sort(key=lambda s: order.get(self.app.evidence_conclusions.source(s["ref"], intent_id)["source_ref"], -1))
+        return {"decision_refs": ["progress:decision/" + r.record_id + ":" + conclusion_digest(asdict(r)) for r in rows],
+                "evidence_sources": sources[-4:]}
+
+    def validate_handoff_progress(self, intent_id, progress):
+        refs = {"progress:decision/" + r.record_id + ":" + conclusion_digest(asdict(r)) for r in self.records(intent_id)}
+        if (set(progress) != {"decision_refs", "evidence_sources"}
+                or any(r not in refs for r in progress["decision_refs"])
+                or any(self.app.evidence_conclusions.source(s["ref"], intent_id)["version"] != s["version"]
+                       for s in progress["evidence_sources"])):
+            raise D3RecoveryRequired("d22_handoff_progress_source_changed")
+
     def due(self, intent_id):
         reviews = self.reviews(intent_id)
         rows = self.records(intent_id)
@@ -312,9 +383,9 @@ class IntentSessions:
             if data["request"]["stage"] != "inner_plan":
                 continue
             kind = data["response"].get("kind")
-            if kind in {"http_request", "mcp_call", "attachment_observation"} or "template" in data["response"]:
+            if kind in {"http_request", "http_request_saved", "mcp_call", "attachment_observation"} or "template" in data["response"]:
                 idle = 0
-            elif kind in {"working_record", "history_query", "history_details", "conclusion_change"}:
+            else:
                 idle += 1
         return idle >= 4
 

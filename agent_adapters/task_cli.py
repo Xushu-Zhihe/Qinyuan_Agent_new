@@ -194,12 +194,8 @@ def _dispatch_v3_run_task(args, raw):
         state="task_run_created",
         task_run_id=task_id,
     )
-    try:
-        result = _run_v3_simulated_operation(
-            directory, declaration, operation="start", events=args.events
-        )
-    except Exception as exc:  # noqa: BLE001 -- sanitized persisted run boundary
-        from agent_adapters.output_evidence import safe_failure_details
+
+    def _failure_phase():
         from agent_core.sqlite_control_store import SqliteControlStore
 
         started = None
@@ -212,7 +208,13 @@ def _dispatch_v3_run_task(args, raw):
                 started = False
         except Exception:
             pass  # Unknown state must not be reported as a confirmed startup failure.
-        phase = "execution" if started is True else "start" if started is False else "dispatch"
+        return "execution" if started is True else "start" if started is False else "dispatch"
+
+    def _record_failure(exc):
+        from agent_adapters.output_evidence import safe_failure_details
+        from agent_adapters.web.task_result import snapshot_v3_task_result
+
+        phase = _failure_phase()
         prefix = ("d8_real" if d8_real else "simulation" if "execution_profile" in raw
                   else "d7_simulation")
         error_code = f"{prefix}_{phase}_failed"
@@ -221,13 +223,30 @@ def _dispatch_v3_run_task(args, raw):
             directory / ("dispatch-stop-" + str(uuid4()) + ".json"),
             {"stop": "recovery_required", "reason": error_code, "diagnostic": failure},
         )
-        from agent_adapters.web.task_result import snapshot_v3_task_result
+        snapshot = snapshot_v3_task_result(directory, declaration)
+        snapshot.setdefault("errors", []).append(failure)
+        if not snapshot.get("recovery", {}).get("required"):
+            snapshot["recovery"] = {"required": True, "reason": error_code}
+        snapshot["recovery_status"] = "required"
+        return snapshot
 
-        result = snapshot_v3_task_result(directory, declaration)
-        result.setdefault("errors", []).append(failure)
-        if not result.get("recovery", {}).get("required"):
-            result["recovery"] = {"required": True, "reason": error_code}
-        result["recovery_status"] = "required"
+    try:
+        result = _run_v3_simulated_operation(
+            directory, declaration, operation="start", events=args.events
+        )
+    except Exception as exc:  # noqa: BLE001 -- sanitized persisted run boundary
+        # 启动阶段失败时控制数据库还没建，没有任何已记录状态会被重放，因此
+        # 重开一次是安全的：冷启动的容器引擎握手超时变成"多等一次"，而不是
+        # 丢掉整轮。数据库一旦落盘就不再重试，避免掩盖真实缺陷。
+        if (directory / "control.sqlite").is_file():
+            result = _record_failure(exc)
+        else:
+            try:
+                result = _run_v3_simulated_operation(
+                    directory, declaration, operation="start", events=args.events
+                )
+            except Exception as retry_exc:  # noqa: BLE001
+                result = _record_failure(retry_exc)
     result["request_id"] = request.request_id
     result["request_receipt"] = _safe_request_receipt(receipt)
     result["exit_code"] = _v3_run_operation_exit(result)
@@ -304,7 +323,7 @@ def _has_unresolved_external_validation(result: dict) -> bool:
         ):
             return True
         key = (candidate_id, evidence_version)
-        if candidate_states.get(key) not in {"accepted", "rejected"} or (
+        if candidate_states.get(key) not in {"accepted", "rejected", "partial"} or (
             candidate_id, evidence_version, operation_id
         ) in unresolved_unknowns:
             return True
@@ -329,7 +348,7 @@ def _has_unresolved_external_validation(result: dict) -> bool:
             ):
                 return True
             key = (candidate_id, evidence_version)
-            if candidate_states.get(key) not in {"accepted", "rejected"} or (
+            if candidate_states.get(key) not in {"accepted", "rejected", "partial"} or (
                 candidate_id, evidence_version, submission_operation_id
             ) in unresolved_unknowns:
                 return True
@@ -367,12 +386,16 @@ def _finish_event_export(exporter) -> tuple[int, str | None]:
 
 
 def _run_v3_simulated_operation(
-    directory: Path, declaration: dict, *, operation: str, events: str | None
+    directory: Path, declaration: dict, *, operation: str, events: str | None, competition_request=None
 ) -> dict:
     from agent_adapters.web.simulated_application import run_simulated_task
+    extra={}
+    if competition_request is not None:
+        from agent_adapters.simulation import run_simulated_task
+        extra["competition_request"]=competition_request
 
     if not events:
-        return run_simulated_task(directory, declaration, operation=operation)
+        return run_simulated_task(directory, declaration, operation=operation, **extra)
 
     from agent_adapters.event_export import EventExporter
 
@@ -394,7 +417,7 @@ def _run_v3_simulated_operation(
 
     try:
         result = run_simulated_task(directory, declaration, operation=operation,
-                                    finalize_export=finish_once)
+                                    finalize_export=finish_once, **extra)
     except BaseException:
         finish_once()
         raise
@@ -813,7 +836,49 @@ def dispatch_v3_existing(args, directory: Path, declaration: dict):
                 "events": events,
                 "next_sequence": events[-1]["sequence"] if events else args.after_sequence,
                 "exit_code": 0}
+    if args.command == "operator-control":
+        from agent_core.sqlite_control_store import SqliteControlStore
+        from agent_core.controller import TaskRunController
+        from agent_core.control_store import StorageError
+        import sqlite3
+        try:
+            with SqliteControlStore.open(directory/"control.sqlite") as store:
+                payload={} if args.seconds is None else {"seconds":args.seconds}
+                control=TaskRunController.submit_operator_control(store,task_id,args.operation_id,args.action,payload)
+            return {"protocol_version":3,"task_run_id":task_id,"operator_control":control,"exit_code":0}
+        except ValueError as error:
+            return {"protocol_version":3,"task_run_id":task_id,"errors":[{"code":str(error)}],"exit_code":2}
+        except (StorageError,sqlite3.Error,OSError):
+            return {"protocol_version":3,"task_run_id":task_id,"errors":[{"code":"operator_command_outcome_unknown"}],"exit_code":5}
     result = snapshot_v3_task_result(directory, declaration)
+    if args.command in {'competition-submit','competition-end'}:
+        try:
+            payload=parse_json(sys.stdin.buffer.read(16385),16384)
+            if not isinstance(payload,dict) or set(payload)!={"credential"} or not isinstance(payload["credential"],str):
+                raise ValueError("competition_credentials_invalid")
+            from agent_adapters.competition_submission import frozen_binding
+            binding=frozen_binding(args.binding_file,declaration)
+        except (ValueError, OSError):
+            result.setdefault("errors",[]).append({"code":"competition_submission_input_invalid"})
+            return operation_result(result,exit_code=2)
+        try:
+            return operation_result(_run_v3_simulated_operation(directory,declaration,operation=args.command,
+                events=getattr(args,"events",None),competition_request={"binding":binding,
+                "credential":payload["credential"],"operation_id":args.operation_id}))
+        except Exception as error:
+            from agent_adapters.output_evidence import safe_failure_details
+            from qinyuan_core import get_logger
+            trace=error.__traceback__
+            while trace is not None and trace.tb_next is not None:trace=trace.tb_next
+            get_logger("ctrl").error("competition.submission_failed",run=task_id,
+                category="recovery",code="competition_end_recovery_required" if args.command=="competition-end" else "competition_submission_recovery_required",
+                location={"module":trace.tb_frame.f_globals.get("__name__","unknown"),"line":trace.tb_lineno} if trace else None,
+                **safe_failure_details(error,include_chain=True))
+            result=snapshot_v3_task_result(directory,declaration)
+            failure_code="competition_end_recovery_required" if args.command=="competition-end" else "competition_submission_recovery_required"
+            result.setdefault("errors",[]).append({"code":failure_code})
+            result["recovery"]={"required":True,"reason":failure_code}
+            return operation_result(result,exit_code=5)
     if args.command == 'validation-check':
         from agent_adapters.validation_check import dispatch_check
         selection = {key: getattr(args, key) for key in

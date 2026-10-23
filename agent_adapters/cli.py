@@ -86,7 +86,7 @@ def parser():
     directory = candidate.add_mutually_exclusive_group(required=True)
     directory.add_argument("--state-dir")
     directory.add_argument("--run-dir")
-    for command in ("resume", "cancel", "cleanup", "status", "replay", "validation-check"):
+    for command in ("resume", "cancel", "cleanup", "status", "replay", "validation-check", "competition-submit", "competition-end", "operator-control"):
         item = commands.add_parser(command)
         if command == "status":
             selector = item.add_mutually_exclusive_group(required=True)
@@ -105,6 +105,14 @@ def parser():
             group.add_argument("--verify-import", action="store_true")
             item.add_argument("--events")
         elif command in {"cancel", "cleanup"}:
+            item.add_argument("--events")
+        elif command == "operator-control":
+            item.add_argument("--operation-id",required=True)
+            item.add_argument("--action",required=True,choices=("pause","resume","extend_question","extend_overall"))
+            item.add_argument("--seconds",type=int)
+        elif command in {"competition-submit","competition-end"}:
+            item.add_argument("--binding-file",required=True)
+            item.add_argument("--operation-id",required=True)
             item.add_argument("--events")
         elif command == 'validation-check':
             for field in ('candidate-id', 'evidence-version', 'submission-operation-id', 'query-id'):
@@ -860,7 +868,7 @@ def dispatch(args):
     protocol_version = _persisted_protocol_version(declaration)
     if declaration.get("task_run_id") != args.task_run_id:
         raise ValueError("run_identity_mismatch")
-    if args.command == 'validation-check' and protocol_version != 3:
+    if args.command in {'validation-check','competition-submit','competition-end','operator-control'} and protocol_version != 3:
         raise ValueError('d9_validation_check_profile_unsupported')
     if protocol_version == 2:
         from agent_adapters.task_cli import dispatch_existing
@@ -952,51 +960,62 @@ def main(argv=None):
         console=bool(os.environ.get("QY_LOG_CONSOLE")),
         jsonl=os.environ.get("QY_LOG_JSONL"),
     )
-    try:
-        result = dispatch(parser().parse_args(argv))
-        if result is None:
-            return 0
-    except KeyboardInterrupt:
-        from agent_adapters.application import base_result
+    from contextlib import ExitStack
+    with ExitStack() as ownership:
+        try:
+            args=parser().parse_args(argv)
+            root=None
+            if args.command=="run-task":root=Path(args.state_dir).resolve().parent
+            elif args.command in {"resume","cancel","cleanup","competition-submit","competition-end"}:
+                root=_existing_task_directory(args).parent.parent
+            if root is not None:
+                binding=root/"competition-binding.json"
+                if binding.is_file() and "schedule" in immutable_read(binding):
+                    ownership.enter_context(run_lock(root,lock_name="worker.lock"))
+            result = dispatch(args)
+            if result is None:
+                return 0
+        except KeyboardInterrupt:
+            from agent_adapters.application import base_result
 
-        result = base_result()
-        result["errors"].append({"code": "interrupted_before_run_started"})
-    except Exception as exc:  # noqa: BLE001 -- sanitized CLI/process boundary
-        category, code, retryable = classify(exc)
-        get_logger("ctrl").error(
-            "cli.unhandled",
-            code=code,
-            category=str(category),
-            retryable=retryable,
-            exc=type(exc).__name__,
-        )
-        from agent_adapters.application import base_result, safe_error
-
-        from agent_adapters.protected_evidence import ProtectedEvidenceError
-        from agent_adapters.web.candidate_evidence import D7CandidateEvidenceError
-        from agent_adapters.web.candidate_operator_view import (
-            D7CandidateOperatorViewError,
-        )
-
-        if isinstance(exc, ProtectedEvidenceError):
             result = base_result()
-            result.update(exit_code=2, errors=[{"code": exc.code}])
-        elif isinstance(exc, (D7CandidateEvidenceError, D7CandidateOperatorViewError)):
-            result = base_result()
-            result.update(exit_code=2, errors=[{"code": exc.code}])
-        elif isinstance(exc, (ValueError, OSError)):
-            result = base_result()
-            code = (
-                str(exc)
-                if isinstance(exc, ValueError)
-                and str(exc).replace("_", "").isalnum()
-                and len(str(exc)) <= 80
-                else "input_or_configuration_rejected"
+            result["errors"].append({"code": "interrupted_before_run_started"})
+        except Exception as exc:  # noqa: BLE001 -- sanitized CLI/process boundary
+            category, code, retryable = classify(exc)
+            get_logger("ctrl").error(
+                "cli.unhandled",
+                code=code,
+                category=str(category),
+                retryable=retryable,
+                exc=type(exc).__name__,
             )
-            result.update(exit_code=2, errors=[{"code": code}])
-        else:
-            result = base_result()
-            result["errors"].append(safe_error(exc))
-    sys.stdout.write(encode(result).decode("ascii") + "\n")
-    sys.stdout.flush()
-    return result["exit_code"]
+            from agent_adapters.application import base_result, safe_error
+
+            from agent_adapters.protected_evidence import ProtectedEvidenceError
+            from agent_adapters.web.candidate_evidence import D7CandidateEvidenceError
+            from agent_adapters.web.candidate_operator_view import (
+                D7CandidateOperatorViewError,
+            )
+
+            if isinstance(exc, ProtectedEvidenceError):
+                result = base_result()
+                result.update(exit_code=2, errors=[{"code": exc.code}])
+            elif isinstance(exc, (D7CandidateEvidenceError, D7CandidateOperatorViewError)):
+                result = base_result()
+                result.update(exit_code=2, errors=[{"code": exc.code}])
+            elif isinstance(exc, (ValueError, OSError)):
+                result = base_result()
+                code = (
+                    str(exc)
+                    if isinstance(exc, ValueError)
+                    and str(exc).replace("_", "").isalnum()
+                    and len(str(exc)) <= 80
+                    else "input_or_configuration_rejected"
+                )
+                result.update(exit_code=2, errors=[{"code": code}])
+            else:
+                result = base_result()
+                result["errors"].append(safe_error(exc))
+        sys.stdout.write(encode(result).decode("ascii") + "\n")
+        sys.stdout.flush()
+        return result["exit_code"]

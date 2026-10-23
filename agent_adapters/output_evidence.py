@@ -37,6 +37,7 @@ SAFE_HTTP_ERROR_CODES = frozenset({
 SAFE_MODEL_ERROR_CODES = SAFE_HTTP_ERROR_CODES | frozenset({
     "d3_review_provider_failure", "d3_review_call_outcome_unknown", "d4_review_dispatch_stopped",
     "d3_model_call_outcome_unknown", "d3_model_call_interrupted", "d22_strategy_result_processing_failed",
+    "d22_handoff_progress_source_changed",
     "d8_output_cancelled_call_binding_changed", "d8_output_interruption_binding_changed", "d8_output_model_audit_changed",
     "d8_model_context_rejected", "d8_provider_envelope_invalid", "provider_envelope_invalid",
     "provider_content_invalid", "provider_refused", "d8_transport_outcome_unknown",

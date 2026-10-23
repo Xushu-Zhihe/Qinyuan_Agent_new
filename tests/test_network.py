@@ -216,3 +216,47 @@ def test_explicit_cleanup_recognizes_new_and_existing_names(tmp_path, monkeypatc
         assert deleted == [directory.resolve()]  # No actual directory deletion in this test.
     finally:
         db.close()
+
+
+def test_private_target_needs_runtime_capability_and_updated_forwarder_image():
+    adapter,networks,containers=network()
+    url="http://10.0.1.5:8080"
+    with pytest.raises(TargetAddressError,match="non_public_target"):adapter.create(str(uuid4()),url)
+    adapter.allow_private_ipv4=True
+    adapter.client.images.get=lambda name:SimpleNamespace(id="a"*64,labels={})
+    with pytest.raises(T6TargetNetworkError) as error:adapter.create(str(uuid4()),url)
+    assert error.value.code=="forwarder_private_support_missing"
+    assert networks.calls==0 and containers.calls==0
+
+
+def test_private_forwarder_create_and_rebind_keep_exact_command_and_isolation():
+    from dataclasses import replace
+    from Sandbox.target_network import PRIVATE_IPV4_LABEL
+    adapter,networks,containers=network();adapter.allow_private_ipv4=True
+    adapter.client.images.get=lambda name:SimpleNamespace(id="a"*64,labels={PRIVATE_IPV4_LABEL:"rfc1918"})
+    make_network=networks.create;make_container=containers.create
+    def create_network(*args,**kwargs):
+        resource=make_network(*args,**kwargs);resource.attrs["Internal"]=kwargs.get("internal",False)
+        resource.connect=lambda container,aliases:container.attrs["NetworkSettings"]["Networks"].update({resource.name:{"Aliases":aliases}})
+        return resource
+    def create_container(**kwargs):
+        resource=make_container(**kwargs)
+        resource.attrs.update(Image=kwargs["image"],Config={"Labels":kwargs["labels"],"Cmd":kwargs["command"],"User":kwargs["user"]},
+            HostConfig={"NetworkMode":kwargs["network"],"ReadonlyRootfs":kwargs["read_only"],"CapDrop":kwargs["cap_drop"],"SecurityOpt":kwargs["security_opt"]},
+            NetworkSettings={"Networks":{kwargs["network"]:{"Aliases":[]}}})
+        resource.start=lambda:setattr(resource,"status","running")
+        return resource
+    networks.create=create_network;containers.create=create_container
+    task=str(uuid4());url="http://10.0.1.5:8080"
+    binding=adapter.create(task,url)
+    proxy=containers.get(binding.forwarder_id)
+    assert binding.target_url==url and proxy.attrs["Config"]["Cmd"]==["--allow-private-ipv4",url]
+    assert networks.get(binding.private_network_id).attrs["Internal"] is True
+    assert proxy.attrs["HostConfig"]["NetworkMode"]==adapter._egress_name(task)
+    assert set(proxy.attrs["NetworkSettings"]["Networks"])=={adapter.private_name(task),adapter._egress_name(task)}
+    recovered=T6TargetNetwork(adapter.runtime,allow_private_ipv4=True)
+    recovered.bind(task,binding,terminal=False)
+    with pytest.raises(T6TargetNetworkError):T6TargetNetwork(adapter.runtime).bind(task,binding,terminal=False)
+    with pytest.raises(T6TargetNetworkError):recovered.bind(task,replace(binding,target_url="http://10.0.1.5:8081"),terminal=False)
+    proxy.attrs["Config"]["Cmd"]=[url]
+    with pytest.raises(T6TargetNetworkError):recovered.bind(task,binding,terminal=False)

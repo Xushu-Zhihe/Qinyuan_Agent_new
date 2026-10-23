@@ -108,7 +108,7 @@ class HandoffContext:
         self._commit("append_d8_capacity", new)
         return new
 
-    def _pause(self, kind, required, current, needed, omitted=()):
+    def _pause(self, kind, required, current, needed, omitted=(), *, reason=None):
         self.pause_report = {"kind": kind, "required_refs": list(required),
                              "current_capacity": current, "known_needed": needed,
                              "unknown_needed": needed is None, "unit": "unicode_codepoints",
@@ -118,9 +118,10 @@ class HandoffContext:
             measured = getattr(self.capacity_port, "last_measurement", None)
             if measured is not None:
                 self.pause_report["input_measurement"] = measured
+                self.pause_report["unit"] = measured.get("estimate_unit", self.pause_report["unit"])
         identity = self._id("pause/" + conclusion_digest(self.pause_report))
         self.evidence.save("pause", identity, self.pause_report)
-        raise D3RecoveryRequired("d8_context_paused:" + kind)
+        raise D3RecoveryRequired(reason or "d8_context_paused:" + kind)
 
     def history(self, *, apply_revisions=True):
         state, items = self.state, []
@@ -248,6 +249,13 @@ class HandoffContext:
             if record.turn_id not in turns:
                 continue
             owner_intent = record.intent_id if record.intent_id in intents and intents[record.intent_id].turn_id == record.turn_id else None
+            if record.kind in {"suspended", "strategy_yielded"} and self.app.sessions is not None:
+                note = self.evidence.read("pause" if record.kind == "suspended" else "strategy-yield", record.record_id)
+                if note is not None and "progress" in note:
+                    self.app.sessions.validate_handoff_progress(owner_intent, note["progress"])
+                    add("handoff/" + record.record_id, "progress", record.turn_id, owner_intent, None,
+                        handoff_json(note), tuple(note["progress"]["decision_refs"]),
+                        {"record": asdict(record), "note": note}, "unreviewed_intent_handoff_not_fact")
             content = {"kind": record.kind, "support_fact_id": record.support_fact_id,
                        "local_goal_decision_is_not_a_fact": True}
             if record.kind == "selection":
@@ -294,7 +302,8 @@ class HandoffContext:
                     candidate.source_ref, handoff_json({'kind': 'answer_feedback',
                         'candidate_id': candidate.candidate_id, 'verdict': feedback.verdict,
                         'operation_id': feedback.operation_id, 'source_ref': feedback.source_ref,
-                        'evidence_version': candidate.evidence_version}),
+                        'evidence_version': candidate.evidence_version,
+                        **(self.app.competition_feedback_port(feedback) if getattr(self.app,'competition_feedback_port',None) else {})}),
                     (candidate.source_ref,) if candidate.execution_id is None else (candidate.execution_id,), asdict(feedback),
                     'trusted_final_answer_feedback_not_local_goal_verdict', conflict=projection == 'conflict')
         if apply_revisions and self.app.revisions is not None:
@@ -403,6 +412,19 @@ class HandoffContext:
                 review_refs = set((*stop["evidence_refs"], *stop["new_evidence_refs"]))
                 required.update(i.ref for i in items if i.ref in review_refs
                     and not (i.record_type == "intent" and i.turn_id == turn_id and i.record_id != intent_id))
+        if phase == "execution" and intent_id and self.app.config.intent_execution_policy == "continuous_v1":
+            # Durable model-authored reading indexes remain unreviewed, but must
+            # not disappear solely because newer dialog displaced their window.
+            required.update(i.ref for i in items if i.intent_id == intent_id and i.identity == "unreviewed_working_record")
+            from agent_core.intent_execution import last_continuation
+            previous_review = last_continuation(self.app, intent_id)
+            if previous_review is not None:
+                required.update(i.ref for i in items if i.record_id == "tree/" + previous_review.record_id)
+        if phase == "execution" and intent_id:
+            handoffs = [i for i in items if i.identity == "unreviewed_intent_handoff_not_fact"
+                        and i.turn_id == turn_id]
+            own = [i for i in handoffs if i.intent_id == intent_id]
+            required.update(i.ref for i in [*handoffs[-1:], *own[-1:]])
         evaluation = None
         by_ref = {i.ref: i for i in items}
         by_id = {i.record_id: i for i in items}
@@ -529,6 +551,12 @@ class HandoffContext:
             if evaluation is not None:
                 result['s4_evaluation_policy'] = {**evaluation,
                     'history_sha256': digest([asdict(i) for i in chosen])}
+            if self.app.config.intent_execution_policy == "continuous_v1" and intent_id and phase == "execution":
+                result["progress_rule"] = ("Repeated end applications and conclusion proposals are internal work, not "
+                    "automatic progress. Compare actual evidence/deliverable gain and whether the next action can "
+                    "distinguish the hypothesis under recorded observation limits. Consult preserved reading indexes "
+                    "and original refs before calling a source unread; an unreviewed index is not evidence. "
+                    "A useful sibling remains optional; absence of new requests or Facts alone never proves failure.")
             if self.app.config.intent_execution_policy:
                 result["unresolved_conclusions"] = [i.visible() for i in items if i.conflict]
                 result["intent_execution_policy"] = "rolling_v1"
@@ -1482,6 +1510,10 @@ class HandoffContext:
                 packet["intent_execution"] = execution_context(self.app, intent_id)
             if self.app.evidence_conclusions is not None and request.stage=="inner_plan":
                 packet["evidence_sources"]=self.app.evidence_conclusions.catalog(intent_id)
+                if packet["evidence_sources"] and self.app.sessions is not None:
+                    marker = self.app.sessions.consolidation_context(intent_id)
+                    if marker is not None and not packet.get("intent_execution", {}).get("stop_requested"):
+                        packet["knowledge_checkpoint"] = marker
             if self.app.mcp is not None and request.stage == "inner_plan":
                 from agent_adapters.mcp_plan_executor import compact_tools
                 packet["mcp_tools"] = compact_tools(self.app.mcp.tools)

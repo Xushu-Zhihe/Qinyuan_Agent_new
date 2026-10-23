@@ -81,8 +81,8 @@ def run_path(root: Path, task_id: str):
 
 
 @contextmanager
-def run_lock(directory: Path):
-    stream = (directory / "operation.lock").open("a+b")
+def run_lock(directory: Path, *, lock_name="operation.lock"):
+    stream = (directory / lock_name).open("a+b")
     try:
         stream.seek(0)
         if os.name == "nt":

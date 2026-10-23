@@ -47,19 +47,19 @@ def canonical_id(value: str) -> str:
     return value
 
 
-def endpoint(value: str) -> str:
+def endpoint(value: str, *, allow_private_ipv4=False) -> str:
     if not isinstance(value, str) or not value or len(value) > 2048:
         raise WorkbenchError("endpoint_required")
     from Sandbox.target_address import TargetAddress, TargetAddressError
 
     try:
-        TargetAddress.from_url(value)
+        TargetAddress.from_url(value,allow_private_ipv4=allow_private_ipv4)
     except TargetAddressError as exc:
         raise WorkbenchError("invalid_endpoint") from exc
     return value
 
 
-def challenge_fields(value: object) -> tuple[str, str, str, str, int, int]:
+def challenge_fields(value: object, *, allow_private_ipv4=False) -> tuple[str, str, str, str, int, int]:
     required = {"title", "category", "description", "deadline_minutes", "step_timeout_seconds"}
     if not isinstance(value, dict) or not required <= value.keys() or value.keys() - required - {"endpoint", "http_methods"}:
         raise WorkbenchError("invalid_challenge_fields")
@@ -72,7 +72,7 @@ def challenge_fields(value: object) -> tuple[str, str, str, str, int, int]:
         raise WorkbenchError("invalid_description")
     target = value.get("endpoint")
     if target is not None and target != "":
-        target = endpoint(target)
+        target = endpoint(target,allow_private_ipv4=allow_private_ipv4)
     else:
         target = ""
     deadline, step_timeout = value["deadline_minutes"], value["step_timeout_seconds"]
@@ -185,6 +185,8 @@ class Workbench:
         self.runner = Runner(self)
         from agent_adapters.competition import CompetitionConnections
         self.competitions = CompetitionConnections(self)
+        from agent_adapters.competition_schedule import CompetitionSchedules
+        self.schedules = CompetitionSchedules(self)
 
     @staticmethod
     def error(code, status=HTTPStatus.BAD_REQUEST):
@@ -330,7 +332,7 @@ class Workbench:
             return self._get(db, challenge_id)
 
     def create(self, value):
-        title, category, description, target, deadline, step_timeout = challenge_fields(value)
+        title, category, description, target, deadline, step_timeout = challenge_fields(value,allow_private_ipv4=self.protocol_version == 3 and self.execution_profile == "d8_v22")
         methods = http_methods(value.get('http_methods', ['GET', 'HEAD', 'OPTIONS']))
         if 'http_methods' in value and self.execution_profile not in {'d8_v20','d8_v21','d8_v22'}:
             raise WorkbenchError('http_methods_profile_unsupported')
@@ -345,7 +347,7 @@ class Workbench:
             return self._get(db, challenge_id)
 
     def update(self, challenge_id, value):
-        title, category, description, target, deadline, step_timeout = challenge_fields(value)
+        title, category, description, target, deadline, step_timeout = challenge_fields(value,allow_private_ipv4=self.protocol_version == 3 and self.execution_profile == "d8_v22")
         with self.lock, self._db() as db:
             current = self._get(db, challenge_id)
             methods = http_methods(value.get('http_methods', current.get('http_methods', ['GET', 'HEAD', 'OPTIONS'])))
@@ -621,6 +623,18 @@ class Handler(BaseHTTPRequestHandler):
                    if self.server.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"} else {}),
             }})
             return
+        if parts == ["api", "competition", "sessions"]:
+            service=self.server.workbench.schedules
+            if self.command=="GET":self._send(HTTPStatus.OK,[service.project(row) for row in service.rows()])
+            elif self.command=="POST":self._send(HTTPStatus.CREATED,service.start(self._json()))
+            else:raise WorkbenchError("method_not_allowed",HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+        if len(parts) in {4,5} and parts[:3]==["api","competition","sessions"]:
+            identity=canonical_id(parts[3]);service=self.server.workbench.schedules
+            if len(parts)==4 and self.command=="GET":self._send(HTTPStatus.OK,service.project(service.get(identity)))
+            elif len(parts)==5 and parts[4]=="control" and self.command=="POST":self._send(HTTPStatus.OK,service.command(identity,self._json()))
+            else:raise WorkbenchError("method_not_allowed",HTTPStatus.METHOD_NOT_ALLOWED)
+            return
         if parts == ["api", "competition", "profiles"]:
             if self.command == "GET":
                 self._send(HTTPStatus.OK, self.server.workbench.competitions.list())
@@ -638,6 +652,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) == 5 and parts[4] == "check" and self.command == "POST":
                 if self._json():raise WorkbenchError("competition_check_fields_invalid")
                 self._send(HTTPStatus.OK, service.check(identity))
+            elif len(parts) == 5 and parts[4] == "import" and self.command == "POST":
+                self._send(HTTPStatus.CREATED,service.import_question(identity,self._json()))
             else:raise WorkbenchError("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
             return
         if parts == ["api", "model"]:
@@ -719,6 +735,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise WorkbenchError('d9_resume_input_invalid') from exc
                 self._send(HTTPStatus.ACCEPTED, result)
                 return
+            if len(parts) == 4 and parts[3] == "competition-submit" and self.command == "POST":
+                if self._json():raise WorkbenchError("competition_submit_fields_invalid")
+                self._send(HTTPStatus.ACCEPTED,workbench.runner.competition_submit(challenge_id))
+                return
             if len(parts) == 4 and parts[3] == 'validation-check' and self.command == 'POST':
                 try:
                     result = workbench.runner.validation_check(challenge_id, self._json())
@@ -786,6 +806,7 @@ class WorkbenchServer(ThreadingHTTPServer):
     def server_close(self):
         # A workbench owns the child processes it started.  Stop them before
         # releasing the listening socket so a restart cannot orphan a run.
+        self.workbench.schedules.shutdown()
         self.workbench.runner.shutdown()
         super().server_close()
 

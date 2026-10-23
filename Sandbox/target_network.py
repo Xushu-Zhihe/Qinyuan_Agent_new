@@ -9,9 +9,10 @@ from uuid import UUID
 from docker.errors import APIError, NotFound
 
 from agent_core.control_store import TargetNetworkBinding
-from Sandbox.target_address import TargetAddress
+from Sandbox.target_address import TargetAddress, is_rfc1918_ipv4
 
 FORWARDER_IMAGE = "qinyuan/t6-target-forwarder:0.1.0"
+PRIVATE_IPV4_LABEL = "qinyuan.target.private_ipv4"
 
 
 class T6TargetNetworkError(RuntimeError):
@@ -37,7 +38,8 @@ def docker_error_code(error):
 
 
 class T6TargetNetwork:
-    def __init__(self, runtime) -> None:
+    def __init__(self, runtime, *, allow_private_ipv4: bool = False) -> None:
+        self.allow_private_ipv4 = allow_private_ipv4
         self.runtime = runtime
         self.client = runtime.client
         self._attempted: set[str] = set()
@@ -66,8 +68,15 @@ class T6TargetNetwork:
             "qinyuan.task_run_id": task_run_id,
         }
 
-    def _image_id(self) -> str:
-        return str(self.client.images.get(FORWARDER_IMAGE).id)
+    def _image_id(self, *, require_private_ipv4=False) -> str:
+        image = self.client.images.get(FORWARDER_IMAGE)
+        if require_private_ipv4 and (image.labels or {}).get(PRIVATE_IPV4_LABEL) != "rfc1918":
+            raise T6TargetNetworkError("create", "unsupported_image", (), code="forwarder_private_support_missing")
+        return str(image.id)
+
+    def _command(self, target_url):
+        target = TargetAddress.from_url(target_url, allow_private_ipv4=self.allow_private_ipv4)
+        return ["--allow-private-ipv4", target_url] if is_rfc1918_ipv4(target.literal_ip) else [target_url]
 
     def _fingerprint(self, task_run_id: str, target_url: str) -> str:
         value = {
@@ -119,7 +128,9 @@ class T6TargetNetwork:
 
     def create(self, task_run_id: str, target_url: str) -> TargetNetworkBinding:
         self._task_id(task_run_id)
-        TargetAddress.from_url(target_url)
+        command = self._command(target_url)
+        if len(command) == 2:
+            self._image_id(require_private_ipv4=True)
         if task_run_id in self._attempted:
             raise T6TargetNetworkError("create", "already_attempted", ())
         self._attempted.add(task_run_id)
@@ -147,7 +158,7 @@ class T6TargetNetwork:
             )
             proxy = self.client.containers.create(
                 image=image_id,
-                command=[target_url],
+                command=command,
                 network=external.name,
                 name="Ayui-forwarder-" + task_run_id,
                 labels=labels,
@@ -225,7 +236,7 @@ class T6TargetNetwork:
                 proxy.status != "running"
                 or any((config.get("Labels") or {}).get(k) != v for k, v in labels.items())
                 or proxy.attrs.get("Image") != self._image_id()
-                or config.get("Cmd") != [binding.target_url]
+                or config.get("Cmd") != self._command(binding.target_url)
                 or config.get("User") != "10001:10001"
                 or host.get("ReadonlyRootfs") is not True
                 or host.get("CapDrop") != ["ALL"]

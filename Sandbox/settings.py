@@ -101,8 +101,9 @@ class SandboxSettings:
 
     maximum_timeout_seconds: int = 300
 
-    # Docker 初始化连接应快速失败，避免 Docker Desktop 异常时等待很久。
-    docker_connect_timeout_seconds: int = 10
+    # Docker 初始化连接要留出冷启动余量：容器引擎刚唤醒时，首次
+    # /version 握手可能超过十秒，太短会让整轮在启动阶段直接失败。
+    docker_connect_timeout_seconds: int = 20
 
     # 镜像、网络和容器生命周期操作必须快速失败。长时间运行的命令
     # 使用独立的流客户端，不得把控制面的超时一并放大。
@@ -147,7 +148,7 @@ class SandboxSettings:
             ).strip(),
             docker_connect_timeout_seconds=_configured_positive_int(
                 "QINYUAN_DOCKER_CONNECT_TIMEOUT_SECONDS",
-                10,
+                20,
             ),
             docker_control_timeout_seconds=_configured_positive_int(
                 "QINYUAN_DOCKER_CONTROL_TIMEOUT_SECONDS",

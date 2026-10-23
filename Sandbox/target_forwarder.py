@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import select
 import socket
@@ -44,13 +45,19 @@ def serve_connection(
             except TargetAddressError as exc:
                 emit("target_rejected", reason=exc.code)
                 return
+            failures = set()
             for address in addresses:
                 upstream = None
                 try:
                     upstream = socket.socket(address.family, socket.SOCK_STREAM)
                     upstream.settimeout(5)
                     upstream.connect(address.sockaddr)
-                except OSError:
+                except OSError as error:
+                    code = ("target_connect_timeout" if isinstance(error, TimeoutError) else
+                            "target_connection_refused" if error.errno == errno.ECONNREFUSED else
+                            "target_network_unreachable" if error.errno in {errno.ENETUNREACH, errno.EHOSTUNREACH} else
+                            "target_connect_failed")
+                    failures.add(code)
                     if upstream is not None:
                         upstream.close()
                     continue
@@ -58,18 +65,23 @@ def serve_connection(
                     emit("target_connected", ip=address.ip, port=address.port)
                     relay(client, upstream)
                 return
-            emit("target_connection_failed")
+            emit("target_connection_failed", reasons=sorted(failures))
     except OSError:
-        emit("target_connection_failed")
+        emit("target_relay_failed")
     finally:
         limit.release()
 
 
+def target_from_arguments(arguments):
+    private = len(arguments) == 2 and arguments[0] == "--allow-private-ipv4"
+    if not private and len(arguments) != 1:
+        raise TargetAddressError("invalid_target_arguments")
+    return TargetAddress.from_url(arguments[-1], allow_private_ipv4=private)
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
-        return 2
     try:
-        target = TargetAddress.from_url(sys.argv[1])
+        target = target_from_arguments(sys.argv[1:])
     except TargetAddressError:
         return 2
     family = socket.AF_INET

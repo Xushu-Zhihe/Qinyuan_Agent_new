@@ -271,7 +271,7 @@ class _LifecycleModel:
         raise ValueError("d8_lifecycle_model_dispatch_forbidden")
 
 
-def run_simulated_task(directory, declaration, *, operation="start", validation_selection=None, validation_checker=None, finalize_export=None):
+def run_simulated_task(directory, declaration, *, operation="start", validation_selection=None, validation_checker=None, finalize_export=None, competition_request=None):
     from agent_adapters.web.task_result import snapshot_v3_task_result
     from agent_adapters.web.request_staging import D7RequestStager
 
@@ -309,7 +309,8 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
             if config.web_authorization is not None:
                 from agent_adapters.target_network_cleanup import RecordedTargetNetwork
                 from Sandbox.target_network import T6TargetNetwork
-                target_network = RecordedTargetNetwork(T6TargetNetwork(resources._runtime), directory)
+                target_network = RecordedTargetNetwork(T6TargetNetwork(resources._runtime,
+                    allow_private_ipv4=config.contract_version == 22), directory)
     try:
         app = D3Application(
             directory, config=config, sandbox=RecordedSandbox(resources, directory) if resources else sandbox,
@@ -325,7 +326,14 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
             resources.close()
         raise
     task_id, token = declaration["task_run_id"], _Token(directory)
+    from agent_core import operator_controls
+    if operator_controls.current(app.store,task_id) is not None:operator_controls.enable(app.controller)
+    pause_file=directory.parent.parent/"operator-pause-request.json"
+    app.store.operator_pause_probe=lambda:pause_file.exists()
     report = None
+    competition_result = None
+    from agent_adapters.competition_submission import feedback_progress
+    app.competition_feedback_port=lambda feedback: feedback_progress(directory,feedback)
     check_record = None
     writer_closed = False
 
@@ -358,10 +366,38 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
             if link.enabled(task_id):
                 app.mcp = link
         if operation == "start":
-            app.start(_d3_request(declaration), directory, task_run_id=task_id)
+            from agent_adapters.run_files import run_lock,immutable_read
+            controls_dir=directory.parent.parent/"operator-start-controls";controls_dir.mkdir(exist_ok=True)
+            with run_lock(controls_dir):
+                task_request=_d3_request(declaration)
+                binding_file=directory.parent.parent / "competition-binding.json"
+                if binding_file.is_file():
+                    from agent_adapters.competition_submission import frozen_binding
+                    frozen=frozen_binding(binding_file,declaration)
+                    caps=[value for value in (frozen["platform_deadline_at"],frozen.get("schedule",{}).get("overall_deadline_at")) if value is not None]
+                    if caps:
+                        remaining=int(min(caps)-time.time())
+                        if remaining<1:raise ValueError("competition_question_not_active")
+                        task_request=replace(task_request,deadline_seconds=min(task_request.deadline_seconds,remaining))
+                app.start(task_request, directory, task_run_id=task_id)
+                if binding_file.is_file() and "schedule" in frozen:
+                    app.controller.submit_operator_control(app.store,task_id,declaration["request_id"],"configure",{
+                        "question_seconds":frozen["schedule"]["question_seconds"],
+                        "overall_deadline_at":frozen["schedule"]["overall_deadline_at"],"platform_deadline_at":frozen["platform_deadline_at"],
+                        "overall_ceiling_at":frozen["schedule"].get("overall_ceiling_at")})
+                    operator_controls.enable(app.controller)
+                    queued=sorted((immutable_read(path) for path in controls_dir.glob("*.json")),key=lambda item:(item["requested_at"],item["request"]["operation_id"]))
+                    for entry in queued:
+                        command=entry["request"]
+                        if command["request_id"]!=declaration["request_id"]:raise ValueError("operator_start_scope_invalid")
+                        app.controller.submit_operator_control(app.store,task_id,command["operation_id"],command["action"],command["payload"])
+                    if pause_file.is_file():
+                        command=immutable_read(pause_file)
+                        if command["request_id"]!=declaration["request_id"]:raise ValueError("operator_start_scope_invalid")
+                        app.controller.submit_operator_control(app.store,task_id,command["operation_id"],"pause",{})
             if declaration["mode"] == "real":
-                outer.bind_runtime(token, app.state.task_run.deadline_at)
-                inner.bind_runtime(token, app.state.task_run.deadline_at)
+                outer.bind_runtime(token, lambda: app.state.task_run.deadline_at)
+                inner.bind_runtime(token, lambda: app.state.task_run.deadline_at)
             if not declaration.get("staged_attachment_paths") and config.web_authorization is None:
                 app.controller.conclude(TaskRunStatus.INCONCLUSIVE, str(uuid4()),
                                         reason="single_intent_slice_finished")
@@ -373,13 +409,26 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
                 rows = app.store.load_control_state_rows(task_id)
                 if rows is None:
                     raise ValueError("d8_runtime_state_unavailable")
-                outer.bind_runtime(token, rows.task_run.deadline_at)
-                inner.bind_runtime(token, rows.task_run.deadline_at)
+                outer.bind_runtime(token, lambda: app.state.task_run.deadline_at)
+                inner.bind_runtime(token, lambda: app.state.task_run.deadline_at)
             report = asyncio.run(dispatch(resume=True))
         elif operation == "cancel":
             report = app.cancel(task_id)
         elif operation == "cleanup":
             report = app.resume_cleanup(task_id)
+        elif operation in {"competition-submit","competition-end"} and config.contract_version == 22:
+            from agent_adapters.run_files import run_lock
+            from agent_adapters.competition_submission import submit
+            with run_lock(directory):
+                app.controller.attach(task_id)
+                app._bound_task_run_id=task_id
+                if app.store.load_d3_run_config(task_id)!=config:raise ValueError("d3_frozen_run_configuration_changed")
+                if token.is_cancelled:raise ValueError("competition_submission_cancelled")
+                if operation=="competition-submit":competition_result=submit(app,**competition_request)
+                else:
+                    from agent_adapters.competition_submission import end_unavailable
+                    competition_result=end_unavailable(app,**competition_request)
+                if app.state.task_run.status in TERMINAL_STATUSES:app.controller.cleanup_sandbox()
         elif operation == 'validation-check' and config.contract_version in {19, 20, 21, 22}:
             from agent_adapters.run_files import run_lock
             with run_lock(directory):
@@ -399,6 +448,11 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
             finalize_export()
         close_writer()
         result = snapshot_v3_task_result(directory, declaration)
+        if competition_result is not None:
+            result["competition_submission" if operation=="competition-submit" else "competition_end"]=competition_result
+            if competition_result["state"]=="unknown":
+                result["recovery"]={"required":True,"reason":"competition_submission_unknown"}
+                result["exit_code"]=5
         if check_record is not None:
             result['validation_check'] = {'state': check_record.result.verdict,
                                          'query_id': check_record.request.query_id}

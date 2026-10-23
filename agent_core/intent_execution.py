@@ -99,6 +99,90 @@ def facts(app, intent_id):
             and (app.revisions is None or app.revisions.reliable(i))]
 
 
+def continuation_scope(app, intent_id):
+    """Ignore bookkeeping from repeated proposals; retain actual material and authority."""
+    history = app.handoff.history()
+    material = [(i.ref, i.source_status, i.conflict) for i in history if not i.record_id.startswith("tree/")
+                and (not i.record_id.startswith("decision/") or i.identity == "unreviewed_working_record")]
+    constraints = max((r.constraint_version for r in app.store.list_d3_review_applications(app.state.task_run.task_run_id)), default=0)
+    return digest(dict(material=sorted(material), epoch=app.supervision.epoch(intent_id), constraints=constraints,
+                       reads=app.handoff.read_count(intent_id)))
+
+
+def last_continuation(app, intent_id):
+    return next((r for r in reversed(app.store.list_d8_tree_records(app.state.task_run.task_run_id))
+                 if r.intent_id == intent_id and r.kind == "evaluation_continued"), None)
+
+
+def validate_continuation_reuse(app, request_id):
+    """A receipt reuses an old continue; it is never a new model verdict."""
+    identity = app._id("continuation-reuse/" + request_id)
+    receipt = app.handoff.evidence.read("decision", identity)
+    if receipt is None:
+        return None
+    frozen = app.sessions.evidence.read("request", request_id)
+    marker = packet(frozen["request"]).get("intent_execution", {}).get("last_review", {}) if frozen else {}
+    record = next((r for r in app.store.list_d8_tree_records(app.state.task_run.task_run_id)
+                   if r.record_id == marker.get("record_id") and r.kind == "evaluation_continued"), None)
+    if record is None:
+        raise D3RecoveryRequired("d22_continuation_reuse_changed")
+    from agent_core.handoff_contracts import D8HandoffRequest
+    saved = app.handoff.evidence.read("request", record.model_request_id)
+    if saved is None:
+        raise D3RecoveryRequired("d22_continuation_reuse_changed")
+    original = D8HandoffRequest.from_dict(saved)
+    policy = evaluation_policy(original, json.loads(original.prior_summary)["s4_evaluation_policy"])
+    decision = app.handoff._known_call(original)
+    proposal = app.validator._known_model(record.task_run_id, request_id, "inner_plan")
+    expected = dict(kind="reused_intent_continue", task_run_id=record.task_run_id, intent_id=record.intent_id,
+                    model_request_id=request_id, review_record_id=record.record_id,
+                    scope_sha256=marker.get("scope_sha256"))
+    if (receipt != expected or frozen["intent_id"] != record.intent_id or frozen["turn_id"] != record.turn_id
+            or not isinstance(proposal, IntentResolution)
+            or handoff_json(asdict(proposal)) != handoff_json(policy["proposal"])
+            or not marker.get("scope_sha256") or marker["scope_sha256"] != policy.get("continuation_scope_sha256")
+            or decision is None or decision["outcome"] != "valid" or decision["raw"]["decision"] != "continue"):
+        raise D3RecoveryRequired("d22_continuation_reuse_changed")
+    return dict(reused=True, review_record_id=record.record_id, review_request_id=record.model_request_id,
+                reason=decision["raw"]["reason"])
+
+
+def reuse_continuation(app, request_id, intent_id, proposal):
+    if not continuous(app.config):
+        return False
+    identity = app._id("continuation-reuse/" + request_id)
+    if app.handoff.evidence.read("decision", identity) is None:
+        frozen = app.sessions.evidence.read("request", request_id)
+        if frozen is None:
+            raise D3RecoveryRequired("d22_resolution_request_missing")
+        context = packet(frozen["request"])["intent_execution"]
+        marker = context.get("last_review")
+        if not marker or stop_request(app, intent_id) is not None:
+            return False
+        record = last_continuation(app, intent_id)
+        if record is None or marker["record_id"] != record.record_id:
+            return False
+        original = app.handoff.evidence.read("request", record.model_request_id)
+        policy = json.loads(original["prior_summary"])["s4_evaluation_policy"]
+        if (handoff_json(asdict(proposal)) != handoff_json(policy["proposal"])
+                or marker["scope_sha256"] != policy.get("continuation_scope_sha256")
+                or marker["scope_sha256"] != continuation_scope(app, intent_id)):
+            return False
+        validate_resolution(app, frozen["request"], proposal)
+        app.handoff.evidence.save("decision", identity, dict(kind="reused_intent_continue",
+            task_run_id=record.task_run_id, intent_id=intent_id, model_request_id=request_id,
+            review_record_id=record.record_id, scope_sha256=marker["scope_sha256"]))
+    reviewed = validate_continuation_reuse(app, request_id)
+    app._check_dispatch()
+    app.store.mark_d3_operation_applied(request_id, identity)
+    app.sessions.reconcile()
+    from qinyuan_core import get_logger
+    get_logger("ctrl").info("intent.resolution_reused", run=app.state.task_run.task_run_id,
+        intent=intent_id, request=request_id, review=reviewed["review_request_id"],
+        outcome="continue", category="review_reuse")
+    return True
+
+
 def validate_resolution(app, request, proposal):
     from agent_core.dual_llm_modeling import D3ProposalRejected
     stop = packet(request)["intent_execution"].get("stop_requested")
@@ -173,15 +257,18 @@ def execution_context(app, intent_id):
                 if note is not None:notes.append(note)
             if row.intent_id == intent_id and row.kind == "strategy_yielded":
                 strategy.append(app.handoff.evidence.read("strategy-yield", row.record_id))
-    return {**({"technical_history": notes, "revisit_count": visits(app.store, app.state.task_run.task_run_id, intent_id)} if notes else {}), "policy": POLICY, "review_contract": "candidate_subset_v1", "facts": [{"fact_id": f["fact_id"], "ref": f["ref"]}
+    from agent_core.intent_planning import LOCAL_GOAL_GUIDANCE
+    previous = last_continuation(app, intent_id) if continuous(app.config) else None
+    return {**({"last_review": {"record_id": previous.record_id, "scope_sha256": continuation_scope(app, intent_id)}} if previous else {}),**({"technical_history": notes, "revisit_count": visits(app.store, app.state.task_run.task_run_id, intent_id)} if notes else {}), "policy": POLICY, "review_contract": "candidate_subset_v1", "facts": [{"fact_id": f["fact_id"], "ref": f["ref"]}
                                       for f in facts(app, intent_id)],
         "stop_requested": stop_request(app, intent_id),
         **({"strategy_history": strategy, "strategy_identity": "voluntary_yield_not_technical_retry_or_business_failure"} if strategy else {}),
-        "goal_rule": "A local goal with observable completion criteria and explicit scope, not a predetermined action list.",
+        "goal_rule": LOCAL_GOAL_GUIDANCE,
         "next_decision": "Continue with a Plan/tool, request a review, or propose an evidence-bound Intent resolution.",
         "stop_rule": "No new Fact and repeated responses do not prove saturation. Negative observations may increase coverage; prerequisites may enable later progress.",
         "reason_rule": "For an end/review proposal summarize reason, tested scope, unresolved issues and optional conditions for revisiting; this is not a verified Fact.",
-        "evidence_rule": "Cite exact visible refs; use history reads for missing details. An open candidate space is not disproved by a few misses."}
+        "evidence_rule": "Cite exact visible refs; use history reads for missing details. Separate directly observed source text or measurements from causal/runtime hypotheses. An important narrow observation may be proposed with inferred=false and original evidence for normal outer review; derived or mixed unverified claims remain inferred=true. Never promote an accepted inference merely to obtain success support. An open candidate space is not disproved by a few misses.",
+        "progress_rule": "Optionally save a concise working_record indexing important files/ranges already read, their original refs and reading limits. It is an unreviewed retrieval aid, never Fact evidence. Consult earlier read indexes and original results before re-reading. After continue address its concrete original-scope gap or explain a material deliverable change; repeating the identical request on unchanged material reuses that continue. Different wording alone is not new evidence; the supervisor assesses its value."}
 
 
 def make_request(app, intent_id, inner_id, proposal):
@@ -216,7 +303,10 @@ def make_request(app, intent_id, inner_id, proposal):
         support_fact_ref=fact_refs[0] if fact_refs else None, support_fact_refs=fact_refs,
         required_observation_refs=observations,
         history_sha256=digest([asdict(i) for i in selected]),
-        goal_interpretation="Judge evidence coverage of the local goal. Insufficient evidence normally means continue. Only a bounded complete test domain supports a universal negative. Strategy closure is not proof of impossibility.")
+        goal_interpretation=packet(frozen["request"])["intent_execution"].get("goal_rule", "") +
+            " Judge evidence coverage of the local goal. Insufficient evidence normally means continue. Only a bounded complete test domain supports a universal negative. Strategy closure is not proof of impossibility.")
+    if continuous(app.config):
+        policy["continuation_scope_sha256"] = continuation_scope(app, intent_id)
     if review:
         policy["strategy_review"] = review
     context.update(items=[i.visible() for i in selected], required_refs=sorted(required), s4_evaluation_policy=policy)
@@ -346,6 +436,8 @@ async def resolve(app, request_id, intent_id, proposal, token):
     from agent_core.control_store import UpsertIntent
     from agent_core.domain import IntentStatus
     from agent_core.handoff_contracts import D8TreeRecord
+    if reuse_continuation(app, request_id, intent_id, proposal):
+        return
     request = make_request(app, intent_id, request_id, proposal)
     final, decision = await app.handoff.call(request, token)
     intent = next(i for i in app.state.intents if i.intent_id == intent_id)
@@ -401,6 +493,14 @@ def validate_record(app, request, record):
 
 def reconcile(app):
     """Finish an inner application marker after a committed end review; never redispatch."""
+    if continuous(app.config):
+        for operation in app.store.list_d3_operations(app.state.task_run.task_run_id):
+            if operation.start.category != "inner_model" or operation.completion is None or operation.application_ref is not None:
+                continue
+            identity = app._id("continuation-reuse/" + operation.start.operation_id)
+            if app.handoff.evidence.read("decision", identity) is not None:
+                validate_continuation_reuse(app, operation.start.operation_id)
+                app.store.mark_d3_operation_applied(operation.start.operation_id, identity)
     for record in app.store.list_d8_tree_records(app.state.task_run.task_run_id):
         if not record.inner_request_id:
             continue
@@ -835,6 +935,8 @@ def suspend_local(app, intent, error):
     record_id = app._id(f"suspend/{intent.intent_id}/{visits(app.store, app.state.task_run.task_run_id, intent.intent_id)}")
     note = {"intent_id": intent.intent_id, "reason": code if context_failure or code in allowed else "d22_local_model_failure",
             "failed_request_id": identity, "identity": "technical_suspension_not_business_verdict"}
+    note = app.handoff.evidence.read("pause", record_id) or {**note, "progress": app.sessions.handoff_progress(intent.intent_id)}
+    app.sessions._safe(note)
     app.handoff.evidence.save("pause", record_id, note)
     record = D8TreeRecord(record_id, app.state.task_run.task_run_id, intent.turn_id, intent.intent_id, "suspended", identity)
     app.handoff._commit("suspend_d8_intent", record, (UpsertIntent(intent.intent_id, intent.turn_id,

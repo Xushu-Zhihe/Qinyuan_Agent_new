@@ -8,6 +8,14 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 
+PRIVATE_IPV4_NETWORKS = tuple(ipaddress.ip_network(value) for value in
+                              ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def is_rfc1918_ipv4(value) -> bool:
+    return value is not None and any(ipaddress.ip_address(value) in network for network in PRIVATE_IPV4_NETWORKS)
+
+
 class TargetAddressError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
@@ -29,7 +37,7 @@ class TargetAddress:
     literal_ip: str | None
 
     @classmethod
-    def from_url(cls, url: str) -> TargetAddress:
+    def from_url(cls, url: str, *, allow_private_ipv4: bool = False) -> TargetAddress:
         if (
             not isinstance(url, str)
             or len(url) > 2048
@@ -57,7 +65,8 @@ class TargetAddress:
             literal = ipaddress.ip_address(host)
         except ValueError:
             literal = None
-        if literal is not None and not literal.is_global:
+        if literal is not None and (literal.is_multicast or
+                not literal.is_global and not (allow_private_ipv4 and is_rfc1918_ipv4(literal))):
             raise TargetAddressError("non_public_target")
         return cls(host=host, port=port, literal_ip=str(literal) if literal else None)
 
@@ -95,6 +104,7 @@ class TargetAddress:
             if (
                 address.version != (6 if family == socket.AF_INET6 else 4)
                 or not address.is_global
+                or address.is_multicast
                 or (
                     family == socket.AF_INET6
                     and (len(sockaddr) < 4 or sockaddr[3] != 0)

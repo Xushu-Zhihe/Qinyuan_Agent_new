@@ -702,3 +702,5 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .competition-description, .competition-addresses { white-space: pre-wrap; overflow-wrap: anywhere; }
 .competition-addresses { color: var(--blue); font: 12px/1.7 var(--mono); margin: 0; }
 @media (max-width: 1050px) { .competition-layout { grid-template-columns: 1fr; } }
+
+.competition-import { display: grid; gap: 12px; margin-top: 16px; }

@@ -27,7 +27,12 @@ def platform(tmp_path):
             self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
         def do_POST(self):
             state.requests.append((self.command,self.path,dict(self.headers)))
-            self.send_error(405)
+            if not hasattr(state,"post_payload"):self.send_error(405);return
+            length=int(self.headers.get("Content-Length","0"))
+            state.bodies.append(json.loads(self.rfile.read(length)))
+            body=json.dumps(state.post_payload).encode()
+            self.send_response(getattr(state,"post_status",200));self.send_header("Content-Length",str(len(body)))
+            self.end_headers();self.wfile.write(body)
     upstream=ThreadingHTTPServer(("127.0.0.1",0),Upstream)
     workbench=Workbench(tmp_path)
     server=WorkbenchServer(("127.0.0.1",0),workbench)

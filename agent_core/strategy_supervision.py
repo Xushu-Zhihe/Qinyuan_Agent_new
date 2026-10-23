@@ -467,9 +467,12 @@ class StrategySupervision:
         current = next(i for i in app.state.intents if i.intent_id == saved["intent_id"])
         record = D8TreeRecord(app._id("strategy-yield/" + request_id), app.state.task_run.task_run_id,
             current.turn_id, current.intent_id, "strategy_yielded", request_id)
-        app.handoff.evidence.save("strategy-yield", record.record_id,
-            {"target_intent_id": target.intent_id, "review_id": proposal.review_id,
-             "reason": proposal.reason, "content": proposal.content, "identity": "strategy_yield_not_technical_failure"})
+        note = app.handoff.evidence.read("strategy-yield", record.record_id) or {
+            "target_intent_id": target.intent_id, "review_id": proposal.review_id,
+            "reason": proposal.reason, "content": proposal.content, "identity": "strategy_yield_not_technical_failure",
+            "progress": app.sessions.handoff_progress(current.intent_id)}
+        app.sessions._safe(note)
+        app.handoff.evidence.save("strategy-yield", record.record_id, note)
         app.handoff._commit("yield_d8_strategy", record, (
             UpsertIntent(current.intent_id, current.turn_id, current.description, current.priority, current.intent_type, IntentStatus.SUSPENDED),
             UpsertIntent(target.intent_id, target.turn_id, target.description, target.priority, target.intent_type, IntentStatus.RUNNING)))
@@ -606,6 +609,9 @@ def validate_yield_note(app, record, mutation):
     target = next(c for c in mutation.state_changes if isinstance(c, UpsertIntent) and c.intent_id != record.intent_id)
     if (not isinstance(proposal, StrategyYield) or advice["review_id"] != proposal.review_id
             or advice["intent_id"] != target.intent_id
-            or note != {"target_intent_id": target.intent_id, "review_id": proposal.review_id,
+            or note is None
+            or {k: v for k, v in note.items() if k != "progress"} != {"target_intent_id": target.intent_id, "review_id": proposal.review_id,
                         "reason": proposal.reason, "content": proposal.content, "identity": "strategy_yield_not_technical_failure"}):
         raise D3RecoveryRequired("d22_strategy_yield_evidence_changed")
+    if "progress" in note:
+        app.sessions.validate_handoff_progress(record.intent_id, note["progress"])

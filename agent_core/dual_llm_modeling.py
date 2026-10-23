@@ -39,6 +39,7 @@ from agent_core.modeling import (
 )
 from agent_core.turn_contracts import D1RoleConfig
 from agent_core.turn_modeling import digest, stable_id
+from agent_core.competition_candidates import MCPAnswerCandidateContext
 from agent_core.operation_accounting import D4RecoveryRequired, D4BudgetExhausted
 
 D3ModelStage = Literal[
@@ -192,7 +193,7 @@ def parse_d3_plan_proposal(raw: object) -> D3PlanProposal:
 @dataclass(frozen=True, slots=True)
 class D3CandidateFlagAction:
     value: str
-    execution_id: str
+    execution_id: str | None
     evidence_version: str
     source_ref: str
 
@@ -431,7 +432,7 @@ class D3ModelRequest:
     role_config_ref: str
     resource_ref: str
     stage: D3ModelStage
-    context: D3OuterContext | D3PlanContext | D3ActionContext | D3CandidateContext
+    context: D3OuterContext | D3PlanContext | D3ActionContext | D3CandidateContext | MCPAnswerCandidateContext
     correction_of_model_request_id: str | None = None
     rejection_code: str | None = None
     process_facts: tuple[dict[str, object], ...] = ()
@@ -639,7 +640,7 @@ class D3AuditedModel:
             if request.stage == "outer_turn"
             else D3PlanContext
             if request.stage == "inner_plan"
-            else D3CandidateContext
+            else (D3CandidateContext,MCPAnswerCandidateContext)
             if request.stage == "inner_candidate"
             else D3ActionContext
         )
@@ -667,7 +668,7 @@ class D3AuditedModel:
         repair the ordinary, body-free D3 evidence and later Controller commit.
         """
         if request.stage != "inner_candidate" or not isinstance(
-            request.context, D3CandidateContext
+            request.context, (D3CandidateContext,MCPAnswerCandidateContext)
         ):
             raise D3RecoveryRequired("d3_candidate_request_invalid")
         if not callable(getattr(protected, "save_pending", None)) or not callable(
@@ -677,7 +678,7 @@ class D3AuditedModel:
         self._check(request)
 
         context = request.context
-        from agent_core.competition_candidates import MCPAnswerCandidateContext, provenance
+        from agent_core.competition_candidates import provenance
         source = provenance(context)
         if self.config.contract_version in {19, 20, 21, 22} and self.evidence.read(request.model_request_id) is not None:
             evidence, record = self._saved(request)
@@ -757,7 +758,7 @@ class D3AuditedModel:
                 if proposal.review_requested:
                     raise D3ProposalRejected("d3_candidate_review_not_supported")
                 if (
-                    action.execution_id != context.execution_id
+                    action.execution_id != source["execution_id"]
                     or action.evidence_version != source["evidence_version"]
                     or action.source_ref != source["source_ref"]
                 ):
@@ -965,7 +966,7 @@ class D3AuditedModel:
         metadata: Mapping[str, object],
     ) -> None:
         context = request.context
-        if not isinstance(context, D3CandidateContext):
+        if not isinstance(context, (D3CandidateContext,MCPAnswerCandidateContext)):
             raise D3RecoveryRequired("d3_candidate_context_invalid")
         from agent_core.competition_candidates import provenance
         source=provenance(context)
@@ -976,7 +977,7 @@ class D3AuditedModel:
             or metadata.get("model_request_id") != request.model_request_id
             or metadata.get("candidate_id") != candidate.candidate_id
             or metadata.get("task_run_id") != request.task_run_id
-            or metadata.get("execution_id") != context.execution_id
+            or metadata.get("execution_id") != source["execution_id"]
             or metadata.get("evidence_version") != source["evidence_version"]
         ):
             raise D3RecoveryRequired("d3_candidate_protected_binding_changed")

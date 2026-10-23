@@ -187,11 +187,12 @@ def manager(*, refs=(), previous=(), kinds=()):
 
 
 def test_periodic_counts_actual_executions_and_includes_repeated_or_failed_tools():
-    assert not manager(refs=("one","two"), kinds=["fact_candidate"]*10).due("intent")
+    assert manager(refs=("one","two"), kinds=["fact_candidate"]*10).due("intent")
     assert manager(refs=("a","b","c","d"), kinds=["http_request"]*4).due("intent")
     assert not manager(refs=("a","b","c","d","e"), previous=("a","b","c","d")).due("intent")
     assert manager(kinds=["working_record","history_query","history_details","working_record"]).due("intent")
     assert not manager(kinds=["working_record"]*3+["http_request","working_record"]).due("intent")
+    assert not manager(kinds=["working_record"]*3+["http_request_saved","working_record"]).due("intent")
 
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
@@ -349,3 +350,217 @@ def test_attachment_tools_return_observed_and_review_counts_executions_not_model
     assert len(checks)==1
     marker=checks[0]
     assert len(marker["execution_refs"])==4 and marker["decision_count"]==7
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_phase_reminder_is_optional_once_per_tool_window_and_frozen(http_case, monkeypatch):
+    c = http_case
+    events, _ = install(c, steps=9)
+    choose = c.models[1].invoke
+    def bounded_candidate(envelope, *args):
+        raw = choose(envelope, *args)
+        if isinstance(raw, dict) and raw.get("kind") == "fact_candidate":
+            raw["evidence_refs"] = raw["evidence_refs"][-8:]
+        return raw
+    c.models[1].invoke = bounded_candidate
+    result = asyncio.run(c.app._run_once(c.token))
+    assert result.stop_reason == "d9_awaiting_external_feedback", result
+    decisions = [e for e in c.exploration_envelopes if e.output_contract["stage"] == "inner_plan"]
+    reminders = [e for e in decisions if "knowledge_checkpoint" in json.loads(e.request.history_context)]
+    assert [len(json.loads(e.request.history_context)["knowledge_checkpoint"]["execution_refs"]) for e in reminders] == [4, 8]
+    # Both reminders were answered with another tool, without any forced review or note.
+    assert len(c.sends) == 9 and events.count("fact_review") == 1
+    assert events.count("inner_plan") == 11
+    saved = reminders[0].request
+    monkeypatch.setattr(c.app.sessions, "consolidation_context", lambda _: pytest.fail("frozen request must not be recomputed"))
+    from dataclasses import fields
+    from agent_core.dual_llm_modeling import D3ModelRequest
+    base = D3ModelRequest(**{f.name: getattr(saved, f.name) for f in fields(D3ModelRequest)})
+    assert c.app.handoff.wrap_execution_request(base).history_context == saved.history_context
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_two_phase_facts_keep_same_intent_until_explicit_reviewed_end(http_case):
+    c = http_case
+    install(c, steps=4)
+    inner, outer = c.models[1].invoke, c.models[0].invoke
+    phases, end_rules = [], []
+    def choose(envelope, *args):
+        if envelope.output_contract["stage"] != "inner_plan":return inner(envelope, *args)
+        ctx = json.loads(envelope.request.history_context)
+        if len(c.sends) in {2, 4} and len(c.app.state.facts) < len(c.sends) // 2:
+            assert c.app.state.intents[0].status.value == "running"
+            phases.append(len(c.sends))
+            return dict(kind="fact_candidate", content="Scoped phase " + str(len(c.sends)) + " is observed.",
+                        reason="Distinct saved comparison for this phase.",
+                        evidence_refs=[s["ref"] for s in ctx["evidence_sources"]][-2:], inferred=False)
+        if len(c.sends) < 4:
+            return dict(kind="http_request", method="GET", path_query="/?phase="+str(len(c.sends)), headers={}, body="")
+        return dict(kind="intent_resolution", outcome="succeeded", reason="The declared local deliverable is supported.",
+                    evidence_refs=[i["ref"] for i in ctx["items"]], fact_ids=[f["fact_id"] for f in ctx["intent_execution"]["facts"]], next_intent_candidates=[])
+    def review(envelope, *args):
+        if envelope.output_contract["stage"] == "intent_evaluation":
+            from agent_adapters.deepseek_roles import build_payload
+            policy = json.loads(envelope.request.prior_summary)["s4_evaluation_policy"]
+            end_rules.append(policy["goal_interpretation"])
+            payload = build_payload(envelope, c.app.config.outer_role, context_loader=c.app.web.model_context)
+            assert "do not add a requirement to execute that later request" in payload["messages"][-2]["content"]
+        return outer(envelope, *args)
+    c.models[1].invoke, c.models[0].invoke = choose, review
+    result = asyncio.run(c.app._run_once(c.token))
+    assert result.stop_reason == "d9_awaiting_external_feedback", result
+    assert phases == [2, 4] and len(c.app.state.facts) == 2 and len(c.sends) == 4
+    assert len(c.app.state.turns) == 1 and end_rules
+    # The claim/evidence and independent task-verification gates are unchanged.
+    assert c.app.state.task_run.status.value == "awaiting_external_feedback"
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_known_technical_handoff_keeps_sources_visible_without_promoting_facts(http_case, monkeypatch):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    c = http_case
+    install(c, steps=1, stop="inconclusive")
+    inner, outer = c.models[1].invoke, c.models[0].invoke
+    seen = []
+    def plan(envelope, *args):
+        if envelope.output_contract["stage"] == "tree_planning":
+            return (dict(kind="exhausted", reason="No new direction.", evidence_refs=[]) if c.app.state.turns else
+                    dict(kind="candidates", intents=[dict(description=name, intent_type=None, dependency_refs=[])
+                         for name in ("Source route", "Sibling route")]))
+        return outer(envelope, *args)
+    def choose(envelope, *args):
+        if envelope.output_contract["stage"] != "inner_plan":return inner(envelope, *args)
+        actor = next(i for i in c.app.state.intents if i.intent_id == envelope.request.context.intent_id)
+        if actor.description == "Source route":
+            if not c.sends:
+                return dict(kind="http_request", method="GET", path_query="/?known=1", headers={}, body="")
+            c.app.output_boundary.evidence.save("provider-result", envelope.request.model_request_id,
+                {"transport": {"transport_end": "timeout", "worker_exit_confirmed": True}})
+            return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
+        ctx = json.loads(envelope.request.history_context)
+        notes = [i for i in ctx["items"] if i["identity"] == "unreviewed_intent_handoff_not_fact"]
+        assert notes and notes[0]["ref"] in ctx["required_refs"]
+        note = json.loads(notes[0]["content"])
+        assert note["progress"]["decision_refs"] and note["progress"]["evidence_sources"]
+        assert not ctx["intent_execution"]["facts"]
+        assert not any(i["record_type"] == "intent" and i["record_id"] != actor.intent_id for i in ctx["items"])
+        seen.append(note)
+        return inner(envelope, *args)
+    c.models[1].invoke, c.models[0].invoke = choose, plan
+    result = asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required, result
+    assert seen and len(c.sends) == 1 and not c.app.state.facts
+    progress = seen[0]["progress"]
+    owner = c.app.state.intents[0].intent_id
+    c.app.sessions.validate_handoff_progress(owner, progress)
+    source = c.app.evidence_conclusions.source
+    monkeypatch.setattr(c.app.evidence_conclusions, "source", lambda *args: {**source(*args), "version": "0" * 64})
+    with pytest.raises(D3RecoveryRequired, match="d22_handoff_progress_source_changed"):
+        c.app.sessions.validate_handoff_progress(owner, progress)
+
+
+def test_handoff_recent_sources_follow_tool_order_across_mcp_and_http():
+    m = manager(refs=("old-http", "mcp1", "mcp2", "mcp3", "mcp4"))
+    m.records = lambda _: ()
+    # The catalogue groups MCP before HTTP; its tail is not chronological.
+    catalogue = [dict(ref=ref, kind="mcp", version="v") for ref in ("mcp1", "mcp2", "mcp3", "mcp4")]
+    catalogue.append(dict(ref="old-proof", kind="http", version="v"))
+    m.app.evidence_conclusions = NS(catalog=lambda _: catalogue,
+        source=lambda ref, _: {"source_ref": "old-http" if ref == "old-proof" else ref})
+    progress = m.handoff_progress("intent")
+    assert [s["ref"] for s in progress["evidence_sources"]] == ["mcp1", "mcp2", "mcp3", "mcp4"]
+
+
+@pytest.mark.parametrize('kind',['intent_resolution','fact_candidate','strategy_yield','history_next_page'])
+def test_all_internal_decisions_count_toward_the_existing_supervision_window(kind):
+    from agent_core.sessions import IntentSessions
+    rows=[NS(ordinal=n,record_id=str(n)) for n in range(4)]
+    sessions=object.__new__(IntentSessions)
+    sessions.app=NS(config=NS(intent_execution_policy='continuous_v1'),supervision=NS(watermark=lambda _:[]))
+    sessions.reviews=lambda _:[]
+    sessions.records=lambda _:rows
+    sessions.execution_refs=lambda _:[]
+    sessions.payload=lambda _:dict(request=dict(stage='inner_plan'),response=dict(kind=kind))
+    assert sessions.due('actor')
+    rows.pop()
+    assert not sessions.due('actor')
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+def test_early_reading_index_and_continue_feedback_survive_recent_window(http_case):
+    c=http_case
+    install(c,steps=1,stop='inconclusive')
+    inner,outer=c.models[1].invoke,c.models[0].invoke
+    state={'notes':0,'reads':0,'resolutions':0,'review':0}
+    seen=[]
+    def choose(envelope,*args):
+        if envelope.output_contract['stage']=='inner_plan' and c.sends:
+            h=json.loads(envelope.request.history_context)
+            ref=next(i['ref'] for i in h['items'] if i['record_id']==c.app.state.executions[0].execution_id)
+            if state['notes']==0:
+                state['notes']+=1
+                return dict(kind='working_record',content='Read source/view lines 1-3; complete excerpt, runtime effect remains unverified.',evidence_refs=[ref])
+            if state['reads']<6:
+                state['reads']+=1
+                return dict(kind='history_query',query={})
+            state['resolutions']+=1
+            if state['resolutions']==1:
+                return dict(kind='intent_resolution',outcome='review',reason='Review the bounded local deliverable.',
+                    evidence_refs=[ref],fact_ids=[],next_intent_candidates=[])
+            seen.append(h)
+        return inner(envelope,*args)
+    def review(envelope,*args):
+        if envelope.output_contract['stage'] in {'strategy_supervision','intent_evaluation'}:
+            req=envelope.request
+            if envelope.output_contract['stage']=='intent_evaluation':
+                state['review']+=1
+                if state['review']==1:
+                    return dict(decision='continue',reason='Check the remaining local assumption against the original source.',evidence_refs=[i.ref for i in req.history])
+            if state['reads']>=6:
+                assert any(i.identity=='unreviewed_working_record' and 'Read source/view' in i.content for i in req.history)
+        return outer(envelope,*args)
+    c.models[1].invoke,c.models[0].invoke=choose,review
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required,result
+    assert seen and any('reviewed_summary' in i['content'] for i in seen[-1]['items'])
+    assert not c.app.state.facts
+    assert c.app.state.intents[0].status.value=='inconclusive'
+
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+def test_observed_fact_and_conditional_inference_keep_separate_review_identity(http_case):
+    c=http_case
+    install(c,steps=1,stop='inconclusive')
+    inner=c.models[1].invoke
+    candidates=[]
+    def choose(envelope,*args):
+        if envelope.output_contract['stage']=='inner_plan' and c.sends and len(candidates)<2:
+            h=json.loads(envelope.request.history_context)
+            assert 'inferred=false' in h['intent_execution']['evidence_rule']
+            inferred=not candidates
+            candidates.append(inferred)
+            return dict(kind='fact_candidate',inferred=inferred,evidence_refs=[h['evidence_sources'][0]['ref']],
+                content='A later variant may change this response; that causal hypothesis is untested.' if inferred else
+                        'The original scoped request returned status 200 and the recorded body.',
+                reason='Keep the causal hypothesis separate from the directly recorded observation.')
+        return inner(envelope,*args)
+    outer=c.models[0].invoke
+    def review(envelope,*args):
+        if envelope.output_contract['stage']=='fact_review':
+            from agent_adapters.deepseek_roles import build_payload
+            payload=build_payload(envelope,c.app.config.outer_role,context_loader=c.app.web.model_context)
+            guidance=' '.join(m['content'] for m in payload['messages'])
+            expected='Acceptance records a reviewed inference, not a Fact.' if envelope.request.candidate.inferred else 'Acceptance may create a formal Fact only for this narrow directly supported observation'
+            assert expected in guidance
+            assert 'Accept creates a distinct Fact.' not in guidance
+        return outer(envelope,*args)
+    c.models[1].invoke,c.models[0].invoke=choose,review
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required,result
+    conclusions=c.app.store.list_d8_conclusions(c.task)
+    assert [r.outcome for r in conclusions]==['reviewed_inference','verified_fact']
+    assert conclusions[0].fact_id is None and len(c.app.state.facts)==1
+    assert c.app.state.intents[0].status.value=='inconclusive'
+    assert len(c.sends)==1

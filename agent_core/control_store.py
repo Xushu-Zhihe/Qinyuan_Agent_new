@@ -238,8 +238,8 @@ class UpsertTaskRun:
             )
         _finite_timestamp(self.started_at, "UpsertTaskRun.started_at")
         _finite_timestamp(self.deadline_at, "UpsertTaskRun.deadline_at")
-        if self.deadline_at != self.started_at + self.request.deadline_seconds:
-            raise ValueError("UpsertTaskRun.deadline_at must match TaskRequest")
+        if self.deadline_at < self.started_at + self.request.deadline_seconds:
+            raise ValueError("UpsertTaskRun.deadline_at cannot precede initial TaskRequest deadline")
         if not isinstance(self.status, TaskRunStatus):
             raise ValueError("UpsertTaskRun.status must be a TaskRunStatus")
         _non_empty(self.sandbox_id, "UpsertTaskRun.sandbox_id")
@@ -779,7 +779,7 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
         ),
         "apply_external_validation_feedback": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
-            allowed_results=frozenset({"accepted", "rejected", "unknown"}),
+            allowed_results=frozenset({"accepted", "rejected", "unknown", "partial"}),
         ),
         "start_external_validation_check": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
@@ -787,7 +787,7 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
         ),
         "complete_external_validation_check": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
-            allowed_results=frozenset({"accepted", "rejected", "unknown"}),
+            allowed_results=frozenset({"accepted", "rejected", "unknown", "partial"}),
         ),
         "finish_task_run": OperationResultRule(
             event_type="task_run_finished",
@@ -1281,6 +1281,7 @@ def validate_control_event(
             expected_status = {
                 "accepted": TaskRunStatus.ACHIEVED,
                 "rejected": TaskRunStatus.RUNNING,
+                "partial": TaskRunStatus.RUNNING,
                 "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
             }.get(verdict)
             if (
@@ -1307,6 +1308,7 @@ def validate_control_event(
             expected_status = {
                 "accepted": TaskRunStatus.ACHIEVED,
                 "rejected": TaskRunStatus.RUNNING,
+                "partial": TaskRunStatus.RUNNING,
                 "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
             }.get(verdict)
             if (

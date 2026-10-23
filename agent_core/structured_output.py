@@ -203,12 +203,16 @@ class StructuredOutput:
                   else self.app.config.handoff_config.outer_capacity)
         fits = self.app.handoff.capacity_port.fits(envelope, policy)
         measurement = getattr(self.app.handoff.capacity_port, "last_measurement", None)
+        if not fits:
+            # A rejected draft is not a frozen model request. Keep its measurement
+            # in the existing pause receipt, so changed input can later be admitted
+            # without overwriting immutable per-request evidence.
+            self.app.handoff._pause("complete_model_request", (), policy.total_units, None,
+                                    reason="d8_output_complete_request_capacity_paused")
         if self.app.config.intent_execution_policy and measurement is not None:
             self.evidence.save("input-measurement", record["model_request_id"],
                 {"task_run_id": record["task_run_id"], "model_request_id": record["model_request_id"],
                  "stage": record["stage"], "fits": fits, **measurement})
-        if not fits:
-            raise D3RecoveryRequired("d8_output_complete_request_capacity_paused")
         self.evidence.save("contract", record["model_request_id"], record)
         if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.app.selection_bindings.freeze(envelope.request, record)

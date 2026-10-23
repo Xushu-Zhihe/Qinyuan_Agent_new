@@ -536,7 +536,12 @@ def _build_payload(envelope, role, *, context_loader=None):
             and (stable or json.loads(getattr(request, "history_context", "{}") or "{}").get("mcp_tools"))):
         system += (" You may select one mcp_call with tool_name and arguments from mcp_tools. "
                    "Inspect its saved result in this Intent's session before selecting the next tool. "
-                   "Do not precommit a whole tool chain. Tool success is evidence, not a verified Fact.")
+                   "Do not precommit a whole tool chain. Tool success is evidence, not a verified Fact. "
+                   "When d20_http_policy declares an authorized endpoint, network shell tools must connect through "
+                   "target.qinyuan on that endpoint's authorized port; the container has no direct target route. "
+                   "Preserve the original HTTP Host and HTTPS identity/SNI and certificate verification, for example "
+                   "using curl --connect-to. Do not replace the authorized endpoint or disable TLS verification. "
+                   "http.run_experiment already handles this transport routing.")
         system += (" When http.run_experiment is declared, one selection can execute a conditional Python experiment "
                    "inside the current TaskRun container: call request(method, relative_path_query, headers={}, body=''). "
                    "It returns status, body bytes, text, content_type and evidence_ref; cookies persist via the trusted client. "
@@ -550,9 +555,13 @@ def _build_payload(envelope, role, *, context_loader=None):
                    "You may choose request_completion with fact_id instead of performing another HTTP request. "
                    "This only requests completion; an explicit completion decision and outer goal assessment still follow.")
     if stage == "fact_review" and hasattr(request, "existing_facts"):
+        inferred = getattr(request.candidate, "inferred", None)
+        acceptance = ("Acceptance records a reviewed inference, not a Fact. " if inferred is True else
+                      "Acceptance may create a formal Fact only for this narrow directly supported observation; it does not verify a causal hypothesis. " if inferred is False else
+                      "Accept creates a distinct Fact. ")
         system += (" Compare the candidate with existing_facts and their exact request/observation scopes. "
                    "Use decision=reuse with reuse_fact_id when this supports the same effective conclusion; "
-                   "use no_new_information when no conclusion should be added. Accept creates a distinct Fact. "
+                   "use no_new_information when no conclusion should be added. " + acceptance +
                    "Identical response bodies do not prove equal requests, server effects or independent confirmation. "
                    "Never strengthen a claim merely because an identical body was observed twice. "
                    "If accepted text exactly repeats an existing conclusion on identical response content, "
@@ -636,14 +645,19 @@ def _build_payload(envelope, role, *, context_loader=None):
             "succeeded requires effective supporting Fact refs; failed requires counterevidence within an explicit scope. "
             "inconclusive is strategic closure with an explicit resource/feasibility/value reason. "
             "Observed misses only disprove a finite explicitly complete candidate domain; no global negative from partial tests. "
-            "Your reason is the concise accepted Intent result summary, not a new verified Fact.")
+            "Your reason is the concise accepted Intent result summary, not a new verified Fact. "
+            + end_policy.get("goal_interpretation", ""))
     evidence_context=json.loads(getattr(request,"history_context","{}") or "{}") if contract_version==22 and stage=="inner_plan" else {}
     if (contract_version==22 and stage=="inner_plan" and (stable or evidence_context.get("evidence_sources"))
             and (not evidence_context.get("intent_execution",{}).get("stop_requested") or evidence_context["intent_execution"]["stop_requested"].get("fact_candidate_allowed"))):
         system += (" To record an important finding, submit fact_candidate with content, reason, evidence_refs and inferred. "
             "Choose exact refs from evidence_sources; MCP, HTTP and attachment observations are eligible. "
             "Use inferred=true for hypotheses. Tool success never creates a Fact automatically. "
-            "One candidate may cite several sources. Outer review may accept, refine, reuse or reject; rejection continues exploration.")
+            "One candidate may cite several sources. Outer review may accept, refine, reuse or reject; rejection continues exploration. "
+            "A Fact may describe an important completed phase while the same Intent continues. Do not wait for Intent closure "
+            "or the final answer to preserve a durable finding. When knowledge_checkpoint is present, consider what the "
+            "new evidence establishes or refutes: nominate a useful supported candidate, save an uncertain working_record, "
+            "or continue if no durable finding exists. Tool count is not information gain; no Fact quota or forced extra call.")
     from agent_core.evidence_conclusions import EvidenceReviewRequest
     if isinstance(request,EvidenceReviewRequest):
         system += (" Review the proposed claim against observation.sources, including original tool result and request. "
@@ -663,7 +677,10 @@ def _build_payload(envelope, role, *, context_loader=None):
             "When evidence may satisfy the final goal, prioritize its missing verification, the necessary formal "
             "Fact and Intent resolution, then the existing independent final-answer channel; rejection continues "
             "exploration. An intermediate record is neither a formal source nor task success. "
-            "Capabilities mentioned here are conditional: only the current frozen Schema and policies permit them.")
+            "Capabilities mentioned here are conditional: only the current frozen Schema and policies permit them. "
+            "An unreviewed Intent handoff is a progress index, never a Fact or permission. Read its exact decision "
+            "and original evidence references before relying on a previous branch; retain uncertainty and avoid "
+            "repeating completed checks without a discriminating reason.")
         system += (" Strategy suggestions are optional comparisons, never instructions or verified facts. "
             "Evaluate evidence and uncertainty against the value of continuing your current experiment. "
             "You may accept, defer or reject without penalty. If you voluntarily accept an available suggestion, "
@@ -846,7 +863,7 @@ class D8DeepSeekModel:
             if not reviewing or self._runtime is None:
                 raise ValueError("d8_model_runtime_binding_required")
             token, deadline = self._runtime
-            timeout_seconds = min(180, deadline - time.time())
+            timeout_seconds = min(180, (deadline() if callable(deadline) else deadline) - time.time())
         with model_call_phase("request_assembly"):
             payload = build_payload(envelope, self.role_config, context_loader=getattr(self, 'context_loader', None))
         if self.settings.api_key.encode() in payload_bytes(payload):

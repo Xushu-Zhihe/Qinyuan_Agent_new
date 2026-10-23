@@ -63,7 +63,7 @@ class D7CandidateEvidenceMetadata:
     task_run_id: str
     candidate_id: str
     evidence_version: str
-    execution_id: str
+    execution_id: str | None
     candidate_binding: dict[str, object]
     body_sha256: str
     cipher_sha256: str

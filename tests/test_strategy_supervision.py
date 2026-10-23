@@ -232,7 +232,7 @@ def test_segments_append_history_and_dynamic_catalog_follows_it(http_case):
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
 @pytest.mark.parametrize("restart", [False, True])
-def test_voluntary_yield_restores_same_session_without_technical_revisit(http_case, restart):
+def test_voluntary_yield_restores_same_session_without_technical_revisit(http_case, restart, monkeypatch):
     c = http_case
     install(c, steps=7, stop="inconclusive")
     outer = c.models[0].invoke
@@ -282,6 +282,12 @@ def test_voluntary_yield_restores_same_session_without_technical_revisit(http_ca
             return dict(kind="strategy_yield", review_id=advice["review_id"],
                 reason="Voluntarily inspect the now-testable alternative first.",
                 content="Original hypothesis remains open; four checks saved; next compare the response condition.")
+        if yielded and identity != yielded[0]:
+            handoffs = [i for i in packet["items"] if i["identity"] == "unreviewed_intent_handoff_not_fact"]
+            assert handoffs and handoffs[0]["ref"] in packet["required_refs"]
+            note = json.loads(handoffs[0]["content"])
+            assert "Original hypothesis remains open" in note["content"]
+            assert note["progress"]["decision_refs"] and note["progress"]["evidence_sources"]
         own_executions = requests.get(identity, 0)
         if (not yielded and own_executions < 4) or identity != (yielded or [None])[0] and not own_executions:
             requests[identity] = own_executions + 1
@@ -322,6 +328,21 @@ def test_voluntary_yield_restores_same_session_without_technical_revisit(http_ca
     assert not snapshots[0]["errors"], snapshots[0]
     parked = next(i for t in snapshots[0]["turns"] for i in t["intents"] if i["intent_id"] == yielded[0])
     assert parked["status"] == "suspended" and parked["suspension_kind"] == "strategy"
+    from agent_core.strategy_supervision import validate_yield_note
+    from agent_core.control_store import UpsertIntent
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from types import SimpleNamespace
+    row = next(r for r in rows if r.kind == "strategy_yielded")
+    note = c.app.handoff.evidence.read("strategy-yield", row.record_id)
+    target = next(i for i in c.app.state.intents if i.intent_id == note["target_intent_id"])
+    mutation = SimpleNamespace(state_changes=[UpsertIntent(target.intent_id, target.turn_id,
+        target.description, target.priority, target.intent_type, target.status)])
+    read = c.app.handoff.evidence.read
+    with monkeypatch.context() as patch:
+        patch.setattr(c.app.handoff.evidence, "read", lambda kind, key:
+            None if kind == "strategy-yield" and key == row.record_id else read(kind, key))
+        with pytest.raises(D3RecoveryRequired, match="d22_strategy_yield_evidence_changed"):
+            validate_yield_note(c.app, row, mutation)
 
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)

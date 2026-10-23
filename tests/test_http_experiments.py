@@ -536,3 +536,66 @@ def test_request_unknown_is_not_masked_by_stop_failure_or_replayed(http_case):
         dict(ContainerID=c.app.state.task_run.sandbox_id,Running=False))))
     with pytest.raises(D3RecoveryRequired,match='request_outcome_unknown'):c.app.mcp.reconcile()
     assert len(c.sends)==2 and len(calls)==1
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+@pytest.mark.parametrize('fallback',['none','http','mcp'])
+def test_experiment_detail_does_not_impersonate_a_final_candidate_source(http_case,monkeypatch,fallback):
+    c=http_case
+    parents=setup(c,"request('GET','/child')",fact=True)
+    choose=c.models[1].invoke
+    seeded=[]
+    candidates=[]
+    def inner(envelope,*args):
+        if envelope.output_contract['stage']=='inner_plan' and fallback!='none' and not seeded:
+            seeded.append(True)
+            if fallback=='mcp':
+                return dict(kind='mcp_call',tool_name='shell.run_bash',arguments=dict(script='fixed test'))
+            return dict(kind='http_request',method='GET',path_query='/ordinary',headers={},body='')
+        if envelope.output_contract['stage']=='inner_candidate':
+            candidates.append(envelope.request.context)
+            return dict(action=dict(kind='no_candidate'))
+        return choose(envelope,*args)
+    c.models[1].invoke=inner
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required,result
+    assert len(parents)==1 and len(c.app.mcp.experiments.records(parents[0]))==1
+    assert len(c.app.state.facts)==1 and c.app.state.intents[0].status.value=='succeeded'
+    assert c.app.state.task_run.status.value=='running'  # No independent final validation.
+    if fallback=='none':
+        assert not candidates  # Unsupported source skips the checkpoint, not child planning.
+        assert any(r.kind=='expansion_exhausted' and r.intent_id==c.app.state.intents[0].intent_id
+                   for r in c.app.store.list_d8_tree_records(c.task))
+    elif fallback=='http':
+        assert candidates[0].execution_id==c.app.state.executions[0].execution_id
+    else:
+        assert '/experiment/' not in c.app.store.load_d4_operation(
+            candidates[0].source_ref.removeprefix('mcp-result/')).start.resource_ref
+    # Directly presenting a child as an ordinary MCP source must still be rejected.
+    from types import SimpleNamespace
+    from agent_core.competition_candidates import validate_mcp_source
+    if fallback=='none':
+        with monkeypatch.context() as absent:
+            absent.setattr(c.app.store,'list_d4_operations',lambda task:())
+            with pytest.raises(D3RecoveryRequired,match='d9_candidate_source_missing'):
+                c.app.answers._request(c.app.state.intents[0])
+    if fallback=='mcp':
+        from dataclasses import replace
+        from uuid import uuid4
+        from agent_core.competition_candidates import provenance
+        original=SimpleNamespace(**provenance(candidates[0]))
+        validate_mcp_source(c.app.store,original,c.app.output_boundary.evidence)
+        for change in ({'task_run_id':str(uuid4())},{'intent_id':str(uuid4())},{'evidence_version':'0'*64}):
+            with pytest.raises(ValueError,match='mcp_candidate_source_invalid'):
+                validate_mcp_source(c.app.store,SimpleNamespace(**(vars(original)|change)),c.app.output_boundary.evidence)
+        operation=c.app.store.load_d4_operation(original.source_ref.removeprefix('mcp-result/'))
+        model=c.app.store.load_d3_operation(operation.start.resource_ref.split('/')[-1])
+        with monkeypatch.context() as broken:
+            broken.setattr(c.app.store,'load_d3_operation',lambda key:replace(model,application_ref=parents[0]))
+            with pytest.raises(ValueError,match='mcp_candidate_model_binding_invalid'):
+                validate_mcp_source(c.app.store,original,c.app.output_boundary.evidence)
+    child=c.app.mcp.experiments.records(parents[0])[0]
+    candidate=SimpleNamespace(source_ref=child.completion.evidence_ref,plan_id=None,execution_id=None,
+        task_run_id=c.task,intent_id=c.app.state.intents[0].intent_id,evidence_version=child.completion.evidence_sha256)
+    with pytest.raises(ValueError,match='mcp_candidate_source_invalid'):
+        validate_mcp_source(c.app.store,candidate,c.app.output_boundary.evidence)

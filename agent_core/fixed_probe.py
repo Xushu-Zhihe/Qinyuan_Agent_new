@@ -73,7 +73,7 @@ class FixedProbeBindings:
 
     def _request(self, identity):
         snapshot = self.app.sessions.evidence.read("request", identity)
-        if not isinstance(snapshot, dict) or set(snapshot) != {"turn_id", "intent_id", "request"}:
+        if not isinstance(snapshot, dict) or set(snapshot) - {"context_sha256"} != {"turn_id", "intent_id", "request"}:
             raise D3RecoveryRequired("s1_fixed_request_missing")
         try:
             value = dict(snapshot["request"])

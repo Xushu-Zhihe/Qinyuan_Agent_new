@@ -40,6 +40,7 @@ class ActiveRun:
     process: subprocess.Popen
     cancel_requested: bool = False
     cleanup_only: bool = False
+    operation: str = "run"
 
 
 class Runner:
@@ -51,6 +52,12 @@ class Runner:
         self.root.mkdir(exist_ok=True)
         self._lock = threading.RLock()
         self._active: dict[str, ActiveRun] = {}
+
+    @staticmethod
+    def _scheduled_process_options(scheduled):
+        # Ctrl+C on the workbench must not interrupt admitted calls in its child.
+        if not scheduled:return {}
+        return {"creationflags":subprocess.CREATE_NO_WINDOW} if os.name=="nt" else {"start_new_session":True}
 
     @staticmethod
     def _safe_filename(name: str) -> str:
@@ -193,8 +200,15 @@ class Runner:
             raise WorkbenchError("attachment_run_capacity_exceeded", 409)
         return d7_model
 
-    def start(self, challenge_id: str, *, mode=None):
+    def start(self, challenge_id: str, *, mode=None, competition_control=None):
         with self.workbench.lock:
+            schedules=getattr(self.workbench,"schedules",None)
+            if competition_control is None and schedules is not None and schedules.has_active():
+                raise WorkbenchError("competition_schedule_active",409)
+            if competition_control is not None and schedules is not None:
+                schedules.check_task_operation(challenge_id,"start")
+                scheduled=schedules.get(competition_control["session_id"])
+                if scheduled["state"]["status"]!="running" or scheduled["state"]["challenge_id"]!=challenge_id or schedules.closed.is_set() or schedules.clock()>=scheduled["state"]["deadline_at"]:raise WorkbenchError("competition_session_scope_invalid",409)
             challenge = self.workbench.get(challenge_id)
             if self.workbench.execution_profile in {"d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"}:
                 if mode is not None and mode not in {"simulated", "real"}:
@@ -387,6 +401,7 @@ class Runner:
                 command.extend(["--env-file", str(D7_ENV_FILE)])
             elif self.workbench.protocol_version == 2:
                 command.extend(["--env-file", str(directory / "unused.env")])
+            self.workbench.competitions.freeze(challenge,directory,request,schedule=competition_control)
             self.workbench._insert_run(run_id, challenge_id, directory)
             try:
                 stdout_file = (directory / "agent.stdout.log").open("wb")
@@ -398,6 +413,7 @@ class Runner:
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_file,
                     stderr=stderr_file,
+                    **self._scheduled_process_options(competition_control is not None),
                 )
             except OSError as exc:
                 for stream in (locals().get("stdout_file"), locals().get("stderr_file")):
@@ -536,6 +552,105 @@ class Runner:
     def resume(self, challenge_id: str):
         return self._d9_operation(challenge_id, 'resume')
 
+    def operator_control(self,challenge_id,action,*,seconds=None,operation_id=None):
+        """A separate narrow CLI command can reach an active worker's control ledger."""
+        operation_id=operation_id or str(uuid4())
+        with self.workbench.lock:
+            run=self._current(challenge_id)
+            if run is None:raise WorkbenchError("operator_run_missing",409)
+            directory=Path(run["directory"])
+            pause_file=directory/"operator-pause-request.json"
+            if action=="pause" and not pause_file.exists():
+                binding=immutable_read(directory/"competition-binding.json")
+                immutable_write(pause_file,{"request_id":binding["request_id"],"operation_id":operation_id})
+            from agent_adapters.run_files import run_lock
+            from agent_core.sqlite_control_store import SqliteControlStore
+            from agent_core.operator_controls import current
+            from uuid import UUID
+            try:valid=str(UUID(operation_id))==operation_id and UUID(operation_id).version==4
+            except (TypeError,ValueError,AttributeError):valid=False
+            if not valid:raise WorkbenchError("operator_operation_invalid")
+            controls_dir=directory/"operator-start-controls";controls_dir.mkdir(exist_ok=True)
+            try:
+                with run_lock(controls_dir):
+                    agent_dir=self._find_agent_directory(directory);ready=False
+                    if agent_dir is not None and (agent_dir/"control.sqlite").is_file():
+                        with SqliteControlStore.open_readonly(agent_dir/"control.sqlite") as store:ready=current(store,agent_dir.name) is not None
+                    if not ready:
+                        binding=immutable_read(directory/"competition-binding.json")
+                        path=controls_dir/(operation_id+".json")
+                        request={"request_id":binding["request_id"],"operation_id":operation_id,"action":action,
+                            "payload":{} if seconds is None else {"seconds":seconds}}
+                        if path.exists():
+                            if immutable_read(path)["request"]!=request:raise WorkbenchError("operator_operation_conflict",409)
+                        else:immutable_write(path,{"request":request,"requested_at":time.time()})
+                        return {"pending":True,"initializing":True,"operation_id":operation_id}
+            except ValueError as error:
+                if str(error)=="task_run_busy":
+                    if action=="pause":return {"pending":True,"initializing":True,"operation_id":operation_id}
+                    raise WorkbenchError("operator_task_initializing",409) from None
+                raise
+            command=[sys.executable,"-m","agent","operator-control","--run-dir",str(agent_dir),
+                     "--task-run-id",agent_dir.name,"--operation-id",operation_id,"--action",action]
+            if seconds is not None:command.extend(["--seconds",str(seconds)])
+        try:
+            completed=subprocess.run(command,cwd=directory,env=self._subprocess_environment(3),stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
+            output=json.loads(completed.stdout)
+        except (OSError,ValueError,subprocess.TimeoutExpired):raise WorkbenchError("operator_command_outcome_unknown",503) from None
+        if completed.returncode or output.get("exit_code"):
+            errors=output.get("errors",[])
+            raise WorkbenchError(errors[0]["code"] if errors else "operator_command_rejected",409)
+        if action=="resume":pause_file.unlink(missing_ok=True)
+        return output["operator_control"]
+
+    def runtime_control(self,challenge_id):
+        from agent_core.sqlite_control_store import SqliteControlStore
+        from agent_core.operator_controls import current
+        run=self._current(challenge_id)
+        if run is None:return None
+        directory=self._find_agent_directory(Path(run["directory"]))
+        if directory is None or not (directory/"control.sqlite").is_file():return None
+        import sqlite3
+        from agent_core.control_store import StorageError
+        try:
+            with SqliteControlStore.open_readonly(directory/"control.sqlite") as store:
+                task=store.load_task_run(directory.name)
+                if task is None:return None
+                return {"task_run_id":task.task_run_id,"status":task.status.value,"deadline_at":task.deadline_at,
+                        "control":current(store,task.task_run_id),"unknown":bool(store.blocking_d4_operations(task.task_run_id))}
+        except (OSError,ValueError,sqlite3.Error,StorageError):raise WorkbenchError("operator_state_read_failed",409) from None
+
+    def reconcile_stopped_process(self,challenge_id):
+        """Explicit restart recovery checks whole-worker ownership, including idle waits."""
+        if challenge_id is None:return
+        with self.workbench.lock,self._lock:
+            run=self._current(challenge_id)
+            if run is None or run["status"] not in {"starting","running","cancelling","cleaning"}:return
+            if run["run_id"] in self._active:raise WorkbenchError("competition_still_pausing",409)
+            agent_dir=self._find_agent_directory(Path(run["directory"]))
+            if agent_dir is None:raise WorkbenchError("competition_startup_requires_attention",409)
+            from agent_adapters.run_files import run_lock
+            from agent_adapters.web.task_result import snapshot_v3_task_result
+            try:
+                with run_lock(Path(run["directory"]),lock_name="worker.lock"),run_lock(agent_dir):
+                    result=snapshot_v3_task_result(agent_dir,immutable_read(agent_dir/"run.json"))
+                    self.workbench._finish_run(run["run_id"],status="paused",exit_code=4,result=result,agent_task_run_id=agent_dir.name)
+            except ValueError as error:
+                if str(error)=="task_run_busy":raise WorkbenchError("competition_still_pausing",409) from None
+                raise
+
+    def inflight_operation(self,challenge_id):
+        with self._lock:
+            active=next((item for item in self._active.values() if item.challenge_id==challenge_id),None)
+            return active.operation if active is not None else None
+
+    def competition_submit(self, challenge_id: str):
+        return self._d9_operation(challenge_id,"competition-submit")
+
+    def competition_end(self,challenge_id):
+        return self._d9_operation(challenge_id,"competition-end")
+
     def validation_check(self, challenge_id: str, selection: dict):
         return self._d9_operation(challenge_id, 'validation-check', selection)
 
@@ -544,6 +659,7 @@ class Runner:
         from agent_adapters.web.task_result import snapshot_v3_task_result
         from agent_adapters.validation_check import validate_selection
         with self.workbench.lock, self._lock:
+            self.workbench.schedules.check_task_operation(challenge_id,operation)
             run = self._current(challenge_id)
             if run is None or run['status'] not in {'paused', 'recovery_required', 'finished', 'cleanup_confirmed'}:
                 raise WorkbenchError('d9_operation_not_available', 409)
@@ -561,6 +677,16 @@ class Runner:
             command = [sys.executable, '-m', 'agent', operation, '--task-run-id',
                        agent_dir.name, '--state-dir', str(agent_dir.parent),
                        '--events', str(directory / 'events.jsonl')]
+            secret=None
+            if operation in {"competition-submit","competition-end"}:
+                if operation=="competition-submit" and result.get("task_run",{}).get("status")!="awaiting_external_feedback":
+                    raise WorkbenchError("competition_candidate_not_awaited",409)
+                from agent_adapters.competition_submission import frozen_binding
+                path=directory / "competition-binding.json"
+                try:binding=frozen_binding(path,declaration)
+                except (OSError,ValueError):raise WorkbenchError("competition_run_binding_invalid",409) from None
+                secret=encode({"credential":"" if operation=="competition-end" and time.time()>=result["task_run"]["deadline_at"] else self.workbench.competitions.credential_for(binding["profile"])})
+                command.extend(["--binding-file",str(path),"--operation-id",str(uuid4())])
             if operation == 'validation-check':
                 selection = validate_selection(agent_dir.name, selection)
                 for key, value in selection.items():
@@ -568,10 +694,16 @@ class Runner:
             try:
                 with (directory / 'agent.stdout.log').open('wb') as stdout, (directory / 'agent.stderr.log').open('wb') as stderr:
                     process = subprocess.Popen(command, cwd=directory,
-                        env=self._subprocess_environment(3), stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+                        env=self._subprocess_environment(3), stdin=subprocess.PIPE if secret is not None else subprocess.DEVNULL,
+                        stdout=stdout, stderr=stderr,
+                        **self._scheduled_process_options(self.workbench.schedules.owns(challenge_id)))
+                    if secret is not None:
+                        try:process.stdin.write(secret);process.stdin.close()
+                        except BrokenPipeError:pass
+                        finally:process.stdin=None;secret=None
             except OSError as exc:
                 raise WorkbenchError('d9_operation_start_failed', 503) from exc
-            self._active[run['run_id']] = ActiveRun(run['run_id'], challenge_id, directory, process)
+            self._active[run['run_id']] = ActiveRun(run['run_id'], challenge_id, directory, process,operation=operation)
             self.workbench._started_run(run['run_id'])
         threading.Thread(target=self._watch, args=(run['run_id'],), daemon=True).start()
         return self.status(challenge_id)
@@ -888,11 +1020,32 @@ class Runner:
             )
             with self._lock:
                 self._active.pop(run_id, None)
+        schedules=getattr(self.workbench,"schedules",None)
+        scheduled=schedules is not None and schedules.owns(active.challenge_id)
+        binding_file=active.directory/"competition-binding.json"
+        if binding_file.is_file():
+            try:scheduled=scheduled or "schedule" in immutable_read(binding_file)
+            except (ValueError,OSError):return # An unreadable binding cannot authorise continuation.
+        if scheduled:
+            schedules.wake.set()
+            return
+        # Only this bound question continues. This is not the C01-3 queue scheduler.
+        if (not active.cancel_requested and not result.get("recovery",{}).get("required")
+            and (active.directory / "competition-binding.json").is_file()):
+            try:
+                if agent_status=="awaiting_external_feedback" and active.operation!="competition-submit":
+                    self.competition_submit(active.challenge_id)
+                elif active.operation=="competition-submit" and agent_status=="running" and result.get("competition_submission",{}).get("state") in {"rejected","partial"}:
+                    self.resume(active.challenge_id)
+            except WorkbenchError as error:
+                from qinyuan_core import get_logger
+                get_logger("ctrl").warning("competition.continuation_blocked",run=run_id,
+                    category="platform_connection",code=error.code)
 
     def shutdown(self):
         """Request cancellation and wait briefly for all owned children."""
         with self.workbench.lock, self._lock:
-            active = list(self._active.values())
+            active = [item for item in self._active.values() if not self.workbench.schedules.owns(item.challenge_id)]
             for item in active:
                 item.cancel_requested = True
                 self.workbench._mark_cancel_requested(item.run_id)
@@ -905,4 +1058,4 @@ class Runner:
                 item.process.kill()
                 item.process.wait(timeout=1.0)
         with self._lock:
-            self._active.clear()
+            for item in active:self._active.pop(item.run_id,None)

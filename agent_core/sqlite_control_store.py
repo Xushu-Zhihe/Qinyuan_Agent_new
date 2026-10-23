@@ -172,7 +172,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 30
+CURRENT_SCHEMA_VERSION = 31
 
 MIGRATION_28 = """
 CREATE TABLE d8_conclusions_new (
@@ -1339,6 +1339,10 @@ class SqliteControlStore:
             if version < 30:
                 for statement in _sql_statements(MIGRATION_30):self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)",(30,self._now()))
+            if version < 31:
+                from agent_core.operator_controls import MIGRATION
+                for statement in _sql_statements(MIGRATION):self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)",(31,self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -2171,6 +2175,7 @@ class SqliteControlStore:
         return None if row is None else turn_binding_from_dict(json.loads(row["binding_json"]))
 
     def load_d3_plan_turn_binding(self, plan_id: str):
+        from agent_core.turn_modeling import digest
         from agent_core.hybrid_contracts import HybridTurnBinding,AttachmentPlanBinding,attachment_binding
         binding=self.load_d3_plan_binding(plan_id)
         if binding is None:return None
@@ -3293,6 +3298,8 @@ class SqliteControlStore:
             if existing.completion is None:
                 raise D4RecoveryRequired("operation result is unknown; do not dispatch again")
             return existing
+        from agent_core.operator_controls import check_admission
+        check_admission(self,start.task_run_id)
         cancellation = self._connection.execute(
             "SELECT 1 FROM d4_audit_events "
             "WHERE task_run_id = ? AND category = 'cancellation_requested' LIMIT 1",
@@ -6176,8 +6183,14 @@ class SqliteControlStore:
                 else None
             ),
         )
-        if previous is not None and tuple(previous) != immutable_values:
+        if previous is None and change.deadline_at != change.started_at + change.request.deadline_seconds:
+            raise StorageError("initial TaskRun deadline must match its request")
+        if previous is not None and (tuple(previous[:3])+tuple(previous[4:]) != immutable_values[:3]+immutable_values[4:]
+                or change.deadline_at > previous[3]):
             raise StorageError("immutable TaskRun fields cannot be modified")
+        if (previous is not None and change.status is TaskRunStatus.DEADLINE_EXCEEDED
+                and change.finished_at is not None and change.finished_at < previous[3]):
+            raise StaleControlStateError("TaskRun deadline changed before expiry commit")
         self._connection.execute(
             """
             INSERT INTO task_runs(

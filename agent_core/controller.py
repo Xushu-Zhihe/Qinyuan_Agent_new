@@ -423,6 +423,8 @@ class TaskRunController(LegacyTaskRunController):
         if self._persistent is None:
             return super().task_run
         self._require_persistent()
+        from agent_core.operator_controls import refresh
+        refresh(self)
         if self._persistent_snapshot is None:
             raise InvalidTransition("TaskRun has not been started or attached")
         return self._persistent_snapshot
@@ -2058,7 +2060,7 @@ class TaskRunController(LegacyTaskRunController):
             status = {
                 "accepted": TaskRunStatus.ACHIEVED,
                 "rejected": TaskRunStatus.RUNNING,
-                    "partial": TaskRunStatus.RUNNING,
+            "partial": TaskRunStatus.RUNNING,
                 "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
                 "conflict": task_run.status,
                 "pending": task_run.status,
@@ -2095,7 +2097,7 @@ class TaskRunController(LegacyTaskRunController):
         return {
             "accepted": TaskRunStatus.ACHIEVED,
             "rejected": TaskRunStatus.RUNNING,
-                    "partial": TaskRunStatus.RUNNING,
+            "partial": TaskRunStatus.RUNNING,
             "unknown": TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
         }[verdict]
 
@@ -2216,6 +2218,13 @@ class TaskRunController(LegacyTaskRunController):
             failure_reason=reason,
         )
 
+    def platform_unavailable(self, reason: str, mutation_id: str) -> Any:
+        """Trusted competition adapter confirmed the current question cannot continue."""
+        if reason not in {"competition_platform_failed","competition_platform_expired","competition_platform_abandoned"}:
+            raise ValueError("competition_platform_state_invalid")
+        self._require_persistent()
+        return self._finish_public(TaskRunStatus.FAILED,mutation_id=mutation_id,failure_reason=reason)
+
     def cancel(self, mutation_id: str | None = None) -> Any:
         if self._persistent is None:
             if mutation_id is not None:
@@ -2285,7 +2294,14 @@ class TaskRunController(LegacyTaskRunController):
             failure_reason=reason,
         )
 
+    @staticmethod
+    def submit_operator_control(store, task_id, operation_id, action, payload):
+        from agent_core.operator_controls import submit
+        return submit(store,task_id,operation_id,action,payload)
+
     def _require_bound_state(self) -> tuple[Any, ControlStateSnapshot]:
+        from agent_core.operator_controls import refresh
+        refresh(self)
         if (
             self._persistent_task_run_id is None
             or self._persistent_snapshot is None
@@ -2919,6 +2935,8 @@ class TaskRunController(LegacyTaskRunController):
     @property
     def control_state(self) -> ControlStateSnapshot:
         self._require_persistent()
+        from agent_core.operator_controls import refresh
+        refresh(self)
         if self._persistent_state is None:
             raise InvalidTransition("persistent TaskRun has not been started or attached")
         return self._persistent_state

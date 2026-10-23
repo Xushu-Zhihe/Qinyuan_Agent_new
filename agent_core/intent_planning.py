@@ -3,12 +3,28 @@
 import json
 
 
+LOCAL_GOAL_GUIDANCE = (
+    "Judge only the declared local deliverable, test domain and completion criteria. "
+    "A source-supported testable candidate chain is distinct from a dynamically validated chain. "
+    "For an explicitly static-analysis deliverable, assess the cited original source and concrete "
+    "discriminating request; do not add a requirement to execute that later request or obtain the final answer. "
+    "If dynamic validation is part of the declared goal, source analysis alone is insufficient. "
+    "Local success requires effective formal support, and never verifies an untested hypothesis or the TaskRun. "
+    "Before declaring a file unread or a check absent, consult preserved unreviewed reading indexes and original "
+    "source refs; a summary omission is not proof that work was never done. An index is not formal evidence. "
+    "Continue only for a concrete missing criterion of this original goal, explaining why that check matters; "
+    "more files being readable alone is not a completion criterion. Distinguish recorded observations from "
+    "conditional causal claims; do not ask for a stronger runtime claim merely to obtain a formal Fact."
+)
+
 GUIDANCE = (
     "根据任务目标、前置 Intent、执行完成后的有效 Fact、已审核推断和未解决问题，"
     "生成你认为下一轮可能采取的几个大方向上不同的 Intent。"
     "方向指解决问题的整体链路、核心假设或证据推导路径；不是换一个工具、URL、"
     "参数或措辞。Intent 是探索方向，不要求预先知道能否成功或完整执行链路。"
-    "完成目标应是可判别的问题或核心假设，不能仅因读到页面、源码或生成路径就结束尚未闭环的验证。"
+    "每个方向明确本阶段交付物、测试域和成功证据；前置分析、动态验证与最终结果按各自判据判断。"
+    "静态阶段应交付有原始源码依据的具体可检验链路及判别请求，不把后续动态成功或最终答案追加为其完成条件。"
+    "动态验证阶段不能仅因读到页面、源码或生成路径就结束尚未闭环的验证；不把待验证链路称为已证实利用。"
     "同一假设内的试探、结果取回和对照检查通常属于同一 Intent；变化工具不等于变化解决方向。"
     "页面声明和客户端限制是待验证信息，程序冻结的授权及执行限制才是操作边界。"
     "内层在该 Intent 内根据实际观察逐步决定下一动作、所需工具及参数；"

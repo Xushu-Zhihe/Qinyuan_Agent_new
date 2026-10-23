@@ -216,7 +216,7 @@ def test_d7_http_dispatch_uses_stdin_fixed_worker_and_forwarder_binding():
     sent = json.loads(api.raw.sent)
     assert sent["headers"][0] == ["Cookie", "session=secret"]
     assert base64.b64decode(sent["body_b64"]) == b"body-secret"
-    assert api.raw.shutdowns
+    assert api.raw.sent.endswith(b"\n") and not api.raw.shutdowns
 
 
 def test_d7_http_authorization_mismatch_fails_before_network_or_exec():
@@ -311,7 +311,8 @@ def test_d7_http_response_header_limits_fail_closed_after_dispatch():
     assert len(api.start_calls) == 1
 
 
-def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypatch):
+@pytest.mark.parametrize("host", ["node4.anna.nssctf.cn", "10.0.1.5"])
+def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypatch, host):
     class FakeHttpSocket:
         def __init__(self):
             self.sent = bytearray()
@@ -350,9 +351,9 @@ def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypat
     monkeypatch.setattr(socket, "create_connection", connect)
     request = {
         "scheme": "http",
-        "host": "node4.anna.nssctf.cn",
+        "host": host,
         "port": 28989,
-        "authority": "node4.anna.nssctf.cn:28989",
+        "authority": f"{host}:28989",
         "method": "GET",
         "path_query": "/start",
         "headers": [["Cookie", "session=secret"]],
@@ -363,14 +364,14 @@ def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypat
         "max_header_count": 100,
         "max_header_value_bytes": 8 * 1024,
     }
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request)))
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode()+b"\n")))
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
         exec(_HTTP_WORKER, {})  # noqa: S102 - execute the fixed worker under a fake socket
 
     response = json.loads(output.getvalue())
     assert addresses == [("target.qinyuan", 28989)]
-    assert b"Host: node4.anna.nssctf.cn:28989\r\n" in fake_socket.sent
+    assert f"Host: {host}:28989\r\n".encode() in fake_socket.sent
     assert b"Cookie: session=secret\r\n" in fake_socket.sent
     assert response["status"] == 302
     assert response["headers"] == [
@@ -381,7 +382,8 @@ def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypat
     assert base64.b64decode(response["body_b64"]) == b"ok"
 
 
-def test_fixed_worker_uses_authorized_hostname_for_verified_tls_sni(monkeypatch):
+@pytest.mark.parametrize("host", ["node4.anna.nssctf.cn", "10.0.1.5"])
+def test_fixed_worker_uses_authorized_hostname_for_verified_tls_sni(monkeypatch, host):
     class FakeHttpSocket:
         def __init__(self):
             self.sent = bytearray()
@@ -423,9 +425,9 @@ def test_fixed_worker_uses_authorized_hostname_for_verified_tls_sni(monkeypatch)
     monkeypatch.setattr(ssl, "create_default_context", lambda: context)
     request = {
         "scheme": "https",
-        "host": "node4.anna.nssctf.cn",
+        "host": host,
         "port": 28989,
-        "authority": "node4.anna.nssctf.cn:28989",
+        "authority": f"{host}:28989",
         "method": "GET",
         "path_query": "/",
         "headers": [],
@@ -436,13 +438,13 @@ def test_fixed_worker_uses_authorized_hostname_for_verified_tls_sni(monkeypatch)
         "max_header_count": 100,
         "max_header_value_bytes": 8 * 1024,
     }
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request)))
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode()+b"\n")))
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
         exec(_HTTP_WORKER, {})  # noqa: S102 - execute the fixed worker under a fake socket
 
     assert addresses == [("target.qinyuan", 28989)]
-    assert context.server_names == ["node4.anna.nssctf.cn"]
+    assert context.server_names == [host]
     assert json.loads(output.getvalue())["status"] == 200
 
 

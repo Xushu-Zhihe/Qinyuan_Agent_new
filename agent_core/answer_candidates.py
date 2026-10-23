@@ -25,7 +25,7 @@ class AnswerCandidates:
         return self.app._id('d9-4/candidate/' + intent_id)
 
     def _request(self, intent):
-        from agent_core.competition_candidates import MCPAnswerCandidateContext,provenance,validate_mcp_source
+        from agent_core.competition_candidates import MCPAnswerCandidateContext,provenance,validate_mcp_source,supports_mcp_candidate
         identity = self._identity(intent.intent_id)
         saved = self.app.sessions.evidence.read('request', identity)
         if saved is not None:
@@ -53,23 +53,28 @@ class AnswerCandidates:
         execution = next((e for e in reversed(state.executions)
                           if e.plan_id in plans and e.status is ExecutionStatus.SUCCEEDED
                           and e.output_ref is not None), None)
-        mcp = [r for r in self.store.list_d4_operations(state.task_run.task_run_id)
-               if (r.start.resource_ref or '').startswith('mcp/'+intent.intent_id+'/') and r.completion is not None
+        operations = self.store.list_d4_operations(state.task_run.task_run_id)
+        mcp = [r for r in operations
+               if supports_mcp_candidate(r,intent.intent_id) and r.completion is not None
                and r.completion.result_kind == 'completed'] if self.app.config.contract_version == 22 else []
         latest = mcp[-1] if mcp else None
         # Serialized execution order comes from the durable ledger, not an
         # absent ExecutionSnapshot.finished_at or ambiguous equal timestamps.
-        order = {r.start.operation_id: n for n, r in enumerate(self.store.list_d4_operations(state.task_run.task_run_id))} if latest else {}
+        order = {r.start.operation_id: n for n, r in enumerate(operations)} if latest else {}
         if latest is not None and execution is not None and execution.execution_id not in order:
             raise D3RecoveryRequired('d9_candidate_source_missing')
         if latest is not None and (execution is None or order[latest.start.operation_id] > order[execution.execution_id]):
-            context=MCPAnswerCandidateContext(None,None,None,None,state.task_run.request.goal,
+            context=MCPAnswerCandidateContext(state.task_run.request.goal,
                 state.task_run.task_run_id,intent.turn_id,intent.intent_id,
                 latest.completion.evidence_ref,latest.completion.evidence_sha256)
             from types import SimpleNamespace
             validate_mcp_source(self.store,SimpleNamespace(**provenance(context)),self.evidence)
         else:
             if execution is None:
+                if self.app.config.contract_version == 22 and any(
+                        (r.start.resource_ref or '').startswith('mcp/'+intent.intent_id+'/experiment/')
+                        and r.completion is not None and r.completion.result_kind == 'completed' for r in operations):
+                    return None  # Known unsupported source; local progress still reaches planning.
                 raise D3RecoveryRequired('d9_candidate_source_missing')
             binding = self.store.load_d3_plan_binding(execution.plan_id)
             result = self.store.load_d3_plan_result(execution.plan_id)
@@ -87,6 +92,11 @@ class AnswerCandidates:
         if intent.status is not IntentStatus.SUCCEEDED:
             raise D3RecoveryRequired('d9_candidate_requires_local_success')
         request = self._request(intent)
+        if request is None:
+            from qinyuan_core import get_logger
+            get_logger("ctrl").info("candidate.skipped", run=self.app.state.task_run.task_run_id,
+                intent=intent.intent_id, code="d9_candidate_source_unsupported", category="source_capability")
+            return False
         identity, candidate = await self.app.inner.propose_candidate(request, token, self.protected_factory())
         if token.is_cancelled:
             raise D3RecoveryRequired('d9_candidate_registration_cancelled')

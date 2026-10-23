@@ -1,11 +1,11 @@
-"""C01-1 competition profiles and read-only platform previews; no Agent dispatch."""
+"""Competition profiles, observed question imports and fixed platform requests."""
 
 import http.client
 import json
 import socket
 import ssl
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode
 from uuid import UUID, uuid4
 
 from agent_adapters.workbench_contracts import WorkbenchError
@@ -27,6 +27,24 @@ def _origin(value):
         return value.rstrip("/")
     except (ValueError, TypeError, AttributeError):
         raise WorkbenchError("competition_origin_invalid") from None
+
+
+def _target_origin(value):
+    """Explicit HTTP(S) URLs use standard ports; original paths remain question data."""
+    from agent_core.web_contracts import canonical_web_origin
+    parsed=urlsplit(value)
+    if parsed.scheme not in {"http","https"} or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise ValueError("competition_target_protocol_unsupported")
+    host=parsed.hostname
+    host=f"[{host}]" if ":" in host else host
+    port=parsed.port if parsed.port is not None else (80 if parsed.scheme=="http" else 443)
+    return canonical_web_origin(f"{parsed.scheme}://{host}:{port}")
+
+
+def _matches_target(raw, target):
+    if "://" not in raw:return urlsplit(target).netloc==raw
+    try:return _target_origin(raw)==target
+    except (TypeError,ValueError):return False
 
 
 def _integer(value, *, minimum=0):
@@ -145,7 +163,7 @@ def submit_candidate(profile,credential,remote_ref,flag):
     try:
         if profile["adapter"]=="arena":
             data=value["data"]; attempt=data["attempt"];correct=data["correct"]
-            if type(correct) is not bool or attempt["id"]!=remote_ref:raise ValueError()
+            if type(correct) is not bool or _integer(attempt["id"],minimum=1)!=remote_ref:raise ValueError()
             state=_text(attempt["state_label"])
             if correct and state=="solved":return {"verdict":"accepted","platform_state":state}
             if not correct and state=="active":return {"verdict":"rejected","platform_state":state}
@@ -169,6 +187,40 @@ def submit_candidate(profile,credential,remote_ref,flag):
                 "correct_flag_count":correct,"total_flag_count":total}
     except (ValueError,KeyError,TypeError,AttributeError):
         raise WorkbenchError("competition_response_invalid",502) from None
+
+
+def read_question(profile,credential,remote_ref=None):
+    if profile["adapter"]=="benchmark":
+        items=_read(profile,credential)["items"]
+        return next((item for item in items if item["remote_ref"]==remote_ref),None) if remote_ref is not None else items
+    path=READ_PATHS["arena"] if remote_ref is None else f"/api/skill/agent/arena/attempt/{_integer(remote_ref,minimum=1)}/"
+    try:
+        items=_redact(_preview("arena",_exchange(profile,credential,"GET",path)),credential)["items"]
+        item=items[0] if items else None
+        if remote_ref is not None and (item is None or item["remote_ref"]!=remote_ref):raise ValueError()
+        return item
+    except (ValueError,KeyError,TypeError):raise WorkbenchError("competition_response_invalid",502) from None
+
+
+def platform_action(profile,credential,action,remote_ref):
+    if profile["adapter"]=="arena" and action=="next":
+        value=_exchange(profile,credential,"POST","/api/skill/agent/arena/next/")
+        try:
+            if type(value["data"]["reused"]) is not bool:raise ValueError()
+            items=_redact(_preview("arena",value),credential)["items"]
+            if len(items)!=1 or items[0]["state"]!="active":raise ValueError()
+            return {"item":items[0],"reused":value["data"]["reused"]}
+        except (ValueError,KeyError,TypeError):raise WorkbenchError("competition_response_invalid",502) from None
+    if profile["adapter"]!="benchmark" or action not in {"start","close"} or not isinstance(remote_ref,str) or not remote_ref:
+        raise WorkbenchError("competition_platform_action_invalid")
+    path=f"/openapi/v1/challenges/{action}?"+urlencode({"unique_code":remote_ref})
+    value=_exchange(profile,credential,"POST",path)
+    try:
+        if value["unique_code"]!=remote_ref:raise ValueError()
+        if action=="start":return {"addresses":_addresses(value["container_addr"]),"owned":True}
+        if value["closed"] is not True:raise ValueError()
+        return {"closed":True}
+    except (ValueError,KeyError,TypeError):raise WorkbenchError("competition_response_invalid",502) from None
 
 
 class CompetitionConnections:
@@ -217,6 +269,9 @@ class CompetitionConnections:
         with self.workbench.lock:
             previous = self._get(identity) if identity is not None else None
             identity = identity or str(uuid4())
+            schedules=getattr(self.workbench,"schedules",None)
+            if previous and schedules is not None and schedules.uses_profile(identity) and (previous["adapter"],previous["base_url"])!=(value["adapter"],base):
+                raise WorkbenchError("competition_profile_in_use",409)
             profile = dict(id=identity, name=value["name"].strip(), adapter=value["adapter"],
                            base_url=base, timeout_seconds=value["timeout_seconds"])
             with self.workbench._db() as db:
@@ -231,7 +286,10 @@ class CompetitionConnections:
         with self.workbench.lock:
             profile = self._get(identity)
             self.credentials.pop(identity, None)
-            return self._public(profile)
+            public=self._public(profile)
+        schedules=getattr(self.workbench,"schedules",None)
+        if schedules is not None:schedules.pause_profile(identity)
+        return public
 
     def check(self, identity):
         with self.workbench.lock:
@@ -258,6 +316,7 @@ class CompetitionConnections:
         """Import only platform-observed questions; platform actions remain separate."""
         if not isinstance(value,dict) or set(value)-{"remote_ref","endpoint","deadline_minutes","step_timeout_seconds","http_methods"} or "remote_ref" not in value:
             raise WorkbenchError("competition_import_invalid")
+        if self.workbench.execution_profile != "d8_v22":raise WorkbenchError("competition_requires_contract22",409)
         observed_at=time.time()
         checked=self.check(identity);profile=checked["profile"]
         item=next((i for i in checked["preview"]["items"] if type(i["remote_ref"]) is type(value["remote_ref"]) and i["remote_ref"]==value["remote_ref"]),None)
@@ -267,16 +326,14 @@ class CompetitionConnections:
         target=value.get("endpoint","")
         if not isinstance(target,str):raise WorkbenchError("competition_import_invalid")
         if target:
-            from agent_core.web_contracts import canonical_web_origin
-            try:target=canonical_web_origin(target)
+            try:target=_target_origin(target)
             except (TypeError,ValueError):raise WorkbenchError("competition_target_protocol_unsupported") from None
-            matches=[]
-            for raw in item["addresses"]:
-                if "://" in raw:
-                    try:matches.append(canonical_web_origin(raw)==target)
-                    except (TypeError,ValueError):matches.append(False)
-                else:matches.append(urlsplit(target).netloc==raw)
+            matches=[_matches_target(raw,target) for raw in item["addresses"]]
             if not any(matches):raise WorkbenchError("competition_target_not_in_question")
+            from Sandbox.target_address import TargetAddress,TargetAddressError
+            try:TargetAddress.from_url(target,allow_private_ipv4=True)
+            except TargetAddressError as error:
+                raise WorkbenchError("competition_target_address_not_supported" if error.code=="non_public_target" else "competition_target_protocol_unsupported",409) from None
         elif item["addresses"]:
             raise WorkbenchError("competition_target_selection_required")
         snapshot={"profile":{k:profile[k] for k in ("id","adapter","base_url","timeout_seconds")},
@@ -295,27 +352,33 @@ class CompetitionConnections:
             from agent_adapters.workbench import VALID_CATEGORIES
             if category not in VALID_CATEGORIES:category="misc"
             minutes=value.get("deadline_minutes",60)
+            description=item["description"]
+            selected=next((raw for raw,match in zip(item["addresses"],matches) if match),None) if target else None
+            if selected:description += "\n\n平台所选入口："+selected
             local=self.workbench.create(dict(title=item["display_name"][:160],category=category,
-                description=item["description"],endpoint=target,deadline_minutes=minutes,
+                description=description,endpoint=target,deadline_minutes=minutes,
                 step_timeout_seconds=value.get("step_timeout_seconds",60),
                 http_methods=value.get("http_methods",["GET","HEAD","OPTIONS"])))
             with self.workbench._db() as db:
                 db.execute("INSERT INTO competition_questions VALUES (?,?,?,?,?)",(local["id"],identity,scope,remote,json.dumps(snapshot,ensure_ascii=True)))
             return local
 
-    def freeze(self,challenge,directory,request):
+    def freeze(self,challenge,directory,request,*,schedule=None):
         from agent_adapters.run_files import immutable_write
         with self.workbench.lock,self.workbench._db() as db:
             row=db.execute("SELECT snapshot_json FROM competition_questions WHERE challenge_id=?",(challenge["id"],)).fetchone()
             if row is None:return
             snapshot=json.loads(row["snapshot_json"])
             self.credential_for(snapshot["profile"])
+            if challenge["endpoint"] and not any(_matches_target(raw,challenge["endpoint"]) for raw in snapshot["question"]["addresses"]):
+                raise WorkbenchError("competition_target_not_in_question",409)
             if not challenge["endpoint"] and not challenge["attachments"]:
                 raise WorkbenchError("competition_question_input_required",409)
             if request.get("execution_profile")!="d8_v22":raise WorkbenchError("competition_requires_contract22",409)
             deadline=snapshot["platform_deadline_at"]
             if deadline is not None and deadline<=time.time():raise WorkbenchError("competition_question_not_active",409)
-            immutable_write(directory/"competition-binding.json",{"request_id":request["request_id"],**snapshot})
+            immutable_write(directory/"competition-binding.json",{"request_id":request["request_id"],**snapshot,
+                **({"schedule":schedule} if schedule is not None else {})})
 
     def credential_for(self,frozen):
         with self.workbench.lock:

@@ -51,8 +51,8 @@
 
         <section id="competition-view" class="view" hidden>
           <div class="page-head">
-            <div><p class="eyebrow">COMPETITION CONNECTIONS · C01-1</p><h1>比赛连接</h1><p class="subheading">选择比赛配置，验证认证并预览平台题目。连接检查仅执行读取。</p></div>
-            <span class="section-meta">当前阶段：只读连接</span>
+            <div><p class="eyebrow">COMPETITION CONTROL · C01-3</p><h1>比赛连接</h1><p class="subheading">选择比赛配置，验证认证并预览平台题目。连接检查仅执行读取。</p></div>
+            <span class="section-meta">当前阶段：串行赛程与运行控制</span>
           </div>
           <div class="competition-layout">
             <section class="competition-settings">
@@ -72,10 +72,41 @@
             <section class="competition-preview-panel">
               <div class="competition-heading"><div><p class="eyebrow">READ-ONLY PREVIEW</p><h2>连接与题目预览</h2></div><button id="competition-check" class="primary-button" type="button" disabled>测试连接 / 刷新题目</button></div>
               <p id="competition-status" class="competition-status" role="status" aria-live="polite">保存配置后即可检查连接。</p>
-              <p class="competition-note">Arena 读取当前题目；Benchmark 读取题目列表。不领取新题、不启动或关闭靶场、不查看扣分提示、不提交 Flag。</p>
+              <p class="competition-note">连接检查只读取 Arena 当前题目或 Benchmark 列表；下方显式开始自动赛程后，才会领取、启动及提交。</p>
               <div id="competition-summary" class="competition-summary"></div>
               <div id="competition-preview" class="competition-preview"><p>尚未连接平台。</p></div>
-              <p class="competition-note">自动串行答题、立即暂停、本题结束后停止和单题 / 整体延时将在后续阶段接入；本页不会启动 Agent。VPN 地址保持平台原值，不猜测连接协议。</p>
+              <section class="competition-question" aria-labelledby="competition-schedule-title">
+                <h3 id="competition-schedule-title">自动串行赛程</h3>
+                <p class="competition-note">使用当前已保存配置。一次一道题；真实模型与 Docker 沿用原设置。活跃赛程锁定平台来源，可修正同源凭据。</p>
+                <form id="competition-schedule-form">
+                  <fieldset id="competition-schedule-fields" class="competition-fields">
+                    <div class="field-grid">
+                      <label class="field"><span>无协议入口</span><select id="competition-scheme" required><option value="">请确认协议</option><option value="http">HTTP</option><option value="https">HTTPS</option></select></label>
+                      <label class="field"><span>单题预算（分钟）</span><input id="competition-question-minutes" type="number" min="1" max="10080" value="60" required></label>
+                      <label class="field"><span>整体预算（分钟）</span><input id="competition-overall-minutes" type="number" min="1" value="180" required></label>
+                      <label class="field"><span>平台整体截止（可选）</span><input id="competition-platform-end" type="datetime-local"></label>
+                    </div>
+                    <label class="field"><span>允许的 HTTP 方法（逗号分隔）</span><input id="competition-methods" value="GET,HEAD,OPTIONS" required></label>
+                    <label class="field"><span>Benchmark 队列（每行一个题目标识，从上到下）</span><textarea id="competition-queue" rows="4" placeholder="测试连接后选择题目，再按行调整顺序；Arena 留空"></textarea></label>
+                    <div class="form-actions"><button id="competition-fill-queue" class="quiet-button" type="button">填入预览中未完成题目</button><button id="competition-schedule-start" class="primary-button" type="submit">开始真实自动赛程</button></div>
+                  </fieldset>
+                </form>
+                <p id="competition-schedule-status" class="competition-status" role="status" aria-live="polite">尚未创建赛程。</p>
+                <p id="competition-schedule-error" class="competition-note" role="alert"></p>
+                <div id="competition-schedule-progress" class="competition-summary"></div>
+                <div class="form-actions">
+                  <button id="competition-pause" class="secondary-button" type="button" disabled>立即暂停</button>
+                  <button id="competition-resume" class="secondary-button" type="button" disabled>继续原赛程</button>
+                  <label><input id="competition-stop-after" type="checkbox" disabled> 本题结束后停止</label>
+                  <button id="competition-open-task" class="quiet-button" type="button" disabled>打开当前任务</button>
+                </div>
+                <div class="form-actions">
+                  <label class="field"><span>增加分钟数</span><input id="competition-extend-minutes" type="number" min="1" value="10"></label>
+                  <button id="competition-extend-question" class="quiet-button" type="button" disabled>延长本题</button>
+                  <button id="competition-extend-overall" class="quiet-button" type="button" disabled>延长整体</button>
+                </div>
+                <p class="competition-note">暂停期间时间继续计时；已开始的调用先核验，不强杀或重发。延长整体不会增加本题预算，也不会延长平台有效期。Arena 本地到期而平台仍有效时等待处理，不自动放弃扣分。初始化中的控制会显示待应用。</p>
+              </section>
             </section>
           </div>
         </section>
