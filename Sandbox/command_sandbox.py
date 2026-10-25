@@ -49,6 +49,8 @@ class T6TaskRunSandbox(TaskRunSandbox):
         spec["command"] = ["python3", "-I", "-c", REAPER_SCRIPT]
         if self.private_network is not None:
             spec["network_mode"] = self.private_network
+        # 覆盖父类的 tmpfs 表，所以必须把 /tmp 一并带回来：根文件系统只读时，
+        # 缺了它任何默认写临时目录的工具都会拿到 EROFS。
         spec["tmpfs"] = {
             "/workspace": (
                 f"rw,noexec,nosuid,nodev,size={self._settings.workspace_size},"
@@ -57,6 +59,10 @@ class T6TaskRunSandbox(TaskRunSandbox):
             "/workspace/work": (
                 f"rw,exec,nosuid,nodev,size={self._settings.workspace_size},"
                 "uid=10001,gid=10001,mode=0700"
+            ),
+            "/tmp": (
+                f"rw,noexec,nosuid,nodev,size={self._settings.temporary_size},"
+                "mode=1777"
             ),
         }
         return spec

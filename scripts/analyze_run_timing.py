@@ -18,6 +18,7 @@ from agent_core.turn_modeling import digest
 def summarize(task, operations, evidence):
     stages, roles, calls = {}, {}, []
     unfinished, missing_requests, missing_results = [], [], []
+    intervals = []
     observed_end = task.started_at
     for operation in operations:
         start, end = operation.start, operation.completion
@@ -46,6 +47,8 @@ def summarize(task, operations, evidence):
             unfinished.append(identity)
         elif end.finished_at < start.started_at:
             raise ValueError("timing_operation_interval_invalid")
+        if end is not None:
+            intervals.append((start.started_at, end.finished_at))
         transport = result["transport"] if result else {}
         usage = transport.get("usage") or {}
         details = usage.get("completion_tokens_details") or {}
@@ -74,8 +77,15 @@ def summarize(task, operations, evidence):
                 total["max_prompt_tokens"] = max(total["max_prompt_tokens"] or 0, row["prompt_tokens"])
             for name in ("prompt_tokens", "completion_tokens", "reasoning_tokens"):
                 total[name] += row[name] or 0
+    merged = []
+    for begin, finish in sorted(intervals):
+        if merged and begin <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], finish)
+        else:
+            merged.append([begin, finish])
     endpoint = max(observed_end, task.finished_at or observed_end)
-    return dict(task_run_id=task.task_run_id,
+    return dict(model_interval_union_seconds=sum(b-a for a,b in merged),
+        model_interval_sum_seconds=sum(b-a for a,b in intervals), task_run_id=task.task_run_id,
         timing_basis="D4 operation intervals; includes local dispatch overhead; overlapping sums are not wall time",
         usage_basis="reported usage only; reasoning_tokens are included in completion_tokens",
         started_at=task.started_at, observed_through=endpoint,
@@ -84,7 +94,7 @@ def summarize(task, operations, evidence):
         missing_provider_results=missing_results, roles=roles, stages=stages, calls=calls)
 
 
-def summarize_cache(task, operations, evidence, probe_path):
+def summarize_cache(task, operations, evidence, probe_path, *, decisions=()):
     """Join final-attempt probes by identity and audit digest, never size/mtime.
 
     Old build-time probes cannot be corrected retroactively without their text.
@@ -113,7 +123,8 @@ def summarize_cache(task, operations, evidence, probe_path):
         return dict(Counter(branch.get("properties", {}).get("kind", {}).get("const", "object")
                             for branch in schema.get("anyOf", [schema])))
 
-    calls, previous, stages = [], {}, defaultdict(list)
+    calls, previous, stages, roles, intents = [], {}, defaultdict(list), defaultdict(list), defaultdict(list)
+    intent_by_request = {record.model_request_id: record.intent_id for record in decisions}
     for operation in operations:
         start = operation.start
         sent = evidence.read("provider-request", start.operation_id) if start.role else None
@@ -123,7 +134,8 @@ def summarize_cache(task, operations, evidence, probe_path):
         key = (stage, sent["role_config_ref"], digest(sent["parameters"]))
         result = evidence.read("provider-result", identity) or {}
         usage = result.get("transport", {}).get("usage") or {}
-        item = dict(model_request_id=identity, stage=stage, started_at=start.started_at,
+        item = dict(model_request_id=identity, role=start.role, intent_id=intent_by_request.get(identity),
+                    stage=stage, started_at=start.started_at,
                     operation_completed=operation.completion is not None,
                     prompt_tokens=usage.get("prompt_tokens"),
                     cache_hit_tokens=usage.get("prompt_cache_hit_tokens"),
@@ -176,15 +188,17 @@ def summarize_cache(task, operations, evidence, probe_path):
         previous[key] = item
         calls.append(item)
         stages[stage].append(item)
+        roles[start.role].append(item)
+        if item["intent_id"] is not None:
+            intents[item["intent_id"]].append(item)
 
-    totals = {}
-    for stage, rows in stages.items():
+    def aggregate(rows):
         known = [r for r in rows if type(r["prompt_tokens"]) is int and type(r["cache_hit_tokens"]) is int]
         prefixes = [r["system_prefix_chars"] for r in rows if r["prefix_status"] == "comparable"]
         gaps = [r["since_previous_attempt_seconds"] for r in rows if "since_previous_attempt_seconds" in r]
         prompt = sum(r["prompt_tokens"] for r in known)
         hit = sum(r["cache_hit_tokens"] for r in known)
-        totals[stage] = dict(attempts=len(rows), cache_usage_observations=len(known),
+        return dict(attempts=len(rows), cache_usage_observations=len(known),
             prompt_tokens=prompt, cache_hit_tokens=hit, cache_hit_ratio=hit / prompt if prompt else None,
             matched_probes=sum(r["probe_status"] == "matched" for r in rows),
             comparable_prefixes=len(prefixes), median_system_prefix_chars=median(prefixes) if prefixes else None,
@@ -192,7 +206,11 @@ def summarize_cache(task, operations, evidence, probe_path):
     return dict(basis="final provider attempts joined to D4/audit IDs; first observed is not cold cache",
                 prefix_units="Unicode code points, not tokens; user prefix reusable only after identical system",
                 ignored_records=dict(ignored), unmatched_attempt_records=sum(map(len, probes.values())),
-                stages=totals, calls=calls)
+                stages={key: aggregate(rows) for key, rows in stages.items()},
+                roles={key: aggregate(rows) for key, rows in roles.items()},
+                intents={key: aggregate(rows) for key, rows in intents.items()},
+                unattributed_inner_attempts=sum(r["role"] == "inner_action" and r["intent_id"] is None for r in calls),
+                calls=calls)
 
 
 def summarize_supervision(task, operations, decisions, tree, handoff, sessions):
@@ -259,6 +277,62 @@ def summarize_supervision(task, operations, decisions, tree, handoff, sessions):
                         "voluntary_yields": sum(yields.values())}, validity_reasons=dict(validity_reasons), calls=calls)
 
 
+
+def summarize_activity(task, store, output, sessions, handoff):
+    """Count durable identities, not filenames or presumed semantic progress."""
+    from collections import Counter
+    actions, tools, http, reads = Counter(), Counter(), Counter(), Counter()
+    experiment_sessions = set()
+    for row in store.list_d8_decisions(task.task_run_id):
+        data = sessions.read('decision', row.record_id)
+        if data is None or digest(data) != row.evidence_sha256:
+            raise ValueError('timing_decision_binding_changed')
+        if data['request']['stage'] != 'inner_plan':
+            continue
+        raw = data['response']
+        kind = raw.get('kind', 'unclassified')
+        tool = raw.get('tool_name')
+        actions[kind + (':' + tool if kind == 'mcp_call' and tool else '')] += 1
+        if tool == 'http.run_experiment' and output.read('experiment-result', row.model_request_id) is not None:
+            experiment_sessions.add(row.model_request_id)
+    for op in store.list_d4_operations(task.task_run_id):
+        if op.start.category != 'tool_dispatch':
+            continue
+        identity = op.start.operation_id
+        claim = output.read('mcp-call', identity)
+        if claim is not None:
+            if claim['task_run_id'] != task.task_run_id:
+                raise ValueError('timing_tool_owner_changed')
+            tool = claim['call']['tool_name']
+            tools[tool + (':completed' if op.completion is not None else ':pending')] += 1
+            if tool == 'http.run_experiment':
+                http['experiment:' + ('completed' if op.completion is not None else 'pending')] += 1
+        else:
+            binding = store.load_d3_plan_binding(op.start.resource_ref)
+            from agent_core.http_contracts import HttpPlanBinding
+            if not isinstance(binding, HttpPlanBinding):
+                continue
+            stopped = output.read('http-dispatch-stop', identity)
+            result = output.read('http-result', identity)
+            state = 'not_dispatched' if stopped else 'completed' if op.completion is not None else 'pending'
+            http['standalone:' + state] += 1
+    for identity, start, completion in store.list_d8_reads(task.task_run_id):
+        snapshot = handoff.read('read-snapshot', start['snapshot_id'])
+        if snapshot is None or digest(snapshot) != start['snapshot_sha256']:
+            raise ValueError('timing_read_snapshot_changed')
+        reads['completed' if completion is not None else 'pending'] += 1
+        reads['next_page' if snapshot['read_input']['cursor'] else 'initial'] += 1
+    blocks = set()
+    for path in handoff.records.directory.glob('d8-handoff-pause-*.json'):
+        identity = path.stem.removeprefix('d8-handoff-pause-')
+        record = handoff.read('pause', identity)
+        if record.get('task_run_id') == task.task_run_id and record.get('scope') in {'intent', 'task'}:
+            blocks.add((record['checkpoint_sequence'], record.get('intent_id'), record['kind']))
+    return dict(basis='durable applied decisions, operation starts/completions and read starts; counts do not measure quality',
+        applied_inner_decisions=dict(actions), tools=dict(tools), http=dict(http),
+        completed_experiment_sessions=len(experiment_sessions), history_reads=dict(reads),
+        distinct_capacity_blocks=len(blocks))
+
 def analyze(directory, task_run_id=None, *, probe_path=None):
     directory = Path(directory)
     with SqliteControlStore.open_readonly(directory / "control.sqlite") as store:
@@ -275,12 +349,16 @@ def analyze(directory, task_run_id=None, *, probe_path=None):
         report = summarize(task, operations, evidence)
         if (directory / "d8-handoff").is_dir() and (directory / "d8-sessions").is_dir():
             from agent_adapters.handoff_evidence import FileD8HandoffEvidence
+            report['activity'] = summarize_activity(task, store, evidence,
+                FileD8HandoffEvidence(directory / 'd8-sessions', create=False),
+                FileD8HandoffEvidence(directory / 'd8-handoff', create=False))
             report["supervision"] = summarize_supervision(task, operations,
                 store.list_d8_decisions(task_run_id), store.list_d8_tree_records(task_run_id),
                 FileD8HandoffEvidence(directory / "d8-handoff", create=False),
                 FileD8HandoffEvidence(directory / "d8-sessions", create=False))
         if probe_path is not None:
-            report["cache"] = summarize_cache(task, operations, evidence, probe_path)
+            report["cache"] = summarize_cache(task, operations, evidence, probe_path,
+                decisions=store.list_d8_decisions(task_run_id))
         return report
 
 

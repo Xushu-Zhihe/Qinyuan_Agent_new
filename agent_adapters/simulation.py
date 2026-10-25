@@ -35,7 +35,7 @@ def simulation_config(*, rolling=False):
 
 def real_config(*, contract_version=6, http=False, http_timeout_seconds=60, rolling=True):
     from agent_adapters.deepseek_roles import default_capacity_policy, TRANSPORT
-    capacity_policy = default_capacity_policy(contract_version)
+    capacity_policy = default_capacity_policy()
     result = {"handoff_config": asdict(D8HandoffConfig(
                 capacity_policy, capacity_policy,
                 D8Capacity())),
@@ -99,23 +99,17 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
             or set(extra) != expected_fields
             or extra["d5_sensitive_requirements"] != []):
         raise ValueError("invalid_d8_configuration")
+    handoff = D8HandoffConfig.from_dict(extra["handoff_config"])
     if is_real:
         expected = real_config(contract_version=version, http=http,
             http_timeout_seconds=extra.get('http_timeout_seconds',60), rolling='intent_execution_policy' in extra)
-        # Accept an original frozen legacy budget after the default changes.
-        # This does not increase its allowance or rewrite the old declaration.
-        from agent_adapters.deepseek_roles import CAPACITY_POLICY, default_capacity_policy
-        frozen = D8HandoffConfig.from_dict(extra["handoff_config"])
-        allowed = (CAPACITY_POLICY, default_capacity_policy(version))
-        if any(policy not in allowed for policy in (frozen.outer_capacity, frozen.inner_capacity)):
+        if any(asdict(getattr(handoff, name)) != expected["handoff_config"][name]
+               for name in ("outer_capacity", "inner_capacity")):
             raise ValueError("d8_real_capacity_policy_mismatch")
-        expected["handoff_config"]["outer_capacity"] = asdict(frozen.outer_capacity)
-        expected["handoff_config"]["inner_capacity"] = asdict(frozen.inner_capacity)
         if "intent_execution_policy" in extra:
             expected["intent_execution_policy"] = extra["intent_execution_policy"]
         if json.dumps(extra, sort_keys=True) != json.dumps(expected, sort_keys=True):
             raise ValueError("d8_real_configuration_mismatch")
-    handoff = D8HandoffConfig.from_dict(extra["handoff_config"])
     for policy in (handoff.outer_capacity, handoff.inner_capacity):
         if not is_real and (policy.policy_name != "fake-json-v1" or policy.measurement_unit != "unicode_codepoints"):
             raise ValueError("unsupported_d8_simulation_capacity")
@@ -300,7 +294,8 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
         outer, inner = _LifecycleModel(config.outer_role), _LifecycleModel(config.inner_role)
         if operation in {"start", "resume"}:
             outer = D8DeepSeekModel(config.outer_role, settings_from_file(config.outer_role, declaration["env_file"]))
-            inner = D8DeepSeekModel(config.inner_role, settings_from_file(config.inner_role, declaration["env_file"]))
+            inner_settings = settings_from_file(config.inner_role, declaration["env_file"])
+            inner = D8DeepSeekModel(config.inner_role, inner_settings)
         if config.contract_version in {18, 19, 20, 21, 22}:
             from agent_adapters.docker_profile import connect
             from agent_adapters.application import RecordedSandbox
@@ -358,9 +353,13 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
                 await app.mcp.close()
 
     try:
+        if declaration["mode"] == "real" and operation in {"start", "resume"}:
+            from agent_adapters.deepseek_roles import freeze_timeout_policy
+            freeze_timeout_policy(app.output_boundary.evidence, task_id, outer, inner)
         if config.contract_version == 22 and declaration["mode"] == "real" and operation in {"start", "resume"}:
             from agent_adapters.mcp_plan_executor import MCPPlanExecutor
-            link = MCPPlanExecutor(app)
+            from agent_adapters.public_web import from_env_file as public_web_from_file
+            link = MCPPlanExecutor(app, public_web=public_web_from_file(declaration["env_file"], inner_settings))
             if operation == "start":
                 link.authorize(task_id)
             if link.enabled(task_id):

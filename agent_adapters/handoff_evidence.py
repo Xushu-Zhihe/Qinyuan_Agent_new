@@ -23,6 +23,24 @@ class FileD8HandoffEvidence:
         except (T6EvidenceError, OSError, ValueError, TypeError) as exc:
             raise D3RecoveryRequired("d8_handoff_evidence_write_recovery_required") from exc
 
+    def capacity_block(self, task_run_id, checkpoint_sequence):
+        """Project only a block still bound to this durable state, never an old pause."""
+        candidates = []
+        for path in self.records.directory.glob("d8-handoff-pause-*.json"):
+            identity = path.name.removeprefix("d8-handoff-pause-").removesuffix(".json")
+            value = self.read("pause", identity)
+            if value.get("kind") not in {"complete_model_request", "initial_history", "visible_history", "evaluation_required_context"} or "scope" not in value:
+                continue
+            if value.get("task_run_id") != task_run_id:
+                raise D3RecoveryRequired("d8_capacity_block_owner_changed")
+            if value.get("checkpoint_sequence") != checkpoint_sequence:
+                continue
+            if (value["scope"] not in {"intent", "task"} or type(value.get("organization_attempted")) is not bool
+                    or value.get("next_action") not in {"continue_other_feasible_intents", "wait_for_context_change_or_deadline"}):
+                raise D3RecoveryRequired("d8_capacity_block_invalid")
+            candidates.append((path.stat().st_mtime_ns, value))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
     def read(self, kind, identity):
         _uuid(identity, "evidence_id")
         if kind not in self.KINDS:

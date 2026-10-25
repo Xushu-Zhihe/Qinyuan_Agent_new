@@ -9,24 +9,27 @@ from agent_core.output_contracts import D8OutputRequest
 from test_models import real_request
 
 
-def test_confirmed_profile_is_new22_only_and_legacy_is_retained(monkeypatch, tmp_path):
+@pytest.mark.parametrize("version", [6, 21, 22])
+def test_verified_capacity_is_independent_of_contract_version(monkeypatch, tmp_path, version):
     monkeypatch.setattr(roles, "MODEL", "DeepSeek-V4.1-Flash")
     monkeypatch.setitem(roles.TRANSPORT, "base_url", "https://api.scnet.cn/api/llm/v1")
-    assert roles.default_capacity_policy(22) == roles.SCNET_V41_CAPACITY
-    assert roles.default_capacity_policy(21) == roles.CAPACITY_POLICY
-    assert real_config(contract_version=22)["handoff_config"]["inner_capacity"] == asdict(roles.SCNET_V41_CAPACITY)
+    assert roles.default_capacity_policy() == roles.SCNET_V41_CAPACITY
+    assert real_config(contract_version=version)["handoff_config"]["inner_capacity"] == asdict(roles.SCNET_V41_CAPACITY)
     raw = real_request(tmp_path)
-    raw["execution_profile"] = "d8_v22"
-    raw["d8_config"] = real_config(contract_version=22)
-    raw["dual_llm_config"]["outer_role"] = asdict(roles.role_config("outer_planning", version=17))
-    raw["dual_llm_config"]["inner_role"] = asdict(roles.role_config("inner_action", version=17))
+    raw["execution_profile"] = f"d8_v{version}"
+    raw["d8_config"] = real_config(contract_version=version)
+    raw["dual_llm_config"]["outer_role"] = asdict(roles.role_config("outer_planning", version=version-5))
+    raw["dual_llm_config"]["inner_role"] = asdict(roles.role_config("inner_action", version=version-5))
     # Docker schema is validated locally; no Docker process is started.
     raw = json.loads(json.dumps(raw))
     request, config = parse_request(raw)
     assert config.handoff_config.inner_capacity == roles.SCNET_V41_CAPACITY
     for name in ("inner_capacity", "outer_capacity"):
-        raw["d8_config"]["handoff_config"][name] = asdict(roles.CAPACITY_POLICY)
-    assert parse_request(raw)[1].handoff_config.inner_capacity == roles.CAPACITY_POLICY
+        raw["d8_config"]["handoff_config"][name] = asdict(replace(roles.SCNET_V41_CAPACITY,
+            total_units=262144, output_reserve_units=16384))
+        with pytest.raises(ValueError, match="d8_real_capacity_policy_mismatch"):
+            parse_request(raw)
+        raw["d8_config"]["handoff_config"][name] = asdict(roles.SCNET_V41_CAPACITY)
 
 
 @pytest.mark.parametrize("overshoot", [-1, 0, 1])
@@ -60,7 +63,6 @@ def test_previously_paused_request_size_can_pass_without_dropping_context(monkey
     monkeypatch.setattr(roles, "build_payload", lambda *a, **k: payload)
     env = D8OutputRequest(SimpleNamespace(), {"stage": "inner_plan"}, "", None)
     capacity = roles.EstimatedCapacity(role, role)
-    assert not capacity.fits(env, roles.CAPACITY_POLICY)
     assert capacity.fits(env, roles.SCNET_V41_CAPACITY)
     assert len(roles.payload_bytes(payload)) == 246904
     payload["max_tokens"] = 384001
@@ -85,12 +87,13 @@ def test_continuous_session_compacts_before_freezing_full_request(http_case,monk
     actor=c.app.state.intents[0]
     rows=c.app.sessions.records(actor.intent_id)
     assert len(rows)>4
+    assert asyncio.run(c.app.handoff.summarize(actor.turn_id,c.token,decision_prefix=rows[:-4])).origin == 'model_organized'
     previous=c.app.sessions.evidence.read('request',rows[-1].model_request_id)
     original=json.dumps(previous,sort_keys=True)
     base=next(e.request for e in c.exploration_envelopes if e.output_contract['stage']=='inner_plan')
     history=json.loads(base.history_context)
     if trigger in {'full_envelope','still_too_large'}:
-        history['retained_material']='x'*(160000 if trigger=='full_envelope' else 250000)
+        history['retained_material']='x'*(550000 if trigger=='full_envelope' else 850000)
     draft=replace(base,model_request_id=str(uuid4()),base_checkpoint_sequence=c.app.state.latest_checkpoint.sequence,
                   history_context=handoff_json(history))
     payload=c.app.sessions.payload
@@ -105,15 +108,30 @@ def test_continuous_session_compacts_before_freezing_full_request(http_case,monk
         assert len(raw)<limit<len(raw.encode('utf-8'))
     if trigger=='full_envelope':
         assert len(handoff_json([large(r) for r in rows]).encode('utf-8'))<c.app.handoff.capacity().capacity.visible_history
+        # Place the full envelope across the actual profile boundary while its
+        # compressed form fits; do not bake a second legacy model window into the test.
+        history.pop('retained_material')
+        plain = replace(draft, history_context=handoff_json(history))
+        expanded = c.app.sessions._wrap(plain, preview=True)
+        c.app.handoff._fits_complete_request(expanded,c.app.config.handoff_config.inner_capacity)
+        full_size = c.app.handoff.capacity_port.last_measurement['payload_utf8_bytes']
+        packet = json.loads(expanded.session_context)
+        packet['messages'] = packet['messages'][-12:]
+        c.app.handoff._fits_complete_request(replace(expanded,session_context=handoff_json(packet)),c.app.config.handoff_config.inner_capacity)
+        compact_size = c.app.handoff.capacity_port.last_measurement['payload_utf8_bytes']
+        policy = c.app.config.handoff_config.inner_capacity
+        history['retained_material'] = 'x' * (policy.total_units-policy.output_reserve_units-4096-full_size+(full_size-compact_size)//2)
+        draft = replace(draft,history_context=handoff_json(history))
     if trigger=='uncovered':
         latest=c.app.handoff._latest_summary
         record,summary=latest()
         summary={**summary,'all_items':[i for i in summary['all_items'] if not i['record_id'].startswith('decision/')]}
         monkeypatch.setattr(c.app.handoff,'_latest_summary',lambda:(record,summary))
     read_request=c.app.sessions.evidence.read
-    if trigger=='unavailable_summary':
-        record,summary=c.app.handoff._latest_summary()
-        monkeypatch.setattr(c.app.handoff,'_latest_summary',lambda:(replace(record,origin='trusted_code_fallback'),summary))
+    if trigger in {'unavailable_summary','uncovered'}:
+        if trigger=='unavailable_summary':
+            record,summary=c.app.handoff._latest_summary()
+            monkeypatch.setattr(c.app.handoff,'_latest_summary',lambda:(replace(record,origin='trusted_code_fallback'),summary))
         def previously_compacted(kind,key):
             data=read_request(kind,key)
             if kind=='request' and key==rows[-1].model_request_id:
@@ -204,7 +222,8 @@ def test_unchanged_capacity_wait_does_not_rebuild_request(http_case,monkeypatch,
 def test_unconfirmed_alias_does_not_select_scnet_capacity(monkeypatch):
     monkeypatch.setattr(roles,'MODEL','deepseek-flash')
     monkeypatch.setitem(roles.TRANSPORT,'base_url','https://api.scnet.cn/api/llm/v1')
-    assert roles.default_capacity_policy(22)==roles.CAPACITY_POLICY
+    with pytest.raises(ValueError, match="d8_model_capacity_configuration_unsupported"):
+        roles.default_capacity_policy()
 
 
 @pytest.mark.parametrize('http_case',['continuous'],indirect=True)
@@ -233,3 +252,37 @@ def test_capacity_wait_does_not_latch_over_a_just_finished_supervisor(http_case,
     result=asyncio.run(c.app.run(c.token))
     assert len(calls)==2 and result.stop_reason=='task_run_deadline_exceeded'
     assert not c.sends and not c.app.store.list_d4_operations(c.task)
+
+
+@pytest.mark.parametrize("model", sorted(roles.OFFICIAL_V4_MODELS))
+def test_verified_official_models_map_to_current_window(monkeypatch, model):
+    monkeypatch.setattr(roles, "MODEL", model)
+    monkeypatch.setitem(roles.TRANSPORT, "base_url", "https://api.deepseek.com")
+    assert roles.default_capacity_policy() == roles.OFFICIAL_V4_CAPACITY
+    assert roles.OFFICIAL_V4_CAPACITY.total_units == 1_000_000
+    assert roles.OFFICIAL_V4_CAPACITY.output_reserve_units == 384_000
+
+
+@pytest.mark.parametrize("endpoint,model", [("https://other.test", "deepseek-flash"),
+    ("https://api.deepseek.com", "unverified-model"), ("https://api.scnet.cn/api/llm/v1", "deepseek-flash")])
+def test_unverified_pair_never_inherits_official_window(endpoint, model):
+    with pytest.raises(ValueError, match="d8_model_capacity_configuration_unsupported"):
+        roles.model_capacity_policy(model, endpoint)
+
+
+def test_official_full_request_matches_runs112_size_without_sending_output_cap(monkeypatch):
+    monkeypatch.setitem(roles.TRANSPORT, "base_url", "https://api.deepseek.com")
+    role = replace(roles.role_config("inner_action"), model="deepseek-flash")
+    payload = dict(model=role.model, messages=[dict(role="system", content="rule"), dict(role="user", content="{}")],
+                   thinking={"type":"enabled"}, reasoning_effort="high")
+    payload["padding"] = "x" * (244604-len(roles.payload_bytes({**payload,"padding":""})))
+    monkeypatch.setattr(roles, "build_payload", lambda *a, **k: payload)
+    capacity = roles.EstimatedCapacity(role, role)
+    request = D8OutputRequest(SimpleNamespace(model_request_id="offline"), {"stage":"inner_plan"}, "", None)
+    assert capacity.fits(request, roles.OFFICIAL_V4_CAPACITY)
+    assert capacity.last_measurement["input_tokens"] is None
+    assert capacity.last_measurement["estimated_input_tokens"] == 248700
+    assert capacity.last_measurement["output_reserve_tokens"] == 384000
+    assert "max_tokens" not in payload and payload["reasoning_effort"] == "high"
+    with pytest.raises(ValueError, match="capacity_binding"):
+        capacity.fits(request, roles.SCNET_V41_CAPACITY)

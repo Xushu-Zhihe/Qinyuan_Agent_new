@@ -58,6 +58,7 @@ def test_stage_schema_rule_and_role_binding(stage):
     payload = deepseek_roles.build_payload(env, role)
     assert env.output_contract["schema"] == json.loads(payload["messages"][0]["content"].split("output_contract=")[1].split(" correction=")[0])["schema"]
     assert deepseek_roles.RULES[stage] in payload["messages"][0]["content"]
+    assert payload["stream"] is True
     assert payload["thinking"] == {"type": "enabled"}
     assert "max_tokens" not in payload and payload["reasoning_effort"] == "high"
     assert "max_tokens" not in dict(role.parameters)
@@ -113,11 +114,12 @@ def test_additional_stages_map_typed_business_requests(stage):
 def test_capacity_counts_actual_payload_with_output_and_fixed_margin():
     env, role = envelope()
     capacity = deepseek_roles.EstimatedCapacity(deepseek_roles.role_config("outer_planning"), role)
-    assert capacity.fits(env, deepseek_roles.CAPACITY_POLICY)
-    oversized = replace(env, request=replace(env.request, history_context="大" * 90000))
-    assert not capacity.fits(oversized, deepseek_roles.CAPACITY_POLICY)
-    with pytest.raises(ValueError, match="capacity_policy"):
-        capacity.fits(env, replace(deepseek_roles.CAPACITY_POLICY, measurement_unit="tokens"))
+    policy = deepseek_roles.default_capacity_policy()
+    assert capacity.fits(env, policy)
+    oversized = replace(env, request=replace(env.request, history_context="大" * (policy.total_units // 3)))
+    assert not capacity.fits(oversized, policy)
+    with pytest.raises(ValueError, match="capacity_binding"):
+        capacity.fits(env, replace(policy, measurement_unit="tokens"))
 
 
 class Pipe:
@@ -452,7 +454,7 @@ def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_p
     result = persisted.read("provider-result", business.review_id)
     assert sent["model_request_id"] == business.review_id and sent["task_run_id"] == business.task_run_id
     assert sent["parameters"] == {"model": role.model, "response_format": {"type": "json_object"},
-        "stream": False, "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+        "stream": True, "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
     assert sent["timeout_seconds"] == 90 and result["request_sha256"] == digest(sent)
     if failure == "length":
         assert result["transport"]["usage"]["completion_tokens"] == 32768

@@ -69,8 +69,18 @@ if (-not (Test-Path .env)) {
 | `QINYUAN_LLM_BACKEND` | 当前真实链路使用 `openai` 兼容传输 |
 | `QINYUAN_MODEL` | 当前部署实际可用的 DeepSeek 模型名称 |
 | `OPENAI_API_KEY` | 模型平台密钥 |
+| `QINYUAN_SEARCH_API_KEY` | 可选，DeepSeek官方Search/Fetch独立凭据；不随主模型切换 |
 | `OPENAI_BASE_URL` | 必须与当前适配器冻结的传输地址一致 |
-| `QINYUAN_LLM_TIMEOUT_SECONDS` | 当前适配器要求为 `180` |
+| `QINYUAN_LLM_TIMEOUT_SECONDS` | 单次总时限，默认 `600` 秒，受 TaskRun 剩余时间约束 |
+| `QINYUAN_LLM_CONNECT_TIMEOUT_SECONDS` | 模型建连，默认 `10` 秒 |
+| `QINYUAN_LLM_FIRST_OUTPUT_TIMEOUT_SECONDS` | 连接后首次非空推理／正文增量，默认 `180` 秒 |
+| `QINYUAN_LLM_IDLE_TIMEOUT_SECONDS` | 开始生成后无新增推理／正文，默认 `60` 秒 |
+
+当前 D8 模型使用 SSE 流式接收，只在完整响应通过原校验后采用决策。心跳不延长生成等待；thinking=enabled、reasoning_effort=high 保留，不新增默认 max_tokens。省略总时限配置才采用600秒；已有 `.env` 显式180仍为180，需要你调整后用于新运行。实际超时策略在运行内冻结，恢复时改变配置会明确拒绝。诊断保留计数和时间，不保存完整思考；上游未提供 usage 时保持未知。细节见 [上限索引](restrict/explicit_limits_index.md)。
+
+真实运行统一按已核实的模型与端点匹配容量，不再按内部契约版本切换：官方Flash／Pro及已确认的官方Flash别名采用1M上下文、384K输出保守预留，SCNET保留其已确认映射；未知模型／端点明确报配置错误，已移除旧容量策略及兼容回退，旧容量声明不再接受且历史文件不改写。不把预留发送为max_tokens。输入仍按完整序列化字节作保守估算，不冒充精确token。完整请求不足会自动尝试一次有界历史整理，保留原证据和近期对话；局部阻塞且其他分支通过准入探测时技术挂起，任务级阻塞则保留进展并等待有效变化或原deadline。`status`用`capacity_block`说明原因，不增加人工扩容流程。
+
+新建真实d8_v22运行可用`web.search`／`web.fetch`自主检索公共资料。独立搜索Key可放在同一env文件或进程环境；未配置时，仅主模型为DeepSeek官方端点才复用其Key，无可用凭据不展示工具。检索与主模型分开配置，原文取回受公共地址准入，结果不自动成为Fact或目标观测。长正文先返回明确预览，可按details_ref用现有历史详情接口分页读取，不必再次Fetch。真实账号和检索效果需另验。检索选择按未确认的公开知识缺口及其对下一决策的价值判断，也可选择有判别力的现场验证；不会按版本号、次数或“没搜索”强制触发。
 
 真实双角色链路目前使用 DeepSeek 专用适配器，内外层共用配置的模型名称。`openai` 这个传输名称不代表已经完成 GPT 或 Claude 接入，示例文件中的其他供应商注释也不代表运行支持。
 

@@ -97,18 +97,19 @@ def test_new_shared_payload_and_legacy_frozen_request_remain_separate(http_case,
     # A formerly duplicated packet can fit only after sharing. Admission must
     # not reject it with the unprojected business-request estimate first.
     from uuid import uuid4
-    from agent_adapters.deepseek_roles import CAPACITY_POLICY
+    from agent_adapters.deepseek_roles import default_capacity_policy
     history = json.loads(envelope.request.history_context)
-    history["shared_test_detail"] = "x" * 140000
+    policy = default_capacity_policy()
+    history["shared_test_detail"] = "x" * ((policy.total_units - policy.output_reserve_units - 4096) // 2)
     session = json.loads(envelope.request.session_context)
     session["current_history"] = history
     larger = replace(envelope.request, model_request_id=str(uuid4()),
                      history_context=json.dumps(history), session_context=json.dumps(session))
     large_envelope = boundary._contract(larger)[0]
-    assert capacity.fits(large_envelope, CAPACITY_POLICY)
+    assert capacity.fits(large_envelope, default_capacity_policy())
     assert not capacity.fits(replace(large_envelope, output_contract={k: v for k, v in large_envelope.output_contract.items()
-                               if k != "input_projection"}), CAPACITY_POLICY)
-    assert c.app.handoff._fits_complete_request(larger, CAPACITY_POLICY)
+                               if k != "input_projection"}), default_capacity_policy())
+    assert c.app.handoff._fits_complete_request(larger, default_capacity_policy())
     identity = envelope.request.model_request_id
     read = boundary.evidence.read
     saved = read("contract", identity)

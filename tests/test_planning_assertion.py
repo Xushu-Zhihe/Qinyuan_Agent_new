@@ -263,7 +263,7 @@ def test_outer_rejects_registered_assertion_before_later_accepted_proposal(tmp_p
 
 
 def test_v7_http_uses_new_wire_and_inherits_fixed_and_review_offline(tmp_path, monkeypatch):
-    from agent_adapters.deepseek_roles import EstimatedCapacity, CAPACITY_POLICY
+    from agent_adapters.deepseek_roles import EstimatedCapacity, default_capacity_policy
     result, _, seen, _ = run_s2(tmp_path, monkeypatch)
     assert result['verified_facts']
     outer, inner = role_config('outer_planning', version=7), role_config('inner_action', version=7)
@@ -276,7 +276,7 @@ def test_v7_http_uses_new_wire_and_inherits_fixed_and_review_offline(tmp_path, m
         payload = build_payload(envelope, role)
         system = payload['messages'][0]['content']
         assert payload['model'] == 'deepseek-flash' and payload['response_format'] == {'type': 'json_object'}
-        assert EstimatedCapacity(outer, inner).fits(envelope, CAPACITY_POLICY)
+        assert EstimatedCapacity(outer, inner).fits(envelope, default_capacity_policy())
         if stage == 'tree_planning':
             assert 'never generate turn_target or rule version' in system
             assert 'copy turn_target exactly' not in system

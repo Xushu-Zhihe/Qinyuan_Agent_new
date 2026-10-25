@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict, replace
 
 from agent_core.dual_llm_contracts import D3RecoveryRequired
-from agent_core.modeling import ModelError, ModelErrorKind
+from agent_core.modeling import model_call_timeout, ModelError, ModelErrorKind
 from agent_core.operation_accounting import (
     D4BudgetExhausted,
     D4OperationCompletion,
@@ -38,7 +38,7 @@ class ProcessRefinement:
         stopped,
         redactor,
         *,
-        timeout_seconds: float = 180.0,
+        timeout_seconds: float | None = None,
     ) -> None:
         self.controller = controller
         self.store = store
@@ -448,7 +448,9 @@ class ProcessRefinement:
             def is_cancelled(self):
                 return stopped.is_set() or owner.stopped()
 
-        timeout = min(self.timeout_seconds, state.task_run.deadline_at - self.clock())
+        timeout = model_call_timeout(self.adapter, state.task_run.deadline_at - self.clock())
+        if self.timeout_seconds is not None:
+            timeout = min(timeout, self.timeout_seconds)
 
         def invoke():
             try:

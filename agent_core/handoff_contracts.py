@@ -139,6 +139,19 @@ class D8HistoryItem:
         return cls(**value)
 
 
+def session_read_refs(value):
+    """Program-owned references visible in frozen session metadata, never source prose."""
+    session = json.loads(value or "{}") if isinstance(value, str) else value or {}
+    refs = list(session.get("compaction", {}).get("omitted_decision_refs", []))
+    for message in session.get("messages", []):
+        content = message.get("content")
+        source = content.get("mcp_tool_result") if message.get("role") == "tool" and isinstance(content, dict) else None
+        if (isinstance(source, dict) and source.get("identity") == "public_reference_not_target_observation"
+                and isinstance(source.get("details_ref"), str)):
+            refs.append(source["details_ref"])
+    return tuple(dict.fromkeys(refs))
+
+
 def checked_refs(raw, available: set[str]) -> tuple[str, ...]:
     if not isinstance(raw, list) or any(not isinstance(v, str) for v in raw):
         raise ValueError("d8_refs_must_be_array")

@@ -404,6 +404,14 @@ def _snapshot_v3_task_result(directory: Path, declaration: dict, *, read_store=N
             ),
         }
         result["recovery_status"] = "required" if recovery_required else "not_required"
+        if time.time() >= task.deadline_at and task.status not in TERMINAL_STATUSES:
+            pending = [op.start.operation_id for op in store.list_d4_operations(task_id)
+                       if op.completion is None]
+            result['dispatch'].update(status='stopped', reason='task_run_deadline_exceeded',
+                                      pending_operation_ids=pending)
+            if pending:
+                result['errors'].append(dict(code='deadline_reached_with_pending_operations',
+                    phase='operation_settlement', category='technical_wait'))
         if task.status in TERMINAL_STATUSES:
             terminal = store.load_terminal_commit(task_id)
             if terminal is None or terminal.event.status not in TERMINAL_STATUSES:
@@ -681,6 +689,16 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
             elif known_model_failure is not None and (result.get("task_run") or {}).get("status") == "running":
                 result["recovery"] = {"required": True, "reason": known_model_failure}
                 result["recovery_status"] = "required"
+            if (expected.intent_execution_policy == "continuous_v1" and not d8_unresolved
+                    and (result.get("task_run") or {}).get("status") == "running"):
+                from agent_adapters.handoff_evidence import FileD8HandoffEvidence
+                block = FileD8HandoffEvidence(Path(directory) / "d8-handoff", create=False).capacity_block(
+                    declaration["task_run_id"], result["checkpoint"]["sequence"])
+                if block is not None:
+                    result["capacity_block"] = block
+                    if not result.get("recovery", {}).get("required"):
+                        result["recovery"] = {"required": True, "reason": "d8_context_capacity_blocked"}
+                        result["recovery_status"] = "required"
             # An inconclusive local Intent is not a recovery condition: it only
             # means that direction's evidence could not decide it. The run keeps
             # exploring other directions, and only a found flag needs a human.

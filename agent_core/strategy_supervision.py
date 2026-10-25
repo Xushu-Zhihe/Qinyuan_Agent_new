@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, replace
 
 from agent_core.dual_llm_contracts import D3RecoveryRequired
 from agent_core.handoff_contracts import D8HandoffRequest, D8TreeRecord, handoff_json
-from agent_core.modeling import ModelError
+from agent_core.modeling import model_call_timeout, ModelError
 from agent_core.operation_accounting import D4OperationStart
 from agent_core.turn_modeling import digest
 
@@ -251,7 +251,7 @@ class StrategySupervision:
     def _launch(self, request):
         finished, stopped, values = threading.Event(), threading.Event(), []
         self.pending = request, finished, values, stopped
-        timeout = min(180.0, self.app.state.task_run.deadline_at - self.app.clock())
+        timeout = model_call_timeout(self.app.handoff.model.adapter, self.app.state.task_run.deadline_at - self.app.clock())
         token = self.app._token
         class InvocationToken:
             @property

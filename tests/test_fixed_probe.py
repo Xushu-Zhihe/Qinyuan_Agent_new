@@ -199,7 +199,7 @@ def test_current_review_timeout_limit_is_frozen_in_schema(tmp_path, monkeypatch)
 
 def test_v6_actual_transport_uses_current_choice_schema_offline(tmp_path, monkeypatch):
     from dataclasses import replace
-    from agent_adapters.deepseek_roles import build_payload, role_config, EstimatedCapacity, CAPACITY_POLICY
+    from agent_adapters.deepseek_roles import build_payload, role_config, EstimatedCapacity, default_capacity_policy
     result, _, seen, _ = run_fixed(tmp_path, monkeypatch)
     assert len(result['verified_facts']) == 1
     inner, outer = role_config('inner_action', version=6), role_config('outer_planning', version=6)
@@ -213,7 +213,7 @@ def test_v6_actual_transport_uses_current_choice_schema_offline(tmp_path, monkey
         schema = envelope.output_contract['schema']['anyOf'][0]['properties']['action']['properties']
         assert schema['operation']['enum'] == ['observe_size' if request.stage == 'inner_size' else 'observe_sha256']
         assert not {'script', 'working_directory', 'stdin_base64', 'conditions'} & set(schema)
-        assert EstimatedCapacity(outer, inner).fits(envelope, CAPACITY_POLICY)
+        assert EstimatedCapacity(outer, inner).fits(envelope, default_capacity_policy())
         with pytest.raises(ValueError, match='output_contract_mismatch'):
             build_payload(replace(envelope, request=replace(request,
                 role_config_ref=role_config('inner_action', version=5).role_config_ref)),

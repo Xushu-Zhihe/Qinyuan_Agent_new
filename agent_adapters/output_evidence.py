@@ -41,11 +41,13 @@ SAFE_MODEL_ERROR_CODES = SAFE_HTTP_ERROR_CODES | frozenset({
     "d8_output_cancelled_call_binding_changed", "d8_output_interruption_binding_changed", "d8_output_model_audit_changed",
     "d8_model_context_rejected", "d8_provider_envelope_invalid", "provider_envelope_invalid",
     "provider_content_invalid", "provider_refused", "d8_transport_outcome_unknown",
-    "http_transport_failure", "model_worker_lost", "d8_output_request_not_frozen",
+    "http_transport_failure", "model_worker_lost", "d8_output_request_not_frozen", "d8_input_measurement_changed",
+    "d8_capacity_block_owner_changed", "d8_capacity_block_invalid",
     "d20_http_model_projection_not_frozen", "d8_review_diagnostic_write_failed",
     "d9_review_contract_binding_changed", "d9_review_request_missing",
     "d9_review_request_invalid", "d9_review_request_binding_changed",
     "d5_redaction_configuration_unavailable", "model_call_failed",
+    "provider_stream_invalid", "model_first_output_timeout", "model_idle_timeout",
     "http_timeout", "model_total_timeout", "model_connect_timeout", "model_cancelled",
     "model_budget_exhausted", "response_rejected", "empty_response",
     "d8_model_output_budget_exhausted", "d8_model_output_truncated",
@@ -141,7 +143,7 @@ def safe_failure_details(error, *, include_chain=False):
 
 class FileD8OutputEvidence(FileD8HandoffEvidence):
     # Session envelopes reuse this immutable evidence store, not new tables.
-    KINDS = {"provider-request", "provider-result", "input-measurement", "mcp-registry", "mcp-catalog", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "review-failure"}
+    KINDS = {"model-timeouts", "provider-request", "provider-result", "input-measurement", "mcp-registry", "mcp-catalog", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "http-dispatch-stop", "review-failure"}
 
     KINDS = KINDS | {"experiment-session", "experiment-process", "experiment-result", "experiment-stop", "call-interruption"}
 

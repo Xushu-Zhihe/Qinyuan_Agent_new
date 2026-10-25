@@ -442,3 +442,139 @@ def test_http_conclusion_review_keeps_existing_d8_recovery_loop(http_case,first)
     assert outcomes==(['reviewed_inference','verified_fact'] if first=='inference' else
         ['rejected','verified_fact'] if first=='rejected' else ['verified_fact'])
     assert len(case.sends)==(2 if first=='review_replan' else 1)
+
+
+@pytest.mark.parametrize('stop', ['deadline', 'cancel'])
+def test_returned_http_response_is_settled_before_stop(http_case, monkeypatch, stop):
+    c = http_case
+    deadline = c.app.state.task_run.deadline_at
+    dispatch = c.app.web.dispatch
+    async def returned(*args):
+        response = await dispatch(*args)
+        if stop == 'deadline':c.clock.now = deadline
+        else:c.token.is_cancelled = True
+        return response
+    monkeypatch.setattr(c.app.web, 'dispatch', returned)
+    result = asyncio.run(c.app.run(c.token))
+    execution = c.app.state.executions[0]
+    op = c.app.store.load_d4_operation(execution.execution_id)
+    assert op.completion is not None and op.completion.result_kind == 'completed', result
+    assert c.app.web.result(execution.execution_id)['body_bytes'] == len(b'<p>ordinary response</p>')
+    assert c.app.state.task_run.status.value == ('deadline_exceeded' if stop == 'deadline' else 'cancelled')
+    assert not result.recovery_required and not c.app.state.facts and len(c.sends) == 1
+
+
+def test_deadline_after_http_preparation_never_admits_send(http_case, monkeypatch):
+    c = http_case
+    original = c.app.web.restore_cookies
+    def cookies():
+        value = original()
+        c.clock.now = c.app.state.task_run.deadline_at
+        return value
+    monkeypatch.setattr(c.app.web, 'restore_cookies', cookies)
+    result = asyncio.run(c.app.run(c.token))
+    assert c.app.state.task_run.status.value == 'deadline_exceeded', result
+    assert not c.sends and not c.app.state.facts
+    assert not [op for op in c.app.store.list_d4_operations(c.task) if op.start.category == 'tool_dispatch']
+
+
+def test_deadline_during_http_admission_has_durable_not_dispatched_receipt(http_case, monkeypatch):
+    c = http_case
+    original = c.app.store.begin_d4_operation
+    def admit(start):
+        value = original(start)
+        if start.category == 'tool_dispatch':c.clock.now = c.app.state.task_run.deadline_at
+        return value
+    monkeypatch.setattr(c.app.store, 'begin_d4_operation', admit)
+    result = asyncio.run(c.app.run(c.token))
+    assert c.app.state.task_run.status.value == 'deadline_exceeded', result
+    assert not c.sends and not c.app.state.facts
+    execution = c.app.state.executions[0]
+    binding = c.app.store.load_d3_plan_binding(execution.plan_id)
+    receipt = c.app.web.dispatch_stop(binding)
+    assert receipt['dispatch_state'] == 'not_dispatched' and receipt['reason'] == 'deadline'
+    op = c.app.store.load_d4_operation(execution.execution_id)
+    assert op.completion.result_kind == 'rejected' and not c.app.web.result(execution.execution_id)
+    c.app.web.reconcile()
+    assert not c.app.store.blocking_d4_operations(c.task)
+
+
+@pytest.mark.parametrize('outcome,valid', [('observed',True),('satisfied',True),('observed',False)])
+def test_attachment_observation_reuse_keeps_source_validation_without_fact(outcome, valid):
+    from agent_adapters.http_capability import HttpCapability
+    from agent_core.dual_llm_contracts import D3TurnBinding,D3RecoveryRequired
+    from agent_core.hybrid_contracts import HybridTurnBinding,AttachmentPlanBinding
+    task,turn,actor,plan,proposal,import_id,proof_id = (str(uuid4()) for _ in range(7))
+    attachment = D3TurnBinding(str(uuid4()),task,turn,0,import_id,20,'a'*64,proposal)
+    turn_binding = HybridTurnBinding(str(uuid4()),task,turn,ORIGIN,str(uuid4()),proposal,attachments=(attachment,))
+    binding = AttachmentPlanBinding(task,turn,actor,plan,'size_then_sha256','new_observation',str(uuid4()),proposal,'b'*64)
+    checks=[]
+    def verified(execution, proof, **kwargs):
+        checks.append((execution,proof,kwargs))
+        if not valid:raise D3RecoveryRequired('d3_proof_source_changed')
+    store=SimpleNamespace(load_d3_turn_binding=lambda _:turn_binding,load_d3_plan_binding=lambda _:binding,
+        load_d3_plan_result=lambda _:SimpleNamespace(outcome=outcome,proof_id=proof_id))
+    proof=SimpleNamespace(source_execution_id=str(uuid4()))
+    capability=SimpleNamespace(state=SimpleNamespace(intents=[SimpleNamespace(intent_id=actor,turn_id=turn)],
+        plans=[SimpleNamespace(intent_id=actor,plan_id=plan)]),store=store,
+        file_proofs=SimpleNamespace(proofs=SimpleNamespace(read=lambda _:proof),read_verified=verified),
+        task=SimpleNamespace(request=SimpleNamespace(goal='Read authorized input')),
+        app=SimpleNamespace(config=SimpleNamespace(intent_execution_policy='continuous_v1')),sources=lambda:())
+    if valid:
+        context=HttpCapability.plan_context(capability,actor)
+        assert context.file_proof_sources == ((0,proof_id),)
+        assert context.reusable_proof_ids == (proof_id,)
+    else:
+        with pytest.raises(D3RecoveryRequired,match='source_changed'):
+            HttpCapability.plan_context(capability,actor)
+    assert checks == [(proof.source_execution_id,proof_id,{'allow_inactive_plan':True})]
+
+
+def test_not_dispatched_receipt_repairs_completion_without_send(http_case, monkeypatch):
+    from test_chain_multi_turn import ProcessLoss
+    c = http_case
+    begin, complete = c.app.store.begin_d4_operation, c.app.store.complete_d4_operation
+    def expire(start):
+        value=begin(start)
+        if start.category=='tool_dispatch':c.clock.now=c.app.state.task_run.deadline_at
+        return value
+    def crash(value):
+        if value.result_kind=='rejected':raise ProcessLoss()
+        return complete(value)
+    monkeypatch.setattr(c.app.store,'begin_d4_operation',expire)
+    monkeypatch.setattr(c.app.store,'complete_d4_operation',crash)
+    with pytest.raises(ProcessLoss):asyncio.run(c.app.run(c.token))
+    assert not c.sends
+    execution=c.app.state.executions[0]
+    binding=c.app.store.load_d3_plan_binding(execution.plan_id)
+    assert c.app.web.dispatch_stop(binding) and c.app.store.load_d4_operation(execution.execution_id).completion is None
+    monkeypatch.setattr(c.app.store,'complete_d4_operation',complete)
+    c.app.web.reconcile()
+    c.app.web.reconcile()
+    assert c.app.store.load_d4_operation(execution.execution_id).completion.result_kind=='rejected'
+    read=c.app.web.evidence.read
+    monkeypatch.setattr(c.app.web.evidence,'read',lambda kind,identity:
+        {**read(kind,identity),'request_sha256':'f'*64} if kind=='http-dispatch-stop' else read(kind,identity))
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    with pytest.raises(D3RecoveryRequired,match='binding_changed'):c.app.web.reconcile()
+    assert not c.sends
+
+
+def test_deadline_unknown_projection_names_pending_operation(http_case, monkeypatch):
+    from agent_adapters.web import task_result
+    from test_chain_multi_turn import ProcessLoss
+    c = http_case
+    begin = c.app.store.begin_d4_operation
+    def crash(start):
+        value=begin(start)
+        if start.category=='tool_dispatch':raise ProcessLoss()
+        return value
+    monkeypatch.setattr(c.app.store,'begin_d4_operation',crash)
+    with pytest.raises(ProcessLoss):asyncio.run(c.app.run(c.token))
+    monkeypatch.setattr(task_result.time,'time',lambda:c.app.state.task_run.deadline_at+1)
+    projected=task_result.snapshot_v3_task_result(c.directory,c.declaration)
+    assert projected['task_run']['status']=='running'
+    assert projected['dispatch']['reason']=='task_run_deadline_exceeded'
+    assert projected['dispatch']['pending_operation_ids']==[c.app.state.executions[0].execution_id]
+    assert any(e['code']=='deadline_reached_with_pending_operations' for e in projected['errors'])
+    assert projected['recovery']['required'] and not c.sends

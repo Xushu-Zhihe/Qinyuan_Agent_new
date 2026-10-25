@@ -17,6 +17,9 @@ from agent_adapters.run_files import parse_json
 from agent_core.action_model_request import T6ActionModelRequest
 from agent_core.actions import T6ActionValidationCode, T6ActionValidationFailure
 from agent_core.modeling import (
+    DEFAULT_MODEL_TIMEOUT_SECONDS,
+    DEFAULT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS,
+    DEFAULT_MODEL_IDLE_TIMEOUT_SECONDS,
     ModelError,
     ModelErrorKind,
     ModelRequestType,
@@ -83,13 +86,27 @@ def t6_step_timeout_from_env() -> int:
     return value
 
 
+def stream_timeouts_from_values(values):
+    try:
+        return {
+            "connect_timeout_seconds": float(values.get("QINYUAN_LLM_CONNECT_TIMEOUT_SECONDS") or CONNECT_TIMEOUT_SECONDS),
+            "first_output_timeout_seconds": float(values.get("QINYUAN_LLM_FIRST_OUTPUT_TIMEOUT_SECONDS") or DEFAULT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS),
+            "idle_timeout_seconds": float(values.get("QINYUAN_LLM_IDLE_TIMEOUT_SECONDS") or DEFAULT_MODEL_IDLE_TIMEOUT_SECONDS),
+        }
+    except (TypeError, ValueError):
+        raise ValueError("invalid_model_timeout") from None
+
+
 @dataclass(frozen=True)
 class DeepSeekSettings:
     model: str
     api_key: str = field(repr=False)
     base_url: str = "https://api.deepseek.com"
-    timeout_seconds: float = 180.0
+    timeout_seconds: float = DEFAULT_MODEL_TIMEOUT_SECONDS
     allow_custom_endpoint: bool = False
+    first_output_timeout_seconds: float = DEFAULT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS
+    idle_timeout_seconds: float = DEFAULT_MODEL_IDLE_TIMEOUT_SECONDS
+    connect_timeout_seconds: float = CONNECT_TIMEOUT_SECONDS
 
     def __post_init__(self):
         parsed = urlsplit(self.base_url)
@@ -126,12 +143,9 @@ class DeepSeekSettings:
             or any(ord(c) < 32 for c in self.api_key)
         ):
             raise ValueError("invalid_model_credentials")
-        if (
-            isinstance(self.timeout_seconds, bool)
-            or not math.isfinite(self.timeout_seconds)
-            or not 0 < self.timeout_seconds <= 180
-        ):
-            raise ValueError("model_timeout_must_be_between_zero_and_180")
+        for value in (self.timeout_seconds, self.first_output_timeout_seconds, self.idle_timeout_seconds, self.connect_timeout_seconds):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError("invalid_model_timeout")
 
     @classmethod
     def from_env_file(cls, path: Path):
@@ -141,7 +155,7 @@ class DeepSeekSettings:
         if values.get("QINYUAN_LLM_BACKEND") != "openai":
             raise ValueError("t5_requires_openai_backend")
         try:
-            timeout = float(values.get("QINYUAN_LLM_TIMEOUT_SECONDS") or "180")
+            timeout = float(values.get("QINYUAN_LLM_TIMEOUT_SECONDS") or DEFAULT_MODEL_TIMEOUT_SECONDS)
         except ValueError:
             raise ValueError("invalid_model_timeout") from None
         return cls(
@@ -149,6 +163,7 @@ class DeepSeekSettings:
             api_key=values.get("OPENAI_API_KEY") or "",
             base_url=values.get("OPENAI_BASE_URL") or "",
             timeout_seconds=timeout,
+            **stream_timeouts_from_values(values),
         )
 
     @classmethod
@@ -164,9 +179,10 @@ class DeepSeekSettings:
                 api_key=os.environ["QINYUAN_RUNTIME_API_KEY"],
                 base_url=os.environ.get("QINYUAN_RUNTIME_BASE_URL", ""),
                 timeout_seconds=float(
-                    os.environ.get("QINYUAN_RUNTIME_MODEL_TIMEOUT", "180")
+                    os.environ.get("QINYUAN_RUNTIME_MODEL_TIMEOUT", str(DEFAULT_MODEL_TIMEOUT_SECONDS))
                 ),
                 allow_custom_endpoint=os.environ.get("QINYUAN_RUNTIME_PROVIDER") == "openai_compatible",
+                **stream_timeouts_from_values(os.environ),
             )
         return cls.from_env_file(path)
 
@@ -239,38 +255,22 @@ def build_payload(request, settings):
     }
 
 
-def _response_diagnostic(data, message, finish, content):
+def _response_diagnostic(data, message, finish, content, *, reasoning_chars=None):
     """Keep only bounded numeric provider metadata; never response/thought text."""
+    from agent_adapters.model_stream import numeric_usage, safe_finish_reason
     usage = data.get("usage") if isinstance(data, dict) else None
-    numeric_usage = {}
-    if isinstance(usage, dict):
-        for key in ("prompt_tokens", "completion_tokens", "total_tokens",
-                    "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
-            value = usage.get(key)
-            if type(value) is int and value >= 0:
-                numeric_usage[key] = value
-        for key, names in (("completion_tokens_details", ("reasoning_tokens",)),
-                           ("prompt_tokens_details", ("cached_tokens",))):
-            details = usage.get(key)
-            if isinstance(details, dict):
-                values = {name: details[name] for name in names
-                          if type(details.get(name)) is int and details[name] >= 0}
-                if values:
-                    numeric_usage[key] = values
     return {
-        "finish_reason": finish if isinstance(finish, str) and finish in {
-            "stop", "length", "content_filter", "tool_calls", "function_call",
-            "insufficient_system_resource"} else "other",
+        "finish_reason": safe_finish_reason(finish) or "other",
         "content_is_none": content is None,
         "content_chars": len(content) if isinstance(content, str) else None,
         "content_utf8_bytes": len(content.encode("utf-8")) if isinstance(content, str) else None,
         "reasoning_chars": len(message["reasoning_content"])
-            if isinstance(message.get("reasoning_content"), str) else None,
-        "usage": numeric_usage or None,
+            if isinstance(message.get("reasoning_content"), str) else reasoning_chars,
+        "usage": numeric_usage(usage),
     }
 
 
-def _trace_provider_response(data, choice, message, finish, content, requested_max_tokens=None):
+def _trace_provider_response(data, choice, message, finish, content, requested_max_tokens=None, *, reasoning_chars=None):
     """Record why a provider response was incomplete; silent unless tracing is on.
 
     Only diagnostic: it never alters the returned payload or the decision.
@@ -280,7 +280,7 @@ def _trace_provider_response(data, choice, message, finish, content, requested_m
         return
     import json as _json
     import sys
-    detail = _response_diagnostic(data, message, finish, content)
+    detail = _response_diagnostic(data, message, finish, content, reasoning_chars=reasoning_chars)
     detail["max_tokens_sent"] = requested_max_tokens
     print("[trace] provider.response", _json.dumps(detail, ensure_ascii=False),
           file=sys.stderr, flush=True)
@@ -302,11 +302,11 @@ def _http_worker(
         parsed = urlsplit(settings.base_url)
         if parsed.port is None:
             client = http.client.HTTPSConnection(
-                parsed.hostname, timeout=min(10, timeout)
+                parsed.hostname, timeout=min(settings.connect_timeout_seconds, timeout)
             )
         else:
             client = http.client.HTTPSConnection(
-                parsed.hostname, port=parsed.port, timeout=min(10, timeout)
+                parsed.hostname, port=parsed.port, timeout=min(settings.connect_timeout_seconds, timeout)
             )
         started = time.monotonic()
         client.connect()
@@ -328,16 +328,6 @@ def _http_worker(
         report(http_status=response.status)
         if response.status != 200:
             report(transport_end="http_error")
-            import os as _os
-            if _os.environ.get("QINYUAN_DEBUG_TRACE"):
-                import sys as _sys
-                try:
-                    body = response.read(2048)
-                except Exception:
-                    body = b""
-                text = body.decode("utf-8", "replace")
-                print("[trace] provider.http_error", response.status,
-                      text[:400].replace("\n", " "), file=_sys.stderr, flush=True)
             kind = (
                 "authentication_failed"
                 if response.status in (401, 403)
@@ -349,26 +339,41 @@ def _http_worker(
                 {"error": kind, "reason": f"deepseek_http_{response.status}"}
             )
             return
-        raw = response.read(max_response_bytes + 1)
-        report(response_utf8_bytes=len(raw))
-        if len(raw) > max_response_bytes:
-            report(transport_end="response_limit")
-        elif isinstance(getattr(response, "length", None), int) and response.length > 0:
-            raise http.client.IncompleteRead(b"", response.length)
-        else:
+        reasoning_chars = None
+        if payload.get("stream") is True:
+            from agent_adapters.model_stream import ModelStreamError, read_chat_stream
+            try:
+                data, reasoning_chars = read_chat_stream(response, max_response_bytes, report)
+            except ModelStreamError as exc:
+                report(transport_end=exc.transport_end)
+                connection.send({"error": exc.kind, "reason": exc.code})
+                return
+            if settings.api_key in json.dumps(data, ensure_ascii=False):
+                report(transport_end="response_rejected")
+                connection.send({"error": "invalid_response", "reason": "response_rejected"})
+                return
             report(transport_end="response_received")
-        if len(raw) > max_response_bytes or settings.api_key.encode() in raw:
-            connection.send(
-                {"error": "invalid_response", "reason": "response_rejected"}
-            )
-            return
-        try:
-            data = parse_json(raw, max_response_bytes)
-        except (TypeError, ValueError):
-            _invalid_provider_payload(
-                connection, T6ActionValidationCode.PROVIDER_JSON_INVALID,
-            )
-            return
+        else:
+            raw = response.read(max_response_bytes + 1)
+            report(response_utf8_bytes=len(raw))
+            if len(raw) > max_response_bytes:
+                report(transport_end="response_limit")
+            elif isinstance(getattr(response, "length", None), int) and response.length > 0:
+                raise http.client.IncompleteRead(b"", response.length)
+            else:
+                report(transport_end="response_received")
+            if len(raw) > max_response_bytes or settings.api_key.encode() in raw:
+                connection.send(
+                    {"error": "invalid_response", "reason": "response_rejected"}
+                )
+                return
+            try:
+                data = parse_json(raw, max_response_bytes)
+            except (TypeError, ValueError):
+                _invalid_provider_payload(
+                    connection, T6ActionValidationCode.PROVIDER_JSON_INVALID,
+                )
+                return
         if not isinstance(data, dict):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_ENVELOPE_INVALID,
@@ -387,7 +392,7 @@ def _http_worker(
                 connection, T6ActionValidationCode.PROVIDER_CHOICES_INVALID,
             )
             return
-        report(**_response_diagnostic(data, message, choice.get("finish_reason"), message.get("content")))
+        report(**_response_diagnostic(data, message, choice.get("finish_reason"), message.get("content"), reasoning_chars=reasoning_chars))
         if message.get("tool_calls") or message.get("function_call"):
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
@@ -400,7 +405,7 @@ def _http_worker(
             finish = choice.get("finish_reason")
             content = message.get("content")
             _trace_provider_response(data, choice, message, finish, content,
-                                    (payload or {}).get("max_tokens"))
+                                    (payload or {}).get("max_tokens"), reasoning_chars=reasoning_chars)
             if not isinstance(finish, str) or not finish:
                 connection.send({"error": "invalid_response", "reason": "provider_envelope_invalid"})
                 return
@@ -440,7 +445,7 @@ def _http_worker(
         connection.send({"payload": result})
     except http.client.IncompleteRead as exc:
         report(transport_end="incomplete_response")
-        if exc.partial:
+        if exc.partial and payload.get("stream") is not True:
             report(response_utf8_bytes=len(exc.partial))
         connection.send({"error": "provider_failure", "reason": "http_transport_failure"})
     except TimeoutError:
@@ -524,9 +529,14 @@ class DeepSeekModelAdapter:
         process = context.Process(
             target=self._worker, args=(writer, self.settings, payload, timeout)
         )
-        end = time.monotonic() + timeout
-        connect_end = time.monotonic() + min(CONNECT_TIMEOUT_SECONDS, timeout)
+        started = time.monotonic()
+        end = started + timeout
+        connect_end = started + min(self.settings.connect_timeout_seconds, timeout)
         connected = False
+        streaming = payload.get("stream") is True
+        first_output_end = None
+        last_progress = None
+        progress_chars = 0
         try:
             diagnostic["worker_exit_confirmed"] = False
             process.start()
@@ -545,6 +555,16 @@ class DeepSeekModelAdapter:
                 if not connected and time.monotonic() >= connect_end:
                     diagnostic["transport_end"] = "timeout"
                     return ModelError(ModelErrorKind.TIMED_OUT, "model_connect_timeout")
+                now = time.monotonic()
+                if streaming and connected:
+                    reason = None
+                    if last_progress is None and now >= first_output_end:
+                        reason = "model_first_output_timeout"
+                    elif last_progress is not None and now - last_progress >= self.settings.idle_timeout_seconds:
+                        reason = "model_idle_timeout"
+                    if reason:
+                        diagnostic["transport_end"] = "timeout"
+                        return ModelError(ModelErrorKind.TIMED_OUT, reason)
                 if reader.poll(min(0.025, max(0, end - time.monotonic()))):
                     result = reader.recv()
                     if cancellation_token.is_cancelled:
@@ -554,10 +574,23 @@ class DeepSeekModelAdapter:
                         diagnostic["transport_end"] = "cancelled"
                         return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
                     if "diagnostic" in result:
-                        diagnostic.update(result["diagnostic"])
+                        detail = result["diagnostic"]
+                        elapsed = time.monotonic() - started
+                        if (detail.get("response_utf8_bytes") or 0) > (diagnostic.get("response_utf8_bytes") or 0):
+                            diagnostic.setdefault("first_byte_seconds", elapsed)
+                            diagnostic["last_byte_seconds"] = elapsed
+                        chars = (detail.get("content_chars") or 0) + (detail.get("reasoning_chars") or 0)
+                        if streaming and chars > progress_chars:
+                            progress_chars = chars
+                            last_progress = time.monotonic()
+                            diagnostic.setdefault("first_output_seconds", elapsed)
+                            diagnostic["last_output_seconds"] = elapsed
+                        diagnostic.update(detail)
                         continue
                     if result.get("connected") is True:
                         connected = True
+                        first_output_end = time.monotonic() + self.settings.first_output_timeout_seconds
+                        diagnostic["connected_seconds"] = time.monotonic() - started
                         continue
                     if "error" in result:
                         import os as _os
@@ -600,6 +633,7 @@ class DeepSeekModelAdapter:
                     process.close()
             else:
                 diagnostic["worker_exit_confirmed"] = True
+            diagnostic["elapsed_seconds"] = time.monotonic() - started
             reader.close()
             writer.close()
 

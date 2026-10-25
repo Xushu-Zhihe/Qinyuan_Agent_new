@@ -688,12 +688,10 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 }
 
 /* C01-1: original competition connection workspace, reusing workbench tokens. */
-.competition-layout { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 22px; align-items: start; }
-.competition-settings, .competition-preview-panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 24px; display: grid; gap: 20px; min-width: 0; }
+.competition-settings { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 24px; display: grid; gap: 20px; min-width: 0; }
 .competition-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .competition-heading h2 { font-size: 17px; }
 .competition-fields { margin: 0; padding: 0; border: 0; display: grid; gap: 18px; min-width: 0; }
-.competition-status { color: var(--accent); background: var(--accent-soft); border-radius: var(--radius-sm); padding: 14px 16px; overflow-wrap: anywhere; }
 .competition-note { color: var(--muted); font-size: 12px; line-height: 1.7; }
 .competition-summary { display: flex; gap: 12px; flex-wrap: wrap; color: var(--blue); font-family: var(--mono); font-size: 12px; }
 .competition-preview { display: grid; gap: 14px; color: var(--muted); }
@@ -701,6 +699,77 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .competition-question h3 { color: var(--text); font-size: 15px; overflow-wrap: anywhere; }
 .competition-description, .competition-addresses { white-space: pre-wrap; overflow-wrap: anywhere; }
 .competition-addresses { color: var(--blue); font: 12px/1.7 var(--mono); margin: 0; }
-@media (max-width: 1050px) { .competition-layout { grid-template-columns: 1fr; } }
 
 .competition-import { display: grid; gap: 12px; margin-top: 16px; }
+
+/* C01-4 competition desk: presentation over the existing trusted controls. */
+#competition-view { max-width: 1900px; padding: 28px clamp(16px,2.3vw,32px) 48px; }
+.c-page-head { margin-bottom:20px; }
+.c-panel { min-width:0; border:1px solid var(--line); border-radius:var(--radius); background:var(--panel); padding:20px; display:grid; align-content:start; gap:16px; }
+.c-panel h2 { font-size:14px; }
+.c-panel summary { cursor:pointer; font-weight:650; font-size:13px; }
+.c-panel[open]>summary { margin-bottom:4px; }
+.c-command { margin-bottom:20px; background:linear-gradient(115deg,rgba(61,219,165,.055),transparent 55%),var(--panel); }
+.c-command-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.c-command-head>p { font-weight:650; font-size:13px; flex:1; min-width:200px; }
+.c-live-dot { width:8px; height:8px; background:var(--dim); border-radius:50%; }
+.c-command[data-status="running"] .c-live-dot { background:var(--accent); box-shadow:0 0 0 4px var(--accent-soft); }
+.c-command[data-status="pausing"] .c-live-dot,.c-command[data-status="needs_attention"] .c-live-dot { background:var(--amber); }
+.c-clock-row { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:20px; padding:2px 0 14px; border-bottom:1px solid var(--line); }
+.c-clock-row>div { display:grid; gap:5px; }
+.c-clock-row span { color:var(--muted); font-size:11px; }
+.c-clock-row strong { font:500 clamp(20px,2.4vw,30px)/1.2 var(--mono); letter-spacing:-.04em; }
+.c-command-actions { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+.c-stop { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
+.c-extend { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin-left:auto; color:var(--muted); font-size:11px; }
+#competition-extend-minutes { flex:none; width:64px; min-width:0; border:1px solid var(--line-2); border-radius:6px; background:var(--bg); padding:8px; }
+.c-workspace { display:grid; grid-template-columns:210px minmax(0,1fr) 300px; gap:18px; align-items:start; }
+.c-center,.c-inspector { display:grid; gap:18px; min-width:0; }
+.c-inspector .competition-settings { padding:20px; }
+.c-inspector .competition-heading h2 { font-size:12px; }
+.c-inspector .field-grid { grid-template-columns:1fr 1fr; }
+.c-inspector .field-grid .field { min-width:0; }
+.c-inspector input,.c-inspector select,.c-inspector textarea { min-width:0; max-width:100%; }
+.c-facts { display:grid; gap:12px; margin:0; }
+.c-facts>div { display:grid; gap:3px; }
+.c-facts dt { color:var(--dim); font-size:11px; }
+.c-facts dd { margin:0; font:11px/1.6 var(--mono); overflow-wrap:anywhere; }
+.c-queue-list,.c-records { list-style:none; padding:0; margin:0; display:grid; gap:9px; }
+.c-queue-list li { padding:12px 10px; border:1px solid var(--line); border-radius:8px; display:grid; gap:8px; background:var(--panel-2); }
+.c-queue-list li[data-current="true"] { border-color:rgba(61,219,165,.5); box-shadow:inset 3px 0 var(--accent); }
+.c-queue-title { color:var(--text); font-size:12px; overflow-wrap:anywhere; background:none; border:0; text-align:left; padding:0; }
+.c-queue-state { font-size:10px; color:var(--dim); }
+.c-queue-actions { display:flex; gap:4px; }
+.c-queue-actions button { padding:3px 7px; border:1px solid var(--line); border-radius:5px; background:var(--panel); font-size:11px; }
+.c-queue textarea { width:100%; margin-top:10px; }
+.c-empty { color:var(--dim); font-size:12px; padding:14px 0; line-height:1.8; }
+.c-question-body { display:grid; gap:12px; min-width:0; max-height:320px; overflow:auto; }
+.c-question-body h3 { font-size:18px; }
+.c-question-body pre,.c-question-body p { white-space:pre-wrap; overflow-wrap:anywhere; }
+.c-question-body pre { color:var(--blue); font-size:11px; }
+.c-question-body p { color:var(--muted); font-size:12px; line-height:1.85; }
+.c-metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }
+.c-metrics>div { display:grid; gap:6px; padding:12px; background:var(--panel-2); border-radius:8px; }
+.c-metrics span { color:var(--dim); font-size:10px; }
+.c-metrics strong { font:500 22px/1.2 var(--mono); }
+.c-frontier { display:grid; gap:8px; font-size:12px; }
+.c-frontier p { border-left:2px solid var(--line-2); padding-left:10px; overflow-wrap:anywhere; }
+.c-error { color:var(--amber); font-size:12px; line-height:1.7; overflow-wrap:anywhere; }
+.c-error:empty { display:none; }
+.c-records { max-height:360px; overflow:auto; }
+.c-records li { display:grid; grid-template-columns:54px 1fr; gap:10px; padding:9px 0; border-bottom:1px solid var(--line); font-size:11px; overflow-wrap:anywhere; }
+.c-records time { color:var(--dim); font-family:var(--mono); }
+.c-records span { color:var(--muted); }
+.c-center .competition-heading select { min-width:0; max-width:100%; }
+.c-center .competition-question { padding:14px; }
+.c-center .competition-question h3 { font-size:14px; }
+.c-center .competition-description { max-height:260px; overflow:auto; }
+#competition-question-picker { flex:1; }
+@media (max-width:1400px) { .shell:has(#competition-view:not([hidden])) { grid-template-columns:190px minmax(0,1fr); } .c-workspace { grid-template-columns:180px minmax(0,1fr) 270px; gap:12px; } .c-panel { padding:16px; } .c-inspector .competition-settings { padding:16px; } }
+@media (max-width:1180px) { .c-workspace { grid-template-columns:180px minmax(0,1fr); } .c-inspector { grid-column:1/-1; grid-template-columns:repeat(3,minmax(0,1fr)); } .c-extend { margin-left:0; } }
+@media (max-width:800px) { .shell:has(#competition-view:not([hidden])) { grid-template-columns:1fr; } body:has(#competition-view:not([hidden])) .rail { position:static; height:auto; padding:12px 16px; gap:10px; border-right:0; border-bottom:1px solid var(--line); } body:has(#competition-view:not([hidden])) .rail .nav { grid-template-columns:repeat(3,minmax(0,1fr)); } body:has(#competition-view:not([hidden])) .rail-foot { display:none; } .c-workspace { grid-template-columns:1fr; } .c-inspector { grid-column:auto; grid-template-columns:1fr; } .c-queue-list { max-height:240px; overflow:auto; } .c-clock-row { gap:10px; } .c-page-head { align-items:start; } .c-metrics { gap:5px; } .c-metrics>div { padding:10px; } }
+@media (prefers-reduced-motion:reduce) { .c-live-dot { transition:none; } }
+
+#competition-bound-source { max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+
+.c-clock-row strong { min-width:0; overflow-wrap:anywhere; }

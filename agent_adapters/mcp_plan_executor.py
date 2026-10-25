@@ -71,8 +71,9 @@ def _is_operation_id(value):
 class MCPPlanExecutor:
     """One invocation per inner decision; tool success never creates a Fact."""
 
-    def __init__(self, app, manager=None):
+    def __init__(self, app, manager=None, *, public_web=None):
         self.app, self.manager = app, manager
+        self.public_web = public_web
         self.client = None
         self.service = getattr(manager, 'sandbox_service', None)
         self.tools = []
@@ -91,7 +92,8 @@ class MCPPlanExecutor:
     def authorize(self, task_id):
         """Freeze one capability binding for new runs; old runs have no marker."""
         self.evidence.save("mcp-registry", task_id, {
-            "registry_sha256": hashlib.sha256(self.registry_path().read_bytes()).hexdigest()
+            "registry_sha256": hashlib.sha256(self.registry_path().read_bytes()).hexdigest(),
+            **({"public_web": self.public_web.binding} if self.public_web else {})
         })
 
     def enabled(self, task_id):
@@ -107,6 +109,9 @@ class MCPPlanExecutor:
         expected = hashlib.sha256(self.registry_path().read_bytes()).hexdigest()
         if frozen is None or frozen["registry_sha256"] != expected:
             raise D3RecoveryRequired("mcp.registry_binding_changed")
+        retrieval = frozen.get("public_web")
+        if retrieval is not None and (self.public_web is None or self.public_web.binding != retrieval):
+            raise D3RecoveryRequired("retrieval.configuration_unavailable")
         if self.manager is None:
             from MCPs.Mcp_client.client import MCPManager, load_registry
             from agent_adapters.sandbox_adapter import D8SandboxAdapter
@@ -129,6 +134,9 @@ class MCPPlanExecutor:
             if self.experiments.enabled:
                 from agent_adapters.http_experiments import SPEC
                 self.tools = [*self.tools, SPEC]
+            if retrieval is not None:
+                from agent_adapters.public_web import SPECS
+                self.tools = [*self.tools, *SPECS]
             if not self.tools:
                 raise D3RecoveryRequired("mcp.no_tools_available")
             # Drift is rejected on recovery; no silent replacement of a frozen catalog.
@@ -165,6 +173,11 @@ class MCPPlanExecutor:
         from agent_adapters.http_experiments import TOOL
         if call.tool_name == TOOL:
             self.experiments.validate(call)
+        from agent_adapters.public_web import NAMES
+        if call.tool_name in NAMES:
+            if self.public_web is None:
+                raise ValueError("retrieval.configuration_unavailable")
+            self.public_web.validate(call)
 
     def feedback(self, operation_id):
         # An application reference is not always a D4 operation id: reviews use
@@ -186,7 +199,13 @@ class MCPPlanExecutor:
             raise D3RecoveryRequired("mcp.result_binding_changed")
         if 'experiment_request' in claim:
             self.experiments.validate_receipt(operation,claim,result)
-        return result["payload"]
+        from agent_adapters.public_web import IDENTITY, NAMES, preview
+        if (claim['call']['tool_name'] in NAMES and operation.completion is not None
+                and (operation.completion.evidence_sha256 != digest(result)
+                     or operation.completion.evidence_ref != 'mcp-result/' + operation_id)):
+            raise D3RecoveryRequired("mcp.result_binding_changed")
+        payload = result["payload"]
+        return preview(payload, operation_id, claim) if payload.get("identity") == IDENTITY else payload
 
     def _apply(self, operation, claim, result):
         if operation.start.context_sha256 != digest(claim) or result["request_sha256"] != digest(claim):
@@ -229,6 +248,14 @@ class MCPPlanExecutor:
             await self.experiments.run(request_id,intent_id,call,token)
             return
         self.app._check_dispatch()
+        from agent_adapters.public_web import NAMES
+        public = call.tool_name in NAMES
+        if public:
+            frozen = self.evidence.read("mcp-registry", self.app.state.task_run.task_run_id)
+            if (self.public_web is None or frozen is None
+                    or frozen.get("public_web") != self.public_web.binding):
+                raise D3RecoveryRequired("retrieval.configuration_unavailable")
+            self.public_web.validate(call)
         identity = self.app._id("mcp/" + request_id)
         claim = {"task_run_id": self.app.state.task_run.task_run_id,
                  "intent_id": intent_id, "model_request_id": request_id, "call": asdict(call)}
@@ -258,23 +285,31 @@ class MCPPlanExecutor:
             self.app.config.d4_budget.budget_policy_ref))
         self._log.info("mcp.call_started", run=claim["task_run_id"], intent=intent_id,
                        exec=identity, tool=call.tool_name)
-        pending = asyncio.create_task(self.client.call_tool(call.tool_name, dict(call.arguments)))
+        # 公共检索要把"当前目标"作为禁止命中的地址传下去，来源是已授权的 origin。
+        authorization = self.app.config.web_authorization
+        target = authorization.allowed_origin if authorization else None
+        pending = asyncio.create_task(self.public_web.call(call, min(maximum, remaining), token, target)
+                  if public else self.client.call_tool(call.tool_name, dict(call.arguments)))
         try:
             while not pending.done():
                 await asyncio.wait({pending}, timeout=0.25)
                 if token.is_cancelled or self.app.clock() >= self.app.state.task_run.deadline_at:
                     pending.cancel()
+                    if public:
+                        # Read-only transport confirms its child has stopped before returning.
+                        await pending
+                        break
                     try:
                         await pending
                     except BaseException:
                         pass
                     raise D3RecoveryRequired("mcp.outcome_unknown")
             response = pending.result()
-            if (response.agent_id != claim["task_run_id"]
+            if not public and (response.agent_id != claim["task_run_id"]
                     or response.sandbox_id != self.app.state.task_run.sandbox_id
                     or response.qualified_name != call.tool_name):
                 raise D3RecoveryRequired("mcp.execution_binding_changed")
-            payload = self.app.redactor.redact_value(response.to_tool_payload())
+            payload = self.app.redactor.redact_value(response if public else response.to_tool_payload())
         except (MCPCommandPlanError, SandboxPolicyError):
             payload = {"ok": False, "status": "rejected",
                        "tool": call.tool_name, "code": "mcp.command_rejected"}
@@ -285,13 +320,17 @@ class MCPPlanExecutor:
                     await pending
                 except BaseException:
                     pass
+            code = "retrieval.outcome_unknown" if public else "mcp.outcome_unknown"
+            if public and isinstance(exc, D3RecoveryRequired) and exc.args == ("retrieval.worker_stop_unconfirmed",):
+                code = "retrieval.worker_stop_unconfirmed"
             self._log.error("mcp.call_unknown", run=claim["task_run_id"], intent=intent_id,
-                            exec=identity, code="mcp.outcome_unknown", category="unknown",
+                            exec=identity, tool=call.tool_name, code=code, category="unknown",
                             error_type=type(exc).__name__)
-            raise D3RecoveryRequired("mcp.outcome_unknown") from None
+            raise D3RecoveryRequired(code) from None
         result = {"request_sha256": digest(claim), "payload": payload, "finished_at": self.app.clock()}
         self.evidence.save("mcp-result", identity, result)
         self._apply(self.app.store.load_d4_operation(identity), claim, result)
         self._log.info("mcp.call_finished", run=claim["task_run_id"], intent=intent_id,
                        exec=identity, status=payload["status"],
-                       code=payload.get("code"), exit_code=payload.get("exit_code"))
+                       code=payload.get("code"), category=payload.get("category"),
+                       http_status=payload.get("http_status"), exit_code=payload.get("exit_code"))

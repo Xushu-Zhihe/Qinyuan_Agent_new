@@ -69,7 +69,8 @@ def context(raw_request, stage):
         if retrieval['read'].get('next_cursor') is not None:
             cursors.append(retrieval['read']['next_cursor'])
     read_refs = list(dict.fromkeys(item.get("ref") or D8HistoryItem.from_dict(item).ref for item in visible))
-    read_refs.extend(json.loads(raw_request.get("session_context") or "{}").get("compaction", {}).get("omitted_decision_refs", []))
+    from agent_core.handoff_contracts import session_read_refs
+    read_refs.extend(session_read_refs(raw_request.get("session_context")))
     return {**policy, "read_refs": list(dict.fromkeys(read_refs)), 'refs': list(dict.fromkeys(item.get('ref') or D8HistoryItem.from_dict(item).ref for item in visible)),
             'replacement_refs': [item['ref'] for item in visible if item.get('ref')
                 and item.get('record_type') in {'verified_fact', 'reviewed_inference'}],

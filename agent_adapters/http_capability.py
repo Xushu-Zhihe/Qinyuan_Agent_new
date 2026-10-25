@@ -16,7 +16,7 @@ from agent_core.control_store import UpsertPlan,UpsertExecution,UpsertFact,PlanV
 from agent_core.domain import PlanStep,PlanStatus,ExecutionStatus,ExecutionEvidence,PlanValidationStatus
 from agent_core.dual_llm_contracts import D3CommitMetadata,D3RecoveryRequired
 from agent_core.http_contracts import HttpTurnBinding,HttpPlanBinding,HttpPlanContext,HttpObservation,HttpRunConfig
-from agent_core.operation_accounting import D4OperationStart,D4OperationCompletion
+from agent_core.operation_accounting import D4OperationStart,D4OperationCompletion,D4RecoveryRequired
 from agent_core.turn_modeling import digest
 
 
@@ -276,7 +276,7 @@ class HttpCapability:
         for plan in prior:
             binding=self.store.load_d3_plan_binding(plan.plan_id)
             result=self.store.load_d3_plan_result(plan.plan_id)
-            if isinstance(binding,AttachmentPlanBinding) and result is not None and result.outcome=='satisfied':
+            if isinstance(binding,AttachmentPlanBinding) and result is not None and result.outcome in {'satisfied','observed'}:
                 proof=self.file_proofs.proofs.read(result.proof_id)
                 self.file_proofs.read_verified(proof.source_execution_id,result.proof_id,allow_inactive_plan=True)
                 proofs.append((binding.attachment_index,result.proof_id))
@@ -445,10 +445,6 @@ class HttpCapability:
             if timeout<=0:raise D3RecoveryRequired('d20_http_deadline_reached')
             self.attach()
             previous=self.restore_cookies()
-            self.store.begin_d4_operation(D4OperationStart(binding.execution_id,self.task.task_run_id,
-                'tool_dispatch',app.clock(),app.state.latest_checkpoint.sequence,binding.request_sha256,
-                binding.plan_id,app.config.d4_budget.budget_policy_ref))
-            self.http.timeout_seconds=timeout
             phase='http_dispatch'
             try:
                 response=await self.dispatch(binding,timeout,token)
@@ -456,12 +452,14 @@ class HttpCapability:
                 value=dict(task_run_id=self.task.task_run_id,plan_id=binding.plan_id,execution_id=binding.execution_id,
                     request_sha256=binding.request_sha256,method=self.read_request(binding).method,status=response.status,
                     body_evidence_id=response.body_evidence_id,body_sha256=response.body_sha256,
-                    body_bytes=response.body_bytes,finished_at=app.clock(),effective_timeout_seconds=timeout)
+                    body_bytes=response.body_bytes,finished_at=app.clock(),effective_timeout_seconds=self.http.timeout_seconds)
                 phase='cookie_snapshot'
                 value.update(self.save_cookies(binding.execution_id,previous,response))
                 phase='response_save'
                 self.evidence.save('http-result',binding.execution_id,value)
             except Exception as exc:
+                if self.dispatch_stop(binding) is not None:
+                    raise  # A known admission stop is not a failed HTTP exchange.
                 # A diagnostic is not a completion receipt. Preserve the unknown operation.
                 try:
                     self.evidence.save('http-failure',binding.execution_id,dict(
@@ -474,7 +472,8 @@ class HttpCapability:
         if operation is None or operation.completion is None:
             self.store.complete_d4_operation(D4OperationCompletion(binding.execution_id,value['finished_at'],
                 'completed',binding.execution_id,digest(value)))
-        if token.is_cancelled:raise D3RecoveryRequired('d20_http_cancelled_after_result')
+        # Receipt first: expiry/cancellation cannot discard an already returned response.
+        app._check_dispatch()
         if execution is None or execution.status is ExecutionStatus.RUNNING:
             self.commit_execution(binding,ExecutionStatus.SUCCEEDED)
         return await app._review_d8_observation(binding,self.observation(binding.execution_id),(),token)
@@ -482,7 +481,29 @@ class HttpCapability:
     def close(self):
         if self.http is not None:self.http.close()
 
+    def dispatch_stop(self, binding):
+        value = self.evidence.read('http-dispatch-stop', binding.execution_id)
+        if value is None:
+            return None
+        op = self.store.load_d4_operation(binding.execution_id)
+        if (set(value) != {'task_run_id', 'plan_id', 'execution_id', 'request_sha256',
+                           'dispatch_state', 'reason', 'finished_at'}
+                or value['task_run_id'] != binding.task_run_id or value['plan_id'] != binding.plan_id
+                or value['execution_id'] != binding.execution_id
+                or value['request_sha256'] != binding.request_sha256
+                or value['dispatch_state'] != 'not_dispatched'
+                or value['reason'] not in {'deadline', 'cancelled'}
+                or op is None or op.start.task_run_id != binding.task_run_id
+                or op.start.resource_ref != binding.plan_id or op.start.context_sha256 != binding.request_sha256
+                or value['finished_at'] < op.start.started_at
+                or op.completion is not None and (op.completion.result_kind != 'rejected'
+                    or op.completion.evidence_sha256 != digest(value)
+                    or op.completion.evidence_ref != binding.execution_id)):
+            raise D3RecoveryRequired('d20_http_dispatch_stop_binding_changed')
+        return value
+
     async def dispatch(self,binding,timeout,token):
+        app = self.app
         finished=threading.Event()
         result=[]
         request=self.read_request(binding)
@@ -490,18 +511,44 @@ class HttpCapability:
             try:result.append((True,self.http.execute(request)))
             except BaseException as exc:result.append((False,exc))
             finally:finished.set()
-        self.app._check_dispatch(allow_admitted_operation_id=binding.execution_id)
+        # Recheck after cookie restoration/request preparation, before admitting any I/O.
+        app._check_dispatch()
+        timeout = min(timeout, self.task.deadline_at - app.clock())
+        if timeout <= 0:
+            app._check_dispatch()
+            raise D3RecoveryRequired('d20_http_deadline_reached')
+        self.http.timeout_seconds=timeout
+        self.store.begin_d4_operation(D4OperationStart(binding.execution_id,self.task.task_run_id,
+            'tool_dispatch',app.clock(),app.state.latest_checkpoint.sequence,binding.request_sha256,
+            binding.plan_id,app.config.d4_budget.budget_policy_ref))
+        # A ledger write may consume the remaining time. No thread has started here.
+        if token.is_cancelled or app.clock() >= self.task.deadline_at:
+            value = dict(task_run_id=binding.task_run_id, plan_id=binding.plan_id,
+                execution_id=binding.execution_id, request_sha256=binding.request_sha256,
+                dispatch_state='not_dispatched', reason='cancelled' if token.is_cancelled else 'deadline',
+                finished_at=app.clock())
+            self.evidence.save('http-dispatch-stop', binding.execution_id, value)
+            from qinyuan_core import get_logger
+            get_logger('ctrl').info('http.dispatch_stopped', run=binding.task_run_id,
+                intent=binding.intent_id, request=binding.execution_id, phase='admission',
+                category='technical_stop', code=value['reason'])
+            self.store.complete_d4_operation(D4OperationCompletion(binding.execution_id,
+                value['finished_at'], 'rejected', binding.execution_id, digest(value)))
+            app._check_dispatch()
+            raise D3RecoveryRequired('d20_http_not_dispatched')
         threading.Thread(target=send,daemon=True,name='d20-http-request').start()
         expires=time.monotonic()+timeout
         delay=0.001
         while not finished.is_set():
-            if token.is_cancelled or self.app.clock()>=self.task.deadline_at:
-                self.app._check_dispatch(allow_admitted_operation_id=binding.execution_id)
-            if time.monotonic()>=expires:
-                raise D3RecoveryRequired('d20_http_outcome_unknown') from TimeoutError()
+            if token.is_cancelled or app.clock() >= self.task.deadline_at or time.monotonic() >= expires:
+                # No receipt: preserve the admitted operation as unknown; never replay.
+                from qinyuan_core import get_logger
+                get_logger('ctrl').warning('http.outcome_unknown', run=binding.task_run_id,
+                    intent=binding.intent_id, request=binding.execution_id, phase='http_dispatch',
+                    category='technical_wait', code='d4_operation_outcome_unknown')
+                raise D4RecoveryRequired('d4_operation_outcome_unknown')
             await asyncio.sleep(delay)
             delay=min(0.025, delay*2)
-        self.app._check_dispatch(allow_admitted_operation_id=binding.execution_id)
         ok,value=result[0]
         if not ok:raise D3RecoveryRequired('d20_http_outcome_unknown') from value
         return value
@@ -692,6 +739,14 @@ class HttpCapability:
             if not isinstance(binding,HttpPlanBinding):continue
             result=self.result(binding.execution_id)
             op=self.store.load_d4_operation(binding.execution_id)
+            stopped=self.dispatch_stop(binding)
+            if stopped is not None:
+                if result is not None:
+                    raise D3RecoveryRequired('d20_http_dispatch_stop_conflicts_with_response')
+                if op.completion is None:
+                    self.store.complete_d4_operation(D4OperationCompletion(binding.execution_id,
+                        stopped['finished_at'],'rejected',binding.execution_id,digest(stopped)))
+                continue
             if result is not None and (op is None or op.start.task_run_id!=task
                     or op.start.resource_ref!=plan.plan_id or op.start.context_sha256!=binding.request_sha256):
                 raise D3RecoveryRequired('d20_http_result_without_bound_start')
@@ -810,6 +865,12 @@ def check_http_task(directory,store,config,*,diagnostics=None):
             if diagnostics is not None:diagnostics.append(failure)
         value=capability.result(binding.execution_id)
         op=store.load_d4_operation(binding.execution_id)
+        stopped=capability.dispatch_stop(binding)
+        if stopped is not None:
+            if value is not None:
+                raise D3RecoveryRequired('d20_http_dispatch_stop_conflicts_with_response')
+            needs_repair |= op.completion is None
+            continue
         execution=next((e for e in capability.app.state.executions if e.execution_id==binding.execution_id),None)
         if value is not None:
             if op is None:raise D3RecoveryRequired('d20_http_result_without_start')

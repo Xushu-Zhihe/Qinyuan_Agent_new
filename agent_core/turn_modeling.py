@@ -20,6 +20,7 @@ from agent_core.actions import (
 from agent_core.attachment_import import AttachmentImportReceipt
 from agent_core.control_store import canonical_json
 from agent_core.modeling import (
+    model_call_timeout,
     CancellationToken,
     IntentCandidate,
     ModelError,
@@ -783,7 +784,7 @@ class D1AuditedModel:
                 self._configuration(current)
                 raw = yield (
                     current,
-                    min(180.0, state.task_run.deadline_at - self.clock()),
+                    model_call_timeout(self.adapter, state.task_run.deadline_at - self.clock()),
                 )
                 outcome: D1ModelOutcome = "accepted"
                 code = None

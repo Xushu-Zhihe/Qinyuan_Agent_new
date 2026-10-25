@@ -1,4 +1,4 @@
-﻿"""D8-2 contracts and durable internal handoff behavior."""
+"""D8-2 contracts and durable internal handoff behavior."""
 
 import asyncio
 import json
@@ -128,6 +128,13 @@ def tree(tmp_path):
     result[0].store.close()
 
 
+@pytest.fixture
+def read_ready(tree):
+    # Read/receipt tests must reach their boundary rather than the deliberately
+    # tight setup-history pause. The read_return limit is unchanged.
+    tree[0].handoff.increase_capacity({"initial_history": 32768, "visible_history": 65536})
+
+
 def tree_run(tree):
     return asyncio.run(tree[0].run(tree[5]))
 
@@ -214,6 +221,8 @@ def test_known_summary_failure_has_labelled_code_fallback(tree):
 @pytest.mark.parametrize("failure", ["completion", "commit", "reload"])
 def test_saved_joint_summary_survives_fault_without_duplicate_call(tree, monkeypatch, failure):
     app = tree[0]
+    # Reach the persistence fault independently of the tight 8 KiB pause fixture.
+    app.handoff.increase_capacity({"initial_history": 32768, "visible_history": 65536})
     fired = False
     if failure == "completion":
         original = app.store.complete_d4_operation
@@ -282,6 +291,7 @@ def test_all_dependency_candidates_rejected_are_not_exhaustion(tree):
     assert all(tree[0].handoff.evidence.read("result", r.model_request_id)["reason"] == "d8_all_dependency_candidates_rejected" for r in tree[1].calls)
 
 
+@pytest.mark.usefixtures("read_ready")
 def test_index_read_replays_exact_query_and_pages_by_frozen_positions(tree):
     assert tree_run(tree).stop_reason == "search_exhausted"
     app, request_id = tree[0], str(uuid4())
@@ -298,6 +308,7 @@ def test_index_read_replays_exact_query_and_pages_by_frozen_positions(tree):
     assert len(app.store.list_d8_reads(tree[7])) == 2
 
 
+@pytest.mark.usefixtures("read_ready")
 def test_local_read_started_then_interrupted_recovers_once_original_snapshot(tree, monkeypatch):
     assert tree_run(tree).stop_reason == "search_exhausted"
     app, request_id = tree[0], str(uuid4())
@@ -321,6 +332,7 @@ def test_local_read_started_then_interrupted_recovers_once_original_snapshot(tre
     assert len(tree[0].store.list_d8_reads(tree[7])) == 1
 
 
+@pytest.mark.usefixtures("read_ready")
 def test_local_read_result_repairs_completion_without_re_reading(tree, monkeypatch):
     assert tree_run(tree).stop_reason == "search_exhausted"
     app, request_id = tree[0], str(uuid4())
@@ -335,6 +347,7 @@ def test_local_read_result_repairs_completion_without_re_reading(tree, monkeypat
     assert app.store.load_d8_read(request_id)[1] is not None
 
 
+@pytest.mark.usefixtures("read_ready")
 def test_eight_read_starts_are_separate_and_survive_reopen(tree):
     assert tree_run(tree).stop_reason == "search_exhausted"
     before = tree[0].store.d4_budget_usage(tree[7])
@@ -347,6 +360,7 @@ def test_eight_read_starts_are_separate_and_survive_reopen(tree):
     assert tree[0].store.d4_budget_usage(tree[7]) == before
 
 
+@pytest.mark.usefixtures("read_ready")
 def test_inner_can_query_history_before_plan_without_virtual_plan_or_tool(tree):
     inner, original = tree[2], tree[2].invoke
     query_requested = False
@@ -469,6 +483,7 @@ def test_ninth_required_fact_is_not_dropped_by_normal_target(tree, monkeypatch):
     assert set(i.ref for i in items) <= set(packet["required_refs"])
 
 
+@pytest.mark.usefixtures("read_ready")
 def test_known_read_capacity_failure_is_saved_not_left_unknown(tree, monkeypatch):
     from agent_core.handoff_contracts import D8HistoryItem
     assert tree_run(tree).stop_reason == "search_exhausted"
@@ -489,6 +504,8 @@ def test_known_read_capacity_failure_is_saved_not_left_unknown(tree, monkeypatch
 
 
 def test_joint_summary_transaction_rolls_back_index_application_and_checkpoint(tree, monkeypatch):
+    # Capacity is tested separately; this case must reach and replay the commit boundary.
+    tree[0].handoff.increase_capacity({"initial_history": 32768, "visible_history": 65536})
     import agent_core.sqlite_control_store as schema
     original, fired, checkpoint = schema.save_handoff_mutation, False, None
     def fail_inside_transaction(store, mutation, sequence):
@@ -530,6 +547,8 @@ def test_full_request_capacity_checks_output_reserve_before_admission(tree):
 
 
 def test_corrupt_original_read_snapshot_never_switches_to_current_query(tree, monkeypatch):
+    # Reach the snapshot fault instead of stopping at the tight setup capacity.
+    tree[0].handoff.increase_capacity({"initial_history": 32768, "visible_history": 32768})
     assert tree_run(tree).stop_reason == "search_exhausted"
     app, identity = tree[0], str(uuid4())
     original = app.handoff._page
@@ -643,3 +662,63 @@ def test_handoff_evidence_conflict_is_safe_recovery_and_does_not_overwrite(tmp_p
     with pytest.raises(D3RecoveryRequired, match="d8_handoff_evidence_write_recovery_required"):
         evidence.save("pause", identity, {"safe": ["changed"]})
     assert evidence.read("pause", identity) == {"safe": ["original"]}
+
+
+@pytest.mark.usefixtures("read_ready")
+def test_read_fact_uses_shared_projection_and_rejects_tampered_bindings(tree):
+    assert tree_run(tree).stop_reason == "search_exhausted"
+    app = tree[0]
+    fact = next(i for i in app.handoff.history() if i.record_type == "verified_fact")
+    assert any(ref.startswith("d3:") for ref in fact.source_refs)
+    app.handoff._validate_frozen_read_sources((fact,))
+    for altered in (replace(fact, content=fact.content + " unsupported"),
+                    replace(fact, source_refs=(str(uuid4()),)),
+                    replace(fact, source_version="f" * 64),
+                    replace(fact, record_id=str(uuid4()))):
+        with pytest.raises(D3RecoveryRequired, match="d8_read_source_version_(missing|changed)"):
+            app.handoff._validate_frozen_read_sources((altered,))
+
+
+@pytest.mark.parametrize("reason", ["d8_read_source_version_missing", "d8_read_source_version_changed"])
+@pytest.mark.parametrize("completion_fault", [False, True])
+@pytest.mark.usefixtures("read_ready")
+def test_known_source_read_failure_is_settled_and_replayed_without_revalidation(tree, monkeypatch, caplog, reason, completion_fault):
+    assert tree_run(tree).stop_reason == "search_exhausted"
+    app, identity = tree[0], str(uuid4())
+    before = app.store.d4_budget_usage(tree[7])
+    def unavailable(items):
+        raise D3RecoveryRequired(reason)
+    monkeypatch.setattr(app.handoff, "_validate_frozen_read_sources", unavailable)
+    complete = app.store.complete_d8_read
+    if completion_fault:
+        monkeypatch.setattr(app.store, "complete_d8_read", lambda *a: (_ for _ in ()).throw(StorageError("completion fault")))
+        with pytest.raises(StorageError):
+            app.handoff.read_history(query={"record_type": "verified_fact"}, request_id=identity)
+    else:
+        app.handoff.read_history(query={"record_type": "verified_fact"}, request_id=identity)
+    response = app.handoff.evidence.read("read-result", identity)
+    assert response["error"] == "source_unavailable" and response["code"] == reason
+    assert response["items"] == [] and not response["has_more"] and response["next_cursor"] is None
+    assert (app.store.load_d8_read(identity)[1] is None) == completion_fault
+    monkeypatch.setattr(app.store, "complete_d8_read", complete)
+    monkeypatch.setattr(app.handoff, "_validate_frozen_read_sources", lambda *a: pytest.fail("known failure must not revalidate"))
+    assert app.handoff.resume_read(identity) == response
+    assert app.handoff.read_history(query={"record_type": "verified_fact"}, request_id=identity) == response
+    assert app.store.load_d8_read(identity)[1] is not None
+    assert len(app.store.list_d8_reads(tree[7])) == 1
+    assert app.store.d4_budget_usage(tree[7]) == before
+    assert caplog.text.count("history.read_failed") == 1
+
+
+@pytest.mark.usefixtures("read_ready")
+@pytest.mark.parametrize("error_type", [D3RecoveryRequired, OSError])
+def test_unknown_read_validation_failure_stays_pending(tree, monkeypatch, error_type):
+    assert tree_run(tree).stop_reason == "search_exhausted"
+    app, identity = tree[0], str(uuid4())
+    def unknown(items):
+        raise error_type("controlled_unknown_source_state")
+    monkeypatch.setattr(app.handoff, "_validate_frozen_read_sources", unknown)
+    with pytest.raises(error_type, match="controlled_unknown_source_state"):
+        app.handoff.read_history(query={"record_type": "verified_fact"}, request_id=identity)
+    assert app.handoff.evidence.read("read-result", identity) is None
+    assert app.store.load_d8_read(identity)[1] is None

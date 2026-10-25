@@ -1,7 +1,7 @@
 """D8-4 safe conversation replay and a checkpoint before more inner work."""
 
 import json
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 
 from agent_core.conclusion_contracts import D8ModelRequest, conclusion_digest
 from agent_core.dual_llm_contracts import D3RecoveryRequired
@@ -15,6 +15,7 @@ from agent_core.turn_modeling import stable_id
 class IntentSessions:
     def __init__(self, app, evidence):
         self.app, self.store, self.evidence = app, app.store, evidence
+        self._capacity_draft = None
         from agent_core.strategy_supervision import StrategySupervision
         app.supervision = StrategySupervision(app)
         app.store.live_strategy_operation = app.supervision.live
@@ -82,14 +83,14 @@ class IntentSessions:
                          request=request.model_request_id):
             return self._wrap(request)
 
-    def _wrap(self, request):
+    def _wrap(self, request, *, preview=False):
         is_conclusion = isinstance(request, (D8ModelRequest, D8ChangeRequest))
         if not is_conclusion and request.role != "inner_action":
             return request
         if is_conclusion and request.stage != "fact_proposal":
             return request
         turn_id, intent_id = self._scope(request)
-        saved = self.evidence.read("request", request.model_request_id)
+        saved = None if preview else self.evidence.read("request", request.model_request_id)
         cls = (D8SessionChangeRequest if isinstance(request, D8ChangeRequest)
                else D8SessionConclusionRequest if isinstance(request, D8ModelRequest) else D8SessionExecutionRequest)
         values = {f.name: getattr(request, f.name) for f in fields(request)
@@ -114,8 +115,13 @@ class IntentSessions:
                 previous = json.loads(prior["request"].get("session_context", "{}")) if prior else {}
                 segment_start = target_start = previous.get("segment_start", 1) if compact else 1
                 # Only the summary's exact source versions can replace older dialog.
-                covered = {(i["record_id"], i["source_version"]) for i in summary.get("all_items", ())} if compact else set()
-                recent_start = records[-4].ordinal if len(records) >= 4 else 1
+                read_refs = set(summary.get("covered_refs", summary.get("actual_read_refs", ()))) if compact else set()
+                covered = {(i["record_id"], i["source_version"]) for i in summary.get("all_items", ())
+                           if f"{i['record_type']}:{i['record_id']}:{i['source_version']}" in read_refs} if compact else set()
+                if any(r.ordinal < segment_start and ("decision/" + r.record_id, conclusion_digest(asdict(r))) not in covered for r in records):
+                    segment_start = target_start = 1
+                recent_start = (records[-1].ordinal if compact and summary.get("capacity_recovery")
+                                else records[-4].ordinal if len(records) >= 4 else 1)
                 for record in records:
                     if record.ordinal < segment_start:
                         continue
@@ -165,8 +171,22 @@ class IntentSessions:
             session_id = saved["request"]["session_id"]
             context = saved["request"]["session_context"]
         result = cls(**values, session_id=session_id, session_context=context)
-        self.freeze(result)
+        if not preview:
+            try:
+                self.freeze(result)
+            except D3RecoveryRequired as exc:
+                if self.capacity_error(exc):
+                    self._capacity_draft = result
+                raise
+            else:
+                self._capacity_draft = None
         return result
+
+    @staticmethod
+    def capacity_error(error):
+        return str(error) in {"d8_output_complete_request_capacity_paused", "d8_context_paused:complete_model_request",
+            "d8_context_paused:initial_history", "d8_context_paused:visible_history",
+            "d8_context_paused:evaluation_required_context"}
 
     def freeze(self, request):
         if isinstance(request, (D8SessionExecutionRequest, D8SessionConclusionRequest, D8SessionChangeRequest)):
@@ -481,12 +501,105 @@ class IntentSessions:
         if len(rows) <= 4:
             return
         _, summary = self.app.handoff._latest_summary()
-        covered = {i["record_id"] for i in summary.get("all_items", ())} if summary else set()
-        if all("decision/" + r.record_id in covered for r in rows[:-4]):
+        covered = set(summary.get("covered_refs", summary.get("actual_read_refs", ()))) if summary else set()
+        if all("progress:decision/" + r.record_id + ":" + conclusion_digest(asdict(r)) in covered for r in rows[:-4]):
             return
         if len(handoff_json([self.payload(r) for r in rows]).encode("utf-8")) > self.app.handoff.capacity().capacity.visible_history:
             intent = next(i for i in self.app.state.intents if i.intent_id == intent_id)
-            await self.app.handoff.summarize(intent.turn_id, token)
+            await self._organize_once(intent, rows, token)
+
+    def _organization_marker(self, intent, rows):
+        key = {"intent_id": intent.intent_id, "capacity_version": self.app.handoff.capacity().version,
+               "policy_ref": self.app.config.handoff_config.inner_capacity.policy_ref,
+               "decisions": [r.evidence_sha256 for r in rows],
+               "sources": [i.ref for i in self.app.handoff.history() if i.record_type in {"verified_fact", "reviewed_inference"}]}
+        return key, self._id("capacity-organization/" + conclusion_digest(key))
+
+    async def _organize_once(self, intent, rows, token, *, recovery=False):
+        key, marker = self._organization_marker(intent, rows)
+        if self.app.handoff.evidence.read("pause", marker) is not None:
+            return None
+        try:
+            summary = await self.app.handoff.summarize(intent.turn_id, token,
+                decision_prefix=rows[:-1] if recovery else rows[:-4], capacity_recovery=recovery)
+        except D3RecoveryRequired as exc:
+            if not self.capacity_error(exc):
+                raise
+            summary = None
+        self.app.handoff.evidence.save("pause", marker, {**key, "kind": "capacity_organization",
+            "summary_id": summary.record_id if summary else None})
+        return summary
+
+    def _other_branch_fits(self, current):
+        """Probe unstarted alternatives without dispatching or freezing a request."""
+        from agent_core.dual_llm_modeling import D3ModelRequest, D3PlanContext
+        handoff = self.app.handoff
+        for candidate in sorted(self.app.state.intents, key=lambda i: i.priority):
+            if candidate.intent_id == current.intent_id or candidate.status.value != "pending":
+                continue
+            # Existing shares need runtime verification; do not perform tool I/O in a probe.
+            if any(s.claim.target_intent_id == candidate.intent_id for s in self.app.workspace_evidence.list_shares(self.app.state.task_run.task_run_id)):
+                continue
+            turn = next(t for t in self.app.state.turns if t.turn_id == candidate.turn_id)
+            binding = self.store.load_d3_turn_binding(turn.turn_id)
+            if binding is None:
+                continue
+            resource = f"plan:{candidate.intent_id}:1"
+            context = (self.app.web.plan_context(candidate.intent_id) if self.app.web is not None
+                       else D3PlanContext(turn.turn_target, binding, candidate.intent_id, (), ()))
+            request = D3ModelRequest(self._id("capacity-probe/" + candidate.intent_id),
+                self.app.state.task_run.task_run_id, self.app.state.latest_checkpoint.sequence,
+                "inner_action", self.app.config.inner_role.role_config_ref, resource, "inner_plan", context,
+                process_facts=self.app.refinement.context_for(resource) if self.app.refinement is not None else ())
+            try:
+                draft = self._wrap(handoff.wrap_execution_request(request, preview=True), preview=True)
+                if handoff._fits_complete_request(draft, self.app.config.handoff_config.inner_capacity):
+                    return True
+            except D3RecoveryRequired as exc:
+                if not (self.capacity_error(exc) or str(exc).startswith("d8_context_paused:")):
+                    raise
+        return False
+
+    async def recover_capacity(self, intent, token):
+        """One organization per source/version; distinguish local from shared blocking."""
+        handoff = self.app.handoff
+        original = dict(handoff.pause_report or {})
+        draft = self._capacity_draft
+        self._capacity_draft = None
+        if (self.store.blocking_d4_operations(self.app.state.task_run.task_run_id)
+                or any(e.status.value == "running" for e in self.app.state.executions)):
+            return "shared"  # Unknown operations retain their existing recovery boundary.
+        local = False
+        if draft is not None and self._scope(draft)[1] == intent.intent_id:
+            packet = json.loads(draft.session_context)
+            packet["messages"] = []
+            packet.pop("compaction", None)
+            local = handoff._fits_complete_request(replace(draft, session_context=handoff_json(packet)),
+                                                   self.app.config.handoff_config.inner_capacity)
+        rows = self.records(intent.intent_id)
+        _, marker = self._organization_marker(intent, rows)
+        attempted = handoff.evidence.read("pause", marker)
+        can_organize = len(rows) > 1 and (local or original.get("kind") in {"initial_history", "visible_history"})
+        if can_organize and attempted is None:
+            summary = await self._organize_once(intent, rows, token, recovery=True)
+            if summary is not None and summary.origin == "model_organized":
+                return "retry"
+        alternative = self._other_branch_fits(intent)
+        self.record_capacity_block(intent.intent_id, original,
+            attempted=attempted is not None or can_organize, alternative=alternative)
+        return "local" if alternative else "shared"
+
+    def record_capacity_block(self, intent_id, original, *, attempted=False, alternative=False):
+        handoff = self.app.handoff
+        handoff.pause_report = {**original, "task_run_id": self.app.state.task_run.task_run_id,
+            "checkpoint_sequence": self.app.state.latest_checkpoint.sequence, "intent_id": intent_id,
+            "scope": "intent" if alternative else "task", "organization_attempted": attempted,
+            "choices": ["automatic_history_organization", "continue_other_feasible_intents", "wait_for_context_change_or_deadline"],
+            "next_action": "continue_other_feasible_intents" if alternative else "wait_for_context_change_or_deadline"}
+        handoff.evidence.save("pause", handoff._id("capacity-block/" + conclusion_digest(handoff.pause_report)), handoff.pause_report)
+        from qinyuan_core import get_logger
+        get_logger("ctrl").warning("context.capacity_blocked", run=self.app.state.task_run.task_run_id,
+            intent=intent_id, scope=handoff.pause_report["scope"], next_action=handoff.pause_report["next_action"])
 
     @staticmethod
     def visible(request):

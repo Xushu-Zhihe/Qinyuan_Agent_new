@@ -210,9 +210,14 @@ class StructuredOutput:
             self.app.handoff._pause("complete_model_request", (), policy.total_units, None,
                                     reason="d8_output_complete_request_capacity_paused")
         if self.app.config.intent_execution_policy and measurement is not None:
-            self.evidence.save("input-measurement", record["model_request_id"],
-                {"task_run_id": record["task_run_id"], "model_request_id": record["model_request_id"],
-                 "stage": record["stage"], "fits": fits, **measurement})
+            current = {"task_run_id": record["task_run_id"], "model_request_id": record["model_request_id"],
+                       "stage": record["stage"], "fits": fits, **measurement}
+            measured = self.evidence.read("input-measurement", record["model_request_id"])
+            if measured is not None:
+                if any(current.get(key) != value for key, value in measured.items()):
+                    raise D3RecoveryRequired("d8_input_measurement_changed")
+            else:
+                self.evidence.save("input-measurement", record["model_request_id"], current)
         self.evidence.save("contract", record["model_request_id"], record)
         if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.app.selection_bindings.freeze(envelope.request, record)

@@ -3,6 +3,17 @@
 import json
 
 
+REVIEW_HISTORY_GUIDANCE = (
+    "later_intent_results links an earlier continuation review to the later committed result of the same Intent. "
+    "Read both in order and within their recorded source versions and local scope. An earlier request for more "
+    "evidence is not automatically an outstanding obligation after a later reviewed completion; observations "
+    "and counterevidence remain relevant, and a later result is not proof of runtime effects or task success. "
+    "Before reopening a completed phase, explain new counterevidence, a concrete uncovered criterion or a new "
+    "validation purpose in the existing reason. Summary omissions or the earlier reviewer opinion alone do "
+    "not establish that work was never completed. Revisit when justified; this is not a prohibition. "
+)
+
+
 LOCAL_GOAL_GUIDANCE = (
     "Judge only the declared local deliverable, test domain and completion criteria. "
     "A source-supported testable candidate chain is distinct from a dynamically validated chain. "
@@ -16,6 +27,56 @@ LOCAL_GOAL_GUIDANCE = (
     "more files being readable alone is not a completion criterion. Distinguish recorded observations from "
     "conditional causal claims; do not ask for a stronger runtime claim merely to obtain a formal Fact."
 )
+
+
+DIAGNOSTIC_GUIDANCE = (
+    "Selective diagnosis is part of the next normal decision, not a question for the user or an extra model call. "
+    "Recheck assumptions when expanding enumeration while a key prerequisite or the ability to detect a correct "
+    "candidate is unverified; when repeated variants neither exclude candidates nor distinguish explanations; "
+    "or when a reliable observation contradicts an explicit prediction, even after one experiment. "
+    "Ask what the observation actually rules out, which prerequisites remain unobserved, and what next check "
+    "would separate the plausible explanations. Use existing reason or working_record only when useful, with "
+    "original evidence refs; do not add output fields, force a fixed number of explanations or invent a cause. "
+    "A planned variant is not mandatory merely because it appeared in an initial checklist. After a prerequisite "
+    "is contradicted or an operation is infeasible, explain how the next check could change that prerequisite "
+    "or distinguish another live explanation; otherwise consider a supported alternative or scoped closure. "
+    "Source-supported alternatives remain hypotheses until their own prerequisites and effects are tested. "
+    "A bounded enumeration with a working detection method and increasing coverage, or justified repetition "
+    "for noise/timing/stability, can continue without diagnosis at each step. Elapsed time, request count, "
+    "identical responses and absence of Facts alone never trigger diagnosis or prove stagnation. "
+    "First distinguish tool, transport, permission or measurement failures from target counterevidence. "
+    "A diagnostic explanation remains an unverified hypothesis; a negative observation need not identify its cause. "
+    "Once a diagnostic check is planned and progressing, do not repeat the same reflection at each review. "
+    "Revisit it only if new results contradict it, it is infeasible or cannot discriminate, exploration expands "
+    "again, or its stated expected progress does not occur. Preserve tested and untested assumptions in useful "
+    "handoff notes. Supervisors may question the experiment's discriminating value, but diagnostic advice is "
+    "not a mandatory interruption; the inner may explain disagreement and continue within existing authority. "
+    "When supported components have been identified but their connection remains untested, identify that "
+    "specific connection and choose a bounded check with distinguishable outcomes, or explain the missing "
+    "capability/prerequisite in an existing reason or working_record. Do not require another broad source "
+    "inventory merely because more files exist. A static Fact does not verify a composed runtime route. "
+    "For source work, reuse preserved reading indexes and current authorized attachment bindings; obtain a "
+    "current-Intent materialization path through the declared attachment observation/share capability when "
+    "needed. A sibling's workspace path is not current access permission. Do not scan the sandbox root to "
+    "rediscover known input material, and do not confuse the local sandbox with the target deployment."
+)
+
+PUBLIC_KNOWLEDGE_GUIDANCE = (
+    "When a next decision depends on an unconfirmed public technical claim and public retrieval is declared, "
+    "identify that knowledge gap and choose either original-source search/fetch or a discriminating local check. "
+    "Use retrieval for uncertain behavior, compatibility or mechanisms when it can change the next decision; "
+    "a version string alone does not require search. When an uncertain public mechanism is the obstacle, "
+    "make the next useful choice either an original-source lookup or a bounded discriminating local test, "
+    "rather than repeatedly restating that knowledge is missing. Use existing reason/working_record to explain "
+    "the decision this would change; do not request another model call just to decide whether to search. "
+    "Prefer original documentation and verify applicability "
+    "against current observations. Search results are references, not target evidence or verified causes. "
+    "No search count, repeated response or elapsed time alone establishes stagnation. "
+    "Use existing reason or working_record when useful, without an extra call or invented introspection. "
+    "Supervisors may suggest a useful lookup; the inner may choose an effective local experiment instead. "
+    "Respect the frozen public-data boundary and task retrieval permissions; do not send private material."
+)
+
 
 GUIDANCE = (
     "根据任务目标、前置 Intent、执行完成后的有效 Fact、已审核推断和未解决问题，"
@@ -33,7 +94,7 @@ GUIDANCE = (
     "兄弟 Intent 才能成立。只提出有依据的方向；只有一个方向就返回一个，"
     "四五个有价值的方向也可以，不凑数量，不设固定数量指标。"
     "先查看 active_intent_frontier 及对应 history items，不要重新创建仍在等待或执行中的"
-    "同一解决方向。可以沿前置方向继续深入，但必须说明新 Fact 带来的新问题或进展。"
+    "同一解决方向。沿前置方向深入或重访已完成阶段时，在现有理由中说明新增反证、具体未覆盖判据或新的验证用途；旧补证意见本身不等于当前仍有缺口。"
     "内层只提出建议，外层根据证据接受、调整或否决；证据或能力不足时明确说明。"
 )
 

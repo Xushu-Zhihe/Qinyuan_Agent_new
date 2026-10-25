@@ -13,7 +13,7 @@ from agent_core.conclusion_contracts import (
 from agent_core.runtime import TaskRunStatus
 from agent_core.domain import FactStatus, IntentStatus, PlanStatus, TurnStatus
 from agent_core.dual_llm_contracts import D3RecoveryRequired
-from agent_core.modeling import ModelError, ModelErrorKind
+from agent_core.modeling import model_call_timeout, ModelError, ModelErrorKind
 from agent_core.operation_accounting import D4OperationCompletion, D4OperationStart
 from agent_core.turn_modeling import stable_id
 from agent_core.evidence_conclusions import EvidenceReviewRequest, EvidenceObservation, resource
@@ -235,7 +235,7 @@ class ConclusionReview:
         role = self.config.inner_role if request.stage == "fact_proposal" else self.config.outer_role
         if adapter.role_config != role or request.role_config_ref != role.role_config_ref:
             raise D3RecoveryRequired("d8_frozen_role_changed")
-        timeout = min(180.0, self.controller.control_state.task_run.deadline_at - self.clock())
+        timeout = model_call_timeout(adapter, self.controller.control_state.task_run.deadline_at - self.clock())
         finished, stopped, values = threading.Event(), threading.Event(), []
 
         class Token:

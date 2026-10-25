@@ -18,6 +18,19 @@ from agent_core.domain import ExecutionStatus, FailureSummary, FailureType, Plan
 from agent_core.file_inspection import validate_inspection_path
 
 
+DEFAULT_MODEL_TIMEOUT_SECONDS = 600.0
+DEFAULT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS = 180.0
+DEFAULT_MODEL_IDLE_TIMEOUT_SECONDS = 60.0
+
+
+def model_call_timeout(adapter, remaining_seconds):
+    """Use the configured transport limit through the existing adapter wrappers."""
+    while hasattr(adapter, "adapter"):
+        adapter = adapter.adapter
+    settings = getattr(adapter, "settings", None)
+    return min(remaining_seconds, getattr(settings, "timeout_seconds", DEFAULT_MODEL_TIMEOUT_SECONDS))
+
+
 class ModelContractError(ValueError):
     """Raised when a confirmed model-boundary contract is violated."""
 

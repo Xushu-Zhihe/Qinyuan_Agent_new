@@ -183,10 +183,10 @@ class _D3ReviewCall:
                 finished.set()
 
         threading.Thread(target=invoke, daemon=True, name="d3-review-call").start()
-        limit = time.monotonic() + min(
-            180.0,
-            application.controller.control_state.task_run.deadline_at
-            - application.clock(),
+        from agent_core.modeling import model_call_timeout
+        limit = time.monotonic() + model_call_timeout(
+            application.review_model,
+            application.controller.control_state.task_run.deadline_at - application.clock(),
         )
         while not finished.wait(0.01):
             if application._dispatch_stopped() or time.monotonic() >= limit:
@@ -221,7 +221,7 @@ class D3Application:
         clock: Callable[[], float],
         refinement_model=None,
         sensitive_config: Mapping[str, D5SensitiveValue] | None = None,
-        refinement_timeout_seconds: float = 180.0,
+        refinement_timeout_seconds: float | None = None,
         fact_review_model=None,
         handoff_model=None,
         capacity_port=None,
@@ -1600,6 +1600,9 @@ class D3Application:
             if stop:
                 name += "/after-strategy/" + stop["review_id"]
         if self.config.intent_execution_policy == "continuous_v1" and stage != "outer_turn":
+            summaries = self.store.list_d8_handoffs(task_id)
+            if stage == "inner_plan" and summaries:
+                name += "/after-summary/" + summaries[-1].record_id
             discarded = sum(1 for op in self.store.list_d3_operations(task_id)
                             if op.start.resource_ref == resource_ref and self.handoff.evidence.read("strategy-discard", op.start.operation_id))
             if discarded:
@@ -3451,6 +3454,11 @@ class D3Application:
             except (D3RecoveryRequired, D3ProposalRejected, D2ReviewPaused) as exc:
                 from agent_core.intent_execution import suspend_local
                 live = next(i for i in self.state.intents if i.intent_id == current.intent_id)
+                if self.sessions is not None and self.sessions.capacity_error(exc):
+                    action = await self.sessions.recover_capacity(live, token)
+                    if action == "retry":continue
+                    if action != "local":raise
+                    exc = D3RecoveryRequired("d8_context_paused:local_session_capacity")
                 if suspend_local(self, live, exc):continue
                 raise
 
@@ -3631,8 +3639,8 @@ class D3Application:
             if (capacity_blocked is None or capacity_blocked != self._capacity_wait_key()
                     or token.is_cancelled or self._has_cancel_intent(self.state.task_run.task_run_id)):
                 result = await self._run_once(token)
-                capacity_blocked = (self._capacity_wait_key() if result.stop_reason in {
-                    "d8_output_complete_request_capacity_paused", "d8_context_paused:complete_model_request"} else None)
+                capacity_blocked = (self._capacity_wait_key() if self.sessions is not None
+                                    and self.sessions.capacity_error(result.stop_reason) else None)
             if result.stop_reason == "operator_paused":return await paused_result(self)
             if self.state.task_run.status in TERMINAL_STATUSES or token.is_cancelled:return result
             if self.clock() >= self.state.task_run.deadline_at:
@@ -3709,6 +3717,11 @@ class D3Application:
                     return self.result(
                         f"budget_exhausted:{exc}", recovery_required=False
                     )
+                if (self.sessions is not None and self.sessions.capacity_error(exc) and self.handoff.pause_report
+                        and self.handoff.pause_report.get("checkpoint_sequence") != self.state.latest_checkpoint.sequence
+                        and not self.store.blocking_d4_operations(self.state.task_run.task_run_id)
+                        and not any(e.status.value == "running" for e in self.state.executions)):
+                    self.sessions.record_capacity_block(None, self.handoff.pause_report)
                 return self.result(str(exc), recovery_required=True)
             except _D4TerminalStop as exc:
                 return self.result(exc.reason, recovery_required=exc.cleanup_unknown)

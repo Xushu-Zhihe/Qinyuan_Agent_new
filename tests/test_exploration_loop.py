@@ -564,3 +564,148 @@ def test_observed_fact_and_conditional_inference_keep_separate_review_identity(h
     assert conclusions[0].fact_id is None and len(c.app.state.facts)==1
     assert c.app.state.intents[0].status.value=='inconclusive'
     assert len(c.sends)==1
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+def test_old_continuation_dependency_carries_later_completion_without_reopening(http_case, monkeypatch):
+    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.handoff_contracts import D8Capacity
+    c = http_case
+    install(c, steps=1)
+    inner, outer = c.models[1].invoke, c.models[0].invoke
+    reviews, seen = [], {}
+    class ReachedNextDirection(BaseException):
+        pass
+    async def no_final_candidate(*args):
+        return False
+    monkeypatch.setattr(c.app.answers, "after_success", no_final_candidate)
+    def review(envelope, *args):
+        stage, req = envelope.output_contract["stage"], envelope.request
+        if stage == "intent_evaluation":
+            reviews.append(req)
+            if len(reviews) == 1:
+                return dict(decision="continue", reason="Check the remaining local condition before closing this phase.",
+                            evidence_refs=[i.ref for i in req.history])
+            earlier = next(i for i in req.history if i.record_id.startswith("tree/")
+                           and json.loads(i.content).get("kind") == "evaluation_continued")
+            seen["before"] = earlier
+        if stage == "tree_planning" and c.app.state.turns:
+            packet = json.loads(req.prior_summary)
+            earlier = seen["before"]
+            later = packet["later_intent_results"][earlier.ref]
+            assert {earlier.ref, later} <= {i.ref for i in req.history}
+            seen["later"] = later
+            return dict(kind="candidates", reason="Test a distinct runtime prerequisite, not an old reviewer obligation.",
+                intents=[dict(description="Test the next runtime prerequisite using preserved source results.",
+                              intent_type=None, dependency_refs=[earlier.ref])])
+        return outer(envelope, *args)
+    def choose(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan" and len(c.app.state.intents) > 1:
+            packet = json.loads(envelope.request.history_context)
+            old = seen["before"]
+            assert packet["later_intent_results"][old.ref] == seen["later"]
+            items = {i["ref"]: i for i in packet["items"]}
+            assert old.ref in packet["required_refs"] and seen["later"] in packet["required_refs"]
+            assert items[old.ref]["content"] == old.content  # No historical opinion rewritten.
+            assert any(i["record_type"] == "intent" and i["record_id"] == old.intent_id
+                       and json.loads(i["content"])["status"] == "succeeded" for i in items.values())
+            from agent_adapters.deepseek_roles import build_payload
+            wire = build_payload(envelope, c.app.config.inner_role, context_loader=c.app.web.model_context)
+            assert "An earlier request for more evidence is not automatically an outstanding obligation" in wire["messages"][-2]["content"]
+            assert "not a prohibition" in wire["messages"][-2]["content"]
+            seen["envelope"] = envelope
+            seen["new_intent"] = envelope.request.context.intent_id
+            raise ReachedNextDirection()
+        return inner(envelope, *args)
+    c.models[0].invoke, c.models[1].invoke = review, choose
+    result = asyncio.run(c.app._run_once(c.token))
+    # Model workers reconcile interruptions as unknown rather than replaying them.
+    assert "new_intent" in seen and result.recovery_required, result
+    assert len(reviews) == 2 and len(c.sends) == 1 and len(c.app.state.facts) == 1
+    from agent_adapters.deepseek_roles import build_payload
+    envelope = seen["envelope"]
+    packet = json.loads(envelope.request.history_context)
+    old_packet = {key: value for key, value in packet.items() if key != "later_intent_results"}
+    old_request = replace(envelope.request, history_context=json.dumps(old_packet))
+    old_wire = build_payload(replace(envelope, request=old_request), c.app.config.inner_role,
+                             context_loader=c.app.web.model_context)
+    assert "later_intent_results links an earlier" not in old_wire["messages"][-2]["content"]
+    assert c.app.state.intents[0].status.value == "succeeded"
+    turn = next(i.turn_id for i in c.app.state.intents if i.intent_id == seen["new_intent"])
+    original_history = c.app.handoff.history
+    monkeypatch.setattr(c.app.handoff, "history", lambda **kwargs: tuple(
+        replace(i, source_status="unavailable") if i.ref == seen["later"] else i for i in original_history(**kwargs)))
+    with pytest.raises(D3RecoveryRequired, match="d8_required_source_unavailable_or_changed"):
+        c.app.handoff.select("execution", turn, seen["new_intent"])
+    monkeypatch.setattr(c.app.handoff, "history", original_history)
+    monkeypatch.setattr(c.app.handoff, "capacity", lambda: NS(capacity=D8Capacity(initial_history=8192, visible_history=16384)))
+    with pytest.raises(D3RecoveryRequired, match="d8_context_paused"):
+        c.app.handoff.select("execution", turn, seen["new_intent"])
+
+
+@pytest.mark.parametrize("status,later_owner,sequence,kind,expected", [
+    ("succeeded", "one", 3, "succeeded", True),
+    ("failed", "one", 3, "failed", True),
+    ("inconclusive", "one", 3, "inconclusive", True),
+    ("running", "one", 3, "succeeded", False),
+    ("succeeded", "two", 3, "succeeded", False),
+    ("succeeded", "one", 1, "succeeded", False),
+    ("succeeded", "one", 3, "suspended", False),
+])
+def test_review_chronology_requires_same_intent_and_committed_terminal(status, later_owner, sequence, kind, expected):
+    from agent_core.handoff import HandoffContext
+    rows = [NS(record_id="old", intent_id="one", kind="evaluation_continued"),
+            NS(record_id="later", intent_id=later_owner, kind=kind)]
+    fake = NS(state=NS(task_run=NS(task_run_id="task"), intents=[NS(intent_id="one", status=NS(value=status))]),
+              store=NS(list_d8_tree_records=lambda _: rows))
+    items = [NS(record_id="tree/old", ref="old-ref", committed_sequence=2),
+             NS(record_id="tree/later", ref="later-ref", committed_sequence=sequence)]
+    assert HandoffContext._later_intent_results(fake, items) == ({"old-ref": "later-ref"} if expected else {})
+
+
+@pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
+@pytest.mark.parametrize("source_failure", [False, True])
+def test_evidence_fact_history_index_and_details_continue_same_intent(http_case, monkeypatch, caplog, source_failure):
+    c = http_case
+    install(c, steps=1)
+    inner = c.models[1].invoke
+    reads = []
+    validate = c.app.handoff._validate_frozen_read_sources
+    failures = []
+    def transient_source_failure(items):
+        if source_failure and not failures:
+            from agent_core.dual_llm_contracts import D3RecoveryRequired
+            failures.append("d8_read_source_version_changed")
+            raise D3RecoveryRequired(failures[-1])
+        return validate(items)
+    monkeypatch.setattr(c.app.handoff, "_validate_frozen_read_sources", transient_source_failure)
+    def choose(envelope, *args):
+        if envelope.output_contract["stage"] == "inner_plan" and c.app.state.facts:
+            packet = json.loads(envelope.request.history_context)
+            if not reads:
+                reads.append("index")
+                return dict(kind="history_query", query={"intent_id": c.app.state.intents[0].intent_id})
+            if len(reads) == 1:
+                reads.append("details")
+                ref = next(i["ref"] for i in packet["items"] if i["record_type"] == "verified_fact")
+                return dict(kind="history_details", refs=[ref])
+        return inner(envelope, *args)
+    c.models[1].invoke = choose
+    result = asyncio.run(c.app._run_once(c.token))
+    assert result.stop_reason == "d9_awaiting_external_feedback", result
+    assert reads == ["index", "details"] and len(c.sends) == 1
+    fact, = c.app.state.facts
+    assert fact.verification_ref.startswith("d8e:") and len(c.app.state.intents) == 1
+    saved = c.app.store.list_d8_reads(c.task)
+    assert len(saved) == 2 and all(completion is not None for _, _, completion in saved)
+    responses = [c.app.handoff.evidence.read("read-result", identity) for identity, _, _ in saved]
+    snapshot = c.app.handoff.evidence.read("read-snapshot", saved[0][1]["snapshot_id"])
+    assert any(i["record_type"] == "progress" and i["record_id"].startswith("review/") for i in snapshot["items"])
+    if source_failure:
+        assert responses[0]["error"] == "source_unavailable" and responses[0]["items"] == []
+        assert responses[0]["code"] == "d8_read_source_version_changed"
+        assert "history.read_failed" in caplog.text
+    else:
+        assert all("error" not in response for response in responses)
+    assert any(i.get("content") == fact.content for response in responses for i in response["items"])
+    assert all(c.app.handoff.resume_read(identity) == response for (identity, _, _), response in zip(saved, responses))

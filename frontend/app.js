@@ -241,7 +241,7 @@ function showView(name, updateHistory = true) {
   document.body.classList.toggle("detail-open", name === "detail");
   document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === (name === "detail" ? "tasks" : name)));
   document.querySelectorAll(".view").forEach((view) => { const active = view.id === `${name}-view`; view.hidden = !active; view.classList.toggle("active", active); });
-  $("current-view").textContent = name === "competition" ? "比赛连接" : name === "model" ? "模型角色" : name === "detail" ? "题目详情" : "任务与运行";
+  $("current-view").textContent = name === "competition" ? "比赛控制" : name === "model" ? "模型角色" : name === "detail" ? "题目详情" : "任务与运行";
   if (name === "model") loadModel();
   if (name === "competition") CompetitionPage.load();
   if (updateHistory) {

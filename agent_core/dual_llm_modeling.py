@@ -31,6 +31,7 @@ from agent_core.dual_llm_contracts import (
 )
 from agent_core.goal_candidates import D7AnswerCandidate
 from agent_core.modeling import (
+    model_call_timeout,
     CancellationToken,
     IntentCandidate,
     ModelError,
@@ -734,7 +735,7 @@ class D3AuditedModel:
             self.ledger.begin_d3_operation(expected_start)
             raw = await self._invoke(
                 request,
-                min(180.0, state.task_run.deadline_at - self.clock()),
+                model_call_timeout(self.adapter, state.task_run.deadline_at - self.clock()),
                 token,
             )
             try:
@@ -1243,7 +1244,7 @@ class D3AuditedModel:
                 )
                 raw = await self._invoke(
                     current,
-                    min(180.0, state.task_run.deadline_at - self.clock()),
+                    model_call_timeout(self.adapter, state.task_run.deadline_at - self.clock()),
                     token,
                 )
                 outcome: Literal[

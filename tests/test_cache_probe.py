@@ -180,3 +180,23 @@ def test_comparison_groups_do_not_mix_runs_models_or_restarts(tmp_path, monkeypa
     cache_probe.record(payload=payload, sent=sent, role="inner_action")
     row = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
     assert row["previous_request_id"] is None and row["system_prefix_chars"] is None
+
+
+def test_cache_groups_are_weighted_and_only_use_applied_intent_ownership(tmp_path, monkeypatch):
+    task, operations, evidence, path = cache_case(tmp_path, monkeypatch)
+    # Distinct token weights must not become an average of per-call percentages.
+    first, second = (op.start.operation_id for op in operations)
+    evidence.read("provider-result", first)["transport"]["usage"] = {"prompt_tokens": 100, "prompt_cache_hit_tokens": 80}
+    evidence.read("provider-result", second)["transport"]["usage"] = {"prompt_tokens": 900, "prompt_cache_hit_tokens": 0}
+    decisions = [SimpleNamespace(model_request_id=first, intent_id="applied-intent")]
+    report = summarize_cache(task, operations, evidence, path, decisions=decisions)
+    assert report["roles"]["inner_action"]["cache_hit_ratio"] == .08
+    assert report["stages"]["inner_plan"]["cache_hit_ratio"] == .08
+    assert report["intents"]["applied-intent"]["cache_hit_ratio"] == .8
+    assert report["unattributed_inner_attempts"] == 1
+    assert report["calls"][1]["intent_id"] is None
+    evidence.read("provider-result", second)["transport"]["usage"] = None
+    missing = summarize_cache(task, operations, evidence, path, decisions=decisions)
+    assert missing["roles"]["inner_action"]["cache_usage_observations"] == 1
+    assert missing["roles"]["inner_action"]["cache_hit_ratio"] == .8
+    assert missing["calls"][1]["prompt_tokens"] is None

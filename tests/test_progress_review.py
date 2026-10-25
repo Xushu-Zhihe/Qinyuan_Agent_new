@@ -377,7 +377,7 @@ def test_correction_capacity_gate_prevents_second_model_call(tmp_path, monkeypat
 
 
 def test_v8_actual_payload_is_stage_specific_and_capacity_checked_offline(tmp_path, monkeypatch):
-    from agent_adapters.deepseek_roles import build_payload, role_config, EstimatedCapacity, CAPACITY_POLICY
+    from agent_adapters.deepseek_roles import build_payload, role_config, EstimatedCapacity, default_capacity_policy
     result, _, seen, _ = run_progress(tmp_path, monkeypatch)
     assert not result['recovery']['required'], result
     outer, inner = role_config('outer_planning', version=8), role_config('inner_action', version=8)
@@ -388,7 +388,7 @@ def test_v8_actual_payload_is_stage_specific_and_capacity_checked_offline(tmp_pa
     assert 'never scope_id' in payload['messages'][0]['content']
     assert 'not an allowed execution category or alias' in payload['messages'][0]['content']
     assert payload['response_format'] == {'type':'json_object'}
-    assert EstimatedCapacity(outer, inner).fits(envelope, CAPACITY_POLICY)
+    assert EstimatedCapacity(outer, inner).fits(envelope, default_capacity_policy())
     with pytest.raises(ValueError, match='output_contract_mismatch'):
         build_payload(envelope, role_config('outer_planning', version=7))
 

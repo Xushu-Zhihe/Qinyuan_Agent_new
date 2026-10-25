@@ -20,7 +20,7 @@ from agent_core.handoff_contracts import (
     D8ReadStart, D8SummaryCandidate, D8TreeRecord, checked_refs, handoff_json,
 )
 from agent_core.intent_context import build_intent_frontier, format_frontier_for_context
-from agent_core.modeling import ModelError, ModelErrorKind
+from agent_core.modeling import model_call_timeout, ModelError, ModelErrorKind
 from agent_core.operation_accounting import D4BudgetExhausted, D4OperationCompletion, D4OperationRecord, D4OperationStart, _uuid
 from agent_core.turn_modeling import stable_id, digest
 
@@ -114,6 +114,8 @@ class HandoffContext:
                              "unknown_needed": needed is None, "unit": "unicode_codepoints",
                              "omitted_refs": list(omitted),
                              "choices": ["increase_capacity", "narrow_authorized_branch", "end_task"]}
+        if self.app.config.intent_execution_policy == "continuous_v1" and kind == "complete_model_request":
+            self.pause_report["choices"] = ["automatic_history_organization", "continue_other_feasible_intents", "wait_for_context_change_or_deadline"]
         if self.app.config.intent_execution_policy and kind == "complete_model_request":
             measured = getattr(self.capacity_port, "last_measurement", None)
             if measured is not None:
@@ -238,13 +240,18 @@ class HandoffContext:
         if self.app.mcp is not None:
             for operation in self.app.mcp.records():
                 claim = self.app.output_boundary.evidence.read('mcp-call',operation.start.operation_id)
-                if not claim or 'experiment_request' not in claim or operation.completion is None:
+                from agent_adapters.public_web import IDENTITY, NAMES
+                public = claim is not None and claim['call']['tool_name'] in NAMES
+                if not claim or not ('experiment_request' in claim or public) or operation.completion is None:
                     continue
                 owner = intents[claim['intent_id']]
                 result = self.app.mcp.feedback(operation.start.operation_id)
+                if public:
+                    result = self.app.output_boundary.evidence.read('mcp-result', operation.start.operation_id)['payload']
+                identity = IDENTITY if public else 'recorded_http_experiment_observation_not_fact'
                 add(operation.start.operation_id,'progress',owner.turn_id,owner.intent_id,None,
-                    handoff_json({'observation':result,'identity':'recorded_http_experiment_observation_not_fact'}),
-                    (claim['model_request_id'],),{'claim':claim,'result':result},'execution_observation')
+                    handoff_json({'observation':result,'identity':identity}),
+                    (claim['model_request_id'],),{'claim':claim,'result':result},IDENTITY if public else 'execution_observation')
         for record in self.store.list_d8_tree_records(task_id):
             if record.turn_id not in turns:
                 continue
@@ -385,6 +392,29 @@ class HandoffContext:
                     return refs
         return ()
 
+    def _later_intent_results(self, items):
+        """Link earlier continuation reviews to committed same-Intent results.
+
+        This is procedural chronology, not a ruling that an old observation or
+        counterargument became false. Original records and versions stay intact.
+        """
+        by_id = {item.record_id: item for item in items}
+        intents = {intent.intent_id: intent for intent in self.state.intents}
+        records = self.store.list_d8_tree_records(self.state.task_run.task_run_id)
+        terminal = {record.intent_id: record for record in records
+                    if record.intent_id in intents
+                    and record.kind in {"succeeded", "failed", "inconclusive"}
+                    and intents[record.intent_id].status.value == record.kind}
+        links = {}
+        for record in records:
+            later = terminal.get(record.intent_id)
+            if record.kind != "evaluation_continued" or later is None:
+                continue
+            before, after = by_id.get("tree/" + record.record_id), by_id.get("tree/" + later.record_id)
+            if before is not None and after is not None and before.committed_sequence < after.committed_sequence:
+                links[before.ref] = after.ref
+        return links
+
     def select(self, phase, turn_id=None, intent_id=None, support_fact_id=None):
         from qinyuan_core.logging import timed_phase
         with timed_phase("model", "history_selection", run=self.state.task_run.task_run_id,
@@ -484,6 +514,14 @@ class HandoffContext:
             required = {i.ref for i in items if i.conflict or getattr(i, "current_status", "effective") != "effective"}
             required.update(i.last_version_ref for i in items if getattr(i, "last_version_ref", None)
                             and i.last_version_ref in by_ref and i.ref in required)
+        later_results = self._later_intent_results(items) if self.app.config.intent_execution_policy else {}
+        if self.app.config.intent_execution_policy and phase == "tree_planning":
+            required.update(i.ref for i in items if i.identity == "model_local_goal_decision"
+                            and i.source_status == "available" and not i.conflict and i.turn_id in ancestors)
+        for earlier in tuple(required):
+            if earlier in later_results:
+                later = by_ref[later_results[earlier]]
+                required.update((later.ref, by_id[later.intent_id].ref))
         for ref in required:
             item = by_ref.get(ref)
             if (not maintenance_summary and (item is None or item.source_status != "available" or item.conflict
@@ -508,16 +546,15 @@ class HandoffContext:
                 return 4
             return 5
 
-        if self.app.config.intent_execution_policy and phase == "tree_planning":
-            prior_results = [i for i in items if i.identity == "model_local_goal_decision"
-                             and i.source_status == "available" and not i.conflict]
-            required.update(i.ref for i in prior_results if i.turn_id in ancestors)
         chosen = [i for i in items if i.ref in required]
         optional = []
         for kind, target in (("verified_fact", 8), ("reviewed_inference", 4), ("progress", 6)):
             room = max(0, target - sum(i.record_type == kind for i in chosen))
             candidates = [i for i in items if i.record_type == kind and i.ref not in required
                           and i.source_status == "available" and not i.conflict and group(i) < 5
+                          and i.identity != "public_reference_not_target_observation"
+                          and (i.ref not in later_results or
+                               {later_results[i.ref], by_id[by_ref[later_results[i.ref]].intent_id].ref} <= required)
                           and (i.identity != "unreviewed_working_record" or i.intent_id == intent_id)
                           and (self.app.revisions is None or self.app.revisions.reliable(i))]
             candidates.sort(key=lambda i: (group(i), ranks.get(i.ref, len(ranks)), -i.committed_sequence, i.ref))
@@ -530,7 +567,7 @@ class HandoffContext:
             summary_available = True
             if previous:
                 originals = [D8HistoryItem.from_dict(i) for i in previous["all_items"]
-                             if f"{i['record_type']}:{i['record_id']}:{i['source_version']}" in previous["actual_read_refs"]]
+                             if f"{i['record_type']}:{i['record_id']}:{i['source_version']}" in previous.get("covered_refs", previous["actual_read_refs"])]
                 for original in originals:
                     current_source = by_id.get(original.record_id)
                     if original.record_type in {"verified_fact", "reviewed_inference"} and (
@@ -552,12 +589,17 @@ class HandoffContext:
                 result['s4_evaluation_policy'] = {**evaluation,
                     'history_sha256': digest([asdict(i) for i in chosen])}
             if self.app.config.intent_execution_policy == "continuous_v1" and intent_id and phase == "execution":
+                from agent_core.intent_planning import DIAGNOSTIC_GUIDANCE, PUBLIC_KNOWLEDGE_GUIDANCE
                 result["progress_rule"] = ("Repeated end applications and conclusion proposals are internal work, not "
                     "automatic progress. Compare actual evidence/deliverable gain and whether the next action can "
                     "distinguish the hypothesis under recorded observation limits. Consult preserved reading indexes "
                     "and original refs before calling a source unread; an unreviewed index is not evidence. "
-                    "A useful sibling remains optional; absence of new requests or Facts alone never proves failure.")
+                    "A useful sibling remains optional; absence of new requests or Facts alone never proves failure. "
+                    + DIAGNOSTIC_GUIDANCE + " " + PUBLIC_KNOWLEDGE_GUIDANCE)
             if self.app.config.intent_execution_policy:
+                visible_refs = {i.ref for i in chosen}
+                result["later_intent_results"] = {earlier: later for earlier, later in later_results.items()
+                                                 if earlier in visible_refs and later in visible_refs}
                 result["unresolved_conclusions"] = [i.visible() for i in items if i.conflict]
                 result["intent_execution_policy"] = "rolling_v1"
             if intent_id and phase == "execution" and getattr(self.app, "supervision", None):
@@ -819,8 +861,15 @@ class HandoffContext:
                 "Use only exact visible versions. This is model self-checking, not independent verification; "
                 "undeclared implicit dependencies may still be missed.")
         version = self.capacity()
-        latest, _ = self._latest_summary()
-        global_hint = latest.record_id if latest is not None and latest.turn_id != turn_id else None
+        latest, previous_summary = self._latest_summary()
+        if (self.app.config.intent_execution_policy == "continuous_v1" and stage == "handoff_summary"
+                and previous_summary and latest.origin == "model_organized" and packet["global_source_status"] == "available"):
+            current_refs = {i.ref for i in self.history()}
+            packet["previous_summary"] = {"record_id": latest.record_id, "identity": "model_organized_not_verified",
+                "turn_body": previous_summary["turn_body"], "open_questions": previous_summary["open_questions"],
+                "carried_refs": sorted(set(previous_summary.get("covered_refs", previous_summary["actual_read_refs"])) & current_refs)}
+        global_hint = latest.record_id if latest is not None and (latest.turn_id != turn_id or
+            self.app.config.intent_execution_policy == "continuous_v1" and stage == "handoff_summary") else None
         name = f"{stage}/{turn_id}/{intent_id}/{conclusion_digest([asdict(i) for i in selected])}/{version.version}/{global_hint}"
         if stage == "tree_planning" and getattr(self.app, "_root_replanning", False):name += "/root-replan-once"
         request_id = self._id(name)
@@ -864,7 +913,7 @@ class HandoffContext:
                     current.base_checkpoint_sequence, current.context_sha256,
                     current.turn_id or current.task_run_id, self.app.config.d4_budget.budget_policy_ref,
                     "outer_planning", current.role_config_ref))
-                raw = await self.model._invoke(current, min(180., self.state.task_run.deadline_at - self.app.clock()), token)
+                raw = await self.model._invoke(current, model_call_timeout(self.model.adapter, self.state.task_run.deadline_at - self.app.clock()), token)
                 wire = raw
                 bindings = getattr(self.app, "planning_assertion_bindings", None)
                 if (bindings is not None and current.stage == "tree_planning"
@@ -948,8 +997,47 @@ class HandoffContext:
                 rejection_code="d8_output_contract_rejected")
         raise AssertionError("bounded handoff call did not return")
 
-    async def summarize(self, turn_id, token):
-        request, omitted = self._request("handoff_summary", turn_id)
+    def _capacity_summary_request(self, turn_id, decisions, *, recovery=False):
+        """Read a bounded contiguous old prefix, carrying only validated prior coverage."""
+        request, _ = self._request("handoff_summary", turn_id, decisions[0].intent_id)
+        packet = json.loads(request.prior_summary)
+        if recovery:
+            packet["capacity_recovery"] = True
+        items = self.history()
+        by_id = {i.record_id: i for i in items}
+        carry = set(packet.get("previous_summary", {}).get("carried_refs", ()))
+        # Keep the current goal, formal knowledge, and mandatory conflict sources.
+        required = set(packet["required_refs"])
+        chosen = [i for i in request.history if i.record_type in {"turn", "intent", "verified_fact", "reviewed_inference"}
+                  or i.ref in required]
+        admitted = None
+        for row in decisions:
+            item = by_id["decision/" + row.record_id]
+            if item.ref in carry:
+                continue
+            trial = list(dict((i.ref, i) for i in [*chosen, item]).values())
+            packet.update(items=[i.visible() for i in trial], required_refs=[i.ref for i in trial])
+            body = handoff_json(packet)
+            identity = self._id("capacity-summary/" + conclusion_digest({
+                "refs": [i.ref for i in trial], "previous": packet.get("previous_summary", {}).get("record_id"),
+                "capacity_version": request.capacity_version,
+                **({"capacity_recovery": True} if recovery else {})}))
+            draft = replace(request, model_request_id=identity, history=tuple(trial), prior_summary=body)
+            if (len(body.encode("utf-8")) > min(request.capacity.initial_history, request.capacity.visible_history)
+                    or not self._fits_complete_request(draft, self.app.config.handoff_config.outer_capacity)):
+                break
+            chosen, admitted = trial, draft
+        if admitted is None:
+            return None
+        refs = {i.ref for i in admitted.history}
+        return admitted, tuple(i for i in items if i.ref not in refs)
+
+    async def summarize(self, turn_id, token, *, decision_prefix=(), capacity_recovery=False):
+        prepared = (self._capacity_summary_request(turn_id, decision_prefix, recovery=capacity_recovery) if decision_prefix
+                    else self._request("handoff_summary", turn_id))
+        if prepared is None:
+            return None
+        request, omitted = prepared
         source_sha = conclusion_digest([asdict(i) for i in request.history])
         versions = self.store.list_d8_handoffs(request.task_run_id)
         prior = next((v for v in reversed(versions) if v.turn_id == turn_id), None)
@@ -958,7 +1046,8 @@ class HandoffContext:
             data = self.evidence.read("handoff", prior.evidence_ref)
             if data is None or conclusion_digest(data) != prior.evidence_sha256:
                 raise D3RecoveryRequired("d8_reused_summary_evidence_unavailable")
-            return prior
+            if data.get("capacity_recovery", False) == capacity_recovery:
+                return prior
         origin = "model_organized"
         try:
             final, candidate = await self.call(request, token)
@@ -993,6 +1082,11 @@ class HandoffContext:
                 "omitted_refs": [i.ref for i in omitted], "pending_refs": [i.ref for i in omitted],
                 "unordered_refs": [i.ref for i in all_items if i.ref not in candidate.ordered_refs],
                 "all_items": [asdict(i) for i in all_items]}
+        if json.loads(request.prior_summary).get("capacity_recovery"):
+            data["capacity_recovery"] = True
+        previous_context = json.loads(request.prior_summary).get("previous_summary")
+        if previous_context and origin == "model_organized":
+            data["covered_refs"] = sorted({i.ref for i in request.history} | set(previous_context["carried_refs"]))
         if self.app.revisions is not None:
             data["revision_sequence"] = max((r.sequence for r in self.app.revisions.records()
                                              if r.decision == "accept"), default=0)
@@ -1167,6 +1261,23 @@ class HandoffContext:
                         or request.capacity_version != record.capacity_version
                         or list(read_refs) != [i.ref for i in request.history]):
                     raise D3RecoveryRequired("d8_summary_scope_stale")
+                previous_context = json.loads(request.prior_summary).get("previous_summary")
+                if previous_context and record.origin == "model_organized":
+                    parent = next((v for v in self.store.list_d8_handoffs(record.task_run_id)
+                                   if v.record_id == previous_context["record_id"] and v.global_version < record.global_version), None)
+                    parent_data = self.evidence.read("handoff", parent.evidence_ref) if parent else None
+                    if (parent_data is None or parent.origin != "model_organized"
+                            or conclusion_digest(parent_data) != parent.evidence_sha256
+                            or previous_context["turn_body"] != parent_data["turn_body"]
+                            or previous_context["open_questions"] != parent_data["open_questions"]
+                            or json.loads(request.prior_summary)["global_body"] != parent_data["global_body"]
+                            or previous_context["carried_refs"] != sorted(set(parent_data.get("covered_refs", parent_data["actual_read_refs"])) & refs)
+                            or data.get("covered_refs") != sorted(set(read_refs) | set(previous_context["carried_refs"]))):
+                        raise D3RecoveryRequired("d8_summary_coverage_binding_changed")
+                elif "covered_refs" in data:
+                    raise D3RecoveryRequired("d8_summary_coverage_binding_changed")
+                if data.get("capacity_recovery", False) != json.loads(request.prior_summary).get("capacity_recovery", False):
+                    raise D3RecoveryRequired("d8_summary_coverage_binding_changed")
                 if record.origin == "model_organized":
                     candidate = self._parse(request, result["raw"])
                     if (candidate.turn_body, candidate.global_body, list(candidate.ordered_refs),
@@ -1266,27 +1377,38 @@ class HandoffContext:
                 self.app.validator.completion_support(state, binding, result, record.support_fact_id)
 
     def _validate_frozen_read_sources(self, items):
-        for item in items:
-            if item.record_type == "verified_fact" and item.source_status == "available":
-                proof = next((r[3:] for r in item.source_refs if r.startswith("d3:")), None)
-                if proof is None:
-                    raise D3RecoveryRequired("d8_read_source_version_missing")
-                observation = self.app.conclusions.observation(proof, historical=True)
-                fact = next((f for f in self.state.facts if f.fact_id == item.record_id), None)
-                expected = fact.content if self.app.config.contract_version in {21, 22} and fact is not None else observation.fact_content()
-                if expected != item.content:
-                    raise D3RecoveryRequired("d8_read_source_version_changed")
-                if fact is None or item.source_version != conclusion_digest(
-                        {"fact": asdict(fact), "source": observation.source_version_sha256}):
-                    raise D3RecoveryRequired("d8_read_source_version_changed")
+        facts = [item for item in items if item.record_type == "verified_fact" and item.source_status == "available"]
+        if not facts:
+            return
+        # Reuse the authoritative projection instead of reimplementing proof
+        # families here. Revision labels remain separate from source validity.
+        current = {item.record_id: item for item in self.history(apply_revisions=False)
+                   if item.record_type == "verified_fact"}
+        for item in facts:
+            source = current.get(item.record_id)
+            if source is None:
+                raise D3RecoveryRequired("d8_read_source_version_missing")
+            if (source.source_status != "available" or source.ref != item.ref
+                    or source.content != item.content or source.source_refs != item.source_refs):
+                raise D3RecoveryRequired("d8_read_source_version_changed")
 
     def _page(self, snapshot, request_id):
         items = tuple(D8HistoryItem.from_dict(i) for i in snapshot["items"])
+        if snapshot["mode"] == "details" and any(i.identity == "public_reference_not_target_observation" for i in items):
+            originals = {i.ref: i for i in self.history() if i.identity == "public_reference_not_target_observation"}
+            if any(i.ref not in originals for i in items if i.identity == "public_reference_not_target_observation"):
+                raise D3RecoveryRequired("retrieval.source_version_unavailable")
+            from agent_adapters.public_web import document_text
+            items = tuple(replace(i, content=document_text(json.loads(originals[i.ref].content)["observation"])
+                          if snapshot.get("content_projection") == "public_documents_text" else originals[i.ref].content)
+                          if i.identity == "public_reference_not_target_observation" else i for i in items)
         capacity = D8Capacity(**snapshot["capacity"])
         response = {"request_id": request_id, "snapshot_id": snapshot["snapshot_id"],
                     "capacity_version": snapshot["capacity_version"], "checkpoint_sequence": snapshot["checkpoint_sequence"],
                     "historical_snapshot": True, "items": [], "has_more": True,
                     "remaining_count": len(items), "next_cursor": "0" * 36}
+        if "content_projection" in snapshot:
+            response["content_projection"] = snapshot["content_projection"]
         positions = snapshot["positions"]
         if snapshot["mode"] == "index":
             start = positions[0]
@@ -1330,7 +1452,6 @@ class HandoffContext:
         if remaining:
             cursor = self._id(f"cursor/{snapshot['snapshot_id']}/{next_positions}")
         response["next_cursor"] = cursor
-        import json
         return json.loads(handoff_json(response)), next_positions
 
     def read_history(self, *, query=None, refs=None, cursor=None, request_id=None, actor_intent_id=None):
@@ -1380,10 +1501,13 @@ class HandoffContext:
                 mode, positions = "details", [0] * len(items)
             snapshot = {"snapshot_id": self._id("read-snapshot/" + request_id),
                         "task_run_id": self.state.task_run.task_run_id, "mode": mode, "query": query,
-                        "items": [asdict(i) for i in items], "positions": positions,
+                        "items": [asdict(replace(i, content="")) if i.identity == "public_reference_not_target_observation"
+                                  else asdict(i) for i in items], "positions": positions,
                         "capacity_version": version.version, "capacity": asdict(version.capacity),
                         "checkpoint_sequence": self.state.latest_checkpoint.sequence,
                         "actor_intent_id": actor_intent_id or next((i.intent_id for i in self.state.intents if i.status is IntentStatus.RUNNING), None)}
+            if mode == "details" and any(i.identity == "public_reference_not_target_observation" for i in items):
+                snapshot["content_projection"] = "public_documents_text"
         # Frozen selection is prepared before admission; actual response materialization is after the durable start.
         snapshot_ref = self._id("read-page/" + request_id)
         snapshot = {**snapshot, "read_input": {"query": query, "refs": refs, "cursor": cursor}}
@@ -1410,20 +1534,30 @@ class HandoffContext:
                 raise D3RecoveryRequired("d8_read_result_changed")
             self.store.complete_d8_read(request_id, {"sha256": conclusion_digest(saved)})
             return saved
-        self._validate_frozen_read_sources(tuple(D8HistoryItem.from_dict(i) for i in snapshot["items"]))
         try:
+            self._validate_frozen_read_sources(tuple(D8HistoryItem.from_dict(i) for i in snapshot["items"]))
             response, positions = self._page(snapshot, request_id)
         except D3RecoveryRequired as exc:
-            if not str(exc).startswith("d8_context_paused:") or self.pause_report is None:
+            capacity_failure = str(exc).startswith("d8_context_paused:") and self.pause_report is not None
+            source_failure = str(exc) in {"d8_read_source_version_missing", "d8_read_source_version_changed"}
+            if not capacity_failure and not source_failure:
                 raise
-            # A known capacity failure finishes this read; it is not an unknown local outcome.
+            # Known read failures have durable results; they are not unknown
+            # local operations and never supply the requested evidence.
             response = {"request_id": request_id, "snapshot_id": snapshot["snapshot_id"],
                         "capacity_version": snapshot["capacity_version"],
                         "checkpoint_sequence": snapshot["checkpoint_sequence"],
                         "historical_snapshot": True, "items": [], "has_more": False,
                         "remaining_count": len(snapshot["items"]), "next_cursor": None,
-                        "error": "capacity_paused", "pause_report": self.pause_report}
+                        "error": "capacity_paused" if capacity_failure else "source_unavailable",
+                        **({"pause_report": self.pause_report} if capacity_failure else {"code": str(exc)})}
             positions = snapshot["positions"]
+            if source_failure:
+                from qinyuan_core import get_logger
+                get_logger("ctrl").warning("history.read_failed", run=start["task_run_id"],
+                    intent=snapshot["actor_intent_id"], request=request_id,
+                    snapshot=start["snapshot_id"], phase="validate_sources", category="technical_failure", code=str(exc),
+                    exception_type=type(exc).__name__)
         if response["next_cursor"]:
             continuation = {**snapshot, "positions": positions}
             self.evidence.save("read-snapshot", response["next_cursor"], continuation)
@@ -1485,19 +1619,22 @@ class HandoffContext:
     def read_count(self, intent_id):
         return len(self.retrieved_for(intent_id))
 
-    def wrap_execution_request(self, request):
+    def wrap_execution_request(self, request, *, preview=False):
         from dataclasses import fields
         from agent_core.dual_llm_modeling import D8ExecutionModelRequest
         intent_id = getattr(request.context, "intent_id", None)
         if intent_id is None:
             intent_id = request.context.plan_binding.intent_id
         turn_id = next(i.turn_id for i in self.state.intents if i.intent_id == intent_id)
-        saved = self.evidence.read("execution-context", request.model_request_id)
+        saved = None if preview else self.evidence.read("execution-context", request.model_request_id)
         if saved is None:
             selected, _, packet = self.select("execution", turn_id, intent_id)
             packet["process_facts"] = list(request.process_facts)
             packet["process_facts_identity"] = "model_summary_not_verified"
             packet["retrieved"] = self.retrieved_for(intent_id)
+            for page_index, page in enumerate(packet["retrieved"]):
+                for item_index, view in enumerate(page["current_applicability"]):
+                    view["historical_item"] = {"$ref": f"/history_context/retrieved/{page_index}/read/items/{item_index}"}
             if self.app.config.contract_version == 22 and request.stage == "inner_plan":
                 plans = [p for p in self.state.plans if p.intent_id == intent_id]
                 result = self.store.load_d3_plan_result(plans[-1].plan_id) if plans else None
@@ -1554,9 +1691,10 @@ class HandoffContext:
         result = D8ExecutionModelRequest(**values,
                                          history_context=saved["history_context"],
                                          history_capacity_version=saved["capacity_version"])
-        if not self._fits_complete_request(result, self.app.config.handoff_config.inner_capacity):
-            self._pause("complete_model_request", (), self.app.config.handoff_config.inner_capacity.total_units, None)
-        self.evidence.save("execution-context", request.model_request_id, saved)
+        if not preview:
+            if not self._fits_complete_request(result, self.app.config.handoff_config.inner_capacity):
+                self._pause("complete_model_request", (), self.app.config.handoff_config.inner_capacity.total_units, None)
+            self.evidence.save("execution-context", request.model_request_id, saved)
         return result
 
     def _fits_complete_request(self, request, policy):
@@ -1592,7 +1730,8 @@ class HandoffContext:
             from agent_core.dual_llm_modeling import D3ProposalRejected
             raise D3ProposalRejected("d22_closure_history_not_allowed")
         visible = {i["ref"] for i in packet["items"]}
-        visible.update(json.loads(getattr(request, "session_context", "{}") or "{}").get("compaction", {}).get("omitted_decision_refs", []))
+        from agent_core.handoff_contracts import session_read_refs
+        visible.update(session_read_refs(getattr(request, "session_context", "{}")))
         for old in packet["retrieved"]:
             visible.update(i["ref"] for i in old["read"]["items"])
         if action.kind == "history_details":
