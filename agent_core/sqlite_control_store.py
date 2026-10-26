@@ -150,6 +150,11 @@ from agent_core.handoff_storage import (
     D8_HANDOFF_SCHEMA, D8_REVISION_SCHEMA, D8_SESSION_SCHEMA, D8_CHANGES, D8_OPERATIONS,
     load_records, validate_handoff_mutation, save_handoff_mutation,
 )
+from agent_core.handoff_contracts import D8HistoryItem
+from agent_core.stage_contracts import (
+    PlanningSession, StageEvidencePort, StageRunConfig, StageStateChange, StageTurnSnapshot,
+)
+from agent_core import stage_storage
 from agent_core.review_contracts import (
     D2AllowedActionKinds,
     D2Constraint,
@@ -172,7 +177,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 31
+CURRENT_SCHEMA_VERSION = 32
 
 MIGRATION_28 = """
 CREATE TABLE d8_conclusions_new (
@@ -1048,11 +1053,13 @@ class SqliteControlStore:
         path: Path,
         *,
         clock: Callable[[], float],
+        stage_evidence: StageEvidencePort | None = None,
     ) -> None:
         self._connection = connection
         self.path = path
         self._clock = clock
         self._schema_version = 0
+        self.stage_evidence = stage_evidence
 
     @classmethod
     def open(
@@ -1060,6 +1067,7 @@ class SqliteControlStore:
         path: str | os.PathLike[str],
         *,
         clock: Callable[[], float] = time.time,
+        stage_evidence: StageEvidencePort | None = None,
     ) -> "SqliteControlStore":
         database_path = Path(path)
         connection: sqlite3.Connection | None = None
@@ -1076,7 +1084,7 @@ class SqliteControlStore:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute("PRAGMA journal_mode = WAL")
-            store = cls(connection, database_path, clock=clock)
+            store = cls(connection, database_path, clock=clock, stage_evidence=stage_evidence)
             store._migrate()
             store._schema_version = CURRENT_SCHEMA_VERSION
             return store
@@ -1343,6 +1351,10 @@ class SqliteControlStore:
                 from agent_core.operator_controls import MIGRATION
                 for statement in _sql_statements(MIGRATION):self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)",(31,self._now()))
+            if version < 32:
+                for statement in _sql_statements(stage_storage.SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (32,self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -3233,6 +3245,9 @@ class SqliteControlStore:
     def _d4_policy_and_roles(
         self, task_run_id: str
     ) -> tuple[D4BudgetPolicy, D1RoleConfig, D1RoleConfig] | None:
+        stage_config = stage_storage.load_config(self, task_run_id)
+        if stage_config is not None:
+            return stage_config.budget, stage_config.outer_role, stage_config.inner_role
         d3_config = self.load_d3_run_config(task_run_id)
         web_config = self.load_d7_web_run_config(task_run_id)
         if d3_config is not None and web_config is not None:
@@ -3283,6 +3298,13 @@ class SqliteControlStore:
         if configuration is None:
             raise D4OperationConflict("operation requires an explicitly registered D4 TaskRun")
         budget, outer_role, inner_role = configuration
+        stage_config = stage_storage.load_config(self, start.task_run_id)
+        if start.category == "planning" and start.role != (
+                "inner_action" if stage_config is not None else "outer_planning"):
+            if stage_config is not None:
+                raise stage_storage.StageAdmissionError("planning role differs from the registered framework",
+                    code="stage.planning_role_mismatch")
+            raise D4OperationConflict("planning role differs from the registered framework")
         if start.charged and start.category not in budget.category_limits:
             raise D4OperationConflict("operation category is not enabled in frozen budget")
         if start.budget_policy_ref != budget.budget_policy_ref:
@@ -3290,6 +3312,9 @@ class SqliteControlStore:
         if start.role is not None:
             role = outer_role if start.role == "outer_planning" else inner_role
             if start.role_config_ref != role.role_config_ref:
+                if stage_config is not None:
+                    raise stage_storage.StageAdmissionError("model role differs from frozen configuration",
+                        code="stage.model_role_mismatch")
                 raise D4OperationConflict("model role differs from frozen configuration")
         existing = self.load_d4_operation(start.operation_id)
         if existing is not None:
@@ -3326,7 +3351,7 @@ class SqliteControlStore:
             raise D4RecoveryRequired("an earlier operation result remains unknown")
         records = self.list_d4_operations(start.task_run_id)
         config = self.load_d3_run_config(start.task_run_id)
-        if start.charged and config.intent_execution_policy != "continuous_v1":
+        if start.charged and stage_config is None and config.intent_execution_policy != "continuous_v1":
             if sum(record.start.charged for record in records) >= budget.total:
                 raise D4BudgetExhausted("D4 total operation-start budget exhausted")
             if sum(record.start.category == start.category for record in records) >= getattr(budget, start.category):
@@ -5477,6 +5502,7 @@ class SqliteControlStore:
             self._validate_d3_mutation(mutation)
             self._validate_d5_mutation(mutation)
             self._validate_d8_mutation(mutation)
+            stage_change = stage_storage.validate(self, mutation)
             self._validate_existing_owners(mutation)
             self._apply_state_changes(
                 mutation,
@@ -5490,6 +5516,7 @@ class SqliteControlStore:
             self._save_d8_mutation(mutation, event_sequence)
             save_handoff_mutation(self, mutation, event_sequence)
             self._save_d7_mutation(mutation, event_sequence)
+            stage_storage.save(self, mutation, stage_change)
             self._insert_event(mutation.event, event_sequence)
             checkpoint = Checkpoint(
                 task_run_id=mutation.task_run_id,
@@ -5551,6 +5578,12 @@ class SqliteControlStore:
         except (IdempotencyConflictError, StaleControlStateError) as exc:
             self._abort_control_commit(mutation, exc)
             raise
+        except stage_storage.StageStateError as exc:
+            self._abort_control_commit(mutation, exc)
+            from qinyuan_core import get_logger
+            get_logger("store").warning("stage.commit_rejected", run=mutation.task_run_id,
+                operation=mutation.mutation_id, category=str(exc.category), code=exc.code, phase="stage_commit")
+            raise
         except StorageError as exc:
             self._abort_control_commit(mutation, exc)
             raise
@@ -5570,6 +5603,21 @@ class SqliteControlStore:
             return tuple(row["task_run_id"] for row in rows)
         except sqlite3.Error as exc:
             raise StorageError("could not read TaskRun ownership index") from exc
+
+    def load_stage_run_config(self, task_run_id: str) -> StageRunConfig | None:
+        return stage_storage.load_config(self, task_run_id)
+
+    def load_turn(self, task_run_id: str, turn_id: str) -> StageTurnSnapshot | None:
+        return stage_storage.load_turn(self, task_run_id, turn_id)
+
+    def list_stage_turns(self, task_run_id: str) -> tuple[StageTurnSnapshot, ...]:
+        return stage_storage.list_turns(self, task_run_id)
+
+    def read_history(self, task_run_id: str, refs: tuple[str, ...]) -> tuple[D8HistoryItem, ...]:
+        return stage_storage.read_history(self, task_run_id, refs)
+
+    def load_stage_session(self, task_run_id: str, session: PlanningSession) -> str | None:
+        return stage_storage.load_session(self, task_run_id, session)
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None:
         try:
@@ -6022,6 +6070,7 @@ class SqliteControlStore:
             UpsertTaskRun, UpsertTurn, UpsertIntent, UpsertIntentGoal, UpsertPlan, UpsertExecution,
             UpsertFact, AppendPlanValidationRecord, AppendFailureSummary,
             AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion, *D8_CHANGES,
+            StageStateChange,
         ))}
         for ordinal, change in sorted(enumerate(mutation.state_changes), key=lambda entry: order[type(entry[1])]):
             self._validate_change_owner(change, mutation.task_run_id)
@@ -6052,7 +6101,7 @@ class SqliteControlStore:
                 )
             elif isinstance(change, AppendPlanValidationRecord):
                 self._append_plan_validation(change, committed_at)
-            elif isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion, *D8_CHANGES)):
+            elif isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion, *D8_CHANGES, StageStateChange)):
                 # Append-only review rows are saved with the same event and checkpoint.
                 pass
             else:
@@ -6103,6 +6152,8 @@ class SqliteControlStore:
         change: StateChange,
         task_run_id: str,
     ) -> None:
+        if isinstance(change, StageStateChange):
+            return  # Validated as one scoped stage command inside this transaction.
         if isinstance(change, UpsertTaskRun):
             if change.task_run_id != task_run_id:
                 raise StorageError("UpsertTaskRun belongs to another TaskRun")

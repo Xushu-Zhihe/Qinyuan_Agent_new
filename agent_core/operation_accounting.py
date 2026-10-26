@@ -227,7 +227,9 @@ class D4OperationStart:
             if self.category == "action"
             else None
         )
-        if self.role != expected_role:
+        # Shape only: the store additionally requires registered stage ownership
+        # for Inner planning and rejects this role for ordinary TaskRuns.
+        if self.role != expected_role and not (self.category == "planning" and self.role == "inner_action"):
             raise ValueError("D4 model role differs from operation category")
         if expected_role is not None:
             if not isinstance(
