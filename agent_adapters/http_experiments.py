@@ -7,6 +7,8 @@ import time
 from dataclasses import asdict
 
 from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_modeling import parse_d3_plan_proposal
+from agent_core.actions import MCPCall
 from agent_core.operation_accounting import D4OperationStart
 from agent_core.turn_modeling import digest
 from agent_adapters.web.http_adapter import D7HttpRequest, D7HttpError, D7HttpPolicy
@@ -23,6 +25,33 @@ SPEC = dict(qualified_name=TOOL, tags=['http','conditional-experiment'],
     input_schema={'type':'object','properties':{'script':{'type':'string','minLength':1,'maxLength':MAX_SCRIPT_BYTES},
         'timeout_seconds':{'type':'integer','minimum':5,'maximum':300}},
         'required':['script','timeout_seconds'],'additionalProperties':False})
+
+
+def failure_diagnostics(evidence, store, task_id):
+    """Read-only failure projection bound to the original operation and saved receipt."""
+    from agent_adapters.output_evidence import SAFE_MODEL_ERROR_CODES
+    rows=[]
+    for operation in store.list_d4_operations(task_id):
+        if '/experiment/' not in operation.start.resource_ref:continue
+        identity=operation.start.operation_id
+        failure=evidence.read('experiment-failure',identity)
+        if failure is None:continue
+        claim=evidence.read('mcp-call',identity)
+        result=evidence.read('mcp-result',identity)
+        if (claim is None or claim['task_run_id'] != task_id
+                or failure['model_request_id'] != claim['model_request_id']
+                or failure['request_sha256'] != digest(claim) or operation.start.context_sha256 != digest(claim)
+                or failure['phase'] not in {'http_execute','receipt_save','receipt_apply'}
+                or failure['code'] not in SAFE_MODEL_ERROR_CODES
+                or failure['result_sha256'] is not None and (result is None or failure['result_sha256'] != digest(result))):
+            raise D3RecoveryRequired('d22_experiment_failure_diagnostic_invalid')
+        parent=store.load_d3_operation(claim['model_request_id'])
+        rows.append(dict(execution_id=identity,model_request_id=claim['model_request_id'],
+            phase=failure['phase'],code=failure['code'],result_saved=failure['result_sha256'] is not None,
+            active=operation.completion is None or parent is None or parent.application_ref is None,
+            category='unknown' if failure['phase']=='http_execute' else 'integrity' if failure['phase']=='receipt_apply' else 'persistence',
+            exception_types=failure['exception_types'],error_codes=failure['error_codes']))
+    return rows
 
 
 class _StrategyStop(Exception):
@@ -87,8 +116,13 @@ class HttpExperiments:
                 or parent.start.base_checkpoint_sequence != native.base_checkpoint_sequence
                 or parent.completion is None or parent.completion.result_kind != 'completed'
                 or parent.completion.evidence_ref != claim['model_request_id']
-                or parent.completion.evidence_sha256 != digest(asdict(native))
-                or native.raw != {'kind':'mcp_call',**session['call']}):
+                or parent.completion.evidence_sha256 != digest(asdict(native))):
+            raise D3RecoveryRequired('d22_experiment_source_changed')
+        try:
+            proposal = parse_d3_plan_proposal(native.raw)
+        except (TypeError, ValueError) as error:
+            raise D3RecoveryRequired('d22_experiment_source_changed') from error
+        if not isinstance(proposal, MCPCall) or asdict(proposal) != session['call']:
             raise D3RecoveryRequired('d22_experiment_source_changed')
         raw = web.protected.read(source['evidence_id'])
         if hashlib.sha256(raw).hexdigest() != source['sha256']:
@@ -106,6 +140,17 @@ class HttpExperiments:
                 or operation.start.resource_ref != 'mcp/'+claim['intent_id']+'/experiment/'+claim['model_request_id']+'/'+str(source['ordinal'])):
             raise D3RecoveryRequired('d22_experiment_source_changed')
         web.cookie_snapshot(response)
+
+    def record_failure(self, operation_id, claim, result, phase, error):
+        from agent_adapters.output_evidence import safe_failure_details, SAFE_MODEL_ERROR_CODES
+        code = str(error) if isinstance(error,D3RecoveryRequired) and str(error) in SAFE_MODEL_ERROR_CODES else "d22_experiment_receipt_settlement_failed"
+        if phase == "http_execute":code = "d22_experiment_request_outcome_unknown"
+        if self.evidence.read("experiment-failure",operation_id) is None:
+            self.evidence.save("experiment-failure",operation_id,dict(
+                model_request_id=claim["model_request_id"], request_sha256=digest(claim),
+                result_sha256=digest(result) if result is not None else None,
+                phase=phase,code=code,**safe_failure_details(error,include_chain=True)))
+        return code
 
     def projection(self, operation, claim, result):
         self.validate_receipt(operation,claim,result)
@@ -204,6 +249,7 @@ class HttpExperiments:
         self.log.info('experiment.request_started',run=claim['task_run_id'],intent=intent_id,request=parent,exec=identity)
         web.http.timeout_seconds = timeout
         pending = asyncio.create_task(asyncio.to_thread(web.http.execute,proposed))
+        phase, result = 'http_execute', None
         try:
             while not pending.done():
                 await asyncio.wait({pending},timeout=0.025)
@@ -211,6 +257,7 @@ class HttpExperiments:
                 if token.is_cancelled or app.clock() >= app.state.task_run.deadline_at or time.monotonic() >= expires:
                     raise D3RecoveryRequired('d22_experiment_request_outcome_unknown')
             response = pending.result()
+            phase = 'receipt_save'
             data = dict(execution_id=identity,method=method,status=response.status,
                 body_evidence_id=response.body_evidence_id,body_sha256=response.body_sha256,body_bytes=response.body_bytes)
             data.update(web.save_cookies(identity,previous,response))
@@ -218,11 +265,16 @@ class HttpExperiments:
                 http_request=app.redactor.redact_value(saved),http_response=data,body_text_truncated=response.body_text_truncated)
             result = dict(request_sha256=digest(claim),payload=payload,finished_at=app.clock())
             self.evidence.save('mcp-result',identity,result)
+            phase = 'receipt_apply'
             self.mcp._apply(app.store.load_d4_operation(identity),claim,result)
         except BaseException as error:
-            self.log.error('experiment.request_unknown',run=claim['task_run_id'],request=parent,exec=identity,
-                category='unknown',code='d22_experiment_request_outcome_unknown',error_type=type(error).__name__)
-            raise D3RecoveryRequired('d22_experiment_request_outcome_unknown') from error
+            code = self.record_failure(identity,claim,result if phase=='receipt_apply' else None,phase,error)
+            self.log.error('experiment.request_unknown' if phase=='http_execute' else 'experiment.receipt_failed',
+                run=claim['task_run_id'],request=parent,exec=identity,phase=phase,
+                category='unknown' if phase=='http_execute' else 'integrity' if phase=='receipt_apply' else 'persistence',
+                code=code,error_type=type(error).__name__)
+            if phase != 'http_execute' and isinstance(error,D3RecoveryRequired):raise
+            raise D3RecoveryRequired(code) from error
         self.log.info('experiment.request_finished',run=claim['task_run_id'],request=parent,exec=identity,
             status=response.status,body_bytes=response.body_bytes)
         body = web.protected.read(response.body_evidence_id)

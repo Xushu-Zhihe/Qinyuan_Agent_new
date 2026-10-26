@@ -1737,3 +1737,35 @@ def test_new_strategy_stop_cannot_be_overridden_by_cached_continue(monkeypatch):
     monkeypatch.setattr(execution,'stop_request',lambda *args:{'review_id':'new-supervision'})
     assert not execution.reuse_continuation(app,'request','actor',None)
     assert not writes
+
+
+@pytest.mark.parametrize("http_case", ["rolling", "continuous"], indirect=True)
+@pytest.mark.parametrize("unknown", [False, True])
+def test_end_review_crossing_deadline_settles_only_known_operations(http_case, unknown):
+    from uuid import uuid4
+    from agent_core.operation_accounting import D4OperationStart
+    c = http_case
+    install(c, steps=1)
+    original = c.app.handoff.call
+    reviews = []
+    async def finish_review(request, token):
+        final, decision = await original(request, token)
+        if request.stage == "intent_evaluation":
+            reviews.append(final.model_request_id)
+            if unknown:
+                c.app.store.begin_d4_operation(D4OperationStart(str(uuid4()), c.task, "tool_dispatch", c.clock(),
+                    c.app.state.latest_checkpoint.sequence, "0" * 64, "controlled-unknown-tool",
+                    c.app.config.d4_budget.budget_policy_ref))
+            c.clock.now = c.app.state.task_run.deadline_at + 0.01
+        return final, decision
+    c.app.handoff.call = finish_review
+    result = asyncio.run(c.app.run(c.token))
+    assert len(reviews) == len(c.sends) == 1
+    assert not any(r.kind in {"failed", "inconclusive", "succeeded"}
+                   for r in c.app.store.list_d8_tree_records(c.task))
+    if unknown:
+        assert result.stop_reason == "d4_operation_outcome_unknown" and result.recovery_required
+        assert c.app.state.task_run.status.value == "running" and not c.sandbox.destroyed
+    else:
+        assert result.stop_reason == "task_run_deadline_exceeded" and not result.recovery_required
+        assert c.app.state.task_run.status.value == "deadline_exceeded" and c.sandbox.destroyed

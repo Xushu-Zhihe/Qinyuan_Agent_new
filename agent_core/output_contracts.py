@@ -145,6 +145,13 @@ def output_schema(request, *, contract_version=None):
         choice = yield_schema(request)
         if choice is not None:
             schema = {"anyOf": [*schema.get("anyOf", [schema]), choice]}
+    if (contract_version == 22 and stage == "inner_plan"
+            and json.loads(getattr(request,"history_context","{}") or "{}").get("exploration_groups") is True):
+        # Advisory metadata is optional and never part of tool arguments/authorization.
+        for branch in schema.get("anyOf", [schema]):
+            if branch.get("properties", {}).get("kind", {}).get("const") in {"mcp_call", "http_request"}:
+                branch["properties"]["exploration_group"] = {
+                    "type": ["string", "null"], "description": "Optional short string identifying the same tested hypothesis. Reuse across related parameter variants; omit for unrelated work. Not evidence or permission."}
     return stage, schema
 
 
@@ -189,6 +196,9 @@ def _base_output_schema(request, *, contract_version=None):
         return "change_review", obj({"decision": S, "reason": text(512),
                                        "goal_supported": NB, "scope_explanation": NS})
     if stage == "tree_planning":
+        if "tcp_target_policy" in json.loads(getattr(request, "prior_summary", "{}")):
+            from agent_core.intent_planning import direction_schema
+            return stage, direction_schema(request)
         if 'd20_http_policy' in json.loads(getattr(request, 'prior_summary', '{}')):
             from agent_core.http_policy import schema
             return stage, schema(request)
@@ -203,6 +213,8 @@ def _base_output_schema(request, *, contract_version=None):
         return stage, obj({"turn_target": S, "completion_rule": RULE,
                            "intents": array(old_intent, 1, None if contract_version == 22 else 2)})
     if stage == "inner_plan":
+        if getattr(getattr(getattr(request, 'context', None), 'turn_binding', None), 'kind', None) == 'tcp_target':
+            return stage, {"anyOf": [CHANGE, *READS]}
         if getattr(getattr(getattr(request, 'context', None), 'turn_binding', None), 'kind', None) in {'http_origin','hybrid_origin'}:
             from agent_core.http_policy import schema
             return stage, {'anyOf': [schema(request), CHANGE, *READS]}
@@ -494,6 +506,12 @@ def decode_response(response, schema):
         json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (ValueError, UnicodeError):
         return None, [D8FormatIssue("json_value_invalid", "$", "finite_json", "unsupported")], None, units
+    if isinstance(response, dict) and "exploration_group" in response:
+        declared = any("exploration_group" in branch.get("properties", {})
+                       and branch.get("properties", {}).get("kind", {}).get("const") == response.get("kind")
+                       for branch in schema.get("anyOf", [schema]))
+        if declared and (not isinstance(response["exploration_group"],str) or not response["exploration_group"].strip()):
+            response = {k:v for k,v in response.items() if k != "exploration_group"}
     issues = [D8FormatIssue(i.code, i.path if len(i.path) <= 128 else "$", i.expected, i.actual)
               for i in shape_issues(response, schema)]
     return response if not issues else None, issues, None, units

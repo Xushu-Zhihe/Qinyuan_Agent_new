@@ -4783,7 +4783,7 @@ class SqliteControlStore:
             attachments = mutation.request.target.attachments
             from agent_core.http_validation import valid_target
             from agent_core.http_contracts import is_http
-            target_valid = (valid_target(metadata.config, mutation.request) if is_http(metadata.config) else
+            target_valid = (valid_target(metadata.config, mutation.request) if is_http(metadata.config) or metadata.config.tcp_authorization is not None else
                 not mutation.request.target.endpoints
                 and len(attachments) == len(metadata.config.authorization.attachment_indices)
                 and all(item.kind == 'local_path' for item in attachments))

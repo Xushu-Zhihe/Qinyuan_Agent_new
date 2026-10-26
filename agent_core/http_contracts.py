@@ -64,6 +64,9 @@ class HttpPlanBinding:
 
 
 def turn_binding_from_dict(value):
+    if value.get('kind') == 'tcp_target':
+        from agent_core.target_contracts import TcpTurnBinding
+        return TcpTurnBinding(**value)
     if value.get('kind')=='hybrid_origin':
         from agent_core.hybrid_contracts import HybridTurnBinding
         return HybridTurnBinding(**(value|{'attachments':tuple(D3TurnBinding(**b) for b in value['attachments'])}))

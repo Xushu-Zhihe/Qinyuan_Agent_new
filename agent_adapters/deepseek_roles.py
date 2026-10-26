@@ -327,6 +327,7 @@ def _build_payload(envelope, role, *, context_loader=None):
            or getattr(getattr(request, 'observation', None), 'rule_id', None) == 'http_response_observed'
            or 'd20_http_policy' in json.loads(getattr(request, 'prior_summary', '{}') or '{}')
            or any(k in getattr(request, 'context_summary', '') for k in ('http_origin','hybrid_origin')))
+    tcp_target = "tcp_target_policy" in json.loads(getattr(request, "prior_summary", "") or getattr(request, "history_context", "") or "{}")
     if context_loader is not None:
         context['protected_source_projection'] = context_loader(request)
     if context.get("session_context"):
@@ -348,7 +349,7 @@ def _build_payload(envelope, role, *, context_loader=None):
     if isinstance(request,EvidenceReviewRequest):
         rules="Review the single explicit conclusion candidate against all frozen original requests and results. Return the declared decision only."
 
-    if not web and not generic_evidence and role.prompt_template.endswith(('.v11', '.v12', '.v13', '.v14', '.v15', '.v16', '.v17')) and stage == 'inner_plan':
+    if not web and not tcp_target and not generic_evidence and role.prompt_template.endswith(('.v11', '.v12', '.v13', '.v14', '.v15', '.v16', '.v17')) and stage == 'inner_plan':
         from agent_core.plan_policy import policy_for as plan_policy
         rules = ('Select one exact allowed Plan combination from plan_policy, or use an available history read '
                  'or conclusion change. The template, observation_mode and explicitly chosen source_proof_id must '
@@ -363,7 +364,7 @@ def _build_payload(envelope, role, *, context_loader=None):
         from agent_core.fixed_probe import fixed_probe_policy
         rules = ("Choose only the current registered fixed_probe operation and a positive integer timeout_seconds within fixed_probe_policy. Preserve review_requested or use the existing conclusion_change branch. Never generate script, working_directory, stdin or conditions: trusted code materializes and checks them. A choice is not permission or a successful observation."
                  + policy_text("fixed_probe_policy", fixed_probe_policy(request)))
-    if not web and not generic_evidence and role.prompt_template.endswith((".v7", ".v8", ".v9", ".v10", ".v11", ".v12", ".v13", ".v14", ".v15", ".v16", ".v17")) and stage == "tree_planning":
+    if not web and not tcp_target and not generic_evidence and role.prompt_template.endswith((".v7", ".v8", ".v9", ".v10", ".v11", ".v12", ".v13", ".v14", ".v15", ".v16", ".v17")) and stage == "tree_planning":
         from agent_core.planning_assertion import planning_policy
         rules = ("Propose 1-2 independent ordered Intent alternatives or explicit exhausted with reason and evidence_refs. "
                  "Explicitly select completion_rule.rule_id and parameters.attachment_index from planning_policy; "
@@ -437,7 +438,7 @@ def _build_payload(envelope, role, *, context_loader=None):
                       'Keep claim content and conflict choices, and allow zero claims when warranted. For change_review output '
                       'goal_supported only for parent_support and scope_explanation only for different_scope, as declared by Schema. '
                       'Different wording is allowed; identities, evidence, permissions and native verification remain strict.')
-    if not web and not generic_evidence and role.prompt_template.endswith(('.v11', '.v12', '.v13', '.v14', '.v15', '.v16', '.v17')) and stage in {'fact_proposal', 'fact_review'}:
+    if not web and not tcp_target and not generic_evidence and role.prompt_template.endswith(('.v11', '.v12', '.v13', '.v14', '.v15', '.v16', '.v17')) and stage in {'fact_proposal', 'fact_review'}:
         from agent_core.conclusion_contracts import D16Observation
         from agent_core.evidence_conclusions import EvidenceObservation
         if not isinstance(request.observation, (D16Observation,EvidenceObservation)):
@@ -482,6 +483,16 @@ def _build_payload(envelope, role, *, context_loader=None):
         system += (" " + envelope.instruction + " Output only JSON. output_contract="
                    + json.dumps(provider_contract, ensure_ascii=False, allow_nan=False)
                    + " correction=" + json.dumps(envelope.correction, ensure_ascii=False, allow_nan=False))
+    tcp = planning.get("tcp_target_policy")
+    if tcp and stage in {"tree_planning", "inner_plan"}:
+        tcp_rules = ("Propose ordered exploration directions or explicit exhausted; the goal and TCP grant are program-owned. "
+                     "Do not invent an HTTP origin or an attachment completion rule." if stage == "tree_planning" else
+                     "Choose from declared MCP tools. TCP interaction uses target.qinyuan on the port in tcp_target_policy; "
+                     "preserve the authorized service protocol. A TCP service is not an HTTP response. "
+                     "Authorized initial attachment paths are in tcp_target_policy.attachments. "
+                     "Use shell/Python or available analysis tools for local reading and interactive experiments; "
+                     "tool results remain observations and final TaskRun success still requires independent validation.")
+        system = system.replace(rules, tcp_rules, 1)
     if web:
         specific = {
             'tree_planning': 'Propose 1-2 ordered Intent alternatives or explicit exhausted. Keep exact dependency_refs. The goal and HTTP origin authorization are program-owned; never generate attachment rules, target IDs or a goal verdict.',
@@ -563,6 +574,13 @@ def _build_payload(envelope, role, *, context_loader=None):
         system += (" You may select one mcp_call with tool_name and arguments from mcp_tools. "
                    "Inspect its saved result in this Intent's session before selecting the next tool. "
                    "Do not precommit a whole tool chain. Tool success is evidence, not a verified Fact. "
+                   "A missing local executable/module is a sandbox prerequisite, not target counterevidence. "
+                   "When download.install_tool is declared, you may prepare a useful missing portable tool from "
+                   "an authorized HTTPS artifact with a verified expected SHA256, or a pinned Python package. "
+                   "Use its returned executable path/module environment and reuse successful TaskRun installations. "
+                   "Current tool preparation uses controlled fetching and offline installation; do not assume root "
+                   "apt access or direct Internet from the execution container. If preparation is unavailable, "
+                   "explain the capability gap and choose another useful check rather than repeating a missing command. "
                    "When d20_http_policy declares an authorized endpoint, network shell tools must connect through "
                    "target.qinyuan on that endpoint's authorized port; the container has no direct target route. "
                    "Preserve the original HTTP Host and HTTPS identity/SNI and certificate verification, for example "

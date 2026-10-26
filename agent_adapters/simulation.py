@@ -65,7 +65,24 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
         raise ValueError("unsupported_execution_profile")
     version = int(raw["execution_profile"].removeprefix("d8_v"))
     endpoints = raw.get('task_request', {}).get('target', {}).get('endpoints', [])
-    http = bool(endpoints) and version in {15, 16, 17, 18, 19, 20, 21, 22}
+    network = bool(endpoints) and version in {15, 16, 17, 18, 19, 20, 21, 22}
+    from urllib.parse import urlsplit
+    tcp = (network and isinstance(endpoints, list) and len(endpoints) == 1
+           and isinstance(endpoints[0], dict) and isinstance(endpoints[0].get("url"), str)
+           and urlsplit(endpoints[0]["url"]).scheme == "tcp")
+    tcp_authorization = None
+    if tcp:
+        from agent_core.target_contracts import TcpAuthorization, canonical_tcp_endpoint
+        if version != 22 or raw.get("mode") != "real" or set(endpoints[0]) != {"url"}:
+            raise ValueError("tcp.requires_current_real_profile")
+        auth = dict(raw["authorization"])
+        indices = auth.pop("attachment_indices", None)
+        if indices != list(range(len(raw["task_request"]["target"].get("attachments", [])))):
+            raise ValueError("tcp.attachment_authorization_invalid")
+        tcp_authorization = TcpAuthorization.from_dict(auth)
+        if tcp_authorization.allowed_endpoint != canonical_tcp_endpoint(endpoints[0]["url"]):
+            raise ValueError("tcp.endpoint_authorization_mismatch")
+    http = network and not tcp
     web_authorization = None
     if http:
         from agent_core.web_contracts import D7WebAuthorization, canonical_web_origin
@@ -121,16 +138,16 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
     # changing its frozen 48-call budget contract or the caller's request.
     legacy = {k: raw[k] for k in required - {"execution_profile", "mode", "d8_config"}}
     legacy["dual_llm_config"] = {**dual, "d4_budget": asdict(D4BudgetPolicy())}
-    if http:
+    if network:
         legacy['task_request'] = {**raw['task_request'], 'target': {
             **raw['task_request']['target'], 'endpoints': []}}
-        legacy['authorization'] = dict(authorization_id=web_authorization.authorization_id,
+        legacy['authorization'] = dict(authorization_id=(tcp_authorization or web_authorization).authorization_id,
             attachment_indices=raw['authorization']['attachment_indices'] if version in {21,22} else [],
             allowed_tool='d3_fixed_readonly', network_allowed=False)
     request = replace(V3SimulationRequest.parse(legacy), d4_budget=budget)
-    if http:
+    if network:
         task_request = {**raw['task_request'], 'target': {**raw['task_request']['target'],
-            'endpoints': [{'url': web_authorization.allowed_origin}]}}
+            'endpoints': [{'url': tcp_authorization.allowed_endpoint if tcp else web_authorization.allowed_origin}]}}
         request = replace(request, task_request=task_request)
     if is_real:
         from agent_adapters.deepseek_roles import validate_role
@@ -147,11 +164,11 @@ def parse_request(raw: object) -> tuple[V3SimulationRequest, D3RunConfig | None]
         request.outer_role.role_config_ref, contract_version=version,
         d4_budget=budget, d5_enabled=True, d5_sensitive_requirements=(),
         d8_enabled=True, handoff_config=handoff,
-        web_authorization=web_authorization,
+        web_authorization=web_authorization, tcp_authorization=tcp_authorization,
         http_timeout_seconds=extra['http_timeout_seconds'] if http else None,
         intent_execution_policy=extra.get('intent_execution_policy'),
     )
-    return (replace(request, authorization=raw['authorization']) if http else request), config
+    return (replace(request, authorization=raw['authorization']) if network else request), config
 
 
 class SimulationModel:
@@ -301,7 +318,7 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
             from agent_adapters.application import RecordedSandbox
             resources, sandbox = connect(declaration["request"]["d8_config"]["sandbox_config"], directory,
                                          wait_for_ready=operation == "start")
-            if config.web_authorization is not None:
+            if config.web_authorization is not None or config.tcp_authorization is not None:
                 from agent_adapters.target_network_cleanup import RecordedTargetNetwork
                 from Sandbox.target_network import T6TargetNetwork
                 target_network = RecordedTargetNetwork(T6TargetNetwork(resources._runtime,
@@ -397,7 +414,7 @@ def run_simulated_task(directory, declaration, *, operation="start", validation_
             if declaration["mode"] == "real":
                 outer.bind_runtime(token, lambda: app.state.task_run.deadline_at)
                 inner.bind_runtime(token, lambda: app.state.task_run.deadline_at)
-            if not declaration.get("staged_attachment_paths") and config.web_authorization is None:
+            if not declaration.get("staged_attachment_paths") and config.web_authorization is None and config.tcp_authorization is None:
                 app.controller.conclude(TaskRunStatus.INCONCLUSIVE, str(uuid4()),
                                         reason="single_intent_slice_finished")
                 app.controller.cleanup_sandbox()

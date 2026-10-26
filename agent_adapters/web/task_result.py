@@ -607,7 +607,7 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                             model_evidence=FileD3ModelEvidence(Path(directory) / "d3-models", create=False)))
                         phase = "fixed_probe_evidence"
                         d8_unresolved |= fixed.check_task(declaration["task_run_id"])
-                    if config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and not is_http(config):
+                    if config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and not is_http(config) and config.tcp_authorization is None:
                         from agent_core.planning_assertion import PlanningAssertionBindings
                         from agent_adapters.attachment_import_recorder import FileAttachmentImportRecorder
                         assemblies = PlanningAssertionBindings(config,
@@ -677,7 +677,8 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                 specific = next(
                     (item.get("code") for item in reversed(http_diagnostics)
                      if isinstance(item, dict) and isinstance(item.get("code"), str)
-                     and item["code"].startswith(("d20_", "d8_", "d3_"))),
+                     and item.get("active",True)
+                     and item["code"].startswith(("d20_", "d22_", "d8_", "d3_", "mcp."))),
                     None,
                 )
                 result["recovery"] = {"required": True,

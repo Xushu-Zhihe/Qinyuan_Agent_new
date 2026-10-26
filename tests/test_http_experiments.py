@@ -599,3 +599,90 @@ def test_experiment_detail_does_not_impersonate_a_final_candidate_source(http_ca
         task_run_id=c.task,intent_id=c.app.state.intents[0].intent_id,evidence_version=child.completion.evidence_sha256)
     with pytest.raises(ValueError,match='mcp_candidate_source_invalid'):
         validate_mcp_source(c.app.store,candidate,c.app.output_boundary.evidence)
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+@pytest.mark.parametrize('group',[None,'same baseline hypothesis'])
+def test_optional_exploration_group_preserves_multi_request_source_binding(http_case,monkeypatch,group):
+    from dataclasses import asdict,replace
+    from agent_core.turn_modeling import digest
+    c=http_case
+    parents=setup(c,"for i in range(9):\n    request('GET','/variant?i='+str(i))")
+    inner=c.models[1].invoke
+    def choose(envelope,*args):
+        raw=inner(envelope,*args)
+        return {**raw,'exploration_group':group} if group and raw.get('tool_name')==TOOL else raw
+    c.models[1].invoke=choose
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required,result
+    report=c.app.mcp.experiments.result(parents[0])
+    assert report['status']=='completed' and len(report['requests'])==len(c.sends)==9
+    assert not c.app.store.list_d4_unresolved_operations(c.task)
+    if group:
+        notices=[g for _,request in c.app.supervision.calls() for g in json.loads(request.prior_summary)['exploration_progress']['repeated_observations']]
+        assert any(g['threshold']==4 for g in notices)
+        assert c.app.supervision.repeated_observations(c.app.state.intents[0].intent_id)[0]['count']==9
+    child=c.app.store.load_d4_operation(report['requests'][0])
+    claim=c.app.mcp.evidence.read('mcp-call',child.start.operation_id)
+    saved=c.app.mcp.evidence.read('mcp-result',child.start.operation_id)
+    original=c.app.model_evidence.read(parents[0]);parent=c.app.store.load_d3_operation(parents[0])
+    for replacement in [dict(tool_name='shell.run_bash'),dict(arguments={'script':'changed','timeout_seconds':60}),dict(extra_authority=True)]:
+        altered=replace(original,raw={**original.raw,**replacement})
+        # Match the model's own checksum, so the execution-content comparison
+        # itself must still reject a different tool/arguments/unknown field.
+        altered_parent=replace(parent,completion=replace(parent.completion,evidence_sha256=digest(asdict(altered))))
+        with monkeypatch.context() as patch:
+            patch.setattr(c.app.model_evidence,'read',lambda key:altered)
+            patch.setattr(c.app.store,'load_d3_operation',lambda key:altered_parent)
+            with pytest.raises(D3RecoveryRequired,match='d22_experiment_source_changed'):
+                c.app.mcp.experiments.validate_receipt(child,claim,saved)
+    assert len(c.sends)==9
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+@pytest.mark.parametrize('phase',['receipt_save','receipt_apply'])
+def test_receipt_failure_is_durable_before_close_and_public_without_replay(http_case,monkeypatch,phase):
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    from agent_adapters.http_experiments import failure_diagnostics
+    c=http_case;parents=setup(c,"request('GET','/once')\nrequest('GET','/must-not-run')")
+    original_save=c.app.mcp.evidence.save;original_apply=c.app.mcp._apply
+    code='d22_experiment_source_changed' if phase=='receipt_apply' else 'd8_handoff_evidence_write_recovery_required'
+    def save(kind,key,value):
+        if phase=='receipt_save' and kind=='mcp-result':raise D3RecoveryRequired(code)
+        return original_save(kind,key,value)
+    def apply(operation,claim,result):
+        if phase=='receipt_apply' and 'experiment_request' in claim:raise D3RecoveryRequired(code)
+        return original_apply(operation,claim,result)
+    monkeypatch.setattr(c.app.mcp.evidence,'save',save)
+    monkeypatch.setattr(c.app.mcp,'_apply',apply)
+    closed=[]
+    class CheckedClose(ScriptProcess):
+        def close(self):
+            # close runs in a worker thread; inspect only files, never the main-thread SQLite connection.
+            files=list((c.directory/'d8-output').glob('d8-handoff-experiment-failure-*.json'))
+            assert len(files)==1
+            assert json.loads(files[0].read_text('utf-8'))['payload']['phase']==phase
+            closed.append(True);super().close()
+    c.app.mcp.experiments.runner_factory=CheckedClose
+    result=asyncio.run(c.app._run_once(c.token))
+    assert result.recovery_required and result.stop_reason==code,result
+    assert len(c.sends)==1 and closed==[True]
+    operation=c.app.mcp.experiments.records(parents[0])[0]
+    assert operation.completion is None
+    failure=c.app.mcp.evidence.read('experiment-failure',operation.start.operation_id)
+    assert failure['phase']==phase and failure['code']==code
+    assert 'private' not in json.dumps(failure)
+    snapshot=snapshot_v3_task_result(c.directory,c.declaration)
+    assert not snapshot['errors'],snapshot
+    row=next(item for item in snapshot['http_diagnostics'] if item.get('execution_id')==operation.start.operation_id)
+    assert row['phase']==phase and row['active'] and row['result_saved']==(phase=='receipt_apply')
+    assert snapshot['recovery']['reason']==code
+    if phase=='receipt_apply':
+        with pytest.raises(D3RecoveryRequired,match=code):c.app.mcp.reconcile()
+        assert c.app.mcp.evidence.read('experiment-failure',operation.start.operation_id)==failure
+    assert len(c.sends)==1
+    read=c.app.mcp.evidence.read
+    monkeypatch.setattr(c.app.mcp.evidence,'read',lambda kind,key:
+        {**failure,'request_sha256':'0'*64} if kind=='experiment-failure' else read(kind,key))
+    with pytest.raises(D3RecoveryRequired,match='d22_experiment_failure_diagnostic_invalid'):
+        failure_diagnostics(c.app.mcp.evidence,c.app.store,c.task)

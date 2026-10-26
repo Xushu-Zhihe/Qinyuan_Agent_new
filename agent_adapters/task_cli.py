@@ -184,7 +184,11 @@ def _dispatch_v3_run_task(args, raw):
         declaration.update(env_file=str(env_file), sandbox_backend=backend)
         declaration["capabilities"] = ["attachment_digest_only", "d8_real_models",
                                        "docker_task_run_sandbox" if backend == "docker" else "local_simulated_sandbox"]
-        if raw.get('execution_profile') == 'd8_v20' and raw['task_request']['target'].get('endpoints'):
+        endpoints = raw['task_request']['target'].get('endpoints', [])
+        if endpoints and raw.get('execution_profile') == 'd8_v22':
+            protocol = endpoints[0]['url'].split(':', 1)[0]
+            declaration['capabilities'] += ['task_run_target_network', 'mcp', 'tcp' if protocol == 'tcp' else 'http']
+        if raw.get('execution_profile') == 'd8_v20' and endpoints:
             declaration['capabilities'] = ['d8_http', 'd8_real_models', 'docker_task_run_sandbox',
                                            'task_run_origin_bound_target_network']
         immutable_write(directory / "d8-runtime.json", real_declaration_binding(declaration))

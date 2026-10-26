@@ -38,6 +38,8 @@ SAFE_MODEL_ERROR_CODES = SAFE_HTTP_ERROR_CODES | frozenset({
     "d3_review_provider_failure", "d3_review_call_outcome_unknown", "d4_review_dispatch_stopped",
     "d3_model_call_outcome_unknown", "d3_model_call_interrupted", "d22_strategy_result_processing_failed",
     "d22_handoff_progress_source_changed",
+    "d22_experiment_source_changed", "d22_experiment_request_outcome_unknown",
+    "d22_experiment_receipt_settlement_failed", "d22_experiment_failure_diagnostic_invalid", "mcp.result_binding_changed", "mcp.completion_binding_changed",
     "d8_output_cancelled_call_binding_changed", "d8_output_interruption_binding_changed", "d8_output_model_audit_changed",
     "d8_model_context_rejected", "d8_provider_envelope_invalid", "provider_envelope_invalid",
     "provider_content_invalid", "provider_refused", "d8_transport_outcome_unknown",
@@ -143,9 +145,9 @@ def safe_failure_details(error, *, include_chain=False):
 
 class FileD8OutputEvidence(FileD8HandoffEvidence):
     # Session envelopes reuse this immutable evidence store, not new tables.
-    KINDS = {"model-timeouts", "provider-request", "provider-result", "input-measurement", "mcp-registry", "mcp-catalog", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "http-dispatch-stop", "review-failure"}
+    KINDS = {"model-timeouts", "provider-request", "provider-result", "input-measurement", "mcp-registry", "mcp-catalog", "mcp-download", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "http-dispatch-stop", "review-failure"}
 
-    KINDS = KINDS | {"experiment-session", "experiment-process", "experiment-result", "experiment-stop", "call-interruption"}
+    KINDS = KINDS | {"experiment-session", "experiment-process", "experiment-result", "experiment-stop", "experiment-failure", "call-interruption"}
 
     @staticmethod
     def describe_failure(error):

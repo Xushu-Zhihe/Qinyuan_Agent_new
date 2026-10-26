@@ -18,7 +18,7 @@ _MODULE_PATTERN = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
 )
 _SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
-_ARCHIVE_FORMATS = frozenset({"raw", "zip", "tar", "tar.gz"})
+_ARCHIVE_FORMATS = frozenset({"raw", "zip", "tar", "tar.gz", "tar.xz"})
 _DEFAULT_BOOTSTRAP_TIMEOUT = 300
 _BOOTSTRAP_BUDGET = 300
 
@@ -27,7 +27,8 @@ mcp = FastMCP(
     "qinyuan-download-command-planner",
     instructions=(
         "Prepare bounded tool installation commands for the current Agent "
-        "sandbox. Native files or archives are downloaded to /tools first; "
+        "sandbox. The current TaskRun prepares verified artifacts through its controlled fetcher, "
+        "then installs locally under /tools without direct Internet access; "
         "when native installation fails, a pinned Python package fallback may "
         "be attempted. This server never downloads to or executes on the host. "
         "Only use sources authorized by the challenge and provide a SHA256 for "
@@ -154,6 +155,9 @@ def _script(**values: object) -> str:
         TIMEOUT = {encoded['timeout_seconds']}
         MAX_BYTES = 256 * 1024 * 1024
         ROOT = Path('/tools')
+        OFFLINE = os.environ.get('QINYUAN_OFFLINE_TOOL_INSTALL') == '1'
+        WHEELHOUSE = os.environ.get('QINYUAN_TOOL_WHEELHOUSE', '')
+        WHEEL_HASHES = json.loads(os.environ.get('QINYUAN_TOOL_WHEEL_HASHES', '{{}}'))
         DEADLINE = time.monotonic() + TIMEOUT
 
         def remaining():
@@ -223,17 +227,23 @@ def _script(**values: object) -> str:
             staging.unlink(missing_ok=True)
             if install_root.exists():
                 shutil.rmtree(install_root)
-            request = urllib.request.Request(URL, headers={{'User-Agent': 'qinyuan-agent'}})
-            total = 0
-            with urllib.request.urlopen(request, timeout=min(30, remaining())) as response, staging.open('wb') as target:
-                while True:
-                    chunk = response.read(min(1024 * 1024, int(remaining())))
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > MAX_BYTES:
-                        raise ValueError('download exceeds 256 MiB')
-                    target.write(chunk)
+            source = ROOT / 'sources' / SHA256.lower()
+            if OFFLINE:
+                if not source.is_file():
+                    raise ValueError('verified native source was not prepared')
+                shutil.copyfile(source, staging)
+            else:
+                request = urllib.request.Request(URL, headers={{'User-Agent': 'qinyuan-agent'}})
+                total = 0
+                with urllib.request.urlopen(request, timeout=min(30, remaining())) as response, staging.open('wb') as target:
+                    while True:
+                        chunk = response.read(min(1024 * 1024, int(remaining())))
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > MAX_BYTES:
+                            raise ValueError('download exceeds 256 MiB')
+                        target.write(chunk)
             digest = hashlib.sha256(staging.read_bytes()).hexdigest()
             if digest != SHA256:
                 raise ValueError('download SHA256 does not match')
@@ -263,15 +273,20 @@ def _script(**values: object) -> str:
             package = PYTHON_PACKAGE + '==' + PYTHON_VERSION
             environment = dict(os.environ)
             environment['PYTHONPATH'] = str(target) + os.pathsep + environment.get('PYTHONPATH', '')
+            offline_args = []
+            if OFFLINE:
+                wheelhouse = Path(WHEELHOUSE)
+                if not WHEEL_HASHES or not wheelhouse.is_relative_to(ROOT / 'wheels'):
+                    raise ValueError('verified Python wheels were not prepared')
+                for name, expected in WHEEL_HASHES.items():
+                    wheel = wheelhouse / name
+                    if wheel.parent != wheelhouse or not wheel.is_file() or hashlib.sha256(wheel.read_bytes()).hexdigest() != expected:
+                        raise ValueError('prepared Python wheel changed')
+                offline_args = ['--no-index', '--find-links', str(wheelhouse)]
             subprocess.run(
-                [
-                    sys.executable, '-m', 'pip', 'install',
-                    '--disable-pip-version-check', '--no-cache-dir', '--no-input',
-                    '--only-binary=:all:', '--target', str(target), package,
-                ],
-                timeout=remaining(),
-                check=True,
-                env=environment,
+                [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', '--no-input',
+                 '--only-binary=:all:', *offline_args, '--target', str(target), package],
+                timeout=remaining(), check=True, env=environment,
             )
             if PYTHON_MODULE:
                 subprocess.run(
@@ -286,8 +301,11 @@ def _script(**values: object) -> str:
         receipt_dir = ROOT / 'receipts'
         receipt_dir.mkdir(parents=True, exist_ok=True)
         receipt = receipt_dir / (NAME + '.json')
-        if receipt.is_file():
-            print(json.dumps({{'status': 'already_installed', 'path': str(receipt)}}))
+        binding = hashlib.sha256(json.dumps([URL, SHA256, ARCHIVE_FORMAT, EXECUTABLE_PATH, SELF_TEST_ARGS,
+            PYTHON_PACKAGE, PYTHON_VERSION, PYTHON_MODULE], sort_keys=True).encode()).hexdigest()
+        if (receipt.is_file() and json.loads(receipt.read_text()).get('request_sha256') == binding
+                and Path(json.loads(receipt.read_text())['path']).exists()):
+            print(json.dumps({{'status': 'already_installed', 'path': json.loads(receipt.read_text())['path']}}))
             raise SystemExit(0)
         errors = []
         installed = None
@@ -303,7 +321,7 @@ def _script(**values: object) -> str:
                 errors.append('python: ' + type(error).__name__)
         if installed is None:
             raise RuntimeError('tool installation failed: ' + '; '.join(errors))
-        receipt.write_text(json.dumps({{'name': NAME, 'path': str(installed), 'errors': errors}}), encoding='utf-8')
+        receipt.write_text(json.dumps({{'name': NAME, 'path': str(installed), 'errors': errors, 'request_sha256': binding}}), encoding='utf-8')
         print(json.dumps({{'status': 'installed', 'path': str(installed), 'fallback_errors': errors}}))
         """
     ).strip()
@@ -335,7 +353,10 @@ def install_tool(
     python_module: str = "",
     timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
-    """Install a verified native artifact, then a pinned Python fallback."""
+    """Install a verified native artifact, then a pinned Python fallback.
+
+    archive_format accepts raw, zip, tar, tar.gz or tar.xz.
+    """
 
     normalized_name = _validate_name(name, "name")
     normalized_url = _validate_url(url) if url is not None else None

@@ -29,6 +29,8 @@ class IntentSessions:
         advice = json.loads(request.get("history_context", "{}") or "{}").get("strategy_advice")
         if advice and "reason" in advice:
             value["strategy_advice"] = advice
+        repetition = json.loads(request.get("history_context", "{}") or "{}").get("repetition_advice")
+        if repetition:value["repetition_advice"] = repetition
         return value
 
     def records(self, intent_id=None):
@@ -394,6 +396,8 @@ class IntentSessions:
         if attempts:
             previous = attempts[-1]
             watermark = previous["decision_count"]
+        if supervisor and supervisor.repetition_notices(intent_id):
+            return True
         if len(set(self.execution_refs(intent_id)) - set(previous.get("execution_refs", ()))) >= 4:
             return True
         # Pure reasoning/history loops must not evade review by never executing.

@@ -1,15 +1,8 @@
 """Narrow HTTP schemas and model-selected tree goals for contract20."""
-from dataclasses import dataclass
 import json
-from agent_core.handoff_contracts import checked_refs
-from agent_core.modeling import IntentCandidate
 from agent_core.dual_llm_contracts import D3RecoveryRequired
 
 
-@dataclass(frozen=True)
-class HttpTurnProposal:
-    turn_target: str
-    intents: tuple[IntentCandidate, ...]
 
 
 def policy(request):
@@ -22,12 +15,11 @@ def policy(request):
 
 
 def schema(request):
-    from agent_core.output_contracts import tagged,array,INTENT,REFS,text,S
-    from agent_core.intent_planning import candidate_limit, candidate_schema
+    from agent_core.output_contracts import tagged,S
     if request.stage=='tree_planning':
         policy(request)
-        return {'anyOf':[candidate_schema(request,{'intents':array(INTENT,1,candidate_limit(request))}),
-            tagged('exhausted',{'reason':text(512),'evidence_refs':REFS})]}
+        from agent_core.intent_planning import direction_schema
+        return direction_schema(request)
     if request.stage=='inner_plan':
         authorization=json.loads(request.history_context)['d20_http_policy']
         http=tagged('http_request',{'method':{'type':'string','enum':authorization['allowed_methods']},
@@ -54,34 +46,7 @@ def attachment_choices(context, *, rolling=False):
     return choices
 
 
-def planning(request,raw,revisions):
-    from agent_core.handoff import D8PlanningResult,D8DependencyCandidatesRejected
-    from agent_core.intent_planning import candidate_limit, without_order_reason
-    raw = without_order_reason(request, raw)
-    if not isinstance(raw,dict):raise ValueError('d20_http_planning_invalid')
-    if raw.get('kind')=='exhausted':
-        if set(raw)!={'kind','reason','evidence_refs'} or not isinstance(raw['reason'],str) or not raw['reason'].strip():
-            raise ValueError('d20_http_exhaustion_invalid')
-        checked_refs(raw['evidence_refs'],{i.ref for i in request.history})
-        return D8PlanningResult(None,(),(),raw['reason'])
-    maximum=candidate_limit(request)
-    if (set(raw)!={'kind','intents'} or raw['kind']!='candidates' or not isinstance(raw['intents'],list)
-            or not raw['intents'] or maximum is not None and len(raw['intents'])>maximum):
-        raise ValueError('d20_http_planning_invalid')
-    available={i.ref for i in request.history}
-    kept,deps,rejected=[],[],[]
-    for index,item in enumerate(raw['intents']):
-        if not isinstance(item,dict) or set(item)!={'description','intent_type','dependency_refs'}:
-            raise ValueError('d20_http_intent_fields_invalid')
-        refs=checked_refs(item['dependency_refs'],available)
-        if any(i.source_status!='available' or i.conflict or revisions and not revisions.reliable(i)
-               for i in request.history if i.ref in refs):
-            rejected.append(index)
-            continue
-        kept.append(IntentCandidate(item['description'],item['intent_type']))
-        deps.append(refs)
-    if not kept:raise D8DependencyCandidatesRejected(rejected)
-    return D8PlanningResult(HttpTurnProposal(request.goal,tuple(kept)),tuple(deps),tuple(rejected))
+from agent_core.intent_planning import parse_directions as planning
 
 
 GOAL_INTERPRETATION = (

@@ -10,6 +10,7 @@ from typing import Literal
 from uuid import UUID
 
 from agent_core.execution_authorization import D6Authorization
+from agent_core.target_contracts import TcpAuthorization, TcpTurnBinding
 from agent_core.web_contracts import D7WebAuthorization
 from agent_core.operation_accounting import D4BudgetPolicy, D8BudgetPolicy, D8HandoffBudgetPolicy
 from agent_core.handoff_contracts import D8HandoffConfig
@@ -96,6 +97,10 @@ def d3_payload(value: object) -> dict[str, object]:
     payload = (
         asdict(value) if is_dataclass(value) and not isinstance(value, type) else {}
     )
+    if isinstance(value, D3RunConfig) and value.tcp_authorization is None:
+        payload.pop("tcp_authorization", None)
+    elif isinstance(value, D3CommitMetadata) and value.config is not None and value.config.tcp_authorization is None:
+        payload["config"].pop("tcp_authorization", None)
     if isinstance(value, D3RunConfig) and value.web_authorization is None:
         payload.pop('web_authorization', None)
         payload.pop('http_timeout_seconds', None)
@@ -177,8 +182,14 @@ class D3RunConfig:
     web_authorization: D7WebAuthorization | None = None
     http_timeout_seconds: int | None = None
     intent_execution_policy: str | None = None
+    tcp_authorization: TcpAuthorization | None = None
 
     def __post_init__(self) -> None:
+        if self.tcp_authorization is not None and (
+                self.contract_version != 22 or not isinstance(self.tcp_authorization, TcpAuthorization)
+                or self.web_authorization is not None or self.d6_authorization is not None
+                or self.authorization.authorization_id != self.tcp_authorization.authorization_id):
+            raise ValueError("tcp.configuration_invalid")
         if self.intent_execution_policy is not None and (
                 self.intent_execution_policy not in {"rolling_v1", "continuous_v1"} or self.contract_version != 22):
             raise ValueError("d22_intent_execution_policy_invalid")
@@ -293,7 +304,7 @@ class D3RunConfig:
             fields | {"d4_budget", "d5_enabled"},
             fields | {"d4_budget", "d5_enabled", "d5_sensitive_requirements"},
         )
-        if set(value) - {"d6_authorization", "d8_enabled", "handoff_config", "web_authorization", "http_timeout_seconds", "intent_execution_policy"} not in allowed:
+        if set(value) - {"d6_authorization", "d8_enabled", "handoff_config", "web_authorization", "http_timeout_seconds", "intent_execution_policy", "tcp_authorization"} not in allowed:
             raise ValueError("invalid D3RunConfig fields")
         budget = value.get("d4_budget")
         if budget is not None and not isinstance(budget, dict):
@@ -340,6 +351,7 @@ class D3RunConfig:
             D7WebAuthorization.from_dict(value['web_authorization']) if value.get('web_authorization') is not None else None,
             value.get('http_timeout_seconds'),
             value.get('intent_execution_policy'),
+            TcpAuthorization.from_dict(value['tcp_authorization']) if value.get('tcp_authorization') is not None else None,
         )
 
 
@@ -747,7 +759,7 @@ class D3CommitMetadata:
         if self.config is not None and not isinstance(self.config, D3RunConfig):
             raise TypeError("invalid D3 run configuration")
         if self.turn_binding is not None and not isinstance(
-            self.turn_binding, (D3TurnBinding, HttpTurnBinding)
+            self.turn_binding, (D3TurnBinding, HttpTurnBinding, TcpTurnBinding)
         ):
             raise TypeError("invalid D3 Turn binding")
         if not isinstance(self.intent_bindings, tuple) or any(

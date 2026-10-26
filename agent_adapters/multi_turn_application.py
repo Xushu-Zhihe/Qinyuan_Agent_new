@@ -483,6 +483,10 @@ class D3Application:
                 self.handoff.evidence, self.conclusions.evidence, self.store, self.imports)
             self.conclusions.assembly_bindings = self.planning_assertion_bindings
         self.web = None
+        if config.tcp_authorization is not None:
+            self.conclusions.assembly_bindings = None
+            self.planning_assertion_bindings = None
+            self.business_diagnostics = None
         from agent_core.http_contracts import is_http
         if is_http(config):
             from agent_adapters.http_capability import HttpCapability
@@ -1898,6 +1902,8 @@ class D3Application:
         return request_id, proposal
 
     def _source(self, reference: str) -> object:
+        if self.config.tcp_authorization is not None and reference == self.config.tcp_authorization.authorization_id:
+            return asdict(self.config.tcp_authorization)
         if self.web is not None:
             source = self.web.source(reference)
             if source is not None:
@@ -3369,6 +3375,8 @@ class D3Application:
             raise D3RecoveryRequired("d3_tail_review_not_read_only")
 
     async def _run_tree(self, token: CancellationToken) -> D3Result:
+        if token.is_cancelled or self.clock() >= self.state.task_run.deadline_at:
+            self._check_dispatch()
         if self.config.intent_execution_policy:
             from agent_core.intent_execution import finish_budget_closure, budget_stop_reason
             reason = budget_stop_reason(self.store, self.handoff.evidence, self.state.task_run.task_run_id)
@@ -3472,7 +3480,7 @@ class D3Application:
         plans = [p for p in self.state.plans if p.intent_id == current.intent_id]
         if not plans:
             turn_binding = self.store.load_d3_turn_binding(turn.turn_id)
-            sources = ((turn_binding.authorization_id, turn_binding.proposal_request_id) if self.web is not None
+            sources = ((turn_binding.authorization_id, turn_binding.proposal_request_id) if self.web is not None or self.config.tcp_authorization is not None
                        else (turn_binding.import_id, turn_binding.proposal_request_id))
             review_id, output = self._review(turn.turn_id, current.intent_id, "turn_start", None, sources)
             if await self._route(review_id, output, current.intent_id, receipts, token):
@@ -3693,7 +3701,7 @@ class D3Application:
                 D3ProposalRejected,
                 D2ReviewPaused,
             ) as exc:
-                if self.config.d4_budget is not None and token.is_cancelled:
+                if self.config.d4_budget is not None and (token.is_cancelled or self.clock() >= self.state.task_run.deadline_at):
                     try:
                         task_run_id = self._bound_task_run_id
                         if task_run_id is None:

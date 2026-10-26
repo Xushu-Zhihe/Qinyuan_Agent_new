@@ -142,6 +142,8 @@ class D3PlanProposal:
 
 
 def parse_d3_plan_proposal(raw: object) -> D3PlanProposal:
+    if isinstance(raw, dict) and raw.get("kind") in {"mcp_call", "http_request_saved"}:
+        raw = {key: value for key, value in raw.items() if key != "exploration_group"}
     if isinstance(raw,dict) and raw.get("kind")=="fact_candidate":
         from agent_core.evidence_conclusions import EvidenceCandidate
         try:return EvidenceCandidate.parse(raw)

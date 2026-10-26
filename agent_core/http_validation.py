@@ -9,6 +9,11 @@ from agent_core.turn_modeling import digest
 
 
 def valid_target(config,request):
+    if getattr(config, "tcp_authorization", None) is not None:
+        return (config.contract_version == 22 and len(request.target.endpoints) == 1
+                and request.target.endpoints[0].url == config.tcp_authorization.allowed_endpoint
+                and len(request.target.attachments) == len(config.authorization.attachment_indices)
+                and all(a.kind == "local_path" for a in request.target.attachments))
     return (is_http(config) and (not request.target.attachments or config.contract_version in {21,22}
             and len(request.target.attachments)==len(config.authorization.attachment_indices)
             and all(a.kind=='local_path' for a in request.target.attachments)) and len(request.target.endpoints)==1

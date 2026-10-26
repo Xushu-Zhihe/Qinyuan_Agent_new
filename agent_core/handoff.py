@@ -641,7 +641,7 @@ class HandoffContext:
         if request.stage == "tree_planning":
             from agent_core.intent_planning import without_order_reason
             raw = without_order_reason(request, raw)
-        if self.app.web is not None and request.stage == 'tree_planning':
+        if (self.app.web is not None or self.app.config.tcp_authorization is not None) and request.stage == 'tree_planning':
             from agent_core.http_policy import planning
             return self._new_root_directions(request, planning(request, raw, self.app.revisions))
         refs = {i.ref for i in request.history}
@@ -851,7 +851,10 @@ class HandoffContext:
                 self._pause("evaluation_required_context", [i.ref for i in selected], limit,
                             len(handoff_json(packet)))
         if stage == "tree_planning":
-            if self.app.web is not None:
+            if self.app.config.tcp_authorization is not None:
+                from agent_core.target_contracts import policy
+                packet['tcp_target_policy'] = policy(self.app)
+            elif self.app.web is not None:
                 packet['d20_http_policy'] = self.app.web.policy()
             elif self.app.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 from agent_core.planning_assertion import freeze_planning_policy
@@ -1125,7 +1128,10 @@ class HandoffContext:
         from agent_core.turn_manager import TurnManager
         turn_id = TurnManager.registration_turn_id(request.task_run_id, identity)
         intent_ids = tuple(self._id(f"intent/{turn_id}/{n}") for n in range(len(planned.proposal.intents)))
-        if self.app.web is not None:
+        if self.app.config.tcp_authorization is not None:
+            from agent_core.target_contracts import turn_binding
+            binding = turn_binding(self.app, turn_id, final.model_request_id)
+        elif self.app.web is not None:
             binding = self.app.web.turn_binding(turn_id, final.model_request_id)
         else:
             receipt = receipts[planned.proposal.attachment_index]
@@ -1343,7 +1349,11 @@ class HandoffContext:
                         or tuple(refs for _, refs in record.dependencies) != parsed.dependencies
                         or change.turn_target != state.task_run.request.goal):
                     raise D3RecoveryRequired("d8_candidate_or_dependencies_changed")
-                if self.app.web is not None:
+                if self.app.config.tcp_authorization is not None:
+                    from agent_core.target_contracts import turn_binding
+                    if mutation.d3.turn_binding != turn_binding(self.app, change.turn_id, record.model_request_id):
+                        raise D3RecoveryRequired("tcp.turn_source_changed")
+                elif self.app.web is not None:
                     if mutation.d3.turn_binding != self.app.web.turn_binding(change.turn_id, record.model_request_id):
                         raise D3RecoveryRequired('d20_http_turn_source_changed')
                 else:
@@ -1651,10 +1661,17 @@ class HandoffContext:
                     marker = self.app.sessions.consolidation_context(intent_id)
                     if marker is not None and not packet.get("intent_execution", {}).get("stop_requested"):
                         packet["knowledge_checkpoint"] = marker
+            if request.stage == "inner_plan" and self.app.supervision.enabled:
+                packet["exploration_groups"] = True
+                advice = self.app.supervision.inner_repetition_advice(intent_id)
+                if advice:packet["repetition_advice"] = advice
             if self.app.mcp is not None and request.stage == "inner_plan":
                 from agent_adapters.mcp_plan_executor import compact_tools
                 packet["mcp_tools"] = compact_tools(self.app.mcp.tools)
-            if self.app.web is not None:
+            if self.app.config.tcp_authorization is not None:
+                from agent_core.target_contracts import policy
+                packet['tcp_target_policy'] = policy(self.app)
+            elif self.app.web is not None:
                 packet['d20_http_policy'] = self.app.web.policy()
             if self.app.config.contract_version in {17, 18, 19, 20, 21, 22} and request.stage == 'inner_plan':
                 from agent_core.execution_feasibility import KEY, freeze

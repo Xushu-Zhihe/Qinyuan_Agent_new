@@ -14,6 +14,9 @@ from agent_core.turn_modeling import digest
 GUIDANCE = (
     "Evaluate current progress against the unchanged Intent and compare the Turn alternatives. "
     "No new Fact, repeated responses, or elapsed time alone do not prove useless work. "
+    "repeated_observations reports explicitly labeled hypothesis groups at cumulative 4/8/16/... matching "
+    "result checkpoints, not zero information. Compare changed inputs, eliminated candidates and finite "
+    "coverage; suggest reviewing relevant Facts and observations without mandatory switching. "
     "Consider hypothesis discrimination, finite enumeration coverage, prerequisites and remaining cost. "
     "Judge evidence rather than reviewer authority; do not prefer continuing or switching merely by role. "
     "Request Intent resolution only with cited grounds to stop the exploration; "
@@ -154,6 +157,62 @@ class StrategySupervision:
         return digest(sorted(i.ref for i in self.app.handoff.history() if i.intent_id == intent_id
                              and i.record_type in {"verified_fact", "reviewed_inference"}))
 
+    def repeated_observations(self, intent_id):
+        """Explicit model groups + known result projections; never information-gain verdicts."""
+        app, groups = self.app, {}
+        executions = {e.execution_id:e for e in app.state.executions}
+        for identity in app.sessions.execution_refs(intent_id):
+            result = app.web.result(identity) if app.web else None
+            if result is not None:
+                execution = executions.get(identity)
+                binding = app.store.load_d3_plan_binding(execution.plan_id) if execution else None
+                request_id = getattr(binding, "proposal_request_id", None)
+                response = result
+            elif app.mcp is not None:
+                result = app.mcp.feedback(identity)
+                claim = app.mcp.evidence.read("mcp-call", identity)
+                request_id = claim.get("model_request_id") if claim else None
+                response = result.get("http_response") if result else None
+            else:
+                continue
+            native = app.model_evidence.read(request_id) if request_id else None
+            raw = native.raw if native is not None and native.outcome == "accepted" else {}
+            group = raw.get("exploration_group") if isinstance(raw, dict) else None
+            if not isinstance(group, str) or not group.strip() or not result:continue
+            if response:
+                projection = {k:response[k] for k in ("status", "body_sha256", "body_bytes")}
+                if app.web is not None:
+                    cookies = app.web.cookie_snapshot(response)
+                    projection.update(cookies=cookies["session"], response=cookies["response"])
+            else:
+                if result.get("stdout_truncated") or result.get("stderr_truncated"):continue
+                projection = {k:result[k] for k in ("status", "exit_code", "stdout", "stderr", "code") if k in result}
+                if not any(k in projection for k in ("stdout", "stderr", "code")):continue
+            key = group.strip(), digest(projection)
+            groups.setdefault(key, []).append(identity)
+        return [{"group":group, "observation_sha256":signature, "count":len(ids),
+                 "threshold":1 << (len(ids).bit_length()-1), "operation_ids":ids[-4:]}
+                for (group, signature), ids in groups.items() if len(ids) >= 4]
+
+    def repetition_notices(self, intent_id, groups=None):
+        seen = {}
+        for _, request in self.calls(intent_id):
+            for item in json.loads(request.prior_summary).get("exploration_progress", {}).get("repeated_observations", []):
+                key = item["group"], item["observation_sha256"]
+                seen[key] = max(seen.get(key, 0), item["threshold"])
+        return [item for item in (self.repeated_observations(intent_id) if groups is None else groups)
+                if item["threshold"] > seen.get((item["group"],item["observation_sha256"]),0)]
+
+    def inner_repetition_advice(self, intent_id):
+        seen = {}
+        for record in self.app.sessions.records(intent_id):
+            prior = self.app.sessions.payload(record)["request"]
+            for item in prior.get("repetition_advice", []):
+                key = item["group"], item["observation_sha256"]
+                seen[key] = max(seen.get(key,0),item["threshold"])
+        return [item for item in self.repeated_observations(intent_id)
+                if item["threshold"] > seen.get((item["group"],item["observation_sha256"]),0)]
+
     def exploration_progress(self, intent_id):
         """Deterministic completed-request coverage; never a semantic progress verdict."""
         app = self.app
@@ -202,6 +261,7 @@ class StrategySupervision:
             "tool_counts": tools, "known_failed_or_rejected": failures, "experiment_results": experiment_results,
             "request_shape_groups": [{"signature": key, "operation_ids": ids} for key, ids in requests.items()],
             "response_groups": list(responses.values()), "recent_tools": recent[-4:],
+            "repeated_observations": self.repetition_notices(intent_id),
             "remaining_seconds": max(0, app.state.task_run.deadline_at - app.clock())}
 
     def start(self, intent_id):
@@ -210,6 +270,7 @@ class StrategySupervision:
             return
         app = self.app
         app._check_role()
+        notices = self.repetition_notices(intent_id)
         intent = next(i for i in app.state.intents if i.intent_id == intent_id)
         selected, _, packet = app.handoff.select("execution", intent.turn_id, intent_id)
         history = list(selected)
@@ -246,6 +307,10 @@ class StrategySupervision:
         app.store.begin_d4_operation(D4OperationStart(identity, request.task_run_id, "review", app.clock(),
             request.base_checkpoint_sequence, request.context_sha256, request.turn_id,
             app.config.d4_budget.budget_policy_ref, "outer_planning", request.role_config_ref))
+        for item in notices:
+            self._log("repetition.review_requested", request, category="strategy_signal",
+                      group_sha256=digest(item["group"]), observation_sha256=item["observation_sha256"],
+                      count=item["count"], threshold=item["threshold"], operation_ids=item["operation_ids"])
         self._launch(request)
 
     def _launch(self, request):

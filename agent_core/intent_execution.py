@@ -440,6 +440,8 @@ async def resolve(app, request_id, intent_id, proposal, token):
         return
     request = make_request(app, intent_id, request_id, proposal)
     final, decision = await app.handoff.call(request, token)
+    if token.is_cancelled or app.clock() >= app.state.task_run.deadline_at:
+        app._check_dispatch()
     intent = next(i for i in app.state.intents if i.intent_id == intent_id)
     if decision is None:
         if json.loads(final.prior_summary)["s4_evaluation_policy"]["version"] == 3:
@@ -897,7 +899,8 @@ def suspend_local(app, intent, error):
     from agent_core.control_store import UpsertIntent
     from agent_core.handoff_contracts import D8TreeRecord
     from agent_core.review import D2ReviewPaused
-    if not continuous(app.config) or intent.status is not IntentStatus.RUNNING:return False
+    if (not continuous(app.config) or intent.status is not IntentStatus.RUNNING
+            or app.clock() >= app.state.task_run.deadline_at):return False
     if app.store.blocking_d4_operations(app.state.task_run.task_run_id) or any(
             e.status is ExecutionStatus.RUNNING for e in app.state.executions):return False
     code = getattr(error, "code", None) or str(error)

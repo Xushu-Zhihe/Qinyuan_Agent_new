@@ -97,6 +97,8 @@ class HttpCapability:
 
     def normalize_plan(self,request,raw):
         self.attach()
+        group = raw.get("exploration_group") if isinstance(raw, dict) else None
+        if isinstance(raw, dict):raw = {k:v for k,v in raw.items() if k != "exploration_group"}
         if (not isinstance(raw,dict) or set(raw)!={'kind','method','path_query','headers','body'}
                 or raw['kind']!='http_request' or not isinstance(raw['headers'],dict)):
             raise ValueError('d20_http_action_fields_invalid')
@@ -113,10 +115,11 @@ class HttpCapability:
         metadata=self.protected.save(operation,encoded)
         safe=dict(kind='http_request_saved',method=method,request_evidence_id=metadata.evidence_id,
                   request_sha256=hashlib.sha256(encoded).hexdigest())
+        advisory = {"exploration_group": group.strip()} if isinstance(group,str) and group.strip() else {}
         self.evidence.save('http-plan-binding',request.model_request_id,
             dict(task_run_id=self.task.task_run_id,request_sha256=digest(asdict(request)),
-                 result=safe,finished_at=self.app.clock()))
-        return safe
+                 result=safe,finished_at=self.app.clock(), **advisory))
+        return {**safe, **advisory}
 
     def read_request(self,binding):
         self.attach()
@@ -730,7 +733,9 @@ class HttpCapability:
                 start=operation.start
                 native=D3ModelEvidence(identity,task,'inner_plan',start.role_config_ref,start.resource_ref,
                     start.base_checkpoint_sequence,start.context_sha256,
-                    frozen['request'].get('correction_of_model_request_id'),'accepted',saved['result'],None,saved['finished_at'])
+                    frozen['request'].get('correction_of_model_request_id'),'accepted',
+                    {**saved['result'], **({'exploration_group': saved['exploration_group']} if 'exploration_group' in saved else {})},
+                    None,saved['finished_at'])
                 checksum=self.app.model_evidence.save(native)
                 self.store.complete_d3_operation(D3OperationCompletion(identity,native.finished_at,
                     'completed',identity,checksum))
@@ -837,7 +842,10 @@ def readonly_capability(directory,store,config):
 
 def check_http_task(directory,store,config,*,diagnostics=None):
     capability=readonly_capability(directory,store,config)
-    needs_repair=False
+    from agent_adapters.http_experiments import failure_diagnostics
+    failures=failure_diagnostics(capability.evidence,store,capability.task.task_run_id)
+    if diagnostics is not None:diagnostics.extend(failures)
+    needs_repair=any(row['active'] for row in failures)
     for plan in capability.app.state.plans:
         binding=store.load_d3_plan_binding(plan.plan_id)
         if not isinstance(binding,HttpPlanBinding):

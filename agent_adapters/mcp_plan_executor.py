@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+from time import monotonic
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -237,12 +238,18 @@ class MCPPlanExecutor:
             if result is not None:
                 if claim is None:
                     raise D3RecoveryRequired("mcp.call_evidence_missing")
-                self._apply(operation, claim, result)
+                try:
+                    self._apply(operation, claim, result)
+                except Exception as error:
+                    if 'experiment_request' in claim:
+                        self.experiments.record_failure(operation.start.operation_id,claim,result,'receipt_apply',error)
+                    raise
         self.experiments.reconcile()
 
     async def execute(self, request_id, intent_id, call, token):
         from MCPs.Mcp_client.client import MCPCommandPlanError
         from Sandbox.service import SandboxPolicyError
+        from Sandbox.tool_download import ToolDownloadError, ToolDownloadUnknown
         from agent_adapters.http_experiments import TOOL
         if call.tool_name == TOOL:
             await self.experiments.run(request_id,intent_id,call,token)
@@ -287,9 +294,49 @@ class MCPPlanExecutor:
                        exec=identity, tool=call.tool_name)
         # 公共检索要把"当前目标"作为禁止命中的地址传下去，来源是已授权的 origin。
         authorization = self.app.config.web_authorization
-        target = authorization.allowed_origin if authorization else None
-        pending = asyncio.create_task(self.public_web.call(call, min(maximum, remaining), token, target)
-                  if public else self.client.call_tool(call.tool_name, dict(call.arguments)))
+        target = (authorization.allowed_origin if authorization else
+                  self.app.config.tcp_authorization.allowed_endpoint if self.app.config.tcp_authorization else None)
+        async def invoke():
+            if public:
+                return await self.public_web.call(call, min(maximum, remaining), token, target)
+            if call.tool_name == "download.install_tool":
+                from Sandbox.tool_download import ToolDownload
+                from agent_adapters.sandbox_adapter import D8SandboxAdapter
+                if not isinstance(self.service, D8SandboxAdapter):
+                    raise SandboxPolicyError("download.task_run_preparation_unavailable")
+                from MCPs.Download_Mcp.server import install_tool
+                try:installation = install_tool(**dict(call.arguments))
+                except (TypeError, ValueError):raise SandboxPolicyError("download.arguments_invalid") from None
+                preparation_limit = min(maximum, remaining, installation["sandbox_command"]["timeout_seconds"])
+                preparation_started = monotonic()
+                self.service.prepared_download = None
+                preparation = ToolDownload(self.service.sandbox, self.app.state.task_run, identity, self.evidence)
+                # Reuse the latest successful preparation for the exact same tool
+                # selection in this TaskRun. A later failure invalidates that shortcut.
+                prepared = None
+                for prior_call in reversed(self.records()):
+                    if prior_call.start.operation_id == identity:continue
+                    old = self.evidence.read("mcp-call", prior_call.start.operation_id)
+                    if old is None or old.get("call") != asdict(call):continue
+                    outcome = self.evidence.read("mcp-result", prior_call.start.operation_id)
+                    lease = self.evidence.read("mcp-download", prior_call.start.operation_id)
+                    if (outcome and outcome["payload"]["status"] == "completed" and lease
+                            and lease.get("state") == "prepared" and lease.get("cleanup") != "unknown"):
+                        prepared = lease.get("prepared")
+                        if prepared is not None:
+                            self.evidence.save("mcp-download", identity,
+                                {**lease, "operation_id": identity, "reused_from": prior_call.start.operation_id})
+                    break
+                if prepared is None:
+                    prepared = await preparation.run(dict(call.arguments), preparation_limit)
+                remaining_install = int(min(self.app.state.task_run.deadline_at - self.app.clock(),
+                    preparation_limit - (monotonic() - preparation_started)))
+                if token.is_cancelled or remaining_install < 1:
+                    raise ToolDownloadError("download.stopped_before_install")
+                self.service.maximum_timeout_seconds = min(maximum, remaining_install)
+                self.service.prepared_download = (digest(dict(call.arguments)), prepared)
+            return await self.client.call_tool(call.tool_name, dict(call.arguments))
+        pending = asyncio.create_task(invoke())
         try:
             while not pending.done():
                 await asyncio.wait({pending}, timeout=0.25)
@@ -301,6 +348,8 @@ class MCPPlanExecutor:
                         break
                     try:
                         await pending
+                    except ToolDownloadError:
+                        break  # Confirmed preparation stop; no installer was dispatched.
                     except BaseException:
                         pass
                     raise D3RecoveryRequired("mcp.outcome_unknown")
@@ -310,6 +359,10 @@ class MCPPlanExecutor:
                     or response.qualified_name != call.tool_name):
                 raise D3RecoveryRequired("mcp.execution_binding_changed")
             payload = self.app.redactor.redact_value(response if public else response.to_tool_payload())
+        except ToolDownloadError as exc:
+            payload = {"ok": False, "status": "failed", "tool": call.tool_name,
+                       "code": str(exc), "category": ("integrity" if "sha256" in str(exc) else
+                           "authorization" if "not_allowed" in str(exc) or "non_public" in str(exc) else "dependency")}
         except (MCPCommandPlanError, SandboxPolicyError):
             payload = {"ok": False, "status": "rejected",
                        "tool": call.tool_name, "code": "mcp.command_rejected"}
@@ -320,7 +373,7 @@ class MCPPlanExecutor:
                     await pending
                 except BaseException:
                     pass
-            code = "retrieval.outcome_unknown" if public else "mcp.outcome_unknown"
+            code = str(exc) if isinstance(exc, ToolDownloadUnknown) else "retrieval.outcome_unknown" if public else "mcp.outcome_unknown"
             if public and isinstance(exc, D3RecoveryRequired) and exc.args == ("retrieval.worker_stop_unconfirmed",):
                 code = "retrieval.worker_stop_unconfirmed"
             self._log.error("mcp.call_unknown", run=claim["task_run_id"], intent=intent_id,

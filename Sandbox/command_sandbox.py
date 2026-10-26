@@ -51,7 +51,13 @@ class T6TaskRunSandbox(TaskRunSandbox):
             spec["network_mode"] = self.private_network
         # 覆盖父类的 tmpfs 表，所以必须把 /tmp 一并带回来：根文件系统只读时，
         # 缺了它任何默认写临时目录的工具都会拿到 EROFS。
+        spec["environment"] = {
+            "PATH": "/tools/bin:/opt/dirsearch/bin:/opt/microsoft/powershell/7:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PYTHONPATH": "/tools/python:/opt/qinyuan/python",
+            "QINYUAN_OFFLINE_TOOL_INSTALL": "1",
+        }
         spec["tmpfs"] = {
+            "/tools": "rw,exec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700",
             "/workspace": (
                 f"rw,noexec,nosuid,nodev,size={self._settings.workspace_size},"
                 "uid=0,gid=0,mode=0755"

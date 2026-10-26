@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from agent_adapters.run_files import encode, immutable_read, immutable_write
 from agent_adapters.workbench_contracts import ACTIVE_RUN_STATUSES, WorkbenchError
+from agent_core.target_contracts import canonical_tcp_endpoint
 from agent_core.web_contracts import canonical_web_origin
 from agent_core.operation_accounting import D4BudgetPolicy
 from agent_core.command_contracts import T6EvidenceError
@@ -179,7 +180,10 @@ class Runner:
                     from agent_adapters.workbench import http_methods
                     http_methods(challenge.get('http_methods'))
                     try:
-                        canonical_web_origin(challenge['endpoint'])
+                        if challenge['endpoint'].startswith('tcp://') and self.workbench.execution_profile == 'd8_v22':
+                            canonical_tcp_endpoint(challenge['endpoint'])
+                        else:
+                            canonical_web_origin(challenge['endpoint'])
                     except (TypeError, ValueError):
                         raise WorkbenchError('d20_http_endpoint_invalid', 409) from None
             else:
@@ -289,9 +293,15 @@ class Runner:
                     if mode == "real":
                         from agent_adapters.simulation import real_config
                         from agent_adapters.deepseek_roles import role_config
-                        is_http = self.workbench.execution_profile in {'d8_v20','d8_v21','d8_v22'} and bool(challenge['endpoint'])
+                        is_tcp = self.workbench.execution_profile == 'd8_v22' and challenge['endpoint'].startswith('tcp://')
+                        is_http = self.workbench.execution_profile in {'d8_v20','d8_v21','d8_v22'} and bool(challenge['endpoint']) and not is_tcp
                         request["d8_config"] = real_config(contract_version=int(self.workbench.execution_profile.removeprefix("d8_v")),
                             http=is_http, http_timeout_seconds=challenge['step_timeout_seconds'])
+                        if is_tcp:
+                            endpoint = canonical_tcp_endpoint(challenge['endpoint'])
+                            request['task_request']['target']['endpoints'] = [{'url': endpoint}]
+                            request['authorization'] = dict(authorization_id=str(uuid4()), allowed_endpoint=endpoint,
+                                allowed_tool='sandbox_tcp', network_allowed=True, attachment_indices=list(range(len(names))))
                         if is_http:
                             origin = canonical_web_origin(challenge['endpoint'])
                             request['task_request']['target']['endpoints'] = [{'url': origin}]

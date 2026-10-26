@@ -9,6 +9,9 @@ from agent_core.session_contracts import D8DecisionRecord
 
 
 def _turn_authorized(config, binding):
+    if getattr(binding, 'kind', None) == 'tcp_target':
+        from agent_core.target_contracts import valid_turn
+        return valid_turn(config, binding)
     from agent_core.http_validation import valid_turn
     if getattr(binding, 'kind', None) in {'http_origin','hybrid_origin'}:
         return valid_turn(config, binding)

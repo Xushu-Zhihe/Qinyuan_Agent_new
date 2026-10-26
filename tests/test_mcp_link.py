@@ -363,6 +363,7 @@ def test_public_real22_wires_mcp_and_closes_same_loop(tmp_path, monkeypatch):
     class Model(simulation.SimulationModel):
         def __init__(self, role, settings):
             super().__init__(role)
+            self.settings = settings
         def bind_runtime(self, *args):
             pass
         def invoke(self, envelope, *args):
@@ -437,3 +438,62 @@ def test_mcp_decisions_trigger_existing_four_step_progress_review(linked):
     assert len(reviews) == 1
     assert len(case.app.mcp.records(intent)) == 5
     assert case.app.state.facts == ()
+
+
+@pytest.mark.parametrize("output_case", [22], indirect=True)
+@pytest.mark.parametrize("failure", [None,"known","unknown","budget"])
+def test_download_preparation_uses_original_ledger_and_feedback(output_case,monkeypatch,failure):
+    from Sandbox.tool_download import ToolDownload,ToolDownloadError,ToolDownloadUnknown
+    c=output_case
+    class DownloadTools(Tools):
+        def bind_agent(self,agent_id,*,allowed_tools):return self
+        async def call_tool(self,name,arguments):
+            self.calls.append((name,arguments))
+            return MCPExecutionResult(self.task,self.sandbox,name,"python3",(),"completed",0,"installed portable tool","",False)
+    tools=DownloadTools(c.task,c.app.state.task_run.sandbox_id)
+    tools.specs=[{"qualified_name":"download.install_tool","description":"Controlled download",
+        "input_schema":{"type":"object","properties":{"name":{"type":"string"},"url":{"type":"string"},"sha256":{"type":"string"}},
+                        "required":["name","url","sha256"],"additionalProperties":False},"tags":["download"]}]
+    sandbox=SimpleNamespace(_settings=SimpleNamespace(maximum_timeout_seconds=300),_runtime=SimpleNamespace(client=object()))
+    tools.sandbox_service=D8SandboxAdapter(sandbox,c.task,tools.sandbox)
+    c.app.mcp=MCPPlanExecutor(c.app,tools);c.app.mcp.authorize(c.task)
+    preparations=[]
+    elapsed=[0.0]
+    if failure=="budget":
+        monkeypatch.setattr("agent_adapters.mcp_plan_executor.monotonic",lambda:elapsed[0])
+    async def prepare(self,arguments,timeout):
+        preparations.append(self.operation_id)
+        if failure=="budget":elapsed[0]=timeout+1
+        if failure=="known":raise ToolDownloadError("download.http_404")
+        if failure=="unknown":raise ToolDownloadUnknown("download.worker_stop_unconfirmed")
+        result={"wheelhouse":"/tools/wheels/"+self.operation_id,"wheel_hashes":{}}
+        self.evidence.save("mcp-download",self.operation_id,{"state":"prepared","prepared":result})
+        return result
+    monkeypatch.setattr(ToolDownload,"run",prepare)
+    seen=[]
+    def select(envelope,raw):
+        if getattr(envelope.request,"stage",None)=="inner_plan":
+            session=json.loads(envelope.request.session_context);seen.append(session)
+            if len(seen)>(2 if failure is None else 1):c.token.is_cancelled=True
+            return {"kind":"mcp_call","tool_name":"download.install_tool",
+                    "arguments":{"name":"sevenzip","url":"https://source.test/portable","sha256":"0"*64}}
+        return raw
+    c.models["inner"].transform=select
+    result=asyncio.run(c.app.run(c.token))
+    assert len(preparations)==1
+    assert not c.app.state.facts
+    if failure=="unknown":
+        assert result.recovery_required and result.stop_reason=="download.worker_stop_unconfirmed"
+        assert not tools.calls and c.app.mcp.records()[0].completion is None
+    else:
+        feedback=[m["content"]["mcp_tool_result"] for m in seen[-1]["messages"]
+                  if m.get("role")=="tool" and "mcp_tool_result" in m.get("content",{})]
+        assert feedback
+        assert all(o["status"]==("failed" if failure else "completed") for o in feedback)
+        if failure:
+            expected="download.stopped_before_install" if failure=="budget" else "download.http_404"
+            assert feedback[-1]["code"]==expected and not tools.calls
+        else:
+            assert len(tools.calls)==2
+            assert c.app.output_boundary.evidence.read("mcp-download",c.app.mcp.records()[-1].start.operation_id)["reused_from"]
+        assert all(o.completion is not None for o in c.app.mcp.records())

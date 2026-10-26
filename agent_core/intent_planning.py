@@ -1,6 +1,7 @@
 """Contract22 planning guidance; strategic diversity remains a model judgment."""
 
 import json
+from dataclasses import dataclass
 
 
 REVIEW_HISTORY_GUIDANCE = (
@@ -45,6 +46,15 @@ DIAGNOSTIC_GUIDANCE = (
     "for noise/timing/stability, can continue without diagnosis at each step. Elapsed time, request count, "
     "identical responses and absence of Facts alone never trigger diagnosis or prove stagnation. "
     "First distinguish tool, transport, permission or measurement failures from target counterevidence. "
+    "For a related series testing one hypothesis, optionally reuse a short exploration_group label on tool "
+    "decisions, including parameter variants or different tools; omit for unrelated work. Labels are advisory, "
+    "not evidence or permissions. repetition_advice is a matching-observation checkpoint: consider relevant "
+    "Facts, observations and working records, then decide whether to continue, discriminate or change method. "
+    "An equal result can still exclude candidates or increase finite coverage; no forced explanation or switch. "
+    "A completed tool result is feedback, including an error or negative result. In the next useful decision, "
+    "account for what it supports, rules out or leaves unchanged. If an unchanged action still matters, "
+    "explain its control, state-change or coverage purpose in the existing reason/working_record when useful. "
+    "Do not mechanically change direction after every result or repeat a contradicted premise without a new check. "
     "A diagnostic explanation remains an unverified hypothesis; a negative observation need not identify its cause. "
     "Once a diagnostic check is planned and progressing, do not repeat the same reflection at each review. "
     "Revisit it only if new results contradict it, it is infeasible or cannot discriminate, exploration expands "
@@ -167,3 +177,45 @@ def candidate_limit(request):
     # Check legacy intent_planning version flag
     return None if enabled(request) else 2
 
+
+@dataclass(frozen=True)
+class IntentTurnProposal:
+    turn_target: str
+    intents: tuple
+
+
+def parse_directions(request,raw,revisions):
+    from agent_core.handoff_contracts import checked_refs
+    from agent_core.modeling import IntentCandidate
+    from agent_core.handoff import D8PlanningResult,D8DependencyCandidatesRejected
+    raw = without_order_reason(request, raw)
+    if not isinstance(raw,dict):raise ValueError('intent.planning_invalid')
+    if raw.get('kind')=='exhausted':
+        if set(raw)!={'kind','reason','evidence_refs'} or not isinstance(raw['reason'],str) or not raw['reason'].strip():
+            raise ValueError('intent.exhaustion_invalid')
+        checked_refs(raw['evidence_refs'],{i.ref for i in request.history})
+        return D8PlanningResult(None,(),(),raw['reason'])
+    maximum=candidate_limit(request)
+    if (set(raw)!={'kind','intents'} or raw['kind']!='candidates' or not isinstance(raw['intents'],list)
+            or not raw['intents'] or maximum is not None and len(raw['intents'])>maximum):
+        raise ValueError('intent.planning_invalid')
+    available={i.ref for i in request.history}
+    kept,deps,rejected=[],[],[]
+    for index,item in enumerate(raw['intents']):
+        if not isinstance(item,dict) or set(item)!={'description','intent_type','dependency_refs'}:
+            raise ValueError('intent.candidate_fields_invalid')
+        refs=checked_refs(item['dependency_refs'],available)
+        if any(i.source_status!='available' or i.conflict or revisions and not revisions.reliable(i)
+               for i in request.history if i.ref in refs):
+            rejected.append(index)
+            continue
+        kept.append(IntentCandidate(item['description'],item['intent_type']))
+        deps.append(refs)
+    if not kept:raise D8DependencyCandidatesRejected(rejected)
+    return D8PlanningResult(IntentTurnProposal(request.goal,tuple(kept)),tuple(deps),tuple(rejected))
+
+
+def direction_schema(request):
+    from agent_core.output_contracts import tagged, array, INTENT, REFS, text
+    return {"anyOf": [candidate_schema(request, {"intents": array(INTENT, 1, candidate_limit(request))}),
+                      tagged("exhausted", {"reason": text(512), "evidence_refs": REFS})]}

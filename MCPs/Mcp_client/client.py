@@ -589,6 +589,10 @@ class MCPManager:
             ) from exc
 
         request, bootstrap_seconds = self._extract_command_plan(mcp_result)
+        if meta.server_name == "download":
+            prepare = getattr(self.sandbox_service, "prepared_tool_command", None)
+            if prepare is not None:
+                request = prepare(qualified_name, arguments, request)
 
         if bootstrap_seconds and meta.server_name != "download":
             raise MCPCommandPlanError(

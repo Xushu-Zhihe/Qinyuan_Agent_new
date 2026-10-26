@@ -86,6 +86,7 @@ class T6TargetNetwork:
             "egress_name": self._egress_name(task_run_id),
             "user": "10001:10001",
             "read_only": True,
+            "download_tmpfs": {"/tools-download": "rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700"},
             "cap_drop": ["ALL"],
             "security_opt": ["no-new-privileges:true"],
         }
@@ -166,6 +167,7 @@ class T6TargetNetwork:
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges:true"],
                 user="10001:10001",
+                tmpfs={"/tools-download": "rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700"},
                 mem_limit="128m",
                 memswap_limit="128m",
                 pids_limit=64,
@@ -231,6 +233,8 @@ class T6TargetNetwork:
                     raise ValueError("network_configuration_mismatch")
             config = proxy.attrs.get("Config") or {}
             host = proxy.attrs.get("HostConfig") or {}
+            if host.get("Tmpfs") != {"/tools-download": "rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700"}:
+                raise T6TargetNetworkError("bind", "configuration_mismatch", (binding.forwarder_id,))
             networks = (proxy.attrs.get("NetworkSettings") or {}).get("Networks") or {}
             if (
                 proxy.status != "running"
