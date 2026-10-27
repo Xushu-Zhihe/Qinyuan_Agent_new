@@ -177,7 +177,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 32
+CURRENT_SCHEMA_VERSION = 34
 
 MIGRATION_28 = """
 CREATE TABLE d8_conclusions_new (
@@ -1355,6 +1355,14 @@ class SqliteControlStore:
                 for statement in _sql_statements(stage_storage.SCHEMA):
                     self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (32,self._now()))
+            if version < 33:
+                for statement in _sql_statements(stage_storage.FACT_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (33,self._now()))
+            if version < 34:
+                for statement in _sql_statements(stage_storage.CANDIDATE_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (34,self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -3350,6 +3358,8 @@ class SqliteControlStore:
         if self.blocking_d4_operations(start.task_run_id):
             raise D4RecoveryRequired("an earlier operation result remains unknown")
         records = self.list_d4_operations(start.task_run_id)
+        if stage_config is not None and start.category == "tool_dispatch":
+            stage_storage.validate_tool_start(self, start)
         config = self.load_d3_run_config(start.task_run_id)
         if start.charged and stage_config is None and config.intent_execution_policy != "continuous_v1":
             if sum(record.start.charged for record in records) >= budget.total:
@@ -4178,6 +4188,10 @@ class SqliteControlStore:
         self._mark_d4_operation_applied(fact.model_request_id, fact.process_fact_id)
 
     def _validate_d7_mutation(self, mutation: ControlMutation) -> None:
+        if mutation.d7 is not None and self.load_stage_run_config(mutation.task_run_id) is not None:
+            from agent_core.stage_storage import validate_goal_mutation
+            validate_goal_mutation(self, mutation)
+            return
         metadata = mutation.d7
         if metadata is not None and metadata.run_config is not None:
             config = metadata.run_config

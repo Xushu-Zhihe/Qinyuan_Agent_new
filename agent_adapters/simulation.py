@@ -282,7 +282,12 @@ class _LifecycleModel:
         raise ValueError("d8_lifecycle_model_dispatch_forbidden")
 
 
-def run_simulated_task(directory, declaration, *, operation="start", validation_selection=None, validation_checker=None, finalize_export=None, competition_request=None):
+def run_simulated_task(directory, declaration, *, operation="start", validation_selection=None, validation_checker=None, finalize_export=None, competition_request=None, human_decision=None):
+    if declaration.get("execution_profile") == "d8_v22":
+        from agent_adapters.stage_public import run_stage_task
+        return run_stage_task(directory, declaration, operation=operation, validation_selection=validation_selection,
+            validation_checker=validation_checker, finalize_export=finalize_export, competition_request=competition_request,
+            human_decision=human_decision)
     from agent_adapters.web.task_result import snapshot_v3_task_result
     from agent_adapters.web.request_staging import D7RequestStager
 

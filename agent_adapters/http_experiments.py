@@ -73,6 +73,36 @@ class HttpExperiments:
     def evidence(self):
         return self.mcp.evidence
 
+    @property
+    def stage(self):
+        return self.app.store.load_stage_run_config(self.app.state.task_run.task_run_id) is not None
+
+    def _limits(self, owner):
+        app = self.app
+        if self.stage:
+            turn = next(t for t in app.store.list_stage_turns(app.task_id) if any(r.road_id == owner for r in t.roads))
+            return app.validator.action_limits(app.task_id, turn.turn_id, owner)[1]
+        turn_id = next(i.turn_id for i in app.state.intents if i.intent_id == owner)
+        _, maximum = app.validator.action_limits(app.state.task_run.task_run_id, turn_id, owner)
+        app.validator._allowed(app.state.task_run.task_run_id, turn_id, owner, 'probe', maximum)
+        return maximum
+
+    async def _strategy(self, owner=None, *, start=False):
+        if self.stage:
+            if owner is not None:
+                await self.app._supervise(owner, self.app._token)
+            return False
+        self.app.supervision.poll()
+        if start and owner is not None and self.app.sessions.due(owner):
+            self.app.supervision.start(owner)
+        return owner is not None and self.app.supervision.stop(owner)
+
+    def _apply_parent(self, parent):
+        if self.stage:
+            self.app.store.mark_d4_operation_applied(parent, parent)
+        else:
+            self.app.store.mark_d3_operation_applied(parent, parent)
+
     def validate(self, call):
         args = call.arguments
         if (not self.enabled or set(args) != {'script','timeout_seconds'}
@@ -106,9 +136,18 @@ class HttpExperiments:
                 or session['intent_id'] != claim['intent_id'] or session['call'] != claim['call']
                 or session['authorization_sha256'] != web.policy()['authorization_sha256']):
             raise D3RecoveryRequired('d22_experiment_source_changed')
-        native = self.app.model_evidence.read(claim['model_request_id'])
-        parent = self.app.store.load_d3_operation(claim['model_request_id'])
-        if (native is None or parent is None or native.outcome != 'accepted' or native.stage != 'inner_plan'
+        if self.stage:
+            from agent_core.stage_contracts import PlanningSession
+            parent = self.app.store.load_d4_operation(claim['model_request_id'])
+            native = self.evidence.read_model_result(parent)
+            if (parent.start.category != 'action' or parent.start.role != 'inner_action'
+                    or native.session != PlanningSession('road_execution',claim['intent_id'])):
+                raise D3RecoveryRequired('d22_experiment_source_changed')
+            proposal = native.result
+        else:
+            native = self.app.model_evidence.read(claim['model_request_id'])
+            parent = self.app.store.load_d3_operation(claim['model_request_id'])
+            if (native is None or parent is None or native.outcome != 'accepted' or native.stage != 'inner_plan'
                 or native.task_run_id != claim['task_run_id'] or parent.start.task_run_id != claim['task_run_id']
                 or parent.start.category != 'inner_model' or parent.start.role != 'inner_action'
                 or native.role_config_ref != self.app.config.inner_role.role_config_ref
@@ -117,11 +156,11 @@ class HttpExperiments:
                 or parent.completion is None or parent.completion.result_kind != 'completed'
                 or parent.completion.evidence_ref != claim['model_request_id']
                 or parent.completion.evidence_sha256 != digest(asdict(native))):
-            raise D3RecoveryRequired('d22_experiment_source_changed')
-        try:
-            proposal = parse_d3_plan_proposal(native.raw)
-        except (TypeError, ValueError) as error:
-            raise D3RecoveryRequired('d22_experiment_source_changed') from error
+                raise D3RecoveryRequired('d22_experiment_source_changed')
+            try:
+                proposal = parse_d3_plan_proposal(native.raw)
+            except (TypeError, ValueError) as error:
+                raise D3RecoveryRequired('d22_experiment_source_changed') from error
         if not isinstance(proposal, MCPCall) or asdict(proposal) != session['call']:
             raise D3RecoveryRequired('d22_experiment_source_changed')
         raw = web.protected.read(source['evidence_id'])
@@ -161,7 +200,9 @@ class HttpExperiments:
 
     def reconcile(self):
         # A lost script may have already changed the target. Never replay it.
-        for op in self.app.store.list_d3_operations(self.app.state.task_run.task_run_id):
+        operations = (self.app.store.list_d4_operations(self.app.state.task_run.task_run_id) if self.stage else
+                      self.app.store.list_d3_operations(self.app.state.task_run.task_run_id))
+        for op in operations:
             identity = op.start.operation_id
             session = self.evidence.read('experiment-session',identity)
             if session is None or identity == self.live:
@@ -195,15 +236,14 @@ class HttpExperiments:
                         requests=[r.start.operation_id for r in rows],status='interrupted',
                         code='d22_experiment_process_lost',output='')
                 self.evidence.save('experiment-result',identity,restored)
-            self.app.store.mark_d3_operation_applied(identity,identity)
+            self._apply_parent(identity)
 
     async def _event(self, runner, token, expires, intent_id=None):
         pending = asyncio.create_task(asyncio.to_thread(runner.receive))
         try:
             while not pending.done():
                 await asyncio.wait({pending},timeout=0.025)
-                self.app.supervision.poll()
-                if intent_id is not None and self.app.supervision.stop(intent_id):
+                if await self._strategy(intent_id):
                     raise _StrategyStop()
                 if token.is_cancelled:
                     raise InterruptedError('d22_experiment_cancelled')
@@ -219,10 +259,7 @@ class HttpExperiments:
         app._check_dispatch()
         if set(raw) != {'kind','method','path_query','headers','body'} or not isinstance(raw['headers'],dict):
             raise ValueError('d22_experiment_request_invalid')
-        _, maximum = app.validator.action_limits(app.state.task_run.task_run_id,
-            next(i.turn_id for i in app.state.intents if i.intent_id==intent_id),intent_id)
-        app.validator._allowed(app.state.task_run.task_run_id,
-            next(i.turn_id for i in app.state.intents if i.intent_id==intent_id),intent_id,'probe',maximum)
+        maximum = self._limits(intent_id)
         from agent_adapters.http_capability import wire_id
         identity = wire_id(app.state.task_run.task_run_id,'experiment/request/'+parent+'/'+str(ordinal))
         proposed = D7HttpRequest(identity,raw['method'],raw['path_query'],tuple(raw['headers'].items()),raw['body'])
@@ -253,7 +290,7 @@ class HttpExperiments:
         try:
             while not pending.done():
                 await asyncio.wait({pending},timeout=0.025)
-                app.supervision.poll()
+                await self._strategy(intent_id)
                 if token.is_cancelled or app.clock() >= app.state.task_run.deadline_at or time.monotonic() >= expires:
                     raise D3RecoveryRequired('d22_experiment_request_outcome_unknown')
             response = pending.result()
@@ -286,15 +323,13 @@ class HttpExperiments:
         self.validate(call)
         app = self.app
         if self.result(parent) is not None:
-            app.store.mark_d3_operation_applied(parent,parent)
+            self._apply_parent(parent)
             return
         if self.evidence.read('experiment-session',parent) is not None:
             raise D3RecoveryRequired('d22_experiment_replay_forbidden')
         app._check_dispatch()
         app.web.attach()
-        intent = next(i for i in app.state.intents if i.intent_id == intent_id)
-        _, maximum = app.validator.action_limits(app.state.task_run.task_run_id,intent.turn_id,intent_id)
-        app.validator._allowed(app.state.task_run.task_run_id,intent.turn_id,intent_id,'probe',maximum)
+        maximum = self._limits(intent_id)
         timeout = min(call.arguments['timeout_seconds'],maximum,app.state.task_run.deadline_at-app.clock())
         if timeout <= 0:
             raise TimeoutError('d22_experiment_timeout')
@@ -319,7 +354,7 @@ class HttpExperiments:
                     exec_id=runner.exec_id))
                 while True:
                     event = await self._event(runner,token,expires,intent_id)
-                    app.supervision.poll()
+                    await self._strategy(intent_id)
                     if event.get('kind') == 'finished':
                         if (event.get('status') not in {'completed','failed'} or not isinstance(event.get('output'),str)
                                 or len(event['output'].encode('utf-8'))>MAX_SCRIPT_BYTES):
@@ -332,9 +367,7 @@ class HttpExperiments:
                             if type(line) is int and 1<=line<=call.arguments['script'].count('\n')+1:
                                 finished['error_line']=line
                         break
-                    if app.sessions.due(intent_id):
-                        app.supervision.start(intent_id)
-                    if app.supervision.stop(intent_id):
+                    if await self._strategy(intent_id, start=True):
                         finished = dict(status='stopped',code='d22_experiment_strategy_stop',output='')
                         break
                     if event.get('kind') != 'request':
@@ -350,8 +383,7 @@ class HttpExperiments:
                             category='policy',code=code)
                         finished = dict(status='rejected',code=code,output='')
                         break
-                    if app.sessions.due(intent_id):
-                        app.supervision.start(intent_id)
+                    await self._strategy(intent_id, start=True)
                     await asyncio.to_thread(runner.send,result)
         except D3RecoveryRequired as error:
             primary_error = error
@@ -397,6 +429,6 @@ class HttpExperiments:
                 self.live = None
         result = dict(session_sha256=digest(session),requests=[r.start.operation_id for r in self.records(parent)],**finished)
         self.evidence.save('experiment-result',parent,result)
-        app.store.mark_d3_operation_applied(parent,parent)
+        self._apply_parent(parent)
         self.log.info('experiment.finished',run=session['task_run_id'],intent=intent_id,request=parent,
             status=result['status'],code=result['code'],request_count=len(result['requests']))

@@ -221,6 +221,12 @@ window.addEventListener("d9-validation-check", async (event) => {
   try { const run = await request(`/api/challenges/${challengeId}/validation-check`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(selection) }); renderRun(run); await refreshRun(challengeId); notify("核查请求已交给可信入口；不会自动执行任务"); }
   catch (error) { notify(`核查未启动：${error.message}`); }
 });
+  window.addEventListener("stage-human-decision", async (event) => {
+    const { challengeId, selection } = event.detail;
+    if (!challengeId || challengeId !== state.selected) return;
+    try { const run = await request(`/api/challenges/${challengeId}/human-decision`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(selection) }); renderRun(run); await refreshRun(challengeId); notify("人工决定已登记"); }
+    catch (error) { notify(`人工决定未完成：${error.message}`); }
+  });
 async function loadTasks() { state.tasks = await request("/api/challenges"); renderTaskList(); if (state.selected && state.tasks.some((task) => task.id === state.selected)) selectTask(state.selected, false); else resetForm(); }
 async function saveTask(event) {
   event.preventDefault(); const value = { title: $("task-title").value.trim(), category: $("task-category").value, description: $("task-description").value, endpoint: $("task-endpoint").value.trim(), deadline_minutes: Number($("task-deadline").value), step_timeout_seconds: Number($("step-timeout").value) };

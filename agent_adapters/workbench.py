@@ -748,6 +748,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise WorkbenchError('d9_validation_check_fields_invalid') from exc
                 self._send(HTTPStatus.ACCEPTED, result)
                 return
+            if len(parts) == 4 and parts[3] == "human-decision" and self.command == "POST":
+                self._send(HTTPStatus.OK, workbench.runner.human_decision(challenge_id, self._json()))
+                return
             if len(parts) == 4 and parts[3] == "cleanup" and self.command == "POST":
                 self._send(HTTPStatus.ACCEPTED, workbench.runner.cleanup(challenge_id))
                 return

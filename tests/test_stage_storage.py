@@ -415,7 +415,7 @@ def test_schema_update_rolls_back_and_does_not_adopt_existing_tasks(tmp_path, mo
     with sqlite3.connect(case.path) as db:
         for table in ("stage_sessions", "stage_roads", "stage_turns", "stage_runs"):
             db.execute("DROP TABLE " + table)
-        db.execute("DELETE FROM schema_versions WHERE version=32")
+        db.execute("DELETE FROM schema_versions WHERE version>=32")
     schema = stage_storage.SCHEMA
     monkeypatch.setattr(stage_storage, "SCHEMA", schema.replace("CREATE TABLE stage_turns", "CREATE TABL stage_turns"))
     with pytest.raises(StorageError, match="schema migration failed"):

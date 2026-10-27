@@ -43,6 +43,11 @@ from agent_core.tool_contracts import (
 from agent_core.stage_contracts import (
     PlanningExhausted,
     RoadCandidate,
+    StageConclusionChange,
+    StageFactSelection,
+    StageFactProposal,
+    StageHistoryRead,
+    StagePlanningDecision,
     StageTurnSnapshot,
     TurnIntent,
     TurnPlanningContext,
@@ -50,6 +55,7 @@ from agent_core.stage_contracts import (
     TurnPlanningReview,
 )
 from agent_core.handoff_contracts import D8HistoryItem
+from agent_core.conclusion_revision_contracts import D8ChangeDecision
 
 
 class ClockPort(Protocol):
@@ -224,17 +230,17 @@ class TurnPlanningPort(Protocol):
     async def propose_roads(
         self, context: TurnPlanningContext, operation_id: str,
         cancellation_token: CancellationToken,
-    ) -> tuple[RoadCandidate, ...] | PlanningExhausted | ModelError: ...
+    ) -> tuple[RoadCandidate, ...] | PlanningExhausted | StageFactSelection | StageHistoryRead | StageConclusionChange | StageFactProposal | StagePlanningDecision | ModelError: ...
 
 
 class TurnPlanningReviewPort(Protocol):
     """Outer reviews a frozen proposal; the trusted controller owns commit."""
 
     async def review(
-        self, context: TurnPlanningContext, proposal: TurnPlanningProposal,
+        self, context: TurnPlanningContext, proposal: TurnPlanningProposal | StageFactProposal,
         proposal_operation_id: str, operation_id: str,
         cancellation_token: CancellationToken,
-    ) -> TurnPlanningReview | ModelError: ...
+    ) -> TurnPlanningReview | D8ChangeDecision | ModelError: ...
 
 
 class TurnProjectionPort(Protocol):

@@ -156,7 +156,8 @@ class HttpCapability:
     def cookie_history(self):
         """Recheck the complete durable chain, including read-only projections."""
         values=[]
-        for plan in self.state.plans:
+        plans = () if self.store.load_stage_run_config(self.task.task_run_id) is not None else self.state.plans
+        for plan in plans:
             binding=self.store.load_d3_plan_binding(plan.plan_id)
             if not isinstance(binding,HttpPlanBinding):continue
             value=self.result(binding.execution_id)

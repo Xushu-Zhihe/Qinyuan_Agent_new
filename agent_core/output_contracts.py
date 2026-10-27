@@ -100,6 +100,9 @@ CLAIM = obj({"subject_ref": S, "observation_scope": S, "claim_key": text(128),
 
 
 def output_schema(request, *, contract_version=None):
+    from agent_core.stage_planning import StageModelRequest, schema as stage_schema
+    if isinstance(request, StageModelRequest):
+        return request.stage, stage_schema(request)
     stage, schema = _base_output_schema(request, contract_version=contract_version)
     if contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
         from agent_core.governance_policy import patch_schema

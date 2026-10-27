@@ -778,7 +778,7 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
         ),
         "register_d7_candidate": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
-            allowed_results=frozenset({"awaiting_external_feedback"}),
+            allowed_results=frozenset({"awaiting_external_feedback", "awaiting_confirmation"}),
         ),
         "apply_external_validation_feedback": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
@@ -1278,11 +1278,11 @@ def validate_control_event(
         task_change = state_changes[0]
         if operation == "register_d7_candidate":
             if (
-                task_change.status is not TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
-                or event.status is not TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
+                task_change.status not in {TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK, TaskRunStatus.AWAITING_CONFIRMATION}
+                or event.status is not task_change.status
                 or details.get("candidate_id") is None
                 or details.get("evidence_version") is None
-                or details.get("result") != "awaiting_external_feedback"
+                or details.get("result") != task_change.status.value
                 or details.get("entity_ids") != [task_change.task_run_id, details.get("candidate_id")]
             ):
                 raise ValueError("D7 candidate event does not match its waiting transition")

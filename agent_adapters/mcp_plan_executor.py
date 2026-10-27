@@ -226,7 +226,10 @@ class MCPPlanExecutor:
         elif operation.completion != completion:
             raise D3RecoveryRequired("mcp.completion_binding_changed")
         if 'experiment_request' not in claim:
-            self.app.store.mark_d3_operation_applied(claim["model_request_id"], operation.start.operation_id)
+            if self.app.store.load_stage_run_config(claim["task_run_id"]) is not None:
+                self.app.store.mark_d4_operation_applied(claim["model_request_id"], operation.start.operation_id)
+            else:
+                self.app.store.mark_d3_operation_applied(claim["model_request_id"], operation.start.operation_id)
         if payload["status"] == "completed":
             self.app.store.mark_d4_operation_applied(operation.start.operation_id, operation.start.operation_id)
 
@@ -273,7 +276,19 @@ class MCPPlanExecutor:
                 raise D3RecoveryRequired("mcp.outcome_unknown")
             self._apply(prior, claim, result)
             return
-        intent = next(i for i in self.app.state.intents if i.intent_id == intent_id)
+        stage_config = self.app.store.load_stage_run_config(claim["task_run_id"])
+        stage_turn = next((t for t in self.app.store.list_stage_turns(claim["task_run_id"])
+            if any(r.road_id == intent_id for r in t.roads)), None) if stage_config is not None else None
+        if stage_config is not None and stage_turn is None:
+            raise D3RecoveryRequired("stage.tool_road_not_running")
+        if stage_turn is not None:
+            from agent_core.domain import IntentStatus
+            if not any(r.road_id == intent_id and r.status is IntentStatus.RUNNING for r in stage_turn.roads):
+                raise D3RecoveryRequired("stage.tool_road_not_running")
+            from types import SimpleNamespace
+            intent = SimpleNamespace(turn_id=stage_turn.turn_id)
+        else:
+            intent = next(i for i in self.app.state.intents if i.intent_id == intent_id)
         allowed, maximum = self.app.validator.action_limits(
             claim["task_run_id"], intent.turn_id, intent_id)
         # Reuse the existing execution permission; completion-only reviews forbid tools.

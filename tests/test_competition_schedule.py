@@ -79,10 +79,11 @@ def test_expired_deadline_cannot_be_extended_or_reactivated(http_case):
 
 @pytest.mark.parametrize("http_case",["continuous"],indirect=True)
 def test_control_state_survives_readonly_reopen_without_migration(http_case):
-    from agent_core.sqlite_control_store import SqliteControlStore
+    from agent_core.sqlite_control_store import SqliteControlStore, CURRENT_SCHEMA_VERSION
     c=http_case;configure(c);command(c,"pause")
     with SqliteControlStore.open_readonly(c.app.store.path) as store:
-        assert store._schema_version==31 and controls.current(store,c.task)["paused"]
+        assert store._schema_version==CURRENT_SCHEMA_VERSION and controls.current(store,c.task)["paused"]
+        assert store._connection.total_changes == 0
         assert store._connection.execute("PRAGMA foreign_key_check").fetchall()==[]
 
 

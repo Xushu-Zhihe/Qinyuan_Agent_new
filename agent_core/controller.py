@@ -17,6 +17,7 @@ from agent_core.contracts import (
     TaskRequestError,
     resolve_model_backend,
 )
+from agent_core.stage_contracts import StageRunConfig
 from agent_core.control_state_repository import ControlStateRepository, RecoveryResult
 from agent_core.control_store import (
     AppendD2ReviewApplication,
@@ -450,6 +451,7 @@ class TaskRunController(LegacyTaskRunController):
         d2_config: D2RunConfig | None = None,
         d3_config: D3RunConfig | None = None,
         d7_web_config: D7WebRunConfig | None = None,
+        stage_config: StageRunConfig | None = None,
     ) -> Any:
         if self._persistent is None:
             if (
@@ -461,12 +463,13 @@ class TaskRunController(LegacyTaskRunController):
                 or d2_config is not None
                 or d3_config is not None
                 or d7_web_config is not None
+                or stage_config is not None
             ):
                 raise InvalidTransition("persistent dependencies are required for this start signature")
             return super().start(request)
         return self._start_persistent(
             request, effective_model_backend, mutation_id, source_root, task_run_id,
-            d1_config, d2_config, d3_config, d7_web_config,
+            d1_config, d2_config, d3_config, d7_web_config, stage_config,
         )
 
     def _start_persistent(
@@ -480,6 +483,7 @@ class TaskRunController(LegacyTaskRunController):
         d2_config: D2RunConfig | None = None,
         d3_config: D3RunConfig | None = None,
         d7_web_config: D7WebRunConfig | None = None,
+        stage_config: StageRunConfig | None = None,
     ) -> CommittedOperation:
         deps = self._require_persistent()
         if self._persistent_task_run_id is not None or self._closed:
@@ -499,6 +503,8 @@ class TaskRunController(LegacyTaskRunController):
         if request.model_backend is not None and request.model_backend is not backend:
             raise TaskRequestError("TaskRequest model_backend conflicts with effective_model_backend")
         source_root = _validate_source_root(source_root)
+        if stage_config is not None and any(c is not None for c in (d1_config, d2_config, d3_config, d7_web_config)):
+            raise TaskRequestError("stage configuration cannot mix legacy run configurations")
         if d2_config is not None and (
             not isinstance(d2_config, D2RunConfig) or d1_config is None
         ):
@@ -601,6 +607,10 @@ class TaskRunController(LegacyTaskRunController):
                     "result": task_run_id,
                 },
             )
+            from agent_core.stage_contracts import PlanningSession, StageStateChange
+            from agent_core.turn_modeling import stable_id
+            stage_change = (() if stage_config is None else (StageStateChange(config=stage_config,
+                sessions=(PlanningSession("turn_planning", stable_id(task_run_id, "stage/root")),)),))
             mutation = ControlMutation.create(
                 task_run_id=task_run_id,
                 mutation_id=mutation_id,
@@ -608,7 +618,7 @@ class TaskRunController(LegacyTaskRunController):
                 request=request,
                 effective_model_backend=backend,
                 base_checkpoint_sequence=0,
-                state_changes=(change,),
+                state_changes=(change, *stage_change),
                 event=event,
                 d1_config=d1_config,
                 d2_config=d2_config,
@@ -1788,10 +1798,11 @@ class TaskRunController(LegacyTaskRunController):
         task_run, state = self._require_bound_state()
         replay = self._load_existing_commit(mutation_id)
         if replay is not None:
-            self._assert_finish_replay(
-                replay,
-                {TaskRunStatus.DEADLINE_EXCEEDED.value, TaskRunStatus.ASSUMED_ACHIEVED.value},
-            )
+            allowed = {TaskRunStatus.DEADLINE_EXCEEDED.value, TaskRunStatus.ASSUMED_ACHIEVED.value}
+            if (self._require_persistent().store.load_stage_run_config(task_run.task_run_id) is not None
+                    and task_run.failure_reason == "human_confirmation_timeout"):
+                allowed.add(TaskRunStatus.INCONCLUSIVE.value)
+            self._assert_finish_replay(replay, allowed)
             return CommittedOperation.from_commit(replay)
         self._require_persistent()
         if task_run.status in TERMINAL_STATUSES:
@@ -1811,6 +1822,11 @@ class TaskRunController(LegacyTaskRunController):
             and task_run.confirmation_deadline is not None
             and now >= task_run.confirmation_deadline
         ):
+            if self._require_persistent().store.load_stage_run_config(task_run.task_run_id) is not None:
+                return self._finish_persistent(
+                    TaskRunStatus.INCONCLUSIVE, mutation_id=mutation_id, now=now,
+                    failure_reason="human_confirmation_timeout",
+                )
             return self._finish_persistent(
                 TaskRunStatus.ASSUMED_ACHIEVED,
                 mutation_id=mutation_id,
@@ -1873,6 +1889,7 @@ class TaskRunController(LegacyTaskRunController):
         self,
         candidate: D7AnswerCandidate,
         mutation_id: str,
+        *, manual_confirmation: bool = False,
     ) -> CommittedOperation:
         """Persist candidate provenance and pause the TaskRun for trusted feedback."""
 
@@ -1902,7 +1919,7 @@ class TaskRunController(LegacyTaskRunController):
             mutation_id=mutation_id,
             operation="register_d7_candidate",
             metadata=D7CommitMetadata(candidate=candidate),
-            status=TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
+            status=TaskRunStatus.AWAITING_CONFIRMATION if manual_confirmation else TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
             now=now,
             base_checkpoint_sequence=(
                 replay.checkpoint.sequence - 1
@@ -1910,6 +1927,7 @@ class TaskRunController(LegacyTaskRunController):
                 else state.latest_checkpoint.sequence
             ),
             replay=replay,
+            confirmation_deadline=min(now + 300, task_run.deadline_at) if manual_confirmation else None,
         )
 
     def apply_external_validation_feedback(
@@ -1956,7 +1974,7 @@ class TaskRunController(LegacyTaskRunController):
         )
         if prior_determinate or task_run.status in TERMINAL_STATUSES:
             status = task_run.status
-        elif task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK:
+        elif task_run.status in {TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK, TaskRunStatus.AWAITING_CONFIRMATION}:
             status = (
                 TaskRunStatus.DEADLINE_EXCEEDED
                 if now >= task_run.deadline_at
@@ -2111,6 +2129,7 @@ class TaskRunController(LegacyTaskRunController):
         now: float,
         base_checkpoint_sequence: int,
         replay: ControlCommitResult | None = None,
+        confirmation_deadline: float | None = None,
     ) -> CommittedOperation:
         deps = self._require_persistent()
         task_run, state = self._require_bound_state()
@@ -2131,7 +2150,7 @@ class TaskRunController(LegacyTaskRunController):
             deadline_at=task_run.deadline_at,
             status=status,
             sandbox_id=task_run.sandbox_id,
-            confirmation_deadline=task_run.confirmation_deadline,
+            confirmation_deadline=confirmation_deadline if operation == "register_d7_candidate" else task_run.confirmation_deadline,
             finished_at=finished_at,
             failure_reason=task_run.failure_reason,
             source_root=task_run.source_root,
@@ -2146,7 +2165,7 @@ class TaskRunController(LegacyTaskRunController):
             details["entity_ids"] = [task_run.task_run_id, candidate.candidate_id]
             details["candidate_id"] = candidate.candidate_id
             details["evidence_version"] = candidate.evidence_version
-            result = "awaiting_external_feedback"
+            result = status.value
         elif metadata.feedback is not None:
             feedback = metadata.feedback
             details["entity_ids"] = [task_run.task_run_id, feedback.candidate_id]
@@ -2286,6 +2305,15 @@ class TaskRunController(LegacyTaskRunController):
                     or state.executions
                 ):
                     raise InvalidTransition("capability conclusion requires an empty-input D3 run")
+            elif reason == "human_unverified_end":
+                task_run, _ = self._require_bound_state()
+                config = self._require_persistent().store.load_stage_run_config(task_run.task_run_id)
+                if config is None or config.goal_validation != "human" or task_run.status is not TaskRunStatus.AWAITING_CONFIRMATION:
+                    raise InvalidTransition("human end requires an awaited stage candidate")
+            elif reason in {"stage.exhausted", "stage.root_planning_exhausted", "stage.root_blocked"}:
+                task_run, _ = self._require_bound_state()
+                if self._require_persistent().store.load_stage_run_config(task_run.task_run_id) is None:
+                    raise InvalidTransition("stage conclusion requires a stage task")
             else:
                 raise InvalidTransition("invalid slice conclusion")
         return self._finish_public(

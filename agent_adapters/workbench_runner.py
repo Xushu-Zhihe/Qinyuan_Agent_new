@@ -664,6 +664,45 @@ class Runner:
     def validation_check(self, challenge_id: str, selection: dict):
         return self._d9_operation(challenge_id, 'validation-check', selection)
 
+    def human_decision(self, challenge_id: str, selection: dict):
+        """A short trusted control command; the waiting worker retains its ownership."""
+        if (not isinstance(selection, dict) or set(selection) != {"candidate_id", "action", "operation_id"}
+                or selection["action"] not in {"accept", "continue", "end"}):
+            raise WorkbenchError("stage.human_decision_invalid")
+        from uuid import UUID
+        try:
+            if any(str(UUID(selection[k])) != selection[k] or UUID(selection[k]).version != 4
+                    for k in ("candidate_id", "operation_id")):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            raise WorkbenchError("stage.human_decision_invalid") from None
+        with self.workbench.lock, self._lock:
+            self.workbench.schedules.check_task_operation(challenge_id, "human-decision")
+            run = self._current(challenge_id)
+            directory = Path(run["directory"]) if run else None
+            agent_dir = self._find_agent_directory(directory) if directory else None
+            if agent_dir is None or run["agent_task_run_id"] is not None and agent_dir.name != run["agent_task_run_id"]:
+                raise WorkbenchError("run_identity_unavailable", 409)
+            declaration = immutable_read(agent_dir / "run.json")
+            request = json.loads((directory / "request.json").read_bytes())
+            if (declaration.get("task_run_id") != agent_dir.name or declaration.get("goal_validation") != "human"
+                    or declaration.get("request_id") != request.get("request_id")):
+                raise WorkbenchError("stage.human_decision_invalid", 409)
+            command = [sys.executable, "-m", "agent", "human-decision", "--state-dir", str(agent_dir.parent),
+                "--task-run-id", agent_dir.name, "--candidate-id", selection["candidate_id"],
+                "--operation-id", selection["operation_id"], "--decision", selection["action"]]
+        try:
+            completed = subprocess.run(command, cwd=directory, env=self._subprocess_environment(3),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                **self._scheduled_process_options(True))
+            output = json.loads(completed.stdout)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            raise WorkbenchError("stage.human_decision_outcome_unknown", 503) from None
+        if completed.returncode or output.get("exit_code"):
+            errors = output.get("errors", [])
+            raise WorkbenchError(errors[0]["code"] if errors else "stage.human_decision_rejected", 409)
+        return self.status(challenge_id)
+
     def _d9_operation(self, challenge_id, operation, selection=None):
         """Only the CLI owns checks, continuation and persisted transitions."""
         from agent_adapters.web.task_result import snapshot_v3_task_result

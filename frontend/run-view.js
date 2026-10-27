@@ -14,6 +14,12 @@ const RunView = (() => {
   let graphZoom = null;
   const label = (value) => value === "strategy_yielded" ? "策略让位 · 待续" : labels[value] || value || "—";
   const intentStatus = (intent) => intent.status === "suspended" && intent.suspension_kind === "strategy" ? "strategy_yielded" : intent.status;
+  const routes = (turn) => turn.roads || turn.intents || [];
+  const routeId = (route) => route.road_id || route.intent_id;
+  const currentFacts = (progress) => (progress.verified_facts || []).filter(f => !f.current_status || f.current_status === "effective");
+  labels.awaiting_confirmation = "等待人工确认";
+  labels.in_flight = "执行结果待结算";
+  Object.assign(labels, { active: "可规划", waiting_child: "等待后继", exhausted: "当前方向耗尽" });
   const short = (value) => value ? value.slice(0, 8) : "—";
   const node = (tag, text, className) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el; };
   const empty = (container, text) => container.append(node("p", text, "run-empty"));
@@ -26,9 +32,9 @@ const RunView = (() => {
   // 把「一次运行走到哪」摊平成五个阶段。只做投影，不推断成功。
   function stageStates(progress, live) {
     const turns = progress.turns || [];
-    const intents = turns.flatMap((turn) => turn.intents || []);
-    const executions = progress.executions || [];
-    const facts = progress.verified_facts || [];
+    const intents = turns.flatMap(routes);
+    const executions = progress.tool_operations || progress.executions || [];
+    const facts = currentFacts(progress);
     const recovery = progress.recovery || {};
     const reason = String(recovery.reason || "");
     const goal = progress.goal_evaluation;
@@ -41,14 +47,14 @@ const RunView = (() => {
         state: live ? "done" : progress.task_run_id ? "done" : "idle",
       },
       {
-        n: 2, name: "外层规划",
-        detail: turns.length ? `${turns.length} Turn · ${intents.length} Intent` : "尚未提交 Turn",
+        n: 2, name: progress.goal_validation ? "阶段规划与审核" : "外层规划",
+        detail: turns.length ? `${turns.length} Turn · ${intents.length} ${progress.goal_validation ? "Road" : "Intent"}` : "尚未提交 Turn",
         state: turns.length ? "done" : bad("tree") || bad("planning") ? "alert" : live ? "active" : "idle",
       },
       {
         n: 3, name: "内层执行",
-        detail: executions.length ? `${executions.length} 次执行 · ${(progress.plans || []).length} Plan` : "当前 Intent 尚无动作",
-        state: executions.length ? (executions.some((item) => ["pending", "running"].includes(item.status)) ? "active" : "done") : live && turns.length ? "active" : "idle",
+        detail: executions.length ? `${executions.length} 次执行${progress.goal_validation ? "" : ` · ${(progress.plans || []).length} Plan`}` : "当前路线尚无动作",
+        state: executions.length ? (executions.some((item) => ["pending", "running", "in_flight"].includes(item.status)) ? "active" : "done") : live && turns.length ? "active" : "idle",
       },
       {
         n: 4, name: "取证与复核",
@@ -78,14 +84,15 @@ const RunView = (() => {
   function renderFocus(progress, run, live) {
     const host = get("run-focus"); if (!host) return;
     host.replaceChildren();
-    const executions = progress.executions || [];
-    const running = executions.find((item) => ["pending", "running"].includes(item.status));
-    const activeIntent = (progress.turns || []).flatMap((turn) => turn.intents || []).find((item) => item.status === "running");
+    const executions = progress.tool_operations || progress.executions || [];
+    const running = executions.find((item) => ["pending", "running", "in_flight"].includes(item.status));
+    const activeIntent = (progress.turns || []).flatMap(routes).find((item) => item.status === "running");
     let state = "idle";
     let text;
-    if (running) { state = "live"; text = `执行中 · step ${running.step_index ?? "—"} · ${short(running.plan_id)}`; }
-    else if (live && activeIntent) { state = "live"; text = `Intent ${activeIntent.priority} · ${activeIntent.description || "（无描述）"}`; }
-    else if (live) { state = "live"; text = "等待外层下一步决策"; }
+    if (progress.task_run?.status === "awaiting_confirmation") { state = "warn"; text = "等待人工决定 · 五分钟无决定则未验证结束"; }
+    else if (running) { state = "live"; text = `执行中 · ${short(running.operation_id || running.plan_id)}`; }
+    else if (live && activeIntent) { state = "live"; text = `${activeIntent.road_id ? "Road" : `Intent ${activeIntent.priority}`} · ${activeIntent.description || "（无描述）"}`; }
+    else if (live) { state = "live"; text = "等待下一步规划或审核"; }
     else if (progress.recovery?.required) { state = "warn"; text = `已停止 · ${progress.recovery.reason || "需要恢复"}`; }
     else { text = `已结束 · ${label(progress.task_run?.status) || label(run?.status)}`; }
     host.append(node("span", "", "focus-dot"), node("span", text, "focus-text"));
@@ -101,19 +108,20 @@ const RunView = (() => {
     get("run-dashboard").hidden = !run; get("run-raw").hidden = !run;
     const backend = progress.mode === "simulated" ? "本地模拟 · " : progress.sandbox_backend === "docker" ? "Docker · " : progress.sandbox_backend === "local_simulated" ? "真实模型／本地模拟 Sandbox · " : "";
     get("run-status").textContent = run ? `${label(run.status)} · ${backend}${progress.task_run_id || run.agent_task_run_id || run.run_id}` : "保存题目后，可开始运行。";
-    const executions = progress.executions || [];
-    const activeExecution = executions.find((item) => ["pending", "running"].includes(item.status));
-    const activeIntent = (progress.turns || []).flatMap((turn) => turn.intents).find((item) => item.status === "running");
+    const executions = progress.tool_operations || progress.executions || [];
+    const activeExecution = executions.find((item) => ["pending", "running", "in_flight"].includes(item.status));
+    const activeIntent = (progress.turns || []).flatMap(routes).find((item) => item.status === "running");
     let phase = label(run?.status);
     if (run?.status === "cleaning") phase = "清理 Sandbox 资源";
-    else if (live && run.status !== "cancelling") phase = activeExecution ? "等待命令结果" : activeIntent ? "推进当前 Intent" : "准备运行 / 生成下一轮";
+    else if (live && run.status !== "cancelling") phase = activeExecution ? "等待命令结果" : activeIntent ? `推进当前 ${progress.goal_validation ? "Road" : "Intent"}` : "准备运行 / 生成下一轮";
+    if (progress.task_run?.status === "awaiting_confirmation") phase = "等待人工确认";
     let remaining = "—";
     if (progress.task_run?.deadline_at) {
       const seconds = Math.max(0, Math.ceil(progress.task_run.deadline_at - Date.now() / 1000));
       remaining = progress.task_run.finished_at ? "已结束" : `${Math.floor(seconds / 60)}分 ${seconds % 60}秒`;
     }
     const goal = progress.protocol_version === 3 ? `${progress.mode === "simulated" ? "模拟：" : ""}${label(progress.goal_evaluation)}` : "未验证";
-    const metrics = [metric("当前阶段", phase), metric("剩余总时限", remaining), metric("已验证 Fact", String(progress.verified_facts?.length || 0)), metric("待验证候选", String(progress.pending_candidates?.length || 0)), metric("目标评估", goal)];
+    const metrics = [metric("当前阶段", phase), metric("剩余总时限", remaining), metric("当前有效 Fact", String(currentFacts(progress).length)), metric("待验证候选", String((progress.answer_candidates || progress.pending_candidates || []).length)), metric("目标评估", goal)];
     if (progress.protocol_version === 3) {
       metrics.push(metric("已提交 Checkpoint", String(progress.checkpoint?.sequence ?? "—")));
       if (progress.budget?.status === "available") metrics.push(metric("操作预算", progress.budget.total_limit == null ? `${progress.budget.total_used} 次（按 deadline）` : `${progress.budget.total_used} / ${progress.budget.total_limit}`));
@@ -187,18 +195,21 @@ const RunView = (() => {
     const turnNodes = [];
     for (const turn of progress.turns || []) {
       const row = node("div", undefined, "graph-row");
-      const turnNode = graphButton(`Turn ${turn.sequence}`, `${turn.intents.length} 个 Intent`, { id: turn.turn_id, type: "turn", title: `Turn ${turn.sequence}` }, turn.status, "turn");
+      const index = (progress.turns || []).indexOf(turn) + 1;
+      const title = `Turn ${turn.sequence || index}`;
+      const turnNode = graphButton(title, turn.intent?.description || `${routes(turn).length} 个 Intent`, { id: turn.turn_id, type: "turn", title }, turn.planning_state || turn.status, "turn");
       const intents = node("div", undefined, "graph-intents");
       const intentNodes = [];
-      for (const intent of [...turn.intents].sort((a, b) => a.priority - b.priority)) {
+      for (const intent of [...routes(turn)]) {
         const plans = (progress.plans || []).filter((plan) => plan.intent_id === intent.intent_id);
-        const item = graphButton(`Intent ${intent.priority}`, intent.description, { id: intent.intent_id, type: "intent", title: `Turn ${turn.sequence} / Intent ${intent.priority}` }, intentStatus(intent), "intent");
+        const routeTitle = intent.road_id ? `Road ${routes(turn).indexOf(intent) + 1}` : `Intent ${intent.priority}`;
+        const item = graphButton(routeTitle, intent.description, { id: routeId(intent), type: intent.road_id ? "road" : "intent", title: `${title} / ${routeTitle}` }, intentStatus(intent), "intent");
         item.title = `${intent.description}\n${plans.length} 个短 Plan`;
         intents.append(item); intentNodes.push(item);
       }
       if (!intentNodes.length) empty(intents, "尚无 Intent");
       row.append(turnNode, intents); board.append(row);
-      turnNodes.push({ turn: turnNode, intents: intentNodes });
+      turnNodes.push({ turn: turnNode, intents: intentNodes, identity: turn.turn_id, parent: turn.parent_turn_id });
     }
     if (!turnNodes.length) board.append(node("p", "等待首轮 Intent 提交。", "graph-empty"));
     plane.append(board); host.append(plane);
@@ -215,14 +226,25 @@ const RunView = (() => {
         const bend = kind === "sequence" ? `M${a.x} ${a.y} L${a.x} ${b.y - 12} L${b.x} ${b.y - 12} L${b.x} ${b.y}` : `M${a.x} ${a.y} C${a.x + 38} ${a.y} ${b.x - 38} ${b.y} ${b.x} ${b.y}`;
         path.setAttribute("d", bend); path.setAttribute("class", kind === "sequence" ? "graph-edge sequence" : "graph-edge"); path.setAttribute("marker-end", "url(#graph-arrow)"); wires.append(path);
       };
-      if (turnNodes.length) connect(root, turnNodes[0].turn, "owner");
-      turnNodes.forEach((group, index) => { if (index) connect(turnNodes[index - 1].turn, group.turn, "sequence"); group.intents.forEach((intent) => connect(group.turn, intent, "owner")); });
+      turnNodes.forEach((group, index) => {
+        const parent = progress.goal_validation ? turnNodes.find(t => t.identity === group.parent)?.turn : index ? turnNodes[index - 1].turn : null;
+        connect(parent || root, group.turn, parent ? "sequence" : "owner");
+        group.intents.forEach((intent) => connect(group.turn, intent, "owner"));
+      });
       applyGraphScale();
     });
   }
   function renderDetail(progress) {
     const host = get("run-detail"); host.replaceChildren();
     const turns = progress.turns || [];
+    if (progress.goal_validation) {
+      const turn = turns.find(t => t.turn_id === filter?.id || t.roads.some(r => r.road_id === filter?.id)) || turns.at(-1);
+      if (!turn) { empty(host, "等待阶段登记。"); return; }
+      host.append(node("strong", turn.intent.description, "detail-title"), badge(turn.planning_state), code("阶段完成依据", turn.intent.completion_criterion), node("p", turn.achievement ? "历史达成已登记；任务最终结果另行验证。" : "阶段尚未达成", "run-meta"));
+      host.append(code("前提引用", JSON.stringify(turn.intent.support_refs)), code("精选成果引用", JSON.stringify(turn.fact_refs)));
+      for (const road of turn.roads) host.append(node("p", `${label(road.status)} · ${road.description}`, "detail-description"), node("p", road.road_id, "run-ref"));
+      return;
+    }
     const selectedTurn = turns.find((turn) => turn.turn_id === filter?.id);
     const intents = turns.flatMap((turn) => turn.intents.map((intent) => ({ ...intent, turn })));
     const selectedIntent = intents.find((intent) => intent.intent_id === filter?.id)
@@ -266,6 +288,18 @@ const RunView = (() => {
     get("timeline-scope").textContent = filter?.title || "全部已提交记录";
     get("clear-run-filter").hidden = !filter;
     get("clear-run-filter").onclick = () => select(null);
+    if (progress.goal_validation) {
+      const owner = filter?.type === "turn" ? (progress.turns || []).find(t => t.turn_id === filter.id) : null;
+      for (const op of progress.tool_operations || []) {
+        if (filter?.type === "road" && op.road_id !== filter.id || owner && !owner.roads.some(r => r.road_id === op.road_id)) continue;
+        const item = detail(`tool-${op.operation_id}`, `工具 · ${label(op.status)} · Road ${short(op.road_id)}`);
+        item.append(node("p", op.operation_id, "run-ref")); timeline.append(item);
+      }
+      for (const op of progress.retrospective || []) { const item = detail(`review-${op.operation_id}`, `${op.phase} · ${label(op.status)}`); item.append(node("p", op.operation_id, "run-ref")); timeline.append(item); }
+      for (const el of timeline.querySelectorAll("details")) el.open = opened.has(el.dataset.key);
+      if (!timeline.children.length) empty(timeline, "尚无已提交操作。");
+      return;
+    }
     const plans = new Map((progress.plans || []).map((item) => [item.plan_id, item]));
     const intentTurns = new Map((progress.turns || []).flatMap((turn) => turn.intents.map((intent) => [intent.intent_id, turn.turn_id])));
     const fits = (planId, intentId) => !filter || filter.type === "task" || (filter.type === "plan" ? planId === filter.id : filter.type === "turn" ? intentTurns.get(intentId || plans.get(planId)?.intent_id) === filter.id : (intentId || plans.get(planId)?.intent_id) === filter.id);
@@ -347,8 +381,8 @@ const RunView = (() => {
     const facts = get("run-facts"); facts.replaceChildren();
     for (const fact of progress.verified_facts || []) {
       const item = node("article", undefined, "run-fact");
-      if (progress.protocol_version === 3) item.append(node("p", `验证状态：${label(fact.status)}`));
-      item.append(node("p", fact.content || "正文暂不可用，请刷新运行状态。"), node("p", `Fact ${fact.fact_id}\nExecution ${fact.source_execution_id || fact.source_ref}`, "run-ref"));
+      if (progress.protocol_version === 3) item.append(node("p", `当前适用性：${label(fact.current_status || fact.status)}`));
+      item.append(node("p", fact.content || "正文暂不可用，请刷新运行状态。"), node("p", `Fact ${fact.fact_id}\n${fact.road_id ? `Road ${fact.road_id}\n${(fact.source_refs || []).join("\n")}` : `Execution ${fact.source_execution_id || fact.source_ref}`}`, "run-ref"));
       facts.append(item);
     }
     if (!facts.children.length) empty(facts, "尚无已验证观察。原始输出不会自动成为 Fact。");
@@ -359,6 +393,19 @@ const RunView = (() => {
         const item = node("article", undefined, "run-candidate");
         item.append(node("strong", candidate.validation_state === "partial" ? "候选正确 · 整题未完成" : label(candidate.validation_state)), node("p", `候选 ${candidate.candidate_id}\n证据版本 ${candidate.evidence_version}\n来源 ${candidate.source_ref || candidate.execution_id}`, "run-ref"));
         if ([19, 20, 21, 22].includes(progress.contract_version) && candidate.validation_state === 'pending') item.append(node('p', '等待可信验证反馈；候选尚未被确认。', 'run-meta'));
+        if (progress.goal_validation?.mode === "human" && progress.goal_validation.candidate_id === candidate.candidate_id && progress.task_run?.status === "awaiting_confirmation") {
+          const seconds = Math.max(0, Math.ceil(progress.goal_validation.confirmation_deadline - Date.now() / 1000));
+          item.append(node("p", `人工决定剩余 ${seconds} 秒；无决定则未验证结束。`, "run-meta"));
+          item.append(node("p", "候选正文请通过交互终端 candidate-read 查看并自主提交；普通进度和日志仅展示引用。", "run-meta"));
+          const stateDir = current.run?.directory ? `${current.run.directory}/agent-state` : "<state-dir>";
+          item.append(code("在项目交互终端查看候选", `python -m agent candidate-read --state-dir "${stateDir}" --task-run-id ${progress.task_run_id} --candidate-id ${candidate.candidate_id} --evidence-version ${candidate.evidence_version}`));
+          for (const [action, text] of [["accept", "确认成功"], ["continue", "打回继续"], ["end", "结束但未验证"]]) {
+            const button = node("button", text, "secondary-button"); button.type = "button";
+            const operationId = crypto.randomUUID();
+            button.addEventListener("click", () => { button.disabled = true; window.dispatchEvent(new CustomEvent("stage-human-decision", { detail: { challengeId: current.challengeId, selection: { candidate_id: candidate.candidate_id, action, operation_id: operationId } } })); });
+            item.append(button);
+          }
+        }
         if (progress.competition && !live && candidate.validation_state === "pending") {
           const button=node("button","提交此候选到比赛平台","secondary-button");button.type="button";
           button.addEventListener("click",()=>{button.disabled=true;window.dispatchEvent(new CustomEvent("competition-submit",{detail:{challengeId:current.challengeId}}));});

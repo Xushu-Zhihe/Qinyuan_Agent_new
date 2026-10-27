@@ -8,9 +8,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal, Protocol, TypeAlias
+from typing import ClassVar, Literal, Protocol, TypeAlias
 
 from agent_core.domain import IntentStatus
+from agent_core.actions import MCPCall
+from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8ConclusionChange, D8RevisionRecord
 from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.operation_accounting import D4OperationRecord, D8HandoffBudgetPolicy
 from agent_core.turn_contracts import D1RoleConfig
@@ -102,6 +104,8 @@ class TurnPlanningContext:
     history: tuple[D8HistoryItem, ...]
     feedback_refs: tuple[str, ...] = ()
     pending_operation_ids: tuple[str, ...] = ()
+    effective_support_refs: tuple[str, ...] = ()
+    goal_validation: Literal["human", "external"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,8 +123,34 @@ class RoadResolution:
     support_refs: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class StageFactSelection:
+    support_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StageHistoryRead:
+    refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StageConclusionChange(D8ConclusionChange):
+    SUPPORT_RELATIONS: ClassVar[frozenset[str]] = frozenset({"turn_premise", "road_premise"})
+
+
+@dataclass(frozen=True, slots=True)
+class StagePlanningDecision:
+    kind: Literal["select_road", "return_to_parent", "request_final_validation"]
+    reason: str
+    support_refs: tuple[str, ...]
+    road_id: str | None = None
+    candidate: str | None = None
+    source_ref: str | None = None
+
+
 TurnPlanningProposal: TypeAlias = (
     TurnIntent | tuple[RoadCandidate, ...] | TurnCompletion | PlanningExhausted | RoadResolution
+    | StageFactSelection | StageHistoryRead | StageConclusionChange | StagePlanningDecision
 )
 
 
@@ -143,6 +173,40 @@ class StageRunConfig:
     outer_role: D1RoleConfig
     inner_role: D1RoleConfig
     budget: D8HandoffBudgetPolicy
+    execution_policy_ref: str | None = None
+    goal_validation: Literal["human", "external"] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StageFactProposal:
+    content: str
+    reason: str
+    support_refs: tuple[str, ...]
+    inferred: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class StageFactApplication:
+    fact_id: str
+    review_operation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class StageIncomplete:
+    reason: str
+    support_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StageStrategyAdvice:
+    decision: Literal["continue_current_intent", "request_intent_resolution"]
+    reason: str
+    support_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StageSessionSummary:
+    content: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +223,9 @@ class StageStateChange:
     sessions: tuple[PlanningSession, ...] = ()
     reviews: tuple[StageReviewBinding, ...] = ()
     config: StageRunConfig | None = None
+    facts: tuple[StageFactApplication, ...] = ()
+    applications: tuple[str, ...] = ()
+    revisions: tuple[D8RevisionRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +233,7 @@ class StageModelEvidence:
     session: PlanningSession
     context_sha256: str
     evidence_sha256: str
-    result: TurnPlanningProposal | TurnPlanningReview
+    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | MCPCall | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
     proposal_operation_id: str | None = None
     proposal_sha256: str | None = None
 
@@ -182,3 +249,5 @@ class StageEvidencePort(Protocol):
     ) -> tuple[D8HistoryItem, ...]: ...
 
     def read_model_result(self, operation: D4OperationRecord) -> StageModelEvidence: ...
+
+    def read_history_result(self, operation: D4OperationRecord) -> tuple[D8HistoryItem, ...]: ...

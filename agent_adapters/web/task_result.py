@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import json
 from pathlib import Path
 from dataclasses import asdict
 
@@ -81,7 +82,7 @@ def _candidate_projection(
             }
         )
         config = store.load_d3_run_config(task_run_id)
-        if config is not None and config.contract_version in {19, 20, 21, 22}:
+        if config is not None and config.contract_version in {19, 20, 21, 22} or store.load_stage_run_config(task_run_id) is not None:
             projected[-1]['checkable_submission_ids'] = list(
                 state.conflict_operation_ids if state.state == 'conflict'
                 else state.unresolved_unknown_operation_ids if state.state == 'unknown' else ())
@@ -137,6 +138,117 @@ def _empty_result(task_run_id: str, mode: str, *, error: str, recovery: bool) ->
         "recovery_status": "required" if recovery else "not_required",
         "errors": [{"code": error}] if error else [],
     }
+
+
+def _stage_task_result(directory, declaration, store, expected):
+    """Project actual stage/Road identities without constructing a writer or legacy tree."""
+    from agent_adapters.stage_evidence import StageEvidence
+    from agent_core.stage_storage import active_turn, execution_policy
+    from agent_core.turn_modeling import digest
+    task_id = declaration["task_run_id"]
+    config = store.load_stage_run_config(task_id)
+    policy = execution_policy(expected)
+    evidence = StageEvidence(Path(directory) / "stage-evidence", store, create=False)
+    if (config.outer_role != expected.outer_role or config.inner_role != expected.inner_role
+            or config.goal_validation != declaration.get("goal_validation")
+            or config.budget != expected.d4_budget or config.execution_policy_ref != "sha256:" + digest(policy)
+            or evidence.read("policy", task_id) != policy):
+        raise ValueError("stage.execution_configuration_changed")
+    rows = store.load_control_state_rows(task_id)
+    if rows is None:
+        raise ValueError("stage.task_run_not_found")
+    task, checkpoint = rows.task_run, rows.latest_checkpoint
+    turns = store.list_stage_turns(task_id)
+    current = active_turn(turns)
+    result = _empty_result(task_id, declaration["mode"], error="", recovery=False)
+    result.update(execution_profile=declaration.get("execution_profile", "d8_v22"),
+        contract_version=declaration.get("contract_version", 22))
+    result["task_run"] = dict(status=task.status.value, reason=task.failure_reason,
+        sandbox_id=task.sandbox_id, deadline_at=task.deadline_at, finished_at=task.finished_at,
+        confirmation_deadline=task.confirmation_deadline)
+    result["checkpoint"] = dict(sequence=checkpoint.sequence, watermark_event_sequence=checkpoint.watermark_event_sequence)
+    result["dispatch"] = dict(status=_dispatch_status(task.status.value), checkpoint_sequence=checkpoint.sequence,
+        turn_id=current.turn_id if current else None)
+    result["turns"] = [dict(turn_id=t.turn_id, parent_turn_id=t.parent_turn_id,
+        intent=asdict(t.intent), planning_state=t.planning_state.value,
+        achievement=asdict(t.achievement) if t.achievement else None, fact_refs=list(t.fact_refs),
+        roads=[dict(road_id=r.road_id, description=r.candidate.description,
+            support_refs=list(r.candidate.support_refs), status=r.status.value) for r in t.roads]) for t in turns]
+    history = evidence.history(task_id)
+    result["verified_facts"] = [dict(fact_id=i.record_id, turn_id=i.turn_id, road_id=i.intent_id,
+        content=i.content, ref=i.ref, source_refs=list(i.source_refs), source_status=i.source_status,
+        current_status=i.current_status, effective_ref=i.effective_ref, conflict=i.conflict)
+        for i in history if i.record_type == "verified_fact"]
+    operations = store.list_d4_operations(task_id)
+    requests = {op.start.operation_id: evidence.request(op.start.operation_id)
+        for op in operations if op.start.category != "tool_dispatch"}
+    corrected = {r.correction_of_model_request_id for r in requests.values() if r.correction_of_model_request_id}
+    failures = []
+    for op in operations:
+        if op.start.operation_id not in requests or op.completion is None:
+            continue
+        saved = evidence.read("result", op.start.operation_id)
+        if saved is None or digest(saved) != op.completion.evidence_sha256:
+            raise ValueError("stage.model_result_changed")
+        if saved["outcome"] != "valid" and op.start.operation_id not in corrected:
+            failures.append(dict(operation_id=op.start.operation_id,
+                phase=requests[op.start.operation_id].stage, code="stage.model_output_unusable",
+                category="input" if saved["outcome"] == "invalid" else "dependency"))
+    result["model_failures"] = failures
+    result["errors"] = failures
+    result["tool_operations"] = [dict(operation_id=op.start.operation_id,
+        road_id=op.start.resource_ref.split("/")[1], phase="tool_dispatch",
+        status=op.completion.result_kind if op.completion else "in_flight")
+        for op in operations if op.start.category == "tool_dispatch"]
+    result["retrospective"] = [dict(operation_id=op.start.operation_id, phase=op.start.category,
+        status=op.completion.result_kind if op.completion else "in_flight", applied=op.application_ref is not None)
+        for op in operations if op.start.role == "outer_planning"]
+    usage = store.d4_budget_usage(task_id)
+    result["budget"] = dict(status="available", policy_ref=usage.budget_policy_ref, total_used=usage.total_used,
+        total_limit=None if expected.intent_execution_policy == "continuous_v1" else expected.d4_budget.total,
+        category_counts=dict(usage.category_counts))
+    candidates, goal, feedback_unknown = _candidate_projection(store, task_id,
+        through_event_sequence=checkpoint.watermark_event_sequence)
+    result["answer_candidates"] = [{("road_id" if k == "intent_id" else k): v for k, v in item.items()} for item in candidates]
+    result["goal_validation"] = dict(mode=config.goal_validation, confirmation_deadline=task.confirmation_deadline,
+        candidate_id=candidates[-1]["candidate_id"] if candidates else None,
+        actions=["accept", "continue", "end"] if task.status.value == "awaiting_confirmation" else [])
+    result["goal_evaluation"] = goal
+    result["overall_goal"] = dict(outcome=goal)
+    result["overall_goal_summary"].update(outcome=goal, candidate_count=len(candidates))
+    result["external_validation_feedback"] = [dict(candidate_id=item["candidate_id"], **feedback)
+        for item in candidates for feedback in item["feedback"]]
+    checks = store.list_d7_external_validation_checks(task_id)
+    result["external_validation_checks"] = [dict(query_id=r.request.query_id,
+        submission_operation_id=r.request.submission_operation_id, candidate_id=r.request.candidate_id,
+        evidence_version=r.request.evidence_version, status="started" if r.result is None else "completed",
+        verdict=r.result.verdict if r.result else None) for r in checks]
+    result["validation_accounting"] = dict(status="available", logical_check_count=len(checks),
+        completed_count=sum(r.result is not None for r in checks))
+    result["imports"] = [dict(ref=i.ref, metadata=json.loads(i.content))
+        for i in history if i.identity == "imported_attachment_not_fact"]
+    unresolved = store.blocking_d4_operations(task_id)
+    recovery = bool(unresolved) or feedback_unknown or any(r.result is None for r in checks) or bool(failures)
+    result["recovery"] = dict(required=recovery, reason="stage.model_output_unusable" if failures else "operation_or_evidence_unknown" if recovery else None)
+    result["recovery_status"] = "required" if recovery else "not_required"
+    result["cleanup"], result["cleanup_status"] = _cleanup(Path(directory), task)
+    from agent_core.operator_controls import current as operator_control
+    control = operator_control(store, task_id)
+    if control is not None:
+        result["operator_control"] = control
+    if task.status in TERMINAL_STATUSES:
+        terminal = store.load_terminal_commit(task_id)
+        if terminal is None:
+            raise ValueError("terminal_result_unavailable")
+        _, terminal_goal, terminal_unknown = _candidate_projection(store, task_id,
+            through_event_sequence=terminal.checkpoint.watermark_event_sequence)
+        outcome = map_run_outcome(D7RunOutcomeState(task_run_status=terminal.event.status.value,
+            goal_evaluation=terminal_goal, cleanup_state=result["cleanup_status"],
+            unresolved_operation_unknown=bool(unresolved) or terminal_unknown, recovery_required=bool(unresolved)))
+        result["run_exit_code"] = outcome.run_exit_code
+        result["run_outcome"] = dict(**outcome.to_dict(), recorded_checkpoint_sequence=terminal.checkpoint.sequence,
+            recorded_event_sequence=terminal.event.sequence, run_status=terminal.event.status.value, goal_evaluation=terminal_goal)
+    return result
 
 
 def _snapshot_v3_task_result(directory: Path, declaration: dict, *, read_store=None) -> dict:
@@ -492,6 +604,8 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                 phase = "database_open"
                 with SqliteControlStore.open_readonly(path) as store:
                     phase = "configuration_read"
+                    if store.load_stage_run_config(declaration["task_run_id"]) is not None:
+                        return _stage_task_result(directory, declaration, store, expected)
                     config = store.load_d3_run_config(declaration["task_run_id"])
                     if config != expected:
                         raise ValueError("d8_frozen_configuration_mismatch")

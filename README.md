@@ -152,6 +152,16 @@ MCP 服务提供工具能力，可执行命令由所属 TaskRun 的 Sandbox 承�
 
 已知且允许纠正的模型请求保留一次共享纠正机会；未知操作不自动重放。暂停或等待不会清空已有 Fact、执行与证据。
 
+已有运行可以直接只读查看，不需要工作台：
+
+```powershell
+python scripts/qymonitor.py runs -n 10      # 最近几轮
+python scripts/qymonitor.py show latest     # 单轮总览
+python scripts/qymonitor.py watch latest    # 实时盯
+```
+
+各命令的读法、指标口径与排查顺序见[运行监测手册](Plan/monitoring_guide.md)。
+
 ## 测试
 
 日常改动优先运行相关测试。快速检查核心不变量：
