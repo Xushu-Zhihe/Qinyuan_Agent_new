@@ -31,7 +31,9 @@ def prepare(case, mode="human"):
     return asyncio.run(app.run(case.token))
 
 
-def test_human_candidate_is_protected_and_manual_success_is_trusted_feedback(case):
+@pytest.mark.parametrize("native", [False, True])
+def test_human_candidate_is_protected_and_manual_success_is_trusted_feedback(case, native):
+    case.models.inner.native = case.models.outer.native = native
     prepare(case)
     candidate, = case.app.store.list_d7_answer_candidates(case.app.task_id)
     task = case.app.state.task_run

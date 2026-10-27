@@ -17,7 +17,7 @@ from agent_core.stage_contracts import (
     StageFactProposal, StageModelEvidence, StageSessionSummary, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, StagePlanningDecision,
 )
-from agent_core.stage_planning import INNER_STAGES, StageModelRequest, model_contract, parse, request_from_dict
+from agent_core.stage_planning import INNER_STAGES, StageModelRequest, model_contract, stage_output_issues, parse, request_from_dict
 from agent_core.stage_storage import StageRecoveryRequired, StageStateError, proposal_digest, _fail
 from agent_core.turn_modeling import digest, stable_id
 from qinyuan_core import Category, get_logger
@@ -68,9 +68,34 @@ class StageEvidence:
             _fail("stage.request_identity_changed", Category.UNKNOWN)
         contract = self.read("contract", identity)
         if (contract is None or request.frozen_contract_ref != "sha256:" + digest(contract)
-                or contract != model_contract(request)):
+                or contract != self.contract(request)):
             _fail("stage.model_contract_changed", Category.POLICY)
         return request
+
+    def contract(self, request):
+        feedback = None
+        source_id = request.correction_of_model_request_id
+        if source_id is not None:
+            source = self.request(source_id)
+            operation = self.store.load_d4_operation(source_id)
+            result = self.read("result", source_id)
+            fields = ("task_run_id", "stage", "role_config_ref", "base_checkpoint_sequence", "context",
+                "tools", "proposal_operation_id", "proposal", "history_catalog")
+            before, after = asdict(source), asdict(request)
+            if (source.correction_of_model_request_id is not None or operation is None or result is None
+                    or operation.completion is None or operation.completion.result_kind != "failed" or result["outcome"] != "invalid"
+                    or digest({field: before[field] for field in fields}) != digest({field: after[field] for field in fields})
+                    or operation.start.context_sha256 != digest(asdict(source))
+                    or result["request_sha256"] != operation.start.context_sha256
+                    or operation.completion.evidence_ref != "stage-result/" + source_id
+                    or operation.completion.evidence_sha256 != digest(result)):
+                _fail("stage.correction_binding_changed", Category.UNKNOWN)
+            issues = stage_output_issues(source, D8ModelResponse(result["content"], result["finish_reason"], result.get("tool_calls")))
+            feedback = {"correction_of_model_request_id": source_id, "source_result_sha256": digest(result),
+                "reason": "output_business_invalid" if any(i.code == "stage.formal_fact_required" for i in issues) else "output_format_invalid",
+                "issues": [asdict(i) for i in issues]
+                    or [{"code": "stage_value_invalid", "path": "$", "expected": "valid_stage_value", "actual": "invalid"}]}
+        return {**model_contract(request), "correction": feedback}
 
     def read_model_result(self, operation: D4OperationRecord) -> StageModelEvidence:
         identity = operation.start.operation_id
@@ -85,7 +110,7 @@ class StageEvidence:
                 or digest(result) != operation.completion.evidence_sha256
                 or result["request_sha256"] != operation.start.context_sha256 or result["outcome"] != "valid"):
             _fail("stage.original_evidence_changed", Category.UNKNOWN)
-        value = parse(request, D8ModelResponse(result["content"], result["finish_reason"]))
+        value = parse(request, D8ModelResponse(result["content"], result["finish_reason"], result.get("tool_calls")))
         if request.proposal_operation_id is not None:
             source = self.store.load_d4_operation(request.proposal_operation_id)
             if source is None:
@@ -487,9 +512,9 @@ class StageModelCalls:
                 task = self.store.load_task_run(request.task_run_id)
                 if token.is_cancelled or self.clock() >= task.deadline_at:
                     raise StageRecoveryRequired("stage.dispatch_stopped", category=Category.POLICY)
-                contract = model_contract(request)
+                contract = self.evidence.read("contract", identity)
                 envelope = D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": contract["schema"]},
-                    contract["instruction"], None)
+                    contract["instruction"], contract["correction"])
                 policy = self.capacity_config.inner_capacity if inner else self.capacity_config.outer_capacity
                 if not self.capacity_port.fits(envelope, policy):
                     if request.stage != "stage_summary" and request.capacity_recovery_of is None and self.recover_capacity is not None:
@@ -514,13 +539,23 @@ class StageModelCalls:
                 else:
                     content = raw.content if isinstance(raw, D8ModelResponse) else raw
                     finish = raw.finish_reason if isinstance(raw, D8ModelResponse) else "stop"
+                    tool_calls = raw.tool_calls if isinstance(raw, D8ModelResponse) else None
                     try:
-                        parse(request, D8ModelResponse(content, finish))
+                        parse(request, D8ModelResponse(content, finish, tool_calls))
                         outcome = "valid"
-                    except ValueError:
+                    except ValueError as error:
                         outcome = "invalid"
+                        code = "stage.output_envelope_invalid" if error.args == ("stage.output_envelope_invalid",) else "stage.output_invalid"
+                        issues = stage_output_issues(request, D8ModelResponse(content, finish, tool_calls))
+                        if any(i.code == "stage.formal_fact_required" for i in issues):
+                            code = "stage.proposal_business_invalid"
+                        get_logger("model").warning("stage.output_rejected", run=request.task_run_id,
+                            operation=identity, phase=request.stage, code=code, category="input",
+                            issue_codes=",".join(i.code for i in issues) or "stage_value_invalid")
                     result = {"request_sha256": start.context_sha256, "outcome": outcome,
                         "content": content, "finish_reason": finish, "finished_at": self.clock()}
+                    if tool_calls is not None:
+                        result["tool_calls"] = tool_calls
                 self.evidence.save("result", identity, result)
                 record = self.store.load_d4_operation(identity)
             if result is None:
@@ -544,7 +579,7 @@ class StageModelCalls:
         raise AssertionError("bounded correction did not terminate")
 
     def _freeze(self, request):
-        contract = model_contract(request)
+        contract = self.evidence.contract(request)
         reference = "sha256:" + digest(contract)
         if request.frozen_contract_ref is not None and request.frozen_contract_ref != reference:
             _fail("stage.model_contract_changed", Category.POLICY)

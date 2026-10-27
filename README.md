@@ -42,6 +42,8 @@ uv sync --frozen
 .\start-workbench.cmd
 ```
 
+启动脚本固定使用项目 `.venv\Scripts\python.exe`，Agent/MCP 子进程沿用同一解释器；缺少 `.venv` 时先运行上述依赖安装命令。
+
 也可以通过命令启动：
 
 ```powershell

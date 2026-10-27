@@ -343,7 +343,8 @@ def _http_worker(
         if payload.get("stream") is True:
             from agent_adapters.model_stream import ModelStreamError, read_chat_stream
             try:
-                data, reasoning_chars = read_chat_stream(response, max_response_bytes, report)
+                data, reasoning_chars = read_chat_stream(response, max_response_bytes, report,
+                    allow_tool_calls=preserve_content and bool(payload.get("tools")))
             except ModelStreamError as exc:
                 report(transport_end=exc.transport_end)
                 connection.send({"error": exc.kind, "reason": exc.code})
@@ -393,7 +394,8 @@ def _http_worker(
             )
             return
         report(**_response_diagnostic(data, message, choice.get("finish_reason"), message.get("content"), reasoning_chars=reasoning_chars))
-        if message.get("tool_calls") or message.get("function_call"):
+        native_output = preserve_content and bool(payload.get("tools"))
+        if message.get("function_call") or message.get("tool_calls") and not native_output:
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
             )
@@ -414,7 +416,10 @@ def _http_worker(
                 return
             # Do not parse, repair, or persist content or reasoning here. D8 owns
             # the strict content boundary and completion-reason handling.
-            connection.send({"payload": {"content": content or "", "finish_reason": finish}})
+            value = {"content": content or "", "finish_reason": finish}
+            if native_output:
+                value["tool_calls"] = message.get("tool_calls") or []
+            connection.send({"payload": value})
             return
         if choice.get("finish_reason") != "stop":
             _invalid_provider_payload(

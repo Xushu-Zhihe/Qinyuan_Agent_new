@@ -179,12 +179,19 @@ class StageApplication:
     def _render_conversation(self, sources):
         messages = []
         for op, request, result in sources:
+            content = result["content"]
+            if "tool_calls" in result:
+                from agent_core.stage_planning import decode_stage_response
+                from agent_core.output_contracts import D8ModelResponse
+                value, _, _, _ = decode_stage_response(request,
+                    D8ModelResponse(content, result["finish_reason"], result["tool_calls"]))
+                content = json.dumps(value, ensure_ascii=False)
             if request.stage in {"stage_review", "stage_supervision"}:
-                messages.append({"role": "user", "content": json.dumps({"review_feedback": result["content"]}, ensure_ascii=False)})
+                messages.append({"role": "user", "content": json.dumps({"review_feedback": content}, ensure_ascii=False)})
             else:
                 messages.extend([{"role": "user", "content": handoff_json({"stage": request.stage, "context": asdict(request.context)})},
-                    {"role": "assistant", "content": result["content"] if isinstance(result["content"], str)
-                     else json.dumps(result["content"], ensure_ascii=False)}])
+                    {"role": "assistant", "content": content if isinstance(content, str)
+                     else json.dumps(content, ensure_ascii=False)}])
                 if isinstance(self.evidence.read_model_result(op).result, StageHistoryRead):
                     items = self.evidence.read_history_result(op)
                     messages.append({"role": "user", "content": json.dumps({"history_read": [asdict(i) for i in items]}, ensure_ascii=False)})
@@ -194,13 +201,13 @@ class StageApplication:
         summaries = [(op, req, result) for op, req, result in sources if req.stage == "stage_summary"]
         if not summaries:
             return set(), ()
-        _, request, result = summaries[-1]
+        operation, request, result = summaries[-1]
         available = {op.start.operation_id: digest({"request": asdict(req), "result": data})
                      for op, req, data in sources}
         if any(available.get(identity) != version for identity, version in request.summary_coverage):
             raise StageStateError("stage.summary_coverage_changed", code="stage.summary_coverage_changed")
         summary = {"identity": "unverified_session_summary", "summary_request_id": request.model_request_id,
-            "coverage": request.summary_coverage, "content": json.loads(result["content"])["content"] if isinstance(result["content"], str) else result["content"]["content"]}
+            "coverage": request.summary_coverage, "content": self.evidence.read_model_result(operation).result.content}
         return {identity for identity, _ in request.summary_coverage}, ({"role": "user", "content": json.dumps(summary, ensure_ascii=False)},)
 
     def _conversation(self, session, sources=None):

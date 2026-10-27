@@ -21,6 +21,7 @@ class D8OutputRequest:
 class D8ModelResponse:
     content: object
     finish_reason: str = "stop"
+    tool_calls: tuple[dict, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -367,8 +368,8 @@ def shape_issues(value, schema, path="$"):
         return [D8FormatIssue("enum_mismatch", path, "allowed_choice", actual)]
     result = []
     if actual == "object":
-        fields = schema["properties"]
-        for key in schema["required"]:
+        fields = schema.get("properties", {})
+        for key in schema.get("required", ()):
             if key not in value:
                 expected_type = fields[key].get("type", "allowed_shape")
                 expected_type = "|".join(expected_type) if isinstance(expected_type, list) else expected_type
@@ -500,6 +501,13 @@ def decode_response(response, schema):
             response = json.loads(encoded, object_pairs_hook=_pairs, parse_constant=_nonfinite, parse_float=_float)
         except _DuplicateKey:
             return None, [D8FormatIssue("json_duplicate_key", "$", "unique_fields", "duplicate")], None, units
+        except json.JSONDecodeError as error:
+            import re
+            code = "json_parse_failed"
+            if error.msg == "Extra data":
+                code = ("output_trailing_markup" if re.search(r"</?[|\uff5c]+DSML[|\uff5c]+", encoded[error.pos:])
+                    else "json_trailing_data")
+            return None, [D8FormatIssue(code, "$", "single_complete_json", "invalid")], None, units
         except (ValueError, RecursionError):
             return None, [D8FormatIssue("json_parse_failed", "$", "valid_json", "invalid")], None, units
     else:
@@ -517,4 +525,7 @@ def decode_response(response, schema):
             response = {k:v for k,v in response.items() if k != "exploration_group"}
     issues = [D8FormatIssue(i.code, i.path if len(i.path) <= 128 else "$", i.expected, i.actual)
               for i in shape_issues(response, schema)]
+    if (issues and isinstance(response, dict) and set(response) == {"version", "stage", "schema"}
+            and isinstance(response["schema"], dict)):
+        issues = [D8FormatIssue("output_envelope_invalid", "$", "direct_result_object", "contract_envelope")]
     return response if not issues else None, issues, None, units

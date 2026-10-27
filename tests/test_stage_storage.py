@@ -316,6 +316,19 @@ def test_reorder_preserves_rows_and_non_pending_road_position(case):
         case.apply(StageStateChange(turns=(replace(turn, roads=tuple(reversed(turn.roads))),)))
 
 
+def test_storage_still_rejects_progress_as_completion_support_when_preflight_is_bypassed(case):
+    turn = case.root()
+    original = case.fact(turn.turn_id)
+    observation = replace(case.evidence.history.pop(original), record_type="progress")
+    case.evidence.history[observation.ref] = observation
+    completion = TurnCompletion("premature", (observation.ref,))
+    binding = case.reviewed(PlanningSession("turn_planning", turn.turn_id), completion, category="action")
+    changed = replace(turn, fact_refs=(observation.ref,), achievement=TurnAchievement(completion, binding.review_operation_id))
+    with pytest.raises(StageStateError, match="formal_fact_required"):
+        case.apply(StageStateChange(turns=(changed,), reviews=(binding,)))
+    assert case.store.load_turn(case.task_id, turn.turn_id).achievement is None
+
+
 def test_historical_achievement_survives_source_withdrawal_but_new_use_fails(case):
     turn = case.root()
     ref = case.fact(turn.turn_id)

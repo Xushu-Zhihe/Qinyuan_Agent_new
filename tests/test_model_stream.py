@@ -20,12 +20,12 @@ def chunk(delta=None, finish=None, **extra):
         "finish_reason": finish}], **extra}, ensure_ascii=False).encode() + b"\r\n\r\n"
 
 
-def read(raw, *, limit=4096, split=None):
+def read(raw, *, limit=4096, split=None, native=False):
     class Response:
         def __init__(self): self.parts = iter(split) if split else None; self.raw = io.BytesIO(raw)
         def read1(self, size): return next(self.parts, b"") if self.parts else self.raw.read1(size)
     reports = []
-    result = read_chat_stream(Response(), limit, lambda **value: reports.append(value))
+    result = read_chat_stream(Response(), limit, lambda **value: reports.append(value), allow_tool_calls=native)
     return result, reports
 
 
@@ -61,6 +61,33 @@ def test_finish_without_done_is_incomplete_and_length_is_preserved():
     chunk({"content": 123}), chunk({}, "stop") + chunk({"content": "late"})])
 def test_malformed_or_native_tool_stream_is_rejected(raw):
     with pytest.raises(ModelStreamError, match="provider_stream_invalid"): read(raw)
+
+
+def test_native_tool_argument_fragments_and_finish_are_preserved():
+    raw = (chunk({"tool_calls": [{"index": 0, "id": "call_local", "type": "function",
+        "function": {"name": "submit_stage_result", "arguments": '{"result":'}}]}) +
+        chunk({"tool_calls": [{"index": 0, "function": {"arguments": '{"value":"汉字"}}'}}]}, "tool_calls") +
+        b"data: [DONE]\n\n")
+    (data, _), reports = read(raw, split=[raw[i:i+3] for i in range(0, len(raw), 3)], native=True)
+    call = data["choices"][0]["message"]["tool_calls"][0]
+    assert call["id"] == "call_local" and call["function"]["name"] == "submit_stage_result"
+    assert json.loads(call["function"]["arguments"]) == {"result": {"value": "汉字"}}
+    assert data["choices"][0]["finish_reason"] == "tool_calls"
+    assert reports[-1]["content_chars"] > 0
+
+
+@pytest.mark.parametrize("index,id_value", [(1, "call_other"), (True, "call_other"), (0, "changed")])
+def test_native_stream_rejects_extra_call_or_changed_identity(index, id_value):
+    raw = chunk({"tool_calls": [{"index": 0, "id": "original", "function": {"name": "submit_stage_result"}}]})
+    raw += chunk({"tool_calls": [{"index": index, "id": id_value, "function": {"arguments": "{}"}}]}, "tool_calls")
+    with pytest.raises(ModelStreamError): read(raw, native=True)
+
+
+def test_native_arguments_remain_bounded_and_incomplete_stream_is_not_valid():
+    raw = chunk({"tool_calls": [{"index": 0, "function": {"arguments": "x" * 4097}}]})
+    with pytest.raises(ModelStreamError, match="response_rejected"): read(raw, native=True)
+    raw = chunk({"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}, "tool_calls")
+    with pytest.raises(ModelStreamError, match="http_transport_failure"): read(raw, native=True)
 
 
 def test_multiline_sse_and_protocol_overhead_do_not_consume_text_allowance():

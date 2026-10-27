@@ -19,6 +19,9 @@ from agent_core.operation_accounting import D8HandoffBudgetPolicy, D4RecoveryReq
 from agent_core.output_contracts import D8ModelResponse
 from agent_core.stage_contracts import PlanningSession, StageStateChange
 from agent_core.stage_contracts import TurnCompletion
+from agent_core.stage_contracts import (TurnIntent, RoadCandidate, RoadResolution, PlanningExhausted,
+    StageFactProposal, StagePlanningDecision, TurnPlanningContext)
+from agent_core.stage_planning import StageModelRequest, schema, parse, OUTPUT_TOOL
 from agent_core.stage_contracts import StageTurnSnapshot, StageReviewBinding, TurnPlanningState
 from agent_core.stage_storage import StageStateError
 from agent_core.turn_contracts import D1RoleConfig
@@ -31,9 +34,12 @@ class Model:
         self.role_config, self.calls = role, []
         self.transform = lambda request, raw: raw
         self.complete = True
+        self.native = False
+        self.envelopes = []
 
     def invoke(self, envelope, timeout, token):
         request = envelope.request
+        self.envelopes.append(envelope)
         self.calls.append(request)
         stage = request.stage
         history = request.context.history
@@ -48,8 +54,9 @@ class Model:
             else:
                 raw = {"kind": "roads", "roads": [{"description": "inspect using the existing tool", "support_refs": []}]}
         elif stage == "stage_review":
-            raw = {"decision": "accept", "reason": "supported within its declared criterion",
-                "accepted_road_indices": [0] if isinstance(request.proposal, tuple) else []}
+            raw = {"decision": "accept", "reason": "supported within its declared criterion"}
+            if isinstance(request.proposal, tuple):
+                raw["accepted_road_indices"] = [0]
         elif stage == "stage_completion":
             raw = {"kind": "turn_completion" if self.complete else "incomplete", "reason": "criterion checked",
                 "support_refs": facts}
@@ -66,7 +73,13 @@ class Model:
                 "reason": "direct observation", "support_refs": observations, "inferred": False}
         else:
             raw = {"kind": "road_resolution", "outcome": "succeeded", "reason": "local result obtained", "support_refs": facts}
-        return D8ModelResponse(json.dumps(self.transform(request, raw)))
+        value = self.transform(request, raw)
+        return native_response(value) if self.native else D8ModelResponse(json.dumps(value))
+
+
+def native_response(value):
+    return D8ModelResponse("", "tool_calls", ({"id": "call_" + uuid4().hex, "type": "function",
+        "function": {"name": OUTPUT_TOOL, "arguments": json.dumps({"result": value})}},))
 
 
 class Tools:
@@ -237,6 +250,129 @@ def test_known_tool_result_before_checkpoint_is_not_dispatched_again(case, monke
     assert result.turn.achievement is not None and len(case.tools.calls) == 1
 
 
+@pytest.fixture
+def review_request():
+    context = TurnPlanningContext("task", "goal", PlanningSession("turn_planning", "turn"), None, ())
+    return StageModelRequest("review", "task", "stage_review", "outer", 0, context)
+
+
+@pytest.mark.parametrize("proposal", [
+    TurnIntent("stage", "criterion"), TurnCompletion("supported", ()),
+    PlanningExhausted("no route", ()), RoadResolution(IntentStatus.SUCCEEDED, "done", ()),
+    StageFactProposal("observation", "supported", ()),
+    StagePlanningDecision("return_to_parent", "blocked", ()),
+    StagePlanningDecision("request_final_validation", "ready", ()),
+])
+def test_non_road_review_never_advertises_or_accepts_road_selection(review_request, proposal):
+    request = replace(review_request, proposal=proposal)
+    assert "accepted_road_indices" not in schema(request)["properties"]
+    for decision in ("accept", "revise", "reject"):
+        raw = {"decision": decision, "reason": "reviewed"}
+        assert parse(request, D8ModelResponse(json.dumps(raw))).accepted_road_indices == ()
+        with pytest.raises(ValueError, match="stage.output_invalid"):
+            parse(request, D8ModelResponse(json.dumps({**raw, "accepted_road_indices": [0]})))
+
+
+@pytest.mark.parametrize("decision,selection,valid", [
+    ("accept", [1, 0], True), ("accept", None, False), ("accept", [], False),
+    ("accept", [2], False), ("accept", [0, 0], False), ("accept", [-1], False),
+    ("revise", None, True), ("reject", [], True), ("reject", [0], False),
+])
+def test_road_review_schema_and_parser_agree_on_selection(review_request, decision, selection, valid):
+    from agent_core.output_contracts import decode_response
+    request = replace(review_request, proposal=(RoadCandidate("first"), RoadCandidate("second")))
+    raw = {"decision": decision, "reason": "reviewed"}
+    if selection is not None:
+        raw["accepted_road_indices"] = selection
+    response = D8ModelResponse(json.dumps(raw))
+    _, issues, terminal, _ = decode_response(response, schema(request))
+    assert (not issues and not terminal) == valid
+    if valid:
+        assert parse(request, response).accepted_road_indices == tuple(selection or ())
+    else:
+        with pytest.raises(ValueError, match="stage.output_invalid"):
+            parse(request, response)
+
+
+def test_schema_guided_turn_review_needs_no_format_correction(case):
+    def transform(request, raw):
+        if request.stage == "stage_review" and isinstance(request.proposal, TurnIntent):
+            raw.pop("accepted_road_indices", None)
+            if "accepted_road_indices" in schema(request).get("properties", {}):
+                raw["accepted_road_indices"] = [0]
+        return raw
+    case.models.outer.transform = transform
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.achievement is not None
+    reviews = [r for r in case.models.outer.calls if isinstance(r.proposal, TurnIntent)]
+    assert len(reviews) == 1 and reviews[0].correction_of_model_request_id is None
+
+
+@pytest.mark.parametrize("arguments,valid", [
+    ({}, True), ({"script": "observed", "symbols": {"entry": "value"}}, True),
+    ({"script": 7}, False), ({"symbols": {"entry": 7}}, False),
+    ({"extra": "not declared"}, False),
+])
+def test_stage_tool_schema_preserves_optional_fields_and_local_refs(review_request, arguments, valid):
+    tool_schema = {"type": "object", "$defs": {"symbol": {"type": "string"}},
+        "properties": {"script": {"type": "string"}, "symbols": {
+            "type": "object", "additionalProperties": {"$ref": "#/$defs/symbol"}}},
+        "additionalProperties": False}
+    request = replace(review_request, stage="stage_action", tools=(
+        {"qualified_name": "shell.run_bash", "input_schema": tool_schema},))
+    response = D8ModelResponse(json.dumps({"kind": "mcp_call", "tool_name": "shell.run_bash", "arguments": arguments}))
+    if valid:
+        assert parse(request, response).arguments == arguments
+    else:
+        with pytest.raises(ValueError, match="stage.output_invalid"):
+            parse(request, response)
+    assert "$schema" not in tool_schema  # Advertised tool metadata stays unchanged.
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_optional_tool_parameters_reach_execution_and_stage_completion(case, invalid):
+    case.tools.specs[0]["input_schema"].pop("required")
+    if invalid:
+        case.models.inner.transform = lambda request, raw: ({**raw, "arguments": {"script": 7}}
+            if raw.get("kind") == "mcp_call" else raw)
+        with pytest.raises(StageStateError, match="model_output_unusable") as error:
+            asyncio.run(case.app.run(case.token))
+        assert error.value.category == "input" and not case.tools.calls
+        actions = [r for r in case.models.inner.calls if r.stage == "stage_action"]
+        assert len(actions) == 2 and actions[1].correction_of_model_request_id == actions[0].model_request_id
+        assert all(op.completion is not None for op in case.app.store.list_d4_operations(case.app.task_id))
+        return
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.achievement is not None and len(case.tools.calls) == 1
+    assert not any(r.correction_of_model_request_id for r in case.models.inner.calls)
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_wrapped_stage_output_remains_invalid_and_correction_is_bounded(case, repeat, monkeypatch):
+    from agent_adapters import stage_evidence
+    seen = []
+    logger = SimpleNamespace(info=lambda *a, **kw: None,
+        warning=lambda event, **kw: seen.append((event, kw)))
+    monkeypatch.setattr(stage_evidence, "get_logger", lambda _: logger)
+    def transform(request, raw):
+        if request.stage == "stage_intent" and (repeat or not request.correction_of_model_request_id):
+            return {"version": 1, "stage": request.stage, "schema": raw}
+        return raw
+    case.models.inner.transform = transform
+    if repeat:
+        with pytest.raises(StageStateError, match="model_output_unusable"):
+            asyncio.run(case.app.run(case.token))
+        assert not case.tools.calls and not case.models.outer.calls
+    else:
+        assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
+    intents = [r for r in case.models.inner.calls if r.stage == "stage_intent"]
+    assert len(intents) == 2 and intents[1].correction_of_model_request_id == intents[0].model_request_id
+    invalid = [entry for event, entry in seen if event == "stage.output_rejected"]
+    assert len(invalid) == (2 if repeat else 1)
+    assert all(i["code"] == "stage.output_envelope_invalid" and i["category"] == "input"
+        and i["phase"] == "stage_intent" for i in invalid)
+
+
 def test_bounded_format_correction_preserves_scope_and_role(case):
     malformed = []
     def transform(request, raw):
@@ -250,6 +386,152 @@ def test_bounded_format_correction_preserves_scope_and_role(case):
     assert len(requests) == 2 and requests[1].correction_of_model_request_id == requests[0].model_request_id
     assert requests[1].context == requests[0].context
     assert result.turn.achievement is not None
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_correction_receives_frozen_exact_length_feedback(case, native):
+    case.models.outer.native = native
+    def transform(request, raw):
+        if request.stage == "stage_review" and isinstance(request.proposal, StageFactProposal) and not request.correction_of_model_request_id:
+            return {**raw, "reason": "a" * 806}
+        return raw
+    case.models.outer.transform = transform
+    assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
+    corrected = [e for e in case.models.outer.envelopes if e.correction]
+    assert corrected
+    for envelope in corrected:
+        feedback = envelope.correction
+        assert feedback["correction_of_model_request_id"] == envelope.request.correction_of_model_request_id
+        issue = feedback["issues"][0]
+        assert issue["code"] == "string_too_long" and issue["path"] == ("$/result/reason" if native else "$/reason")
+        assert issue["expected"] == "unicode_codepoints_le_512" and issue["actual"] == "unicode_codepoints_806"
+        frozen = case.app.evidence.read("contract", envelope.request.model_request_id)
+        assert frozen["correction"] == feedback
+        assert "a" * 806 not in json.dumps(feedback)
+        from agent_adapters.deepseek_roles import build_payload, role_config
+        role = role_config("outer_planning", version=17)
+        outgoing = replace(envelope, request=replace(envelope.request, role_config_ref=role.role_config_ref))
+        payload = build_payload(outgoing, role)
+        assert '"actual": "unicode_codepoints_806"' in payload["messages"][0]["content"]
+
+
+def test_native_output_preserves_raw_identity_and_canonical_history(case):
+    case.models.inner.native = case.models.outer.native = True
+    assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
+    assert len(case.tools.calls) == 1
+    for model in (case.models.inner, case.models.outer):
+        for request in model.calls:
+            result = case.app.evidence.read("result", request.model_request_id)
+            assert result["finish_reason"] == "tool_calls" and result["content"] == ""
+            assert len(result["tool_calls"]) == 1
+            assert result["tool_calls"][0]["function"]["name"] == OUTPUT_TOOL
+            operation = case.app.store.load_d4_operation(request.model_request_id)
+            assert case.app.evidence.read_model_result(operation).result is not None
+    assert any('"kind": "mcp_call"' in m["content"] for r in case.models.inner.calls
+        for m in r.messages if m["role"] == "assistant")
+
+
+def test_correction_cannot_rebind_a_different_stage_scope(case):
+    case.models.inner.transform = lambda request, raw: ({"bad": "shape"}
+        if request.stage == "stage_intent" and not request.correction_of_model_request_id else raw)
+    asyncio.run(case.app.run(case.token))
+    request = next(e.request for e in case.models.inner.envelopes if e.correction)
+    calls = len(case.models.inner.calls), len(case.models.outer.calls), len(case.tools.calls)
+    changed = replace(request, context=replace(request.context, goal="different goal"))
+    with pytest.raises(StageStateError, match="correction_binding_changed"):
+        case.app.evidence.contract(changed)
+    assert calls == (len(case.models.inner.calls), len(case.models.outer.calls), len(case.tools.calls))
+
+
+@pytest.mark.parametrize("change", ["wrong_name", "two_calls", "oversized_content", "duplicate_key", "stop", "length", "missing_result"])
+def test_native_envelope_never_bypasses_local_validation(review_request, change):
+    request = replace(review_request, stage="stage_intent")
+    response = native_response({"kind": "turn_intent", "description": "stage", "completion_criterion": "criterion", "support_refs": []})
+    calls = response.tool_calls
+    if change == "wrong_name": calls[0]["function"]["name"] = "shell.run_bash"
+    elif change == "two_calls": response = replace(response, tool_calls=calls * 2)
+    elif change == "oversized_content": response = replace(response, content="x" * 65537)
+    elif change == "duplicate_key": calls[0]["function"]["arguments"] = '{"result":{},"result":{}}'
+    elif change in {"stop", "length"}: response = replace(response, finish_reason=change)
+    else: calls[0]["function"]["arguments"] = '{"script":"untrusted"}'
+    with pytest.raises(ValueError, match="stage.output_invalid"):
+        parse(request, response)
+
+
+def test_premature_completion_is_corrected_before_outer_and_then_creates_fact(case):
+    case.models.inner.native = case.models.outer.native = True
+    rejected = []
+    def transform(request, raw):
+        observations = [i.ref for i in request.context.history if i.record_type == "progress"]
+        if request.stage == "stage_action" and observations and not rejected:
+            rejected.append(request.model_request_id)
+            return {"kind": "turn_completion", "reason": "premature", "support_refs": observations[:1]}
+        return raw
+    case.models.inner.transform = transform
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.achievement is not None and len(case.tools.calls) == 1
+    corrected = next(e for e in case.models.inner.envelopes if e.request.correction_of_model_request_id == rejected[0])
+    assert corrected.correction["reason"] == "output_business_invalid"
+    assert corrected.correction["issues"][0]["code"] == "stage.formal_fact_required"
+    assert not any(e.request.proposal_operation_id == rejected[0] for e in case.models.outer.envelopes)
+    assert any(i.record_type == "verified_fact" for i in case.app.evidence.history(case.app.task_id))
+
+
+@pytest.mark.parametrize("first", ["format", "business"])
+def test_completion_business_and_format_errors_share_one_correction(case, first):
+    attempted = []
+    def transform(request, raw):
+        observations = [i.ref for i in request.context.history if i.record_type == "progress"]
+        if request.stage == "stage_action" and observations:
+            attempted.append(request)
+            business = {"kind": "turn_completion", "reason": "premature", "support_refs": observations[:1]}
+            return business if (len(attempted) == 1) == (first == "business") else {"bad": "shape"}
+        return raw
+    case.models.inner.transform = transform
+    with pytest.raises(StageStateError, match="model_output_unusable") as error:
+        asyncio.run(case.app.run(case.token))
+    assert error.value.category == "input" and len(attempted) == 2 and len(case.tools.calls) == 1
+    assert attempted[1].correction_of_model_request_id == attempted[0].model_request_id
+    assert not any(e.request.proposal_operation_id in {r.model_request_id for r in attempted}
+        for e in case.models.outer.envelopes)
+
+
+def test_native_commentary_is_retained_but_never_becomes_decision_or_fact(case):
+    case.models.inner.native = case.models.outer.native = True
+    invoke = case.models.inner.invoke
+    commentary = 'COMMENTARY_ONLY: {"kind":"mcp_call","tool_name":"not_authorized","arguments":{}}'
+    case.models.inner.invoke = lambda *a, **kw: replace(invoke(*a, **kw), content=commentary)
+    assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
+    assert len(case.tools.calls) == 1
+    for request in case.models.inner.calls:
+        assert case.app.evidence.read("result", request.model_request_id)["content"] == commentary
+        assert "COMMENTARY_ONLY" not in json.dumps(request.messages)
+    assert all("COMMENTARY_ONLY" not in i.content for i in case.app.evidence.history(case.app.task_id)
+        if i.record_type == "verified_fact")
+
+
+def test_ordinary_stage_reason_is_not_truncated_or_given_a_field_limit(case):
+    long_reason = "r" * 2000
+    def transform(request, raw):
+        if "reason" in raw and raw.get("kind") != "fact_candidate" and not isinstance(request.proposal, StageFactProposal):
+            return {**raw, "reason": long_reason}
+        return raw
+    case.models.inner.transform = case.models.outer.transform = transform
+    assert asyncio.run(case.app.run(case.token)).turn.achievement.completion.reason == long_reason
+    assert not any(r.correction_of_model_request_id for model in (case.models.inner, case.models.outer) for r in model.calls)
+
+
+def test_completion_schema_selects_only_effective_formal_support(case):
+    asyncio.run(case.app.run(case.token))
+    request = next(r for r in case.models.inner.calls if r.stage == "stage_completion")
+    branches = schema(request)["anyOf"]
+    completion = next(b for b in branches if b["properties"]["kind"]["const"] == "turn_completion")
+    allowed = completion["properties"]["support_refs"]["items"]["enum"]
+    assert allowed and all(i.record_type == "verified_fact" for i in request.context.history if i.ref in allowed)
+    for history in (tuple(i for i in request.context.history if i.record_type != "verified_fact"),
+            tuple(replace(i, source_status="unavailable") for i in request.context.history)):
+        unavailable = replace(request, context=replace(request.context, history=history))
+        assert not any(b["properties"]["kind"]["const"] == "turn_completion" for b in schema(unavailable)["anyOf"])
 
 
 def test_format_correction_exhaustion_does_not_register_or_execute(case):
@@ -341,13 +623,20 @@ def test_capacity_admission_stops_before_model_dispatch(case):
 
 def test_real_provider_payload_keeps_role_and_reasoning_parameters(case):
     from agent_adapters.deepseek_roles import build_payload, role_config
-    from agent_core.stage_planning import schema
+    from agent_core.stage_planning import schema, model_contract
     from agent_core.output_contracts import D8OutputRequest
     request = case.app._request("stage_intent", PlanningSession("turn_planning", case.app._id("stage/root")))
     inner, outer = role_config("inner_action", version=17), role_config("outer_planning", version=17)
     request = replace(request, role_config_ref=inner.role_config_ref)
-    envelope = D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": schema(request)}, "JSON only", None)
+    envelope = D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": schema(request)}, model_contract(request)["instruction"], None)
     payload = build_payload(envelope, inner)
+    assert "Do not copy the contract envelope" in payload["messages"][0]["content"]
+    assert payload["tool_choice"] == "auto" and payload["tools"][0]["function"]["name"] == OUTPUT_TOOL
+    assert "response_format" not in payload
+    history = replace(request, messages=({"role": "assistant", "content": '{"kind":"roads"}'},))
+    projected = build_payload(replace(envelope, request=history), inner)
+    assert projected["messages"][1]["role"] == "user"
+    assert json.loads(projected["messages"][1]["content"])["historical_model_result"] == '{"kind":"roads"}'
     assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "high"
     assert "max_tokens" not in payload and payload["stream"] is True
     with pytest.raises(ValueError, match="model_role_binding_changed"):
@@ -393,7 +682,9 @@ def prepare_capacity_episode(case, *, block_summary=False, block_rebuilt=False):
     return blocked
 
 
-def test_automatic_capacity_summary_keeps_recent_four_and_original_sources(case):
+@pytest.mark.parametrize("native", [False, True])
+def test_automatic_capacity_summary_keeps_recent_four_and_original_sources(case, native):
+    case.models.inner.native = case.models.outer.native = native
     blocked = prepare_capacity_episode(case)
     result = asyncio.run(case.app.run(case.token))
     summaries = [r for r in case.models.outer.calls if r.stage == "stage_summary"]

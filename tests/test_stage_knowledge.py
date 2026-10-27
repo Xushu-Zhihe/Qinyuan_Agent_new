@@ -211,17 +211,22 @@ def test_synthesis_is_reviewed_inference_and_never_formal_success_support(case):
     apply_knowledge(case, session, {"kind": "history_details", "refs": [inference.ref]})
     previous = case.models.inner.transform
     case.models.inner.transform = lambda request, raw: {"kind": "turn_completion", "reason": "try the inference", "support_refs": [inference.ref]}
+    outer_calls = len(case.models.outer.calls)
     async def complete():
         request = case.app._request("stage_completion", session)
         proposal, _, binding = await case.app._review(request, case.token)
         updated = replace(descendant, achievement=TurnAchievement(proposal, binding.review_operation_id), fact_refs=(inference.ref,))
         case.app._commit(StageStateChange(turns=(updated,), reviews=(binding,)))
     try:
-        with pytest.raises(StageStateError, match="formal_fact_required"):
+        with pytest.raises(StageStateError, match="model_output_unusable") as error:
             asyncio.run(complete())
+        assert error.value.category == "input"
+        correction = case.models.inner.envelopes[-1].correction
+        assert correction["issues"][0]["code"] == "stage.formal_fact_required"
     finally:
         case.models.inner.transform = previous
     assert case.app.store.load_turn(case.app.task_id, descendant.turn_id).achievement is None
+    assert len(case.models.outer.calls) == outer_calls
 
 
 def test_explicit_source_withdrawal_invalidates_dependent_conclusion(case):

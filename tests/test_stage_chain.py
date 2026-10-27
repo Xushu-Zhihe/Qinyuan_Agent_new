@@ -71,7 +71,9 @@ def reopen(case):
     case.app.bind(identity)
 
 
-def test_three_stages_return_only_to_direct_parent_and_keep_original_achievement(case):
+@pytest.mark.parametrize("native", [False, True])
+def test_three_stages_return_only_to_direct_parent_and_keep_original_achievement(case, native):
+    case.models.inner.native = case.models.outer.native = native
     install_chain(case, combined=True)
     result = asyncio.run(case.app.run(case.token))
     turns = case.app.store.list_stage_turns(case.app.task_id)

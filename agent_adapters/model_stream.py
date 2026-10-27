@@ -35,11 +35,12 @@ class ModelStreamError(ValueError):
         super().__init__(code)
 
 
-def read_chat_stream(response, limit, report):
+def read_chat_stream(response, limit, report, *, allow_tool_calls=False):
     buffer = b""
     data_lines = []
     event_bytes = 0
     content = []
+    tool_call = None
     finish = None
     usage = None
     counts = {"response_utf8_bytes": 0, "content_chars": 0, "content_utf8_bytes": 0,
@@ -52,7 +53,7 @@ def read_chat_stream(response, limit, report):
         raise ModelStreamError("provider_stream_invalid")
 
     def event(raw):
-        nonlocal finish, usage
+        nonlocal finish, usage, tool_call
         counts["sse_events"] += 1
         if raw == b"[DONE]":
             if finish is None:
@@ -77,8 +78,34 @@ def read_chat_stream(response, limit, report):
         delta = choice.get("delta")
         if not isinstance(delta, dict):
             invalid()
-        if delta.get("tool_calls") or delta.get("function_call"):
+        if delta.get("function_call"):
             invalid()
+        if delta.get("tool_calls"):
+            if not allow_tool_calls or finish is not None or not isinstance(delta["tool_calls"], list):
+                invalid()
+            for item in delta["tool_calls"]:
+                if (not isinstance(item, dict) or type(item.get("index")) is not int or item["index"] != 0
+                        or set(item) - {"index", "id", "type", "function"}):
+                    invalid()
+                if tool_call is None:
+                    tool_call = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                if "type" in item and item["type"] != "function":
+                    invalid()
+                if "id" in item:
+                    if not isinstance(item["id"], str) or tool_call["id"] and tool_call["id"] != item["id"]:
+                        invalid()
+                    tool_call["id"] = item["id"]
+                function = item.get("function", {})
+                if not isinstance(function, dict) or set(function) - {"name", "arguments"}:
+                    invalid()
+                for key, part in function.items():
+                    if not isinstance(part, str):
+                        invalid()
+                    tool_call["function"][key] += part
+                    counts["content_chars"] += len(part)
+                    counts["content_utf8_bytes"] += len(part.encode("utf-8"))
+                if counts["content_utf8_bytes"] + counts["reasoning_utf8_bytes"] > limit:
+                    raise ModelStreamError("response_rejected", "response_limit", "invalid_response")
         if delta.get("refusal"):
             raise ModelStreamError("provider_refused", "response_rejected", "refused")
         for key, prefix in (("content", "content"), ("reasoning_content", "reasoning")):
@@ -119,7 +146,10 @@ def read_chat_stream(response, limit, report):
                         event_bytes = 0
                         if event(raw):
                             progress("done")
-                            return {"choices": [{"message": {"content": "".join(content)},
+                            message = {"content": "".join(content)}
+                            if tool_call is not None:
+                                message["tool_calls"] = [tool_call]
+                            return {"choices": [{"message": message,
                                                  "finish_reason": finish}], "usage": usage}, counts["reasoning_chars"]
                 elif line.startswith(b":"):
                     counts["keepalive_lines"] += 1

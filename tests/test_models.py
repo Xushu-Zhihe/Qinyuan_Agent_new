@@ -350,6 +350,7 @@ def test_review_timeout_requires_explicit_worker_exit_receipt(confirmed):
 def test_provider_response_cannot_override_unconfirmed_worker_exit(http_error):
     from agent_core.structured_output import transient_provider_result
     env, role = envelope()
+    env = replace(env, request=replace(env.request, history_context="{}"))
     def invoke(payload, timeout, token, *, diagnostic):
         diagnostic.update(transport_end="http_error" if http_error else "response_received",
                           http_status=503 if http_error else 200, worker_exit_confirmed=False)

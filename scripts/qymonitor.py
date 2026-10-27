@@ -37,7 +37,7 @@ import re
 import sqlite3
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -253,12 +253,84 @@ def budget_usage(con: sqlite3.Connection) -> tuple[Counter, dict]:
 # --------------------------------------------------------------------------
 # evidence readers
 # --------------------------------------------------------------------------
+def _sibling(path: Path, kind: str) -> Path:
+    """<prefix>provider-result-<id>.json  ->  <prefix><kind>-<id>.json.
+
+    Handles both evidence layouts seen in this repo:
+      d8-output/d8-handoff-provider-result-<id>.json   (runs up to ~117)
+      stage-evidence/stage-provider-result-<id>.json   (runs from ~118)
+    """
+    prefix, _, rest = path.name.partition("provider-result-")
+    return path.parent / ("%s%s-%s" % (prefix, kind, rest))
+
+
+def provider_results(run_dir: Path) -> list[tuple[str, Path]]:
+    """(model_request_id, result file) pairs, newest file wins per id."""
+    found: dict[str, Path] = {}
+    for path in sorted(run_dir.rglob("*provider-result-*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True):
+        identity = path.name.split("provider-result-", 1)[1]
+        if identity.endswith(".json"):
+            identity = identity[:-5]
+        found.setdefault(identity, path)
+    return list(found.items())
+
+
+def stage_result_payloads(run_dir: Path):
+    """Yield the parsed payload of every persisted stage result, oldest first."""
+    for path in sorted(run_dir.rglob("stage-result-*.json"), key=lambda p: p.stat().st_mtime):
+        yield path, read_payload(path)
+
+
+def offered_tools(run_dir: Path) -> list[str]:
+    """Tools the model was shown (from the frozen MCP catalog of this run)."""
+    for path in sorted(run_dir.rglob("stage-mcp-catalog-*.json")):
+        payload = read_payload(path)
+        names = [t.get("qualified_name") for t in (payload.get("tools") or [])
+                 if isinstance(t, dict) and t.get("qualified_name")]
+        if names:
+            return names
+    return []
+
+
+def tool_usage(run_dir: Path) -> tuple[Counter, dict]:
+    """Called tools -> count, plus the last argument snippet per tool."""
+    counts: Counter = Counter()
+    last: dict[str, str] = {}
+    for _, payload in stage_result_payloads(run_dir):
+        for call in (payload.get("tool_calls") or []):
+            raw = ((call.get("function") or {}).get("arguments")) or "{}"
+            try:
+                obj = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            result = obj.get("result") if isinstance(obj.get("result"), dict) else obj
+            if result.get("kind") != "mcp_call":
+                continue
+            name = result.get("tool_name") or "?"
+            counts[name] += 1
+            last[name] = json.dumps(result.get("arguments"), ensure_ascii=False)[:110]
+    return counts, last
+
+
+def correction_hints(run_dir: Path) -> list[dict]:
+    """Bounded diagnostics the program sent back with a rejected output."""
+    rows = []
+    for path in sorted(run_dir.rglob("stage-contract-*.json"), key=lambda p: p.stat().st_mtime):
+        payload = read_payload(path)
+        correction = payload.get("correction")
+        if isinstance(correction, dict) and correction.get("issues"):
+            rows.append(dict(
+                at=path.stat().st_mtime,
+                identity=path.stem.split("contract-")[-1][:8],
+                reason=correction.get("reason") or "-",
+                issues=correction.get("issues") or [],
+            ))
+    return rows
+
+
 def load_calls(run_dir: Path, con: sqlite3.Connection | None = None) -> list[dict]:
     """One row per model call, joined with the D4 ledger when available."""
-    outdir = run_dir / "d8-output"
-    if not outdir.is_dir():
-        return []
-
     ledger = {}
     if con is not None:
         for row in query(con, "select operation_id, category, start_json, completion_json from d4_operations"):
@@ -277,25 +349,28 @@ def load_calls(run_dir: Path, con: sqlite3.Connection | None = None) -> list[dic
                                               started_at=started, finished_at=finished)
 
     calls = []
-    for path in sorted(outdir.glob("d8-handoff-provider-result-*.json")):
-        identity = path.stem[len("d8-handoff-provider-result-"):]
+    for identity, path in provider_results(run_dir):
         result = read_payload(path)
         transport = result.get("transport") or {}
         usage = transport.get("usage") or {}
         details = usage.get("completion_tokens_details") or {}
 
-        request = read_payload(outdir / ("d8-handoff-provider-request-%s.json" % identity))
-        contract = read_payload(outdir / ("d8-handoff-contract-%s.json" % identity))
+        request = read_payload(_sibling(path, "provider-request"))
+        contract = read_payload(_sibling(path, "contract"))
+        # Newer layout keeps stage and correction inside stage-request-<id>.json.
+        envelope = read_payload(_sibling(path, "request")).get("request") or {}
         entry = ledger.get(identity, {})
 
         prompt = usage.get("prompt_tokens") or 0
-        hit = usage.get("prompt_cache_hit_tokens") or usage.get("prompt_tokens_details", {}).get("cached_tokens") or 0
+        hit = usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
         calls.append(dict(
             id=identity,
-            stage=request.get("stage") or contract.get("stage") or entry.get("category") or "unrecorded",
+            stage=(request.get("stage") or contract.get("stage") or envelope.get("stage")
+                   or entry.get("category") or "unrecorded"),
             role=entry.get("role") or "-",
             category=entry.get("category") or "-",
-            correction=bool(contract.get("correction_of_model_request_id")),
+            correction=bool(contract.get("correction_of_model_request_id")
+                            or envelope.get("correction_of_model_request_id")),
             started=entry.get("started_at") or path.stat().st_mtime,
             duration=transport.get("elapsed_seconds"),
             prompt=prompt,
@@ -309,6 +384,30 @@ def load_calls(run_dir: Path, con: sqlite3.Connection | None = None) -> list[dic
         ))
     calls.sort(key=lambda row: row["started"])
     return calls
+
+
+def last_file_activity(run_dir: Path) -> float | None:
+    """Newest mtime anywhere under the run directory.
+
+    runtime_events only advances on control commits and model calls only show up
+    as provider evidence, so a long tool/experiment phase looks idle from both.
+    Any evidence write bumps a file mtime, which is the honest "still working"
+    signal.
+    """
+    newest = None
+    try:
+        for path in run_dir.rglob("*"):
+            try:
+                if not path.is_file():
+                    continue
+                stamp = path.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or stamp > newest:
+                newest = stamp
+    except OSError:
+        pass
+    return newest
 
 
 def find_result(run_dir: Path, task_run_id: str) -> dict | None:
@@ -406,6 +505,11 @@ def cmd_show(args) -> int:
         checkpoint = scalar(con, "select max(sequence) from checkpoints", default=0)
         charged, states = budget_usage(con)
         calls = load_calls(run_dir, con)
+        stage_turns = scalar(con, "select count(*) from stage_turns", default=0)
+        stage_roads = scalar(con, "select count(*) from stage_roads", default=0)
+        road_states = {row[0]: row[1] for row in query(
+            con, "select status, count(*) from stage_roads group by status")}
+        last_file = last_file_activity(run_dir)
     finally:
         con.close()
 
@@ -414,7 +518,7 @@ def cmd_show(args) -> int:
     started = task.get("started_at")
     deadline = task.get("deadline_at")
     last_call = max((c["started"] for c in calls), default=None)
-    idle = now - max(last_call or 0, last_event or 0)
+    idle = now - max(last_call or 0, last_event or 0, last_file or 0)
     status = task.get("status") or "-"
 
     prompt = sum(c["prompt"] for c in calls)
@@ -428,17 +532,38 @@ def cmd_show(args) -> int:
         status, fmt_time(started), fmt_span(now - started) if started else "-",
         fmt_time(deadline), fmt_left(deadline, now)))
     print("goal       %s" % clip(task.get("goal"), 96))
-    print("shapes     turns %d | intents %d %s | plans %d | executions %d | facts %d (verified %d) | candidates %d" % (
-        counts["turns"], counts["intents"], dict(intents) or "", counts["plans"],
-        counts["executions"], counts["facts"], facts_verified, candidates))
+    legacy_empty = not any(counts.values()) and not facts_verified and not candidates
+    if stage_turns and legacy_empty:
+        print("shapes     legacy Turn/Intent/Plan/Execution tables empty — this run uses the v3 stage tables only")
+    else:
+        print("shapes     turns %d | intents %d %s | plans %d | executions %d | facts %d (verified %d) | candidates %d" % (
+            counts["turns"], counts["intents"], dict(intents) or "", counts["plans"],
+            counts["executions"], counts["facts"], facts_verified, candidates))
+    if stage_turns:
+        print("stage      %d turn(s) | %d road(s) %s   (v3 stage tables)" % (
+            stage_turns, stage_roads, road_states or ""))
     print("events     %d   last %s (%s)   checkpoint %s" % (events, fmt_clock(last_event), fmt_age(last_event, now), checkpoint))
-    print("calls      %d   last %s (%s)   %s" % (
+    # A run can be dead while task_runs still says running (no terminal commit).
+    # The persisted CLI result is the authority on that.
+    if result and result.get("exit_code") is not None:
+        liveness = "finished (exit %s)" % result["exit_code"]
+    elif status == "running" and idle > args.stall:
+        liveness = "IDLE %s" % fmt_span(idle)
+    else:
+        liveness = "live"
+    print("calls      %d   last %s (%s, evidence %s)   %s" % (
         len(calls), fmt_clock(last_call), fmt_age(last_call, now),
-        "IDLE %s" % fmt_span(idle) if status == "running" and idle > args.stall else "live"))
+        fmt_age(last_file, now), liveness))
     if calls:
         print("tokens     prompt %s   cache %.1f%%   completion %s   reasoning %.0f%%" % (
             fmt_int(prompt), 100.0 * hit / prompt if prompt else 0.0,
             fmt_int(completion), 100.0 * reasoning / completion if completion else 0.0))
+    offered = offered_tools(run_dir)
+    used, _ = tool_usage(run_dir)
+    if offered or used:
+        top = " ".join("%s x%d" % (name, count) for name, count in used.most_common(3))
+        print("tools      %d offered / %d called%s" % (
+            len(offered), sum(used.values()), (" (" + top + ")") if used else " (none)"))
     if charged:
         parts = " ".join("%s %d" % (k, v) for k, v in charged.most_common())
         print("budget     %s   (total %d, %s)" % (parts, sum(charged.values()), states or "-"))
@@ -475,12 +600,15 @@ def cmd_watch(args) -> int:
             last_event = scalar(con, "select max(timestamp) from runtime_events")
             charged, _ = budget_usage(con)
             calls = load_calls(run_dir, con)
+            stage_turns = scalar(con, "select count(*) from stage_turns", default=0)
+            stage_roads = scalar(con, "select count(*) from stage_roads", default=0)
         finally:
             con.close()
 
         status = task.get("status") or "-"
         last_call = max((c["started"] for c in calls), default=None)
-        idle = now - max(last_call or 0, last_event or 0)
+        last_file = last_file_activity(run_dir)
+        idle = now - max(last_call or 0, last_event or 0, last_file or 0)
         prompt = sum(c["prompt"] for c in calls)
         hit = sum(c["hit"] for c in calls)
         completion = sum(c["completion"] for c in calls)
@@ -496,9 +624,10 @@ def cmd_watch(args) -> int:
             len(calls), fmt_age(last_call, now), fmt_int(prompt),
             100.0 * hit / prompt if prompt else 0.0,
             fmt_int(completion), 100.0 * reasoning / completion if completion else 0.0, flag))
-        print("           events %d (last %s)  facts %d  exec %d  intents %s  budget %s" % (
+        print("           events %d (last %s)  facts %d  exec %d  intents %s  budget %s%s" % (
             events, fmt_age(last_event, now), counts["facts"], counts["executions"],
-            dict(intents) or "-", sum(charged.values())))
+            dict(intents) or "-", sum(charged.values()),
+            ("  stage %dT/%dR" % (stage_turns, stage_roads)) if stage_turns else ""))
 
         if args.once:
             return 0
@@ -630,11 +759,35 @@ def cmd_tree(args) -> int:
     run_dir = resolve_run(args.run, state_dir(args.state_dir))
     con = connect(run_dir / "control.sqlite")
     try:
-        turns = query(con, "select * from turns order by sequence")
-        intents = query(con, "select * from intents order by priority")
-        facts = query(con, "select turn_id, status, count(*) as n from facts group by turn_id, status")
+        stage_turns = query(con, "select turn_id, parent_turn_id, intent_json, planning_state, "
+                                 "achievement_json, fact_refs_json from stage_turns")
+        stage_roads = query(con, "select road_id, turn_id, ordinal, candidate_json, status "
+                                 "from stage_roads order by turn_id, ordinal")
+        if not stage_turns:
+            turns = query(con, "select * from turns order by sequence")
+            intents = query(con, "select * from intents order by priority")
+            facts = query(con, "select turn_id, status, count(*) as n from facts group by turn_id, status")
     finally:
         con.close()
+
+    if stage_turns:
+        roads_by_turn: dict[str, list] = defaultdict(list)
+        for row in stage_roads:
+            roads_by_turn[row["turn_id"]].append(row)
+        for turn in stage_turns:
+            intent = json.loads(turn["intent_json"] or "{}")
+            refs = json.loads(turn["fact_refs_json"] or "[]")
+            parent = ("  parent %s" % turn["parent_turn_id"][:8]) if turn["parent_turn_id"] else ""
+            print("Turn %s  [%s]  facts %d%s" % (
+                turn["turn_id"][:8], turn["planning_state"], len(refs), parent))
+            print("   intent   %s" % clip(intent.get("description"), 78))
+            print("   done when %s" % clip(intent.get("completion_criterion"), 78))
+            for road in roads_by_turn.get(turn["turn_id"], []):
+                candidate = json.loads(road["candidate_json"] or "{}")
+                print("   Road %-2s [%-8s] %s" % (
+                    road["ordinal"], road["status"], clip(candidate.get("description"), 70)))
+        print("(v3 stage tables: %d turn(s), %d road(s))" % (len(stage_turns), len(stage_roads)))
+        return 0
 
     fact_counts: dict[tuple, int] = {}
     for row in facts:
@@ -676,6 +829,52 @@ def cmd_facts(args) -> int:
             row["fact_id"][:8], row["status"], row["turn_seq"] if row["turn_seq"] is not None else "-",
             clip(row["content"], 84)))
     print("(%d facts)" % len(rows))
+    return 0
+
+
+def cmd_tools(args) -> int:
+    run_dir = resolve_run(args.run, state_dir(args.state_dir))
+    offered = offered_tools(run_dir)
+    used, last = tool_usage(run_dir)
+
+    print("offered    %d tools" % len(offered))
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for name in offered:
+        prefix, _, leaf = name.partition(".")
+        grouped[prefix].append(leaf or name)
+    for prefix in sorted(grouped):
+        print("  %-12s %s" % (prefix, ", ".join(sorted(grouped[prefix]))))
+
+    print()
+    print("called     %d times" % sum(used.values()))
+    if not used:
+        print("  (no mcp_call recorded)")
+    for name, count in used.most_common():
+        print("  %-24s x%-3d last args %s" % (name, count, last.get(name, "")[:96]))
+    unused = [n for n in offered if n not in used]
+    if unused and args.list_unused:
+        print()
+        print("never called (%d): %s" % (len(unused), ", ".join(sorted(unused))))
+    return 0
+
+
+def cmd_hints(args) -> int:
+    run_dir = resolve_run(args.run, state_dir(args.state_dir))
+    rows = correction_hints(run_dir)
+    if not rows:
+        print("(no correction hints recorded in this run)")
+        return 0
+    print("%-8s %-10s %-22s %s" % ("clock", "op", "reason", "issues"))
+    print("-" * 100)
+    for row in rows:
+        first = row["issues"][0] if row["issues"] else {}
+        print("%-8s %-10s %-22s %s @ %s  expected=%s actual=%s" % (
+            fmt_clock(row["at"]), row["identity"], clip(row["reason"], 22),
+            first.get("code"), first.get("path"), first.get("expected"), first.get("actual")))
+        for extra in row["issues"][1:4]:
+            print("%-42s %s @ %s  expected=%s actual=%s" % (
+                "", extra.get("code"), extra.get("path"), extra.get("expected"), extra.get("actual")))
+    print("(%d correction(s))" % len(rows))
     return 0
 
 
@@ -758,6 +957,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("facts", help="facts with their turn")
     p.add_argument("run", nargs="?", default="latest")
     p.set_defaults(func=cmd_facts)
+
+    p = sub.add_parser("tools", help="MCP tools offered to the model vs actually called")
+    p.add_argument("run", nargs="?", default="latest")
+    p.add_argument("--list-unused", action="store_true", help="also list offered tools never called")
+    p.set_defaults(func=cmd_tools)
+
+    p = sub.add_parser("hints", help="diagnostics sent back with a rejected output")
+    p.add_argument("run", nargs="?", default="latest")
+    p.set_defaults(func=cmd_hints)
 
     p = sub.add_parser("sql", help="read-only SQL escape hatch")
     p.add_argument("run", nargs="?", default="latest")

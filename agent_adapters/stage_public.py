@@ -27,8 +27,9 @@ class StageSimulationModel:
         observations = [i for i in history if i.identity == "tool_observation_not_fact"
             and i.intent_id == request.context.session.owner_id]
         if request.stage == "stage_review":
-            value = dict(decision="accept", reason="controlled local review", accepted_road_indices=
-                list(range(len(request.proposal))) if isinstance(request.proposal, tuple) else [])
+            value = dict(decision="accept", reason="controlled local review")
+            if isinstance(request.proposal, tuple):
+                value["accepted_road_indices"] = list(range(len(request.proposal)))
         elif request.stage == "stage_intent":
             value = dict(kind="turn_intent", description=request.context.goal,
                 completion_criterion="one supported local observation", support_refs=[])

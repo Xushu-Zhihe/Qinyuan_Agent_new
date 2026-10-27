@@ -451,6 +451,40 @@ def test_schema27_migration_failure_rolls_back_both_new_tables(tmp_path, monkeyp
         assert db.execute("SELECT name FROM sqlite_master WHERE name IN ('d8_refinement_corrections', 'd8_refinement_process_facts')").fetchall() == []
 
 
+@pytest.mark.parametrize("schema,value,valid", [
+    ({"type": "object", "properties": {"optional": {"type": "string"}}}, {}, True),
+    ({"type": "object", "properties": {"optional": {"type": "string"}}}, {"optional": "ok"}, True),
+    ({"type": "object", "properties": {"optional": {"type": "string"}}}, {"optional": 1}, False),
+    ({"type": "object", "additionalProperties": {"type": "string"}}, {"entry": "ok"}, True),
+    ({"type": "object", "additionalProperties": {"type": "string"}}, {"entry": 1}, False),
+    ({"type": "object", "additionalProperties": False}, {"entry": "ok"}, False),
+])
+def test_object_schema_optional_keywords_do_not_crash(schema, value, valid):
+    from agent_core.output_contracts import shape_issues
+    assert (not shape_issues(value, schema)) == valid
+
+
+def test_contract_envelope_is_diagnosed_without_unwrapping():
+    from agent_core.output_contracts import obj, text
+    schema = obj({"kind": text()})
+    wrapped = {"version": 1, "stage": "stage_intent", "schema": {"kind": "turn_intent"}}
+    parsed, issues, terminal, _ = decode_response(wrapped, schema)
+    assert parsed is None and terminal is None
+    assert [i.code for i in issues] == ["output_envelope_invalid"]
+    assert decode_response(wrapped["schema"], schema)[0] == wrapped["schema"]
+
+
+@pytest.mark.parametrize("tail,code", [
+    ('</||DSML|| parameter>', "output_trailing_markup"),
+    ('}</\uff5c\uff5cDSML\uff5c\uff5c parameter>', "output_trailing_markup"),
+    ('{}', "json_trailing_data"),
+])
+def test_trailing_output_is_classified_without_extracting_a_prefix(tail, code):
+    from agent_core.output_contracts import obj, text
+    value, issues, _, _ = decode_response('{"script":"example"}' + tail, obj({"script": text()}))
+    assert value is None and [i.code for i in issues] == [code]
+
+
 def test_unpaired_unicode_and_nonfinite_exponents_fail_without_exception():
     for value in ['{"reason":"\\ud800"}', '{"reason":1e400}', {"reason": float("inf")}]:
         parsed, issues, terminal, _ = decode_response(value, {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]})
