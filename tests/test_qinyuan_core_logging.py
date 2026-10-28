@@ -76,3 +76,17 @@ def test_level_filter_keeps_errors(tmp_path, capsys):
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert [row["event"] for row in rows] == ["model.retry"]
     assert "model.retry" in capsys.readouterr().err
+
+
+def test_stream_diagnostics_are_visible_in_console_and_jsonl(tmp_path, capsys):
+    path = tmp_path / "run.jsonl"
+    configure(console=True, jsonl=path)
+    fields = dict(run="run1", request="request1", phase="stage_action", category="dependency",
+        code="provider_stream_invalid", branch="tool_id_changed", event_index=3,
+        field_path="$.choices[0].delta.tool_calls[0].id", observed_type="str", finish_seen=False, done_seen=False)
+    get_logger("model").warning("model.stream_rejected", **fields)
+    _close()
+    text = capsys.readouterr().err
+    row = json.loads(path.read_text(encoding="utf-8"))
+    for key, value in fields.items():
+        assert f"{key}={value}" in text and row[key] == value

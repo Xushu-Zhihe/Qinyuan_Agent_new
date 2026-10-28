@@ -63,6 +63,47 @@ def test_malformed_or_native_tool_stream_is_rejected(raw):
     with pytest.raises(ModelStreamError, match="provider_stream_invalid"): read(raw)
 
 
+@pytest.mark.parametrize("raw,native,branch", [
+    (chunk({"content": "{}"}) + b"data: [DONE]\n\n", False, "done_without_finish"),
+    (b"data: private-invalid-json\n\n", False, "event_json_invalid"),
+    (b"data: []\n\n", False, "event_type_invalid"),
+    (b'data: {}\n\n', False, "choices_type_invalid"),
+    (b'data: {"choices":[]}\n\n', False, "choices_count_invalid"),
+    (b'data: {"choices":[null]}\n\n', False, "choice_type_invalid"),
+    (b'data: {"choices":[{"index":1,"delta":{}}]}\n\n', False, "choice_index_invalid"),
+    (b'data: {"choices":[{"delta":null}]}\n\n', False, "delta_type_invalid"),
+    (chunk({"function_call": {"name": "private"}}), False, "legacy_function_call"),
+    (chunk({"tool_calls": [{"index": 0}]}), False, "tool_calls_not_allowed"),
+    (chunk({}, "stop") + chunk({"tool_calls": [{"index": 0}]}), True, "tool_calls_after_finish"),
+    (chunk({"tool_calls": "private"}), True, "tool_calls_type_invalid"),
+    (chunk({"tool_calls": [None]}), True, "tool_item_type_invalid"),
+    (chunk({"tool_calls": [{"index": -1}]}), True, "tool_index_invalid"),
+    (chunk({"tool_calls": [{"index": 0, "private": "private"}]}), True, "tool_fields_invalid"),
+    (chunk({"tool_calls": [{"index": 0, "type": "private"}]}), True, "tool_type_invalid"),
+    (chunk({"tool_calls": [{"index": 0, "id": "private-original"}]}) +
+        chunk({"tool_calls": [{"index": 0, "id": "private-changed"}]}), True, "tool_id_changed"),
+    (chunk({"tool_calls": [{"index": 0, "id": None}]}), True, "tool_id_type_invalid"),
+    (chunk({"tool_calls": [{"index": 0, "function": None}]}), True, "tool_function_type_invalid"),
+    (chunk({"tool_calls": [{"index": 0, "function": {"private-key": "private-value"}}]}), True, "tool_function_fields_invalid"),
+    (chunk({"tool_calls": [{"index": 0, "function": {"name": None}}]}), True, "tool_function_field_type"),
+    (chunk({}, "stop") + chunk({"content": "private-late"}), False, "text_after_finish"),
+    (chunk({"reasoning_content": 42}), False, "text_type_invalid"),
+    (chunk({}, ""), False, "finish_reason_invalid"),
+])
+def test_stream_rejection_has_safe_branch_and_event_position(raw, native, branch):
+    reports = []
+    with pytest.raises(ModelStreamError, match="^provider_stream_invalid$"):
+        read_chat_stream(io.BytesIO(raw), 65536, lambda **value: reports.append(value), allow_tool_calls=native)
+    diagnostic = reports[-1]
+    detail = diagnostic["stream_error"]
+    assert detail["branch"] == branch
+    assert detail["event_index"] == diagnostic["sse_events"] >= 1
+    assert detail["field_path"].startswith("$") and "private" not in json.dumps(diagnostic)
+    assert set(detail) == {"branch", "event_index", "field_path", "observed_type"}
+    assert diagnostic["done_seen"] == (branch == "done_without_finish")
+    assert diagnostic["finish_seen"] == (branch in {"text_after_finish", "tool_calls_after_finish"})
+
+
 def test_native_tool_argument_fragments_and_finish_are_preserved():
     raw = (chunk({"tool_calls": [{"index": 0, "id": "call_local", "type": "function",
         "function": {"name": "submit_stage_result", "arguments": '{"result":'}}]}) +
@@ -76,11 +117,50 @@ def test_native_tool_argument_fragments_and_finish_are_preserved():
     assert reports[-1]["content_chars"] > 0
 
 
-@pytest.mark.parametrize("index,id_value", [(1, "call_other"), (True, "call_other"), (0, "changed")])
-def test_native_stream_rejects_extra_call_or_changed_identity(index, id_value):
+@pytest.mark.parametrize("index,id_value", [(-1, "call_other"), (True, "call_other"), (0, "changed")])
+def test_native_stream_rejects_invalid_index_or_changed_identity(index, id_value):
     raw = chunk({"tool_calls": [{"index": 0, "id": "original", "function": {"name": "submit_stage_result"}}]})
     raw += chunk({"tool_calls": [{"index": index, "id": id_value, "function": {"arguments": "{}"}}]}, "tool_calls")
     with pytest.raises(ModelStreamError): read(raw, native=True)
+
+
+def test_interleaved_native_calls_are_received_without_selecting_a_decision():
+    raw = (chunk({"tool_calls": [
+        {"index": 1, "id": "second", "function": {"name": "submit_stage_result", "arguments": '{"result":'}},
+        {"index": 0, "id": "first", "function": {"name": "submit_stage_result", "arguments": '{"result":'}}]}) +
+        chunk({"tool_calls": [{"index": 0, "function": {"arguments": '"一"}'}},
+                              {"index": 1, "function": {"arguments": '"二"}'}}]}, "tool_calls",
+              usage={"prompt_tokens": 42, "completion_tokens": 12}) + b"data: [DONE]\n\n")
+    (data, _), reports = read(raw, native=True, split=[raw[i:i+3] for i in range(0, len(raw), 3)])
+    calls = data["choices"][0]["message"]["tool_calls"]
+    assert [call["id"] for call in calls] == ["first", "second"]
+    assert [json.loads(call["function"]["arguments"]) for call in calls] == [{"result": "一"}, {"result": "二"}]
+    assert data["usage"]["completion_tokens"] == 12
+    assert reports[-1]["finish_seen"] and reports[-1]["done_seen"] and reports[-1]["stream_error"] is None
+    with pytest.raises(ModelStreamError, match="http_transport_failure"):
+        read(raw.removesuffix(b"data: [DONE]\n\n"), native=True)
+
+
+def test_native_call_collection_and_index_sequence_remain_bounded():
+    raw = b"".join(chunk({"tool_calls": [{"index": i}]}) for i in range(100))
+    with pytest.raises(ModelStreamError, match="response_rejected"):
+        read(raw, native=True, limit=512)
+    reports = []
+    raw = chunk({"tool_calls": [{"index": 1}]}, "tool_calls") + b"data: [DONE]\n\n"
+    with pytest.raises(ModelStreamError, match="provider_stream_invalid"):
+        read_chat_stream(io.BytesIO(raw), 4096, lambda **v: reports.append(v), allow_tool_calls=True)
+    assert reports[-1]["stream_error"]["branch"] == "tool_index_sequence_invalid"
+    assert reports[-1]["finish_seen"] and reports[-1]["done_seen"]
+
+
+def test_changed_identity_in_second_call_has_its_actual_field_path():
+    reports = []
+    raw = (chunk({"tool_calls": [{"index": 0, "id": "first"}, {"index": 1, "id": "second"}]}) +
+        chunk({"tool_calls": [{"index": 0}, {"index": 1, "id": "changed"}]}))
+    with pytest.raises(ModelStreamError, match="provider_stream_invalid"):
+        read_chat_stream(io.BytesIO(raw), 4096, lambda **v: reports.append(v), allow_tool_calls=True)
+    assert reports[-1]["stream_error"]["branch"] == "tool_id_changed"
+    assert reports[-1]["stream_error"]["field_path"] == "$.choices[0].delta.tool_calls[1].id"
 
 
 def test_native_arguments_remain_bounded_and_incomplete_stream_is_not_valid():
@@ -125,6 +205,28 @@ def test_real_worker_stream_success_and_key_split_redaction(monkeypatch):
     pipe = Pipe(); deepseek_roles._raw_http_worker(pipe, settings, {"stream": True}, 5)
     assert pipe.messages[-1] == {"error": "invalid_response", "reason": "response_rejected"}
     assert not any("payload" in m for m in pipe.messages)
+    raw = (chunk({"tool_calls": [
+        {"index": i, "id": f"call_{i}", "type": "function",
+         "function": {"name": "submit_stage_result", "arguments": '{"result":{}}'}} for i in range(2)]}) +
+        chunk({}, "tool_calls", usage={"prompt_tokens": 42, "completion_tokens": 12}) + b"data: [DONE]\n\n")
+    pipe = Pipe(); deepseek_roles._raw_http_worker(pipe, settings, {"stream": True, "tools": [{}]}, 5)
+    assert len(pipe.messages[-1]["payload"]["tool_calls"]) == 2
+    assert pipe.messages[-1]["payload"]["finish_reason"] == "tool_calls"
+    assert any(m.get("diagnostic", {}).get("done_seen") for m in pipe.messages)
+    assert any(m.get("diagnostic", {}).get("usage", {}).get("completion_tokens") == 12
+               for m in pipe.messages if m.get("diagnostic", {}).get("usage"))
+    raw = (chunk({"reasoning_content": "private thought"}) +
+        chunk({"tool_calls": [{"index": 0, "function": {"name": None}}]}) +
+        chunk({}, "tool_calls") + b"data: [DONE]\n\n")
+    pipe = Pipe(); deepseek_roles._raw_http_worker(pipe, settings, {"stream": True, "tools": [{}]}, 5)
+    assert pipe.messages[-1] == {"error": "provider_failure", "reason": "provider_stream_invalid"}
+    diagnostic = {}
+    for message in pipe.messages:
+        diagnostic.update(message.get("diagnostic", {}))
+    assert diagnostic["stream_error"] == {"branch": "tool_function_field_type", "event_index": 2,
+        "field_path": "$.choices[0].delta.tool_calls[0].function.name", "observed_type": "null"}
+    assert not diagnostic["finish_seen"] and not diagnostic["done_seen"]
+    assert "private thought" not in repr(pipe.messages)
 
 
 def progress_worker(connection, settings, payload, timeout):

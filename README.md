@@ -78,7 +78,7 @@ if (-not (Test-Path .env)) {
 | `QINYUAN_LLM_FIRST_OUTPUT_TIMEOUT_SECONDS` | 连接后首次非空推理／正文增量，默认 `180` 秒 |
 | `QINYUAN_LLM_IDLE_TIMEOUT_SECONDS` | 开始生成后无新增推理／正文，默认 `60` 秒 |
 
-当前 D8 模型使用 SSE 流式接收，只在完整响应通过原校验后采用决策。心跳不延长生成等待；thinking=enabled、reasoning_effort=high 保留，不新增默认 max_tokens。省略总时限配置才采用600秒；已有 `.env` 显式180仍为180，需要你调整后用于新运行。实际超时策略在运行内冻结，恢复时改变配置会明确拒绝。诊断保留计数和时间，不保存完整思考；上游未提供 usage 时保持未知。细节见 [上限索引](restrict/explicit_limits_index.md)。
+当前 D8 模型使用 SSE 流式接收，只在完整响应通过原校验后采用决策。心跳不延长生成等待；2026-10-28按用户指定，内外层统一thinking=enabled、reasoning_effort=max，不新增默认max_tokens。省略总时限配置才采用600秒；已有 `.env` 显式180仍为180，需要你调整后用于新运行。实际角色/超时策略在运行内冻结，恢复时改变配置会明确拒绝，已有任务不静默改档。诊断保留计数和时间，不保存完整思考；上游未提供 usage 时保持未知。细节见 [上限索引](restrict/explicit_limits_index.md)。
 
 真实运行统一按已核实的模型与端点匹配容量，不再按内部契约版本切换：官方Flash／Pro及已确认的官方Flash别名采用1M上下文、384K输出保守预留，SCNET保留其已确认映射；未知模型／端点明确报配置错误，已移除旧容量策略及兼容回退，旧容量声明不再接受且历史文件不改写。不把预留发送为max_tokens。输入仍按完整序列化字节作保守估算，不冒充精确token。完整请求不足会自动尝试一次有界历史整理，保留原证据和近期对话；局部阻塞且其他分支通过准入探测时技术挂起，任务级阻塞则保留进展并等待有效变化或原deadline。`status`用`capacity_block`说明原因，不增加人工扩容流程。
 

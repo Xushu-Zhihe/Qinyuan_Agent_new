@@ -745,7 +745,7 @@ def test_supervision_input_is_losslessly_shared_and_old_frozen_shape_is_unchange
     assert "Distinguish feasibility from priority" not in old_payload["messages"][2]["content"]
     assert len(json.dumps(payload).encode()) < len(json.dumps(old_payload).encode())
     assert payload["thinking"] == old_payload["thinking"] == {"type": "enabled"}
-    assert payload["reasoning_effort"] == old_payload["reasoning_effort"] == "high"
+    assert payload["reasoning_effort"] == old_payload["reasoning_effort"] == "max"
     report = analyze(c.directory, c.task)["supervision"]
     assert report["counts"]["calls"] == len(captured)
     assert report["counts"]["applied"] >= 1 and report["counts"]["stops_applied"] == 0

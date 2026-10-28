@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 from qinyuan_core import Category, Layer, QinyuanError
 from agent_core.control_store import StorageError, UpsertTaskRun, canonical_json
 from agent_core.domain import FactStatus, IntentStatus
-from agent_core.actions import MCPCall
+from agent_core.actions import MCPCall, PUBLIC_REFERENCE_TOOLS
 from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8RevisionRecord
 from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.operation_accounting import D4OperationConflict, D4RecoveryRequired, D8HandoffBudgetPolicy, _text, _uuid, _sha
@@ -19,7 +19,7 @@ from agent_core.stage_contracts import (
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot,
     StageConclusionChange, StageFactApplication, StageFactProposal, StageFactSelection, StageHistoryRead,
     StageModelEvidence, StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
-    TurnAchievement, TurnCompletion, TurnIntent, TurnPlanningReview, TurnPlanningState, StagePlanningDecision,
+    TurnAchievement, TurnCompletion, TurnIntent, TurnPlanningReview, TurnPlanningState, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
 )
 from agent_core.turn_contracts import D1RoleConfig
 
@@ -124,7 +124,9 @@ def execution_policy(config):
     return json.loads(json.dumps({"authorization": asdict(config.authorization),
         "web_authorization": asdict(config.web_authorization) if config.web_authorization else None,
         "tcp_authorization": asdict(config.tcp_authorization) if config.tcp_authorization else None,
-        "capacity": asdict(config.handoff_config)}))
+        "capacity": asdict(config.handoff_config),
+        "tool_execution": {"max_in_flight": MAX_IN_FLIGHT_TOOLS, "sandbox_target_in_flight": 1,
+                           "wake": "first_result_merge_during_generation"}}))
 
 
 def proposal_digest(value):
@@ -159,6 +161,12 @@ def require_run(store, task_id):
     return config
 
 
+def live_tool_requests(store, task_id):
+    live = getattr(store, "live_tool_request", lambda identity: False)
+    return tuple(record for record in store.list_d4_operations(task_id)
+                 if record.start.category == "action" and live(record.start.operation_id))
+
+
 def validate_tool_start(store, start):
     """Bind a new dispatch to the exact admitted Inner decision and live Road."""
     config = require_run(store, start.task_run_id)
@@ -174,17 +182,23 @@ def validate_tool_start(store, start):
             or row["planning_state"] != TurnPlanningState.ACTIVE.value):
         _fail("stage.tool_road_not_running", Category.POLICY)
     operation = store.load_d4_operation(proposal_id)
+    live_experiment = experiment and getattr(store, "live_tool_request", lambda identity: False)(proposal_id)
     if (operation is None or operation.start.task_run_id != start.task_run_id or operation.start.category != "action"
             or operation.start.role != "inner_action" or operation.start.role_config_ref != config.inner_role.role_config_ref
-            or operation.start.base_checkpoint_sequence != start.base_checkpoint_sequence
+            or (operation.start.base_checkpoint_sequence != start.base_checkpoint_sequence and not live_experiment)
             or operation.completion is None or operation.completion.result_kind != "completed"
-            or operation.application_ref is not None):
+            or (operation.application_ref is not None and not (live_experiment and operation.application_ref == proposal_id))):
         _fail("stage.tool_proposal_not_ready", Category.POLICY)
     if store.stage_evidence is None:
         _fail("stage.evidence_unconfigured", Category.DEPENDENCY)
     evidence = store.stage_evidence.read_model_result(operation)
     if evidence.session != PlanningSession("road_execution", road_id) or not isinstance(evidence.result, MCPCall):
         _fail("stage.tool_proposal_scope_changed", Category.POLICY)
+    others = [store.stage_evidence.read_model_result(record).result for record in live_tool_requests(store, start.task_run_id)
+              if record.start.operation_id != proposal_id]
+    if (len(others) >= MAX_IN_FLIGHT_TOOLS or evidence.result.tool_name not in PUBLIC_REFERENCE_TOOLS
+            and any(isinstance(call, MCPCall) and call.tool_name not in PUBLIC_REFERENCE_TOOLS for call in others)):
+        _fail("stage.tool_slot_unavailable", Category.POLICY)
     from agent_core.stage_knowledge import StageKnowledge
     knowledge = StageKnowledge(store.stage_evidence, start.task_run_id, store=store)
     turn = knowledge.turns[row["turn_id"]]
@@ -433,7 +447,9 @@ def _reviewed(store, mutation, change):
     pending = {r.start.operation_id for r in store.list_d4_operations(mutation.task_run_id)
                if (r.completion is None or r.completion.result_kind == "completed" and r.application_ref is None)
                and not (r.start.category == "review" and callable(getattr(store, "live_strategy_operation", None))
-                             and store.live_strategy_operation(r.start.operation_id))} - used - set(change.applications)
+                             and store.live_strategy_operation(r.start.operation_id))
+               and not (r.start.category == "tool_dispatch"
+                        and getattr(store, "live_tool_operation", lambda identity: False)(r.start.operation_id))} - used - set(change.applications)
     if pending:
         _fail("stage.pending_operations", Category.UNKNOWN)
     return accepted
@@ -508,6 +524,8 @@ def _validate(store, mutation):
             or task.request != mutation.request or task.effective_model_backend != mutation.effective_model_backend):
         _fail("stage.task_not_active", Category.POLICY)
     accepted = _reviewed(store, mutation, change)
+    if (change.turns or change.reviews or change.facts or change.revisions) and live_tool_requests(store, mutation.task_run_id):
+        _fail("stage.tools_still_running", Category.POLICY)
     old = {t.turn_id: t for t in list_turns(store, mutation.task_run_id)}
     current = active_turn(tuple(old.values()))
     projected = dict(old)
@@ -586,6 +604,10 @@ def _validate(store, mutation):
                     _fail("stage.fact_selection_not_applied")
             elif isinstance(source.result, StageHistoryRead):
                 store.stage_evidence.read_history_result(operation)
+            elif isinstance(source.result, StagePlanningDecision) and source.result.kind == "wait_for_tools":
+                request = store.stage_evidence.request(identity)
+                if source.session.scope != "road_execution" or not request.context.pending_operation_ids:
+                    _fail("stage.wait_without_tools", Category.POLICY)
             else:
                 _fail("stage.reference_operation_invalid", Category.INPUT)
         if len(change.revisions) > 1:
@@ -672,6 +694,8 @@ def validate_goal_mutation(store, mutation):
             after.deadline_at, after.sandbox_id, after.source_root, after.target_network) != (
             task.request, task.effective_model_backend, task.started_at, task.deadline_at, task.sandbox_id, task.source_root, task.target_network):
         _fail("stage.goal_task_binding_changed", Category.POLICY)
+    if live_tool_requests(store, mutation.task_run_id):
+        _fail("stage.tools_still_running", Category.POLICY)
     if store.blocking_d4_operations(mutation.task_run_id):
         _fail("stage.operation_outcome_unknown", Category.UNKNOWN)
     operation = mutation.operation
@@ -808,7 +832,7 @@ def _validate_turn(store, task_id, turn, prior, projected, accepted, selections)
             _fail("stage.road_transition_invalid")
         if road.status in closed:
             verdicts = match(RoadResolution, road.road_id)
-            if not any(value.outcome is road.status and value.support_refs for _, value, _ in verdicts):
+            if not any(value.outcome is road.status for _, value, _ in verdicts):
                 _fail("stage.road_end_not_reviewed")
             consumed.update(b.review_operation_id for b, value, _ in verdicts if value.outcome is road.status)
             for _, value, _ in verdicts:

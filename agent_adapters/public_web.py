@@ -14,6 +14,7 @@ from agent_core.dual_llm_contracts import D3RecoveryRequired
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.handoff_contracts import D8Capacity
 from agent_core.turn_modeling import digest
+from agent_core.actions import PUBLIC_REFERENCE_TOOLS
 
 MAX_SECONDS = 30
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -30,7 +31,7 @@ SPECS = [
          input_schema=dict(type='object', properties={
              'url': dict(type='string', minLength=1, maxLength=8192)},
              required=['url'], additionalProperties=False))]
-NAMES = frozenset(s['qualified_name'] for s in SPECS)
+NAMES = PUBLIC_REFERENCE_TOOLS
 
 
 def preview(payload, identity, claim):

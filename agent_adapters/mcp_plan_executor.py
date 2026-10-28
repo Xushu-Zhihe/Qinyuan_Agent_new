@@ -297,7 +297,7 @@ class MCPPlanExecutor:
         remaining = int(self.app.state.task_run.deadline_at - self.app.clock())
         if remaining < 1:
             raise D3RecoveryRequired("mcp.deadline_insufficient")
-        if self.service is not None:
+        if not public and self.service is not None:
             self.service.maximum_timeout_seconds = min(maximum, remaining)
         self.evidence.save("mcp-call", identity, claim)
         self.app.store.begin_d4_operation(D4OperationStart(

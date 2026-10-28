@@ -60,6 +60,70 @@ def test_stage_http_script_preserves_per_request_evidence_and_read_only_projecti
         assert len(view["tool_operations"]) == 2 and len(view["verified_facts"]) == 1
 
 
+def test_http_experiment_overlaps_public_search_and_keeps_each_request_bound(case):
+    import threading
+    first_http, release_http = threading.Event(), threading.Event()
+    public_started, public_release = asyncio.Event(), asyncio.Event()
+    request = case.app.state.task_run.request
+    app = StageApplication(case.path / "http-overlap", **case.args, http_sandbox=SimpleNamespace())
+    async def public(call, timeout, token, target):
+        public_started.set()
+        await public_release.wait()
+        return dict(status="completed", ok=True, identity="public_reference_not_target_observation", content="reference")
+    app.mcp.public_web = SimpleNamespace(binding={"backend": "controlled"}, validate=lambda call: None, call=public)
+    app.start(request)
+    asyncio.run(case.app.close())
+    case.app, case.tools.task_id = app, app.task_id
+    sends, actions = [], []
+    class Transport:
+        def send(self, **kwargs):
+            sends.append(kwargs)
+            if len(sends) == 1:
+                first_http.set()
+                assert release_http.wait(5)
+            return D7HttpWireResponse(200, (), b"observed")
+    app.web.transport_factory = lambda _: Transport()
+    app.mcp.experiments.runner_factory = ScriptProcess
+    def decision(req, raw):
+        if req.stage == "stage_action":
+            actions.append(req)
+            if len(actions) == 1:
+                return dict(kind="mcp_call", tool_name="http.run_experiment", arguments=dict(
+                    script="request('GET','/first')\nrequest('GET','/second')", timeout_seconds=60))
+            if len(actions) == 2:
+                assert {t["qualified_name"] for t in req.tools} == {"web.search", "web.fetch"}
+                return dict(kind="mcp_call", tool_name="web.search", arguments={"query": "public knowledge gap"})
+            if len(actions) == 3:
+                return dict(kind="wait_for_tools", reason="the target experiment is still running")
+            return dict(kind="road_resolution", outcome="failed", reason="controlled end", support_refs=[])
+        if req.stage == "stage_completion":
+            return dict(kind="incomplete", reason="no formal success claimed", support_refs=[])
+        return raw
+    case.models.inner.transform = decision
+    async def exercise():
+        pending = asyncio.create_task(app.run(case.token))
+        try:
+            await asyncio.wait_for(public_started.wait(), 5)
+            assert await asyncio.to_thread(first_http.wait, 5)
+            public_release.set()
+            while len(actions) < 3: await asyncio.sleep(0.01)
+            release_http.set()
+            await asyncio.wait_for(pending, 5)
+        finally:
+            release_http.set(); public_release.set()
+            if not pending.done(): pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    asyncio.run(asyncio.wait_for(exercise(), 12))
+    assert len(sends) == 2 and not case.tools.calls
+    report = app.mcp.experiments.result(actions[0].model_request_id)
+    assert report["status"] == "completed" and len(report["requests"]) == 2
+    records = app.mcp.experiments.records(actions[0].model_request_id)
+    assert all(op.completion is not None for op in records)
+    assert any(op.start.base_checkpoint_sequence > actions[0].base_checkpoint_sequence for op in records)
+    app.mcp.reconcile()
+    assert len(sends) == 2 and not app.store.blocking_d4_operations(app.task_id)
+
+
 def test_stage_attachment_import_is_task_scoped_and_reused_without_copying_again(case):
     source = case.path / "source"
     source.mkdir()

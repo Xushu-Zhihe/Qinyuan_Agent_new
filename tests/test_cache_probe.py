@@ -182,6 +182,31 @@ def test_comparison_groups_do_not_mix_runs_models_or_restarts(tmp_path, monkeypa
     assert row["previous_request_id"] is None and row["system_prefix_chars"] is None
 
 
+def test_stage_probe_separates_sessions_and_observes_runtime_and_tool_changes(tmp_path, monkeypatch):
+    path = tmp_path / "stage-probe.jsonl"
+    monkeypatch.setenv("QINYUAN_CACHE_PROBE", str(path))
+    from agent_core.stage_contracts import PlanningSession
+    task = str(uuid4())
+    session = PlanningSession("road_execution", str(uuid4()))
+    payload = {"messages": [{"role": "system", "content": "fixed role"},
+        {"role": "user", "content": "private-source-body"}, {"role": "system", "content": "current reference A"},
+        {"role": "user", "content": "current data"}], "tools": [{"name": "stable-tool"}]}
+    sent = {"task_run_id": task, "model_request_id": str(uuid4()), "role_config_ref": "role",
+        "stage": "stage_action", "parameters": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}}
+    for n in range(3):
+        sent["model_request_id"] = str(uuid4())
+        payload["messages"][2]["content"] = "current reference " + str(n)
+        cache_probe.record(payload=payload, sent=sent, role="inner_action", session=session if n < 2 else
+            PlanningSession("road_execution", str(uuid4())))
+    raw = path.read_text(encoding="utf-8")
+    first, second, third = map(json.loads, raw.splitlines())
+    assert second["previous_request_id"] == first["request_id"] and second["tools_unchanged"] is True
+    assert second["system_prefix_chars"] == len("fixed role") and second["first_changed_message"] == 2
+    assert second["runtime_system_prefix_chars"] == len("current reference ")
+    assert third["previous_request_id"] is None and third["tools_unchanged"] is None
+    assert "private-source-body" not in raw and "current reference" not in raw
+
+
 def test_cache_groups_are_weighted_and_only_use_applied_intent_ownership(tmp_path, monkeypatch):
     task, operations, evidence, path = cache_case(tmp_path, monkeypatch)
     # Distinct token weights must not become an average of per-call percentages.

@@ -33,6 +33,13 @@ D7_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 D7_ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 
 
+def challenge_goal(challenge):
+    """Carry the saved classification through the existing task context."""
+    return (f"题型（任务提供）：{challenge['category']}\n"
+        "将题型作为可依据证据修正的分析背景，用于规划、工具选择与监督；"
+        "它不扩大工具、文件或网络访问授权。\n\n题目描述（原文）：\n" + challenge["description"])
+
+
 @dataclass
 class ActiveRun:
     run_id: str
@@ -258,7 +265,7 @@ class Runner:
                     "protocol_version": 3,
                     "request_id": str(uuid4()),
                     "task_request": {
-                        "goal": challenge["description"],
+                        "goal": challenge_goal(challenge),
                         "target": {
                             "source_root": str(input_dir.resolve()),
                             "attachments": [
@@ -327,7 +334,7 @@ class Runner:
                     "protocol_version": 3,
                     "request_id": str(uuid4()),
                     "task_request": {
-                        "goal": challenge["description"],
+                        "goal": challenge_goal(challenge),
                         "target": {
                             "attachments": [],
                             "endpoints": [{"url": origin}],
@@ -358,7 +365,7 @@ class Runner:
                 request = {
                     "protocol_version": 2,
                     "task_request": {
-                        "goal": challenge["description"],
+                        "goal": challenge_goal(challenge),
                         "target": {"attachments": [
                             {"kind": "local_path", "path": "input/" + name}
                             for name in names

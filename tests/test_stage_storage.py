@@ -303,6 +303,58 @@ def test_closed_road_is_not_reopened(case):
         case.apply(StageStateChange(turns=(replace(turn, roads=(replace(turn.roads[0], status=IntentStatus.RUNNING), b)),)))
 
 
+@pytest.mark.parametrize("outcome", [IntentStatus.SUCCEEDED, IntentStatus.FAILED, IntentStatus.INCONCLUSIVE,
+    IntentStatus.ABANDONED, IntentStatus.SKIPPED])
+def test_reviewed_road_can_close_without_support_or_stage_achievement(case, outcome):
+    turn = case.roads(case.root())
+    road, other = turn.roads
+    turn = replace(turn, roads=(replace(road, status=IntentStatus.RUNNING), other))
+    case.apply(StageStateChange(turns=(turn,)))
+    binding = case.reviewed(PlanningSession("road_execution", road.road_id),
+        RoadResolution(outcome, "reviewed route outcome; no formal stage deliverable claimed", ()), category="action")
+    closed = replace(turn, roads=(replace(turn.roads[0], status=outcome), other))
+    case.apply(StageStateChange(turns=(closed,), reviews=(binding,)))
+    saved = case.store.load_turn(case.task_id, turn.turn_id)
+    assert saved.roads[0].status is outcome and saved.roads[1].status is IntentStatus.PENDING
+    assert saved.achievement is None and saved.fact_refs == ()
+    assert case.store.load_task_run(case.task_id).status is TaskRunStatus.RUNNING
+    assert case.store.load_d4_operation(binding.review_operation_id).application_ref is not None
+
+
+@pytest.mark.parametrize("defect", ["missing", "rejected", "outcome", "scope"])
+def test_empty_support_does_not_bypass_road_review_binding(case, defect):
+    turn = case.roads(case.root())
+    road, other = turn.roads
+    turn = replace(turn, roads=(replace(road, status=IntentStatus.RUNNING), other))
+    case.apply(StageStateChange(turns=(turn,)))
+    reviews = ()
+    if defect != "missing":
+        binding = case.reviewed(PlanningSession("road_execution", other.road_id if defect == "scope" else road.road_id),
+            RoadResolution(IntentStatus.FAILED if defect == "outcome" else IntentStatus.SUCCEEDED, "reviewed", ()),
+            decision="reject" if defect == "rejected" else "accept", category="action")
+        reviews = (binding,)
+    with pytest.raises(StageStateError, match="road_end_not_reviewed"):
+        case.apply(StageStateChange(turns=(replace(turn, roads=(
+            replace(turn.roads[0], status=IntentStatus.SUCCEEDED), other)),), reviews=reviews))
+    assert case.store.load_turn(case.task_id, turn.turn_id) == turn
+
+
+def test_successful_road_nonempty_support_still_requires_formal_fact(case):
+    turn = case.roads(case.root())
+    road, other = turn.roads
+    turn = replace(turn, roads=(replace(road, status=IntentStatus.RUNNING), other))
+    case.apply(StageStateChange(turns=(turn,)))
+    ref = case.fact(turn.turn_id)
+    progress = replace(case.evidence.history.pop(ref), record_type="progress")
+    case.evidence.history[progress.ref] = progress
+    binding = case.reviewed(PlanningSession("road_execution", road.road_id),
+        RoadResolution(IntentStatus.SUCCEEDED, "cannot promote progress", (progress.ref,)), category="action")
+    with pytest.raises(StageStateError, match="formal_fact_required"):
+        case.apply(StageStateChange(turns=(replace(turn, roads=(
+            replace(turn.roads[0], status=IntentStatus.SUCCEEDED), other)),), reviews=(binding,)))
+    assert case.store.load_turn(case.task_id, turn.turn_id) == turn
+
+
 def test_reorder_preserves_rows_and_non_pending_road_position(case):
     turn = case.roads(case.root())
     candidates = tuple(r.candidate for r in turn.roads)

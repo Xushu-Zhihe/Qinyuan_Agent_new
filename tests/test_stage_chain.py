@@ -284,7 +284,7 @@ def test_continuation_provider_payload_and_capacity_use_inner_role(case):
         role_config_ref=inner.role_config_ref)
     envelope = D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": schema(request)}, "JSON only", None)
     payload = build_payload(envelope, inner)
-    assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "high"
+    assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "max"
     assert "max_tokens" not in payload and payload["stream"] is True
     with pytest.raises(ValueError, match="model_role_binding_changed"):
         build_payload(envelope, outer)

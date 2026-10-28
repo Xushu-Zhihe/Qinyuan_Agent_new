@@ -15,6 +15,7 @@ import pytest
 from agent_adapters.run_files import immutable_write
 from agent_adapters.workbench import Workbench, WorkbenchError
 from agent_adapters.workbench_runner import ActiveRun
+from agent_core.operation_accounting import D4BudgetPolicy
 
 
 class _Process:
@@ -54,6 +55,25 @@ def _challenge(*, endpoint: str = ""):
     }
 
 
+@pytest.mark.parametrize("category", ["pwn", "reverse", "web", "misc", "crypto", "other"])
+def test_selected_category_is_carried_into_frozen_stage_task(tmp_path, category):
+    workbench = Workbench(tmp_path, protocol_version=3, execution_profile="d8_v22", d7_mode="simulated")
+    value = {**_challenge(), "category": category, "description": "原始题目\n保留附件说明与换行。"}
+    challenge = workbench.create(value)
+    workbench.add_attachment(challenge["id"], "input.txt", io.BytesIO(b"fixture"), 7)
+    with patch("agent_adapters.workbench_runner.subprocess.Popen", return_value=_Process()), patch(
+        "agent_adapters.workbench_runner.threading.Thread", _NoThread):
+        run = workbench.runner.start(challenge["id"])
+    request = json.loads((Path(run["directory"]) / "request.json").read_text(encoding="utf-8"))
+    goal = request["task_request"]["goal"]
+    assert category in goal and goal.endswith(value["description"])
+    assert workbench.get(challenge["id"])["description"] == value["description"]
+    assert workbench.get(challenge["id"])["category"] == category
+    assert request["authorization"]["network_allowed"] is False
+    assert request["task_request"]["target"]["endpoints"] == []
+    assert set(request["task_request"]) == {"goal", "target", "deadline_seconds"}
+
+
 def test_v3_start_is_explicit_simulation_without_model_key_or_env_file(tmp_path: Path):
     workbench = Workbench(tmp_path, protocol_version=3)
     challenge = workbench.create(_challenge())
@@ -78,14 +98,14 @@ def test_v3_start_is_explicit_simulation_without_model_key_or_env_file(tmp_path:
     assert command[0:5] == [command[0], "-m", "agent", "run-task", "--mode"]
     assert command[5] == "simulated"
     assert "--env-file" not in command
-    request = json.loads((Path(run["directory"]) / "request.json").read_text())
+    request = json.loads((Path(run["directory"]) / "request.json").read_text(encoding="utf-8"))
     assert request["protocol_version"] == 3
     assert request["request_id"]
     assert request["task_request"]["target"]["endpoints"] == []
     assert request["authorization"]["allowed_tool"] == "d3_fixed_readonly"
     assert request["authorization"]["network_allowed"] is False
     assert request["authorization"]["attachment_indices"] == [0]
-    assert request["dual_llm_config"]["d4_budget"]["total"] == 48
+    assert request["dual_llm_config"]["d4_budget"]["total"] == D4BudgetPolicy().total
     # The model key is not a v3 simulation prerequisite and never enters the request.
     assert "api_key" not in json.dumps(request)
     child_env = popen.call_args.kwargs["env"]

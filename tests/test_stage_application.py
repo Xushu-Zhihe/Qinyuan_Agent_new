@@ -11,6 +11,7 @@ import pytest
 from agent_adapters.stage_application import StageApplication
 from agent_adapters.handoff_evidence import FakeUnicodeCapacity
 from agent_core.contracts import TaskRequest, ModelBackend
+from agent_core.actions import MCPCall
 from agent_core.domain import IntentStatus
 from agent_core.control_store import TargetNetworkBinding
 from agent_core.handoff_contracts import D8HandoffConfig, D8CapacityPolicy
@@ -170,6 +171,30 @@ def test_single_turn_actual_mcp_path_and_single_canonical_fact(case):
     assert any(request.messages for request in case.models.inner.calls if request.stage == "stage_action")
 
 
+def test_challenge_category_reaches_inner_outer_and_actual_payload(case):
+    from agent_adapters.workbench_runner import challenge_goal
+    from agent_adapters.deepseek_roles import build_payload, role_config
+    goal = challenge_goal({"category": "pwn", "description": "原始题目描述保持完整。"})
+    request = replace(case.app.state.task_run.request, goal=goal)
+    asyncio.run(case.app.close())
+    case.path = case.path / "category"
+    case.app = StageApplication(case.path, **case.args)
+    case.app.start(request, effective_model_backend=ModelBackend.CODEX_CLI)
+    case.tools.task_id = case.app.task_id
+    assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
+    assert case.app.state.task_run.request.goal == goal
+    for model in (case.models.inner, case.models.outer):
+        assert model.envelopes and all(e.request.context.goal == goal for e in model.envelopes)
+        envelope = model.envelopes[0]
+        role = role_config(model.role_config.role, version=17)
+        outgoing = replace(envelope, request=replace(envelope.request, role_config_ref=role.role_config_ref))
+        payload = build_payload(outgoing, role)
+        wire = json.dumps(payload, ensure_ascii=False)
+        assert "题型（任务提供）：pwn" in wire and "原始题目描述保持完整。" in wire
+        assert "可依据证据修正的分析背景" in wire
+        assert payload["reasoning_effort"] == "max"
+
+
 def test_road_success_does_not_imply_stage_success(case):
     case.models.inner.complete = False
     result = asyncio.run(case.app.run(case.token))
@@ -273,6 +298,25 @@ def test_non_road_review_never_advertises_or_accepts_road_selection(review_reque
             parse(request, D8ModelResponse(json.dumps({**raw, "accepted_road_indices": [0]})))
 
 
+def test_fact_review_scope_and_revision_reason_limit_remain_distinct(review_request):
+    from agent_core.conclusion_revision_contracts import D8RevisionTarget
+    from agent_core.stage_contracts import StageConclusionChange
+    from agent_core.stage_planning import model_contract
+    request = replace(review_request, proposal=StageFactProposal("a supported partial observation", "direct source", ()))
+    rules = model_contract(request)["rules"]
+    assert "not the whole Turn completion criterion" in rules
+    assert "Accept a supported partial observation" in rules
+    assert "an accepted inference remains inference" in rules
+    long_review = {"decision": "accept", "reason": "r" * 2000}
+    assert parse(request, long_review).reason == long_review["reason"]
+    revision = StageConclusionChange("withdraw", (D8RevisionTarget(str(uuid4()), 1, "existing-version"),),
+        None, None, (), "source withdrawn", None, None, None)
+    request = replace(request, proposal=revision)
+    with pytest.raises(ValueError, match="stage.output_invalid"):
+        parse(request, long_review)
+    assert parse(request, {"decision": "accept", "reason": "checked the revision"}).decision == "accept"
+
+
 @pytest.mark.parametrize("decision,selection,valid", [
     ("accept", [1, 0], True), ("accept", None, False), ("accept", [], False),
     ("accept", [2], False), ("accept", [0, 0], False), ("accept", [-1], False),
@@ -292,6 +336,16 @@ def test_road_review_schema_and_parser_agree_on_selection(review_request, decisi
     else:
         with pytest.raises(ValueError, match="stage.output_invalid"):
             parse(request, response)
+
+
+def test_stable_provider_indices_do_not_relax_local_selection_range(review_request):
+    from agent_core.output_contracts import decode_response
+    from agent_core.stage_planning import provider_schema
+    request = replace(review_request, proposal=(RoadCandidate("first"), RoadCandidate("second")))
+    value = {"decision": "accept", "reason": "select original candidates", "accepted_road_indices": [99]}
+    assert not decode_response(value, provider_schema(request))[1]
+    with pytest.raises(ValueError, match="stage.output_invalid"):
+        parse(request, value)
 
 
 def test_schema_guided_turn_review_needs_no_format_correction(case):
@@ -390,29 +444,29 @@ def test_bounded_format_correction_preserves_scope_and_role(case):
 
 @pytest.mark.parametrize("native", [False, True])
 def test_correction_receives_frozen_exact_length_feedback(case, native):
-    case.models.outer.native = native
+    case.models.inner.native = native
     def transform(request, raw):
-        if request.stage == "stage_review" and isinstance(request.proposal, StageFactProposal) and not request.correction_of_model_request_id:
-            return {**raw, "reason": "a" * 806}
+        if raw.get("kind") == "fact_candidate" and not request.correction_of_model_request_id:
+            return {**raw, "content": "a" * 806}
         return raw
-    case.models.outer.transform = transform
+    case.models.inner.transform = transform
     assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
-    corrected = [e for e in case.models.outer.envelopes if e.correction]
+    corrected = [e for e in case.models.inner.envelopes if e.correction]
     assert corrected
     for envelope in corrected:
         feedback = envelope.correction
         assert feedback["correction_of_model_request_id"] == envelope.request.correction_of_model_request_id
         issue = feedback["issues"][0]
-        assert issue["code"] == "string_too_long" and issue["path"] == ("$/result/reason" if native else "$/reason")
-        assert issue["expected"] == "unicode_codepoints_le_512" and issue["actual"] == "unicode_codepoints_806"
+        assert issue["code"] == "string_too_long" and issue["path"] == ("$/result/content" if native else "$/content")
+        assert issue["expected"] == "unicode_codepoints_le_256" and issue["actual"] == "unicode_codepoints_806"
         frozen = case.app.evidence.read("contract", envelope.request.model_request_id)
         assert frozen["correction"] == feedback
         assert "a" * 806 not in json.dumps(feedback)
         from agent_adapters.deepseek_roles import build_payload, role_config
-        role = role_config("outer_planning", version=17)
+        role = role_config("inner_action", version=17)
         outgoing = replace(envelope, request=replace(envelope.request, role_config_ref=role.role_config_ref))
         payload = build_payload(outgoing, role)
-        assert '"actual": "unicode_codepoints_806"' in payload["messages"][0]["content"]
+        assert '"actual": "unicode_codepoints_806"' in payload["messages"][2]["content"]
 
 
 def test_native_output_preserves_raw_identity_and_canonical_history(case):
@@ -443,6 +497,64 @@ def test_correction_cannot_rebind_a_different_stage_scope(case):
     assert calls == (len(case.models.inner.calls), len(case.models.outer.calls), len(case.tools.calls))
 
 
+@pytest.mark.parametrize("stage", ["stage_action", "stage_review"])
+@pytest.mark.parametrize("repeat", [False, True])
+def test_complete_multi_call_stream_shares_one_correction_without_dispatch(case, monkeypatch, stage, repeat):
+    import io
+    from agent_adapters.model_stream import read_chat_stream
+    from agent_adapters.web.task_result import _stage_task_result
+    from test_model_stream import chunk
+    model = case.models.inner if stage == "stage_action" else case.models.outer
+    model.native = True
+    original = model.invoke
+    roots, reports = [], []
+    def invoke(envelope, timeout, token):
+        response = original(envelope, timeout, token)
+        request = envelope.request
+        if request.stage != stage:
+            return response
+        if not roots:
+            roots.append(request.model_request_id)
+        if request.model_request_id != roots[0] and request.correction_of_model_request_id != roots[0]:
+            return response
+        calls = list(response.tool_calls)
+        if repeat or request.correction_of_model_request_id is None:
+            calls.append({**calls[0], "id": "second_unapplied_call"})
+        raw = b"".join(chunk({"tool_calls": [{"index": i, **call}]}) for i, call in enumerate(calls))
+        raw += chunk({}, "tool_calls", usage={"prompt_tokens": 42, "completion_tokens": 12}) + b"data: [DONE]\n\n"
+        data, _ = read_chat_stream(io.BytesIO(raw), 65536, lambda **v: reports.append(v), allow_tool_calls=True)
+        message = data["choices"][0]["message"]
+        return D8ModelResponse(message["content"], data["choices"][0]["finish_reason"], tuple(message["tool_calls"]))
+    monkeypatch.setattr(model, "invoke", invoke)
+    if repeat:
+        with pytest.raises(StageStateError, match="model_output_unusable") as error:
+            asyncio.run(case.app.run(case.token))
+        assert error.value.category == "input" and not case.tools.calls
+    else:
+        assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
+        assert len(case.tools.calls) == 1
+    corrected = [e for e in model.envelopes if e.request.correction_of_model_request_id == roots[0]]
+    assert len(corrected) == 1
+    assert corrected[0].correction["reason"] == "output_format_invalid"
+    assert corrected[0].correction["issues"] == [{"code": "multiple_tool_calls", "path": "$/tool_calls",
+        "expected": "exactly_one_output_tool", "actual": "multiple"}]
+    first = case.app.evidence.read("result", roots[0])
+    assert first["outcome"] == "invalid" and first["finish_reason"] == "tool_calls" and len(first["tool_calls"]) == 2
+    assert reports[-1]["finish_seen"] and reports[-1]["done_seen"] and reports[-1]["usage"]["completion_tokens"] == 12
+    assert case.app.store.load_d4_operation(roots[0]).completion.result_kind == "failed"
+    view = _stage_task_result(case.path, dict(task_run_id=case.app.task_id, mode="simulated"),
+        case.app.store, case.args["config"])
+    if repeat:
+        assert view["model_failures"][0]["issue_codes"] == ["multiple_tool_calls"]
+        assert view["model_failures"][0]["category"] == "input"
+        count = len(model.calls)
+        with pytest.raises(StageStateError, match="model_output_unusable"):
+            asyncio.run(case.app.run(case.token))
+        assert len(model.calls) == count and not case.tools.calls
+    else:
+        assert not view["model_failures"]
+
+
 @pytest.mark.parametrize("change", ["wrong_name", "two_calls", "oversized_content", "duplicate_key", "stop", "length", "missing_result"])
 def test_native_envelope_never_bypasses_local_validation(review_request, change):
     request = replace(review_request, stage="stage_intent")
@@ -456,6 +568,14 @@ def test_native_envelope_never_bypasses_local_validation(review_request, change)
     else: calls[0]["function"]["arguments"] = '{"script":"untrusted"}'
     with pytest.raises(ValueError, match="stage.output_invalid"):
         parse(request, response)
+
+
+def test_multi_call_diagnostic_does_not_hide_response_limit(review_request):
+    from agent_core.stage_planning import decode_stage_response
+    response = native_response({"decision": "accept", "reason": "controlled"})
+    response = replace(response, content="x" * 65537, tool_calls=response.tool_calls * 2)
+    _, issues, terminal, _ = decode_stage_response(review_request, response)
+    assert terminal == "output_size_exceeded" and issues[0].code == "output_size_exceeded"
 
 
 def test_premature_completion_is_corrected_before_outer_and_then_creates_fact(case):
@@ -510,10 +630,12 @@ def test_native_commentary_is_retained_but_never_becomes_decision_or_fact(case):
         if i.record_type == "verified_fact")
 
 
-def test_ordinary_stage_reason_is_not_truncated_or_given_a_field_limit(case):
+@pytest.mark.parametrize("native", [False, True])
+def test_ordinary_stage_reason_is_not_truncated_or_given_a_field_limit(case, native):
+    case.models.inner.native = case.models.outer.native = native
     long_reason = "r" * 2000
     def transform(request, raw):
-        if "reason" in raw and raw.get("kind") != "fact_candidate" and not isinstance(request.proposal, StageFactProposal):
+        if "reason" in raw:
             return {**raw, "reason": long_reason}
         return raw
     case.models.inner.transform = case.models.outer.transform = transform
@@ -630,20 +752,135 @@ def test_real_provider_payload_keeps_role_and_reasoning_parameters(case):
     request = replace(request, role_config_ref=inner.role_config_ref)
     envelope = D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": schema(request)}, model_contract(request)["instruction"], None)
     payload = build_payload(envelope, inner)
-    assert "Do not copy the contract envelope" in payload["messages"][0]["content"]
+    assert "Do not copy the contract envelope" in payload["messages"][2]["content"]
     assert payload["tool_choice"] == "auto" and payload["tools"][0]["function"]["name"] == OUTPUT_TOOL
     assert "response_format" not in payload
     history = replace(request, messages=({"role": "assistant", "content": '{"kind":"roads"}'},))
     projected = build_payload(replace(envelope, request=history), inner)
     assert projected["messages"][1]["role"] == "user"
-    assert json.loads(projected["messages"][1]["content"])["historical_model_result"] == '{"kind":"roads"}'
-    assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "high"
+    assert json.loads(projected["messages"][1]["content"])["history"][0]["content"]["historical_model_result"] == {"kind": "roads"}
+    assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "max"
     assert "max_tokens" not in payload and payload["stream"] is True
     with pytest.raises(ValueError, match="model_role_binding_changed"):
         build_payload(envelope, outer)
     request = replace(request, stage="stage_summary", role_config_ref=outer.role_config_ref)
     envelope = replace(envelope, request=request, output_contract={"version": 1, "stage": request.stage, "schema": schema(request)})
-    assert build_payload(envelope, outer)["reasoning_effort"] == "high"
+    assert build_payload(envelope, outer)["reasoning_effort"] == "max"
+
+
+@pytest.mark.parametrize("stage", ["stage_roads", "stage_action", "stage_review",
+    "stage_completion", "stage_continuation", "stage_supervision"])
+def test_generic_exploration_guidance_reaches_provider_without_granting_tools(stage):
+    from agent_adapters.deepseek_roles import build_payload, role_config
+    from agent_adapters.public_web import SPECS
+    from agent_core.actions import MCPCall
+    from agent_core.output_contracts import D8OutputRequest
+    from agent_core.stage_planning import INNER_STAGES, model_contract
+    turn = StageTurnSnapshot(str(uuid4()), TurnIntent("compare candidate explanations", "a discriminating observation"),
+        TurnPlanningState.ACTIVE)
+    session = PlanningSession("road_execution" if stage in {"stage_action", "stage_supervision"} else "turn_planning",
+        str(uuid4()) if stage in {"stage_action", "stage_supervision"} else turn.turn_id)
+    context = TurnPlanningContext(str(uuid4()), "investigate the authorized question", session, turn, ())
+    role = role_config("inner_action" if stage in INNER_STAGES else "outer_planning", version=17)
+    local_tool = {"qualified_name": "shell.run_bash", "input_schema": {"type": "object",
+        "properties": {"script": {"type": "string"}}, "required": ["script"], "additionalProperties": False}}
+    request = StageModelRequest(str(uuid4()), context.task_run_id, stage, role.role_config_ref, 1, context,
+        tools=(*SPECS, local_tool) if stage == "stage_action" else (),
+        proposal=turn.intent if stage == "stage_review" else None)
+    contract = model_contract(request)
+    payload = build_payload(D8OutputRequest(request, {"version": 1, "stage": stage, "schema": contract["schema"]},
+        contract["instruction"], None), role)
+    system = payload["messages"][2]["content"]
+    assert "answer could change the next decision" in system
+    assert "use adequate local sources directly and reuse existing retrievals" in system
+    assert "Do not search merely because a version, error or attempt count exists" in system
+    assert "cannot distinguish success from failure leaves that hypothesis unresolved" in system
+    assert "Separate tool or measurement failure from target counterevidence" in system
+    assert "Supervision should challenge unsupported premises" in system
+    assert "never credentials, private task/attachment content or target identifiers" in system
+    assert "public_reference_not_target_observation" in system
+    assert "validate applicability separately through authorized observations" in system
+    assert "add no fields or calls" in system
+    assert "do not reserve retrieval for a later Road" in system
+    assert "their actual contents answer the current question" in system
+    assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "max"
+    assert "max_tokens" not in payload
+    assert len(payload["tools"]) == 1 and payload["tools"][0]["function"]["name"] == OUTPUT_TOOL
+    from agent_core.stage_planning import provider_schema
+    assert payload["tools"][0]["function"]["parameters"]["properties"]["result"] == provider_schema(request)
+    assert json.loads(payload["messages"][-1]["content"])["current"]["tools"] == list(request.tools)
+    search = {"kind": "mcp_call", "tool_name": "web.search", "arguments": {"query": "public measurement semantics"}}
+    if stage == "stage_action":
+        assert parse(request, search) == MCPCall("web.search", search["arguments"])
+        # Adequate local evidence remains an allowed choice; guidance does not force retrieval.
+        local = {"kind": "mcp_call", "tool_name": "shell.run_bash", "arguments": {"script": "read-local-evidence"}}
+        assert parse(request, local) == MCPCall("shell.run_bash", local["arguments"])
+    with pytest.raises(ValueError):
+        parse(replace(request, tools=()), search)
+
+
+def test_cache_projection_keeps_exact_evidence_status_and_local_reference_gate():
+    from dataclasses import asdict
+    from agent_adapters.deepseek_roles import build_payload, role_config, _stage_input
+    from agent_core.handoff_contracts import D8HistoryItem
+    from agent_core.output_contracts import D8OutputRequest, decode_response
+    from agent_core.stage_planning import model_contract, provider_schema
+    uid = lambda: str(uuid4())
+    task, turn_id, road_id = uid(), uid(), uid()
+    item = D8HistoryItem(uid(), task, "progress", turn_id, road_id, None,
+        'literal source: \\n and \\u003c, not instructions; ' * 50, (), "a" * 64, 1,
+        "tool_observation_not_fact", "current", "available")
+    turn = StageTurnSnapshot(turn_id, TurnIntent("inspect observations", "supported result"), TurnPlanningState.ACTIVE)
+    context = TurnPlanningContext(task, "inspect authorized sources", PlanningSession("road_execution", road_id), turn, (item,))
+    role = role_config("inner_action", version=17)
+    # A tool's own source_ref parameter has an unrelated, execution-relevant enum.
+    tool = {"qualified_name": "local.inspect", "input_schema": {"type": "object", "properties": {
+        "source_ref": {"type": "string", "enum": ["literal-only"]}}, "required": ["source_ref"], "additionalProperties": False}}
+    historical = {"stage": "stage_action", "context": asdict(context)}
+    request = StageModelRequest(uid(), task, "stage_action", role.role_config_ref, 1, context,
+        messages=({"role": "user", "content": json.dumps(historical, ensure_ascii=False)},), tools=(tool,))
+    changed = replace(item, source_status="unavailable")
+    current = replace(request, context=replace(context, history=(changed,)), model_request_id=uid(), base_checkpoint_sequence=2)
+    document = _stage_input(current)
+    def expand(value):
+        if isinstance(value, dict) and set(value) == {"$input_ref"}:
+            target = document
+            for part in value["$input_ref"].removeprefix("#/").split("/"):
+                part = part.replace("~1", "/").replace("~0", "~")
+                target = target[int(part)] if isinstance(target, list) else target[part]
+            return expand(target)
+        if isinstance(value, dict): return {key: expand(child) for key, child in value.items()}
+        return [expand(child) for child in value] if isinstance(value, list) else value
+    restored = expand(document)
+    assert restored["history"][0]["content"] == json.loads(json.dumps(historical))
+    assert restored["current"] == json.loads(json.dumps({key: value for key, value in asdict(current).items() if key != "messages"}))
+    assert restored["history"][0]["content"]["context"]["history"][0]["source_status"] == "available"
+    assert restored["current"]["context"]["history"][0]["source_status"] == "unavailable"
+    assert json.dumps(document, ensure_ascii=False).count(json.dumps(item.content, ensure_ascii=False)) == 1
+    contract = model_contract(current)
+    payload = build_payload(D8OutputRequest(current, {"version": 1, "stage": current.stage, "schema": schema(current)},
+        contract["instruction"], None), role)
+    encoded_contract = payload["messages"][2]["content"].split("Output contract=", 1)[1]
+    runtime, _ = json.JSONDecoder().raw_decode(encoded_contract)
+    assert runtime["schema"] == schema(current)  # Full current constraints stay system-priority.
+    proposal = {"kind": "fact_candidate", "content": "source statement", "reason": "direct",
+        "support_refs": ["invented-reference"], "inferred": False}
+    assert not decode_response(proposal, provider_schema(current))[1]
+    with pytest.raises(ValueError): parse(current, proposal)
+    native_call = next(b for b in provider_schema(current)["anyOf"] if b["properties"]["kind"]["const"] == "mcp_call")
+    assert native_call["properties"]["arguments"] == {"$schema": "https://json-schema.org/draft/2020-12/schema", **tool["input_schema"]}
+    second = replace(item, record_id=uid(), content="a new observed result", source_version="b" * 64)
+    following = replace(request, model_request_id=uid(), base_checkpoint_sequence=3,
+        context=replace(context, history=(item, second)), messages=(*request.messages,
+            {"role": "assistant", "content": '{"kind":"history_details","refs":[]}'}))
+    following_contract = model_contract(following)
+    next_payload = build_payload(D8OutputRequest(following, {"version": 1, "stage": following.stage, "schema": schema(following)},
+        following_contract["instruction"], None), role)
+    assert next_payload["tools"] == payload["tools"]
+    assert next_payload["messages"][0] == payload["messages"][0]
+    assert next_payload["messages"][2] != payload["messages"][2]
+    assert next_payload["messages"][1]["content"].startswith(payload["messages"][1]["content"][:-2])
+    assert request.context.history == (item,) and item.content.startswith('literal source: \\n')
 
 
 def test_single_review_cannot_create_duplicate_formal_facts(case, monkeypatch):
@@ -823,3 +1060,241 @@ def test_changed_prompt_contract_cannot_reinterpret_an_existing_result(case, mon
     monkeypatch.setitem(RULES, "stage_intent", original + " a different contract")
     with pytest.raises(StageStateError, match="model_contract_changed"):
         case.app.evidence.read_model_result(operation)
+
+
+@pytest.fixture
+def overlap_case(case):
+    request = case.app.state.task_run.request
+    asyncio.run(case.app.close())
+    case.path = case.path / "overlap"
+    case.app = StageApplication(case.path, **case.args)
+    control = SimpleNamespace(started={key: asyncio.Event() for key in "ABC"},
+        release={key: asyncio.Event() for key in "ABC"}, active=set(), maximum=0, calls=[], failure=None,
+        known_failure=None, confirmed_stop=False)
+    async def operation(name, arguments):
+        label = (arguments.get("query") or arguments.get("url") or arguments["script"]).split()[-1].rsplit("/", 1)[-1]
+        control.calls.append((label, name))
+        control.active.add(label)
+        control.maximum = max(control.maximum, len(control.active))
+        control.started[label].set()
+        try:
+            await control.release[label].wait()
+            if control.failure == label:
+                raise RuntimeError("controlled unknown tool outcome")
+            return label
+        finally:
+            control.active.remove(label)
+    async def public(call, timeout, token, target):
+        try:
+            label = await operation(call.tool_name, call.arguments)
+        except asyncio.CancelledError:
+            if not control.confirmed_stop:
+                raise
+            return dict(status="failed", ok=False, identity="public_reference_not_target_observation", code="retrieval.cancelled")
+        return dict(status="failed" if control.known_failure == label else "completed", ok=control.known_failure != label,
+            identity="public_reference_not_target_observation", content=label)
+    async def sandbox(name, arguments):
+        label = await operation(name, arguments)
+        case.tools.calls.append((name, arguments))
+        return MCPExecutionResult(case.app.task_id, "controlled-sandbox", name, "bash", ("-lc", arguments["script"]),
+            "completed", 0, label, "", False)
+    case.tools.call_tool = sandbox
+    case.app.mcp.public_web = SimpleNamespace(binding={"backend": "controlled"}, validate=lambda call: None, call=public)
+    case.app.start(request, effective_model_backend=ModelBackend.CODEX_CLI)
+    case.tools.task_id = case.app.task_id
+    control.decide = lambda req: {"kind": "road_resolution", "outcome": "failed", "reason": "controlled exploration ended",
+        "support_refs": [i.ref for i in req.context.history if i.record_type == "progress"]}
+    def transform(req, raw):
+        if req.stage == "stage_action":
+            return control.decide(req)
+        if req.stage == "stage_completion":
+            return {"kind": "incomplete", "reason": "no formal result claimed", "support_refs": []}
+        return raw
+    case.models.inner.transform = transform
+    case.overlap = control
+    return case
+
+
+@pytest.mark.parametrize("first_tool,second_tool", [
+    ("web.search", "web.fetch"), ("web.search", "web.search"), ("shell.run_bash", "web.search")])
+def test_two_slots_first_result_wakes_and_wait_does_not_spin(overlap_case, first_tool, second_tool):
+    case, control = overlap_case, overlap_case.overlap
+    actions = []
+    def decision(req):
+        actions.append(req)
+        n = len(actions)
+        if n <= 2:
+            tool = first_tool if n == 1 else second_tool
+            label = "A" if n == 1 else "B"
+            key = "query" if tool == "web.search" else "url" if tool == "web.fetch" else "script"
+            return dict(kind="mcp_call", tool_name=tool, arguments={key: "https://docs.example/" + label if tool == "web.fetch" else label})
+        if n == 3:
+            assert req.context.pending_operation_ids and len([i for i in req.context.history if i.record_type == "progress"]) == 1
+            return dict(kind="wait_for_tools", reason="the next action depends on the remaining result")
+        return dict(kind="road_resolution", outcome="failed", reason="controlled end", support_refs=[])
+    control.decide = decision
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        try:
+            await asyncio.wait_for(control.started["B"].wait(), 5)
+            assert control.active == {"A", "B"} and len(actions) == 2
+            assert len(case.app.store.list_d4_unresolved_operations(case.app.task_id)) == 2
+            assert not case.app.store.blocking_d4_operations(case.app.task_id)
+            with pytest.raises(StageStateError, match="tools_still_running"):
+                case.app._commit(StageStateChange(turns=case.app.store.list_stage_turns(case.app.task_id)))
+            if first_tool == "shell.run_bash":
+                assert {t["qualified_name"] for t in actions[1].tools} == {"web.search", "web.fetch"}
+            assert '"pending_tools"' in str(actions[1].messages)
+            control.release["B"].set()
+            while len(actions) < 3:
+                await asyncio.sleep(0.01)
+            assert not control.release["A"].is_set()
+            while not any(op.application_ref and case.app.evidence.read("request", op.start.operation_id)
+                          and case.app.evidence.request(op.start.operation_id).stage == "stage_action"
+                          and isinstance(case.app.evidence.read_model_result(op).result, StagePlanningDecision)
+                          for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == "action"):
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.04)
+            assert len(actions) == 3 and control.active == {"A"}
+            control.release["A"].set()
+            await asyncio.wait_for(pending, 5)
+        finally:
+            for gate in control.release.values(): gate.set()
+            if not pending.done(): pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    assert control.maximum == 2 and len(control.calls) == 2
+    assert len(actions) == 4 and not case.app._tools_in_flight
+    assert len([i for i in actions[-1].context.history if i.record_type == "progress"]) == 2
+    assert not any(req.correction_of_model_request_id for req in actions)
+
+
+def test_results_arriving_during_generation_merge_without_interrupting_inner(overlap_case):
+    import threading
+    case, control = overlap_case, overlap_case.overlap
+    case.models.inner.native = case.models.outer.native = True
+    entered, release_model = threading.Event(), threading.Event()
+    actions = []
+    def decision(req):
+        actions.append(req)
+        if len(actions) <= 2:
+            return dict(kind="mcp_call", tool_name="web.search", arguments={"query": "A" if len(actions) == 1 else "B"})
+        if len(actions) == 3:
+            entered.set()
+            assert release_model.wait(5)
+            return dict(kind="wait_for_tools", reason="await the remaining response")
+        return dict(kind="road_resolution", outcome="failed", reason="controlled end", support_refs=[])
+    control.decide = decision
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        try:
+            await asyncio.wait_for(control.started["B"].wait(), 5)
+            control.release["A"].set()
+            while not entered.is_set(): await asyncio.sleep(0.01)
+            assert len([i for i in actions[2].context.history if i.record_type == "progress"]) == 1
+            control.release["B"].set()
+            while control.active: await asyncio.sleep(0.01)
+            await asyncio.sleep(0.04)
+            assert len(actions) == 3 and not pending.done()
+            release_model.set()
+            await asyncio.wait_for(pending, 5)
+        finally:
+            release_model.set()
+            for gate in control.release.values(): gate.set()
+            if not pending.done(): pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    assert len(actions) == 4 and not actions[-1].context.pending_operation_ids
+    assert len([i for i in actions[-1].context.history if i.record_type == "progress"]) == 2
+
+
+def test_concurrent_unknown_keeps_other_known_result_and_blocks_restart(overlap_case):
+    case, control = overlap_case, overlap_case.overlap
+    actions = []
+    def decision(req):
+        actions.append(req)
+        return dict(kind="mcp_call", tool_name="web.search", arguments={"query": "A" if len(actions) == 1 else "B"})
+    control.decide, control.failure = decision, "A"
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        await asyncio.wait_for(control.started["B"].wait(), 5)
+        control.release["A"].set()
+        control.release["B"].set()
+        with pytest.raises(Exception, match="retrieval.outcome_unknown"):
+            await asyncio.wait_for(pending, 5)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    records = [op for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == "tool_dispatch"]
+    assert len(records) == 2 and sum(op.completion is not None for op in records) == 1
+    assert case.app.store.blocking_d4_operations(case.app.task_id) and not case.app._tools_in_flight
+    task_id, count = case.app.task_id, len(case.models.inner.calls)
+    asyncio.run(case.app.close())
+    case.app = StageApplication(case.path, **case.args)
+    case.app.bind(task_id)
+    with pytest.raises(D4RecoveryRequired): asyncio.run(case.app.run(case.token))
+    assert len(case.models.inner.calls) == count and len(control.calls) == 2
+
+
+@pytest.mark.parametrize("known_failure", [None, "B"])
+def test_free_slot_is_reused_but_road_review_waits_for_all_tools(overlap_case, known_failure):
+    case, control = overlap_case, overlap_case.overlap
+    control.known_failure = known_failure
+    actions = []
+    def decision(req):
+        actions.append(req)
+        if len(actions) <= 3:
+            tool = "shell.run_bash" if len(actions) == 3 else "web.search"
+            return dict(kind="mcp_call", tool_name=tool,
+                arguments={"script" if tool == "shell.run_bash" else "query": "ABC"[len(actions)-1]})
+        return dict(kind="road_resolution", outcome="failed", reason="controlled end", support_refs=[])
+    control.decide = decision
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        try:
+            await asyncio.wait_for(control.started["B"].wait(), 5)
+            control.release["B"].set()
+            await asyncio.wait_for(control.started["C"].wait(), 5)
+            assert control.active == {"A", "C"} and control.maximum == 2
+            control.release["C"].set()
+            while len(actions) < 4: await asyncio.sleep(0.01)
+            await asyncio.sleep(0.04)
+            assert not any(isinstance(req.proposal, RoadResolution) for req in case.models.outer.calls)
+            assert case.app.store.list_stage_turns(case.app.task_id)[0].roads[0].status is IntentStatus.RUNNING
+            control.release["A"].set()
+            await asyncio.wait_for(pending, 5)
+        finally:
+            for gate in control.release.values(): gate.set()
+            if not pending.done(): pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    assert len(control.calls) == 3 and control.maximum == 2
+    assert not any(isinstance(req.proposal, MCPCall) for req in case.models.outer.calls)
+
+
+def test_wait_for_tools_requires_pending_operation_and_has_no_tool_effect(review_request):
+    request = replace(review_request, stage="stage_action", proposal=None)
+    value = D8ModelResponse(json.dumps(dict(kind="wait_for_tools", reason="depends on pending observation")))
+    with pytest.raises(ValueError, match="stage.output_invalid"):
+        parse(request, value)
+    request = replace(request, context=replace(request.context, pending_operation_ids=(str(uuid4()),)))
+    assert parse(request, value) == StagePlanningDecision("wait_for_tools", "depends on pending observation", ())
+
+
+def test_cancelled_concurrent_retrievals_keep_confirmed_stop_results(overlap_case):
+    case, control = overlap_case, overlap_case.overlap
+    control.confirmed_stop = True
+    actions = []
+    def decision(req):
+        actions.append(req)
+        return dict(kind="mcp_call", tool_name="web.search", arguments={"query": "A" if len(actions) == 1 else "B"})
+    control.decide = decision
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        await asyncio.wait_for(control.started["B"].wait(), 5)
+        case.token.is_cancelled = True
+        with pytest.raises(Exception, match="dispatch_stopped"):
+            await asyncio.wait_for(pending, 5)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    records = [op for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == "tool_dispatch"]
+    assert len(records) == 2 and all(op.completion is not None and op.completion.result_kind == "failed" for op in records)
+    assert not case.app._tools_in_flight and not case.app.store.blocking_d4_operations(case.app.task_id)
+    assert not control.active and len(actions) == 2

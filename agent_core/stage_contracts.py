@@ -17,6 +17,7 @@ from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.operation_accounting import D4OperationRecord, D8HandoffBudgetPolicy
 from agent_core.turn_contracts import D1RoleConfig
 
+MAX_IN_FLIGHT_TOOLS = 2
 
 class TurnPlanningState(StrEnum):
     ACTIVE = "active"
@@ -140,7 +141,7 @@ class StageConclusionChange(D8ConclusionChange):
 
 @dataclass(frozen=True, slots=True)
 class StagePlanningDecision:
-    kind: Literal["select_road", "return_to_parent", "request_final_validation"]
+    kind: Literal["select_road", "return_to_parent", "request_final_validation", "wait_for_tools"]
     reason: str
     support_refs: tuple[str, ...]
     road_id: str | None = None

@@ -2890,11 +2890,13 @@ class SqliteControlStore:
         return row["unknown_disposition_json"] is not None
 
     def blocking_d4_operations(self, task_run_id):
-        """Only a currently owned, read-only strategy worker may overlap commits."""
+        """Process-owned Stage workers are live; all other unfinished work blocks."""
         live = getattr(self, "live_strategy_operation", lambda identity: False)
+        tool = getattr(self, "live_tool_operation", lambda identity: False)
         return tuple(r for r in self.list_d4_unresolved_operations(task_run_id)
                      if not (r.start.category == "review" and r.start.role == "outer_planning"
-                             and live(r.start.operation_id)))
+                             and live(r.start.operation_id))
+                     and not (r.start.category == "tool_dispatch" and tool(r.start.operation_id)))
 
     def list_d4_unresolved_operations(
         self, task_run_id: str

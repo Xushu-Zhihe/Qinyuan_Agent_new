@@ -76,6 +76,29 @@ def test_model_format_stop_is_classified_without_exposing_original_text(case):
     assert "controlled private" not in str(view)
 
 
+def test_stream_failure_projection_retains_safe_branch_without_correction(case, monkeypatch):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    from agent_core.stage_storage import StageStateError
+    detail = dict(branch="tool_id_changed", event_index=3,
+        field_path="$.choices[0].delta.tool_calls[0].id", observed_type="str")
+    calls = []
+    def invoke(envelope, timeout, token):
+        identity = envelope.request.model_request_id
+        calls.append(identity)
+        case.app.evidence.save("provider-result", identity, {"transport": {
+            "stream_error": detail, "finish_seen": False, "done_seen": False}})
+        return ModelError(ModelErrorKind.PROVIDER_FAILURE, "provider_stream_invalid")
+    monkeypatch.setattr(case.models.inner, "invoke", invoke)
+    with pytest.raises(StageStateError, match="model_output_unusable"):
+        asyncio.run(case.app.run(case.token))
+    view = _stage_task_result(case.path, dict(task_run_id=case.app.task_id, mode="simulated"),
+        case.app.store, case.args["config"])
+    assert len(calls) == 1 and not case.tools.calls
+    failure = view["model_failures"][0]
+    assert failure["category"] == "dependency" and failure["stream_error"] == detail
+    assert failure["finish_seen"] is False and failure["done_seen"] is False
+
+
 def test_operator_commands_accept_actual_stage_scope_without_old_configuration(case):
     from agent_core import operator_controls
     now = case.now.value

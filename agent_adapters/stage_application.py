@@ -23,7 +23,7 @@ from agent_core.stage_contracts import (
     PlanningExhausted, PlanningSession, RoadResolution, RoadSnapshot, StageFactApplication,
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete,
     StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
-    TurnAchievement, TurnCompletion, TurnPlanningContext, TurnPlanningState, TurnIntent, StagePlanningDecision,
+    TurnAchievement, TurnCompletion, TurnPlanningContext, TurnPlanningState, TurnIntent, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
 )
 from agent_core.stage_planning import StageModelRequest
 from agent_core.stage_storage import StageRecoveryRequired, StageStateError, active_turn, _just_registered_roads, execution_policy
@@ -63,7 +63,11 @@ class StageApplication:
             self.evidence.http_validator = self.mcp.experiments.validate_receipt
         self.validator = SimpleNamespace(action_limits=self._action_limits)
         self.task_id, self._token, self._supervision = None, None, None
+        self._tools_in_flight = {}
+        self._tools_stopping = False
         self.store.live_strategy_operation = self._live_supervision
+        self.store.live_tool_request = self._live_tool_request
+        self.store.live_tool_operation = self._live_tool_operation
         self._target_network = target_network_adapter
         self.models.messages = self._conversation
         self.models.recover_capacity = self._recover_capacity
@@ -267,13 +271,18 @@ class StageApplication:
         context = TurnPlanningContext(self.task_id, state.task_run.request.goal, session, turn, history,
             feedback_refs=tuple(i.ref for i in history if i.record_id.startswith("feedback/") and i.turn_id in children
                 or i.record_id.startswith("validation/") and turn and i.turn_id == turn.turn_id),
-            pending_operation_ids=tuple(op.start.operation_id for op in self.store.blocking_d4_operations(self.task_id)),
+            pending_operation_ids=tuple(entry.operation_id for entry in self._tools_in_flight.values()),
             effective_support_refs=premises, goal_validation=self.goal_validation)
         inner = stage != "stage_review" and stage != "stage_supervision"
         role = self.config.inner_role if inner else self.config.outer_role
+        messages = self._conversation(session, sources)
+        if stage == "stage_action" and self._tools_in_flight:
+            messages += ({"role": "user", "content": json.dumps({"pending_tools": [
+                {"operation_id": entry.operation_id, **asdict(entry.call)} for entry in self._tools_in_flight.values()]},
+                ensure_ascii=False)},)
         return StageModelRequest(identity, self.task_id, stage, role.role_config_ref,
-            state.latest_checkpoint.sequence, context, self._conversation(session, sources),
-            tuple(self.mcp.tools) if stage == "stage_action" else (), proposal_id, proposal,
+            state.latest_checkpoint.sequence, context, messages,
+            self._available_tools() if stage == "stage_action" else (), proposal_id, proposal,
             history_catalog=tuple(i.visible(include_content=False) for i in all_history))
 
     async def _review(self, request, token):
@@ -310,6 +319,85 @@ class StageApplication:
     def _live_supervision(self, identity):
         return self._supervision is not None and self._supervision[0] == identity
 
+    def _live_tool_request(self, identity):
+        entry = self._tools_in_flight.get(identity)
+        return entry is not None and not entry.task.done()
+
+    def _live_tool_operation(self, identity):
+        operation = self.store.load_d4_operation(identity)
+        if operation is None or operation.start.task_run_id != self.task_id or operation.start.category != "tool_dispatch":
+            return False
+        parts = operation.start.resource_ref.split("/")
+        if len(parts) == 3 and parts[0] == "mcp":
+            road, request = parts[1:]
+        elif len(parts) == 5 and parts[0] == "mcp" and parts[2] == "experiment":
+            road, request = parts[1], parts[3]
+        else:
+            return False
+        entry = self._tools_in_flight.get(request)
+        return self._live_tool_request(request) and entry.road_id == road
+
+    def _available_tools(self):
+        from agent_adapters.public_web import NAMES
+        sandbox_busy = any(entry.call.tool_name not in NAMES for entry in self._tools_in_flight.values())
+        return tuple(tool for tool in self.mcp.tools if not sandbox_busy or tool["qualified_name"] in NAMES)
+
+    async def _collect_tools(self, *, wait=False, drain=False):
+        while self._tools_in_flight:
+            if wait or drain:
+                while not any(entry.task.done() for entry in self._tools_in_flight.values()):
+                    self._check_dispatch()
+                    await asyncio.wait({entry.task for entry in self._tools_in_flight.values()},
+                        timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+            completed = []
+            for identity, entry in tuple(self._tools_in_flight.items()):
+                if entry.task.done():
+                    entry.task.result()  # Unknown/failed settlement is never hidden by a later success.
+                    del self._tools_in_flight[identity]
+                    completed.append(entry.operation_id)
+            if completed:
+                get_logger("ctrl").info("stage.tools_settled", run=self.task_id, phase="tool_dispatch",
+                    operations=completed, in_flight=len(self._tools_in_flight))
+            if not drain:
+                return
+
+    async def _start_tool(self, identity, road_id, call, token):
+        if (len(self._tools_in_flight) >= MAX_IN_FLIGHT_TOOLS
+                or call.tool_name not in {tool["qualified_name"] for tool in self._available_tools()}):
+            raise StageStateError("stage.tool_slot_unavailable", code="stage.tool_slot_unavailable", category=Category.POLICY)
+        operation_id = identity if call.tool_name == "http.run_experiment" else self._id("mcp/" + identity)
+        app = self
+        class ToolToken:
+            @property
+            def is_cancelled(self):
+                return app._tools_stopping or token.is_cancelled
+            @property
+            def is_timed_out(self):
+                return getattr(token, "is_timed_out", False)
+        entry = SimpleNamespace(road_id=road_id, call=call, operation_id=operation_id,
+            task=asyncio.create_task(self.mcp.execute(identity, road_id, call, ToolToken())))
+        self._tools_in_flight[identity] = entry
+        await asyncio.sleep(0)  # Admit the original operation before advancing the decision checkpoint.
+        await self._collect_tools()
+        self.store.mark_d4_operation_applied(identity, operation_id)
+        self._commit(StageStateChange())
+        get_logger("ctrl").info("stage.tool_dispatched", run=self.task_id, operation=operation_id,
+            phase="tool_dispatch", in_flight=len(self._tools_in_flight))
+
+    async def _stop_tools(self):
+        from agent_core.dual_llm_modeling import MODEL_CANCEL_GRACE_SECONDS
+        self._tools_stopping = True
+        tasks = [entry.task for entry in self._tools_in_flight.values()]
+        if tasks:
+            # Let the original executors settle confirmed stops/results first.
+            await asyncio.wait(tasks, timeout=MODEL_CANCEL_GRACE_SECONDS)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tools_in_flight.clear()
+
     async def _supervise(self, road_id, token):
         if self._supervision is not None:
             identity, pending = self._supervision
@@ -327,6 +415,9 @@ class StageApplication:
             if op.start.category != "action" or op.application_ref is None:
                 continue
             req = self.evidence.request(op.start.operation_id)
+            value = self.evidence.read_model_result(op).result
+            if isinstance(value, StagePlanningDecision) and value.kind == "wait_for_tools":
+                continue
             if req.context.session == PlanningSession("road_execution", road_id) and req.correction_of_model_request_id is None:
                 decisions.append(op)
         if decisions and len(decisions) % 4 == 0:
@@ -338,6 +429,7 @@ class StageApplication:
     async def run(self, token):
         from agent_adapters.run_files import run_lock
         with run_lock(self.directory):
+            self._tools_stopping = False
             try:
                 return await self._run(token)
             except Exception as exc:
@@ -345,6 +437,8 @@ class StageApplication:
                 get_logger("ctrl").warning("stage.run_stopped", run=self.task_id,
                     category=str(category), code=code, phase="stage_loop")
                 raise
+            finally:
+                await self._stop_tools()
 
     def _handoff_result(self):
         for request, review, _ in reversed(self.evidence.applied_reviews(self.task_id)):
@@ -414,6 +508,7 @@ class StageApplication:
         self.mcp.reconcile()
         root_id = self._id("stage/root")
         while True:
+            await self._collect_tools()
             task = self.state.task_run
             if self.goal is not None and task.status is not TaskRunStatus.RUNNING:
                 self.controller._reload_after_commit()
@@ -459,14 +554,24 @@ class StageApplication:
                 continue
             await self._supervise(running.road_id, token)
             await self.mcp.open()
+            if self._tools_in_flight and (len(self._tools_in_flight) >= MAX_IN_FLIGHT_TOOLS or not self._available_tools()):
+                await self._collect_tools(wait=True)
+                continue
             request = self._request("stage_action", PlanningSession("road_execution", running.road_id))
             identity, action = await self.models.call(request, token)
+            await self._collect_tools()
+            self._check_dispatch()
+            if isinstance(action, StagePlanningDecision) and action.kind == "wait_for_tools":
+                self._commit(StageStateChange(applications=(identity,)))
+                await self._collect_tools(wait=True)
+                continue
+            if not isinstance(action, MCPCall):
+                await self._collect_tools(drain=True)
             if await self._knowledge_action(request, identity, action, token):
                 continue
             if isinstance(action, MCPCall):
                 self.mcp.validate(SimpleNamespace(history_context=json.dumps({"mcp_tools": list(request.tools)})), action)
-                await self.mcp.execute(identity, running.road_id, action, token)
-                self._commit(StageStateChange())
+                await self._start_tool(identity, running.road_id, action, token)
                 continue
             review_request = self._request("stage_review", request.context.session, proposal_id=identity, proposal=action)
             review_id, review = await self.models.call(review_request, token)
@@ -522,6 +627,7 @@ class StageApplication:
                 await self.importer.recover_import(item["import_id"], token)
 
     async def close(self):
+        await self._stop_tools()
         if self._supervision:
             _, pending = self._supervision
             if not pending.done():

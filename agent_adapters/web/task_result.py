@@ -191,9 +191,20 @@ def _stage_task_result(directory, declaration, store, expected):
         if saved is None or digest(saved) != op.completion.evidence_sha256:
             raise ValueError("stage.model_result_changed")
         if saved["outcome"] != "valid" and op.start.operation_id not in corrected:
-            failures.append(dict(operation_id=op.start.operation_id,
+            failure = dict(operation_id=op.start.operation_id,
                 phase=requests[op.start.operation_id].stage, code="stage.model_output_unusable",
-                category="input" if saved["outcome"] == "invalid" else "dependency"))
+                category="input" if saved["outcome"] == "invalid" else "dependency")
+            if saved["outcome"] == "invalid":
+                from agent_core.output_contracts import D8ModelResponse
+                from agent_core.stage_planning import stage_output_issues
+                failure["issue_codes"] = [i.code for i in stage_output_issues(requests[op.start.operation_id],
+                    D8ModelResponse(saved["content"], saved["finish_reason"], saved.get("tool_calls")))]
+            provider = evidence.read("provider-result", op.start.operation_id) or {}
+            transport = provider.get("transport", {})
+            if transport.get("stream_error"):
+                failure.update(stream_error=transport["stream_error"], finish_seen=transport["finish_seen"],
+                    done_seen=transport["done_seen"])
+            failures.append(failure)
     result["model_failures"] = failures
     result["errors"] = failures
     result["tool_operations"] = [dict(operation_id=op.start.operation_id,
