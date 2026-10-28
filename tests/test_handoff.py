@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from agent_core.operation_accounting import (
-    D4BudgetPolicy, D4OperationConflict, D4OperationStart,
+    D4BudgetPolicy, OperationIdentityConflict, D4OperationStart,
     D8BudgetPolicy, D8HandoffBudgetPolicy,
     D8_HANDOFF_CATEGORY_LIMITS, D8_HANDOFF_TOTAL, D8_TOTAL,
 )
@@ -21,7 +21,7 @@ from agent_core.contracts import TaskRequest
 from agent_core.dual_llm_contracts import D3Authorization, D3RunConfig, d3_payload
 from agent_core.handoff_contracts import D8Capacity, D8CapacityPolicy, D8HandoffConfig, D8SummaryCandidate
 from agent_core.turn_contracts import D1RoleConfig
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.control_store import StorageError
 from agent_core.modeling import ModelError, ModelErrorKind
 
@@ -51,7 +51,7 @@ def test_existing_d8_run_cannot_admit_handoff_or_gain_budget(case):
         app.config.outer_role.role_config_ref,
     )
     assert start.charged
-    with pytest.raises(D4OperationConflict):
+    with pytest.raises(OperationIdentityConflict):
         app.store.begin_d4_operation(start)
     assert app.store.d4_budget_usage(task_id) == before
     assert app.store.load_d4_operation(start.operation_id) is None
@@ -299,7 +299,7 @@ def test_index_read_replays_exact_query_and_pages_by_frozen_positions(tree):
     assert first["has_more"] and 0 < len(first["items"]) <= 8
     assert len(json.dumps(first, ensure_ascii=False, sort_keys=True, separators=(",", ":"))) <= 2048
     before = app.store.d4_budget_usage(tree[7])
-    with pytest.raises(D3RecoveryRequired):
+    with pytest.raises(ExecutionRecoveryRequired):
         app.handoff.read_history(query={"record_type": "verified_fact"}, request_id=request_id)
     assert app.handoff.read_history(query={}, request_id=request_id) == first
     second = app.handoff.read_history(cursor=first["next_cursor"])
@@ -320,7 +320,7 @@ def test_local_read_started_then_interrupted_recovers_once_original_snapshot(tre
         app.handoff.read_history(query={"record_type": "verified_fact"}, request_id=request_id)
     assert len(app.store.list_d8_reads(tree[7])) == 1
     monkeypatch.setattr(app.handoff, "_page", original)
-    with pytest.raises(D3RecoveryRequired):
+    with pytest.raises(ExecutionRecoveryRequired):
         app.handoff.read_history(query={"record_type": "verified_fact"}, request_id=request_id)
     old = app.handoff.capacity()
     app.handoff.increase_capacity({"read_return": 4096})
@@ -563,7 +563,7 @@ def test_corrupt_original_read_snapshot_never_switches_to_current_query(tree, mo
         return {**result, "positions": [999]} if kind == "read-snapshot" and key == snapshot_id else result
     monkeypatch.setattr(app.handoff.evidence, "read", corrupt)
     monkeypatch.setattr(app.handoff, "history", lambda: pytest.fail("must not query current history"))
-    with pytest.raises(D3RecoveryRequired, match="d8_read_snapshot_unavailable"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d8_read_snapshot_unavailable"):
         app.handoff.resume_read(identity)
     assert len(app.store.list_d8_reads(tree[7])) == 1
     assert app.store.load_d8_read(identity)[1] is None
@@ -639,7 +639,7 @@ def test_refinement_capacity_gate_precedes_start_and_model(tmp_path):
     measured = []
     def stop(request):
         measured.append(request)
-        raise D3RecoveryRequired("d8_context_paused:complete_model_request")
+        raise ExecutionRecoveryRequired("d8_context_paused:complete_model_request")
     app = scenario[0]
     try:
         # Exercise the existing refinement component's opt-in capacity port;
@@ -659,7 +659,7 @@ def test_handoff_evidence_conflict_is_safe_recovery_and_does_not_overwrite(tmp_p
     evidence, identity = FileD8HandoffEvidence(tmp_path / "safe-evidence"), str(uuid4())
     evidence.save("pause", identity, {"safe": ["original"]})
     evidence.save("pause", identity, {"safe": ("original",)})
-    with pytest.raises(D3RecoveryRequired, match="d8_handoff_evidence_write_recovery_required"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d8_handoff_evidence_write_recovery_required"):
         evidence.save("pause", identity, {"safe": ["changed"]})
     assert evidence.read("pause", identity) == {"safe": ["original"]}
 
@@ -675,7 +675,7 @@ def test_read_fact_uses_shared_projection_and_rejects_tampered_bindings(tree):
                     replace(fact, source_refs=(str(uuid4()),)),
                     replace(fact, source_version="f" * 64),
                     replace(fact, record_id=str(uuid4()))):
-        with pytest.raises(D3RecoveryRequired, match="d8_read_source_version_(missing|changed)"):
+        with pytest.raises(ExecutionRecoveryRequired, match="d8_read_source_version_(missing|changed)"):
             app.handoff._validate_frozen_read_sources((altered,))
 
 
@@ -687,7 +687,7 @@ def test_known_source_read_failure_is_settled_and_replayed_without_revalidation(
     app, identity = tree[0], str(uuid4())
     before = app.store.d4_budget_usage(tree[7])
     def unavailable(items):
-        raise D3RecoveryRequired(reason)
+        raise ExecutionRecoveryRequired(reason)
     monkeypatch.setattr(app.handoff, "_validate_frozen_read_sources", unavailable)
     complete = app.store.complete_d8_read
     if completion_fault:
@@ -711,7 +711,7 @@ def test_known_source_read_failure_is_settled_and_replayed_without_revalidation(
 
 
 @pytest.mark.usefixtures("read_ready")
-@pytest.mark.parametrize("error_type", [D3RecoveryRequired, OSError])
+@pytest.mark.parametrize("error_type", [ExecutionRecoveryRequired, OSError])
 def test_unknown_read_validation_failure_stays_pending(tree, monkeypatch, error_type):
     assert tree_run(tree).stop_reason == "search_exhausted"
     app, identity = tree[0], str(uuid4())

@@ -25,7 +25,7 @@ def dispatch_check(directory, declaration, selection, *, events=None):
     selection = validate_selection(declaration['task_run_id'], selection)
     from agent_core.answer_candidates import check_request
     from agent_core.sqlite_control_store import SqliteControlStore
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     from agent_core.goal_feedback import ExternalValidationFeedbackConflict
     try:
         with SqliteControlStore.open_readonly(directory / 'control.sqlite') as store:
@@ -34,7 +34,7 @@ def dispatch_check(directory, declaration, selection, *, events=None):
                 raise ValueError('d9_validation_state_unavailable')
             check_request(store, declaration['task_run_id'], selection, state.latest_checkpoint.sequence + 1)
             previous = store.load_d7_external_validation_check(selection['query_id'])
-    except (D3RecoveryRequired, ExternalValidationFeedbackConflict) as exc:
+    except (ExecutionRecoveryRequired, ExternalValidationFeedbackConflict) as exc:
         raise ValueError('d9_validation_submission_binding_invalid') from exc
     if previous is not None and previous.result is not None:
         result = snapshot_v3_task_result(directory, declaration)

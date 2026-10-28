@@ -3,7 +3,7 @@ from dataclasses import asdict, dataclass
 import json
 from agent_core.domain import MAX_FACT_CONTENT_LENGTH
 from agent_core.conclusion_contracts import MAX_CONCLUSION_REASON_LENGTH, D8Conclusion, D8ReviewDecision, conclusion_digest
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.operation_accounting import _uuid, _sha
 from agent_core.turn_modeling import stable_id
 
@@ -173,14 +173,14 @@ class EvidenceConclusions:
                     or (op.completion.evidence_sha256 != conclusion_digest(result))
                     or (op.completion.evidence_ref != 'mcp-result/' + ref)
                     or (result['payload']['status'] not in {'completed', 'failed', 'rejected'})):
-                raise D3RecoveryRequired('d22_evidence_source_unavailable')
+                raise ExecutionRecoveryRequired('d22_evidence_source_unavailable')
             if 'experiment_request' in claim:
                 return dict(ref=ref,kind='mcp',version=conclusion_digest(dict(claim=claim,result=result)),source_ref=ref,
                     data=app.mcp.experiments.projection(op,claim,result))
             return dict(ref=ref, kind='mcp', version=conclusion_digest(dict(claim=claim, result=result)), source_ref=ref, data=app.redactor.redact_value(dict(call=claim['call'], result=result['payload'])))
         observed = app.conclusions.observation(ref, historical=True)
         if observed.task_run_id != task or observed.intent_id != intent_id:
-            raise D3RecoveryRequired('d22_evidence_source_scope_changed')
+            raise ExecutionRecoveryRequired('d22_evidence_source_scope_changed')
         data = asdict(observed)
         if observed.rule_id == 'http_response_observed':
             from agent_core.conclusion_contracts import D8ModelRequest
@@ -201,20 +201,20 @@ class EvidenceConclusions:
 
     def validate_sources(self, observation):
         if any((self.source(s['ref'], observation.intent_id) != s for s in observation.sources)):
-            raise D3RecoveryRequired('d22_evidence_source_version_changed')
+            raise ExecutionRecoveryRequired('d22_evidence_source_version_changed')
 
     def validate_candidate(self, request, candidate):
-        from agent_core.dual_llm_modeling import D3ProposalRejected
+        from agent_core.dual_llm_modeling import ExecutionProposalRejected
         packet=json.loads(request.history_context)
         if packet.get('intent_execution',{}).get('stop_requested') and not packet['intent_execution']['stop_requested'].get('fact_candidate_allowed'):
-            raise D3ProposalRejected('d22_strategy_stop_summary_required')
+            raise ExecutionProposalRejected('d22_strategy_stop_summary_required')
         frozen = {s['ref']: s for s in packet.get('evidence_sources', [])}
         for ref in candidate.evidence_refs:
             if ref not in frozen:
-                raise D3ProposalRejected('d22_evidence_not_visible')
+                raise ExecutionProposalRejected('d22_evidence_not_visible')
             source = self.source(ref, request.context.intent_id)
             if source['version'] != frozen[ref]['version']:
-                raise D3RecoveryRequired('d22_evidence_source_version_changed')
+                raise ExecutionRecoveryRequired('d22_evidence_source_version_changed')
     parse_review = staticmethod(parse_evidence_review)
 
     def _request(self, proposal_id, intent_id, candidate):
@@ -281,10 +281,10 @@ class EvidenceConclusions:
         app = self.app
         request = app.conclusions.evidence.read_request(record.review_request_id)
         if not isinstance(request, EvidenceReviewRequest):
-            raise D3RecoveryRequired('d22_evidence_review_missing')
+            raise ExecutionRecoveryRequired('d22_evidence_review_missing')
         result = app.conclusions._known(request)
         if result is None or result['outcome'] != 'valid':
-            raise D3RecoveryRequired('d22_evidence_review_unknown')
+            raise ExecutionRecoveryRequired('d22_evidence_review_unknown')
         decision = self.parse_review(request, result['raw'])
         candidate = request.candidate
         inner = app.model_evidence.read(record.proposal_request_id)
@@ -309,14 +309,14 @@ class EvidenceConclusions:
                 or (inner.task_run_id != record.task_run_id)
                 or (inner.stage != 'inner_plan')
                 or (EvidenceCandidate.parse(inner.raw) != candidate)):
-            raise D3RecoveryRequired('d22_evidence_proposal_changed')
+            raise ExecutionRecoveryRequired('d22_evidence_proposal_changed')
         saved = app.sessions.evidence.read('request', record.proposal_request_id)
         contract = app.output_boundary.evidence.read('contract', record.proposal_request_id)
         if (saved is None
                 or contract is None
                 or contract['source_request_sha256'] != conclusion_digest(saved['request'])
                 or (contract['model_audit']['context_sha256'] != inner.context_sha256)):
-            raise D3RecoveryRequired('d22_evidence_request_missing_or_changed')
+            raise ExecutionRecoveryRequired('d22_evidence_request_missing_or_changed')
         source = request.observation
         frozen = {s['ref']: s for s in json.loads(saved['request']['history_context']).get('evidence_sources', [])}
         if (record.task_run_id != source.task_run_id
@@ -328,16 +328,16 @@ class EvidenceConclusions:
                 or (record.source_version_sha256 != source.source_version_sha256)
                 or any((s['ref'] not in frozen
                 or s['version'] != frozen[s['ref']]['version'] for s in source.sources))):
-            raise D3RecoveryRequired('d22_evidence_conclusion_binding_changed')
+            raise ExecutionRecoveryRequired('d22_evidence_conclusion_binding_changed')
         self.validate_sources(source)
         expected = 'verified_fact' if decision.decision == 'reuse' or (decision.decision == 'accept' and (not candidate.inferred)) else 'reviewed_inference' if decision.decision == 'accept' else 'no_new_information' if decision.decision == 'no_new_information' else 'rejected' if decision.decision == 'reject' else 'insufficient'
         expected_fact = decision.reuse_fact_id if decision.decision == 'reuse' else self._id('evidence-fact/' + record.proposal_request_id) if expected == 'verified_fact' else None
         if record.outcome != expected or record.fact_id != expected_fact:
-            raise D3RecoveryRequired('d22_evidence_decision_changed')
+            raise ExecutionRecoveryRequired('d22_evidence_decision_changed')
         if decision.decision == 'reuse':
             fact = next((f for f in state.facts if f.fact_id == record.fact_id), None)
             if fact is None or fact.status.value != 'verified' or fact.turn_id != record.turn_id:
-                raise D3RecoveryRequired('d22_reused_fact_not_effective')
+                raise ExecutionRecoveryRequired('d22_reused_fact_not_effective')
         return source
 
     def validate_current_reuse(self, record):
@@ -350,7 +350,7 @@ class EvidenceConclusions:
         frozen=next(f for f in request.existing_facts if f['fact_id']==decision.reuse_fact_id)
         current=next((f for f in facts(self.app,record.intent_id) if f['fact_id']==decision.reuse_fact_id),None)
         if current is None or current['ref']!=frozen['ref'] or current['content']!=frozen['content']:
-            raise D3RecoveryRequired('d22_reused_fact_not_effective')
+            raise ExecutionRecoveryRequired('d22_reused_fact_not_effective')
 
     def reconcile(self):
         for record in self.app.store.list_d8_conclusions(self.app.state.task_run.task_run_id):
@@ -361,7 +361,7 @@ class EvidenceConclusions:
     def validate_fact(self, fact, state, pending=()):
         record = next((r for r in (*self.app.store.list_d8_conclusions(state.task_run.task_run_id), *pending) if r.plan_id is None and r.fact_id == fact.fact_id and (fact.verification_ref == 'd8e:' + r.review_request_id)), None)
         if record is None or record.outcome != 'verified_fact':
-            raise D3RecoveryRequired('d22_fact_approval_missing')
+            raise ExecutionRecoveryRequired('d22_fact_approval_missing')
         source = self.validate_record(record, state)
         request = self.app.conclusions.evidence.read_request(record.review_request_id)
         raw = self.app.conclusions.evidence.read_result(record.review_request_id)['raw']
@@ -371,5 +371,5 @@ class EvidenceConclusions:
                 or fact.source_ref != source.sources[0]['source_ref']
                 or fact.turn_id != record.turn_id
                 or (fact.status.value != 'verified')):
-            raise D3RecoveryRequired('d22_fact_content_or_source_changed')
+            raise ExecutionRecoveryRequired('d22_fact_content_or_source_changed')
         return (record, source)

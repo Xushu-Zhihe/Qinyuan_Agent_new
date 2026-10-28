@@ -143,7 +143,7 @@ def test_saved_reuse_decision_recovers_without_repeating_request_or_review(http_
 @pytest.mark.parametrize('http_case',[22],indirect=True)
 def test_withdrawn_conflicted_and_foreign_scope_fact_are_not_reusable(http_case,monkeypatch):
     from uuid import uuid4
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     case=http_case
     two_observations(case)
     assert asyncio.run(case.app.run(case.token)).stop_reason=='d9_awaiting_external_feedback'
@@ -157,7 +157,7 @@ def test_withdrawn_conflicted_and_foreign_scope_fact_are_not_reusable(http_case,
         monkeypatch.setattr(case.app.revisions,'_history',lambda status=status: tuple(
             replace(i,current_status=status,conflict=(status=='conflicted')) if i.record_id==fact.fact_id else i for i in history))
         assert case.app.conclusions.reusable_facts(source)==()
-        with pytest.raises(D3RecoveryRequired,match='not_effective'):
+        with pytest.raises(ExecutionRecoveryRequired,match='not_effective'):
             case.app.validator._support(case.app.state,case.app.store.load_d3_plan_binding(last.plan_id),result.proof_id,fact.fact_id)
 
 

@@ -4,7 +4,7 @@ from dataclasses import asdict
 
 from agent_adapters.command_recorder import T6CommandRecorder, T6EvidenceError
 from agent_core.conclusion_contracts import D8ModelRequest
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 
 
 class FileD8Evidence:
@@ -22,7 +22,7 @@ class FileD8Evidence:
                 raise ValueError("request identity mismatch")
             return result
         except (T6EvidenceError, ValueError, TypeError, KeyError) as exc:
-            raise D3RecoveryRequired("d8_request_evidence_unavailable") from exc
+            raise ExecutionRecoveryRequired("d8_request_evidence_unavailable") from exc
 
     def save_result(self, request_id: str, result: dict) -> None:
         self.records._write("d8-result", request_id, result)
@@ -34,7 +34,7 @@ class FileD8Evidence:
                 raise ValueError("result identity mismatch")
             return result
         except (T6EvidenceError, ValueError, TypeError, KeyError) as exc:
-            raise D3RecoveryRequired("d8_result_evidence_unavailable") from exc
+            raise ExecutionRecoveryRequired("d8_result_evidence_unavailable") from exc
 
 
 def check_evidence_conclusions(directory, store, config, task_run_id):
@@ -53,7 +53,7 @@ def check_evidence_conclusions(directory, store, config, task_run_id):
     rows=store.load_control_state_rows(task_run_id)
     if not records:
         if any((f.verification_ref or '').startswith('d8e:') for f in rows.facts):
-            raise D3RecoveryRequired('d22_fact_approval_missing')
+            raise ExecutionRecoveryRequired('d22_fact_approval_missing')
         return
     app=SimpleNamespace(store=store,config=config,state=rows,
         output_boundary=SimpleNamespace(evidence=FileD8OutputEvidence(directory/'d8-output',create=False)),
@@ -80,13 +80,13 @@ def check_evidence_conclusions(directory, store, config, task_run_id):
         for source in observation.sources:
             if source['kind']=='mcp':
                 current=manager.source(source['ref'],observation.intent_id)
-                if current!=source:raise D3RecoveryRequired('d22_evidence_source_version_changed')
+                if current!=source:raise ExecutionRecoveryRequired('d22_evidence_source_version_changed')
             elif source['kind']=='http' and http is not None:
                 current=http.observation(source['ref'],historical=True)
                 if (current.source_version_sha256!=source['version'] or current.execution_id!=source['source_ref']
                         or (current.task_run_id,current.turn_id,current.intent_id)!=(observation.task_run_id,observation.turn_id,observation.intent_id)
                         or any(source['data'].get(k)!=v for k,v in asdict(current).items())):
-                    raise D3RecoveryRequired('d22_evidence_source_version_changed')
+                    raise ExecutionRecoveryRequired('d22_evidence_source_version_changed')
             elif source['kind']=='attachment':
                 proof=proofs.read(source['ref'])
                 receipt=workspace.read_digest(proof.observation_id) if proof else None
@@ -95,8 +95,8 @@ def check_evidence_conclusions(directory, store, config, task_run_id):
                         or (proof.task_run_id,proof.turn_id,proof.intent_id)!=(observation.task_run_id,observation.turn_id,observation.intent_id)
                         or proof.source_execution_id!=source['source_ref']
                         or conclusion_digest(dict(proof=asdict(proof),receipt=asdict(receipt),binding=asdict(binding)))!=source['version']):
-                    raise D3RecoveryRequired('d22_evidence_source_version_changed')
-            else:raise D3RecoveryRequired('d22_evidence_source_unavailable')
+                    raise ExecutionRecoveryRequired('d22_evidence_source_version_changed')
+            else:raise ExecutionRecoveryRequired('d22_evidence_source_unavailable')
     manager.validate_sources=sources
     for record in records:manager.validate_record(record,rows)
     for fact in rows.facts:

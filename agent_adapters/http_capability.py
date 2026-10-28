@@ -8,15 +8,15 @@ import time
 from dataclasses import asdict, replace
 from uuid import UUID
 
-from agent_adapters.web.http_adapter import D7HttpAdapter,D7HttpRequest,D7HttpResponseEvidenceService,D7HttpPolicy,D7HttpError
+from agent_adapters.web.http_adapter import D7HttpAdapter,D7HttpRequest,D7HttpResponseEvidenceService,D7HttpPolicy,HttpCapabilityError
 from agent_adapters.web.sandbox_transport import D7SandboxHttpTransport
 from agent_adapters.output_evidence import safe_failure_details, SAFE_EXCEPTION_TYPES, SAFE_HTTP_ERROR_CODES
 from agent_core.actions import MCPCall, CompleteIntentAction
 from agent_core.control_store import UpsertPlan,UpsertExecution,UpsertFact,PlanValidationRecordDraft,AppendPlanValidationRecord
 from agent_core.domain import PlanStep,PlanStatus,ExecutionStatus,ExecutionEvidence,PlanValidationStatus
-from agent_core.dual_llm_contracts import D3CommitMetadata,D3RecoveryRequired
+from agent_core.dual_llm_contracts import D3CommitMetadata,ExecutionRecoveryRequired
 from agent_core.http_contracts import HttpTurnBinding,HttpPlanBinding,HttpPlanContext,HttpObservation,HttpRunConfig
-from agent_core.operation_accounting import D4OperationStart,D4OperationCompletion,D4RecoveryRequired
+from agent_core.operation_accounting import D4OperationStart,D4OperationCompletion,OperationRecoveryRequired
 from agent_core.turn_modeling import digest
 
 
@@ -43,7 +43,7 @@ class HttpCapability:
         controller=getattr(self.app,'controller',None)
         if controller is not None and controller._persistent_state is None:
             refs=self.store.list_task_run_refs()
-            if len(refs)!=1:raise D3RecoveryRequired('d20_http_state_owner_unavailable')
+            if len(refs)!=1:raise ExecutionRecoveryRequired('d20_http_state_owner_unavailable')
             return self.store.load_control_state_rows(refs[0])
         return self.app.state
 
@@ -84,7 +84,7 @@ class HttpCapability:
             transport=self.transport_factory(self)
         else:
             if self.task.target_network is None:
-                raise D3RecoveryRequired('d20_http_network_binding_missing')
+                raise ExecutionRecoveryRequired('d20_http_network_binding_missing')
             configured=HttpRunConfig(self.task.task_run_id,
                 wire_id(self.task.task_run_id,'request'),self.app.config.web_authorization.allowed_origin,
                 self.app.config.web_authorization,self.app.config.outer_role,self.app.config.inner_role,
@@ -106,7 +106,7 @@ class HttpCapability:
         proposed=D7HttpRequest(operation,raw['method'],raw['path_query'],tuple(raw['headers'].items()),raw['body'])
         try:
             method,path,headers,body=self.http.policy.validate(proposed)
-        except D7HttpError as exc:
+        except HttpCapabilityError as exc:
             raise ValueError('d20_http_request_not_authorized') from exc
         if method not in self.app.config.web_authorization.allowed_methods:
             raise ValueError('d20_http_method_not_authorized')
@@ -125,13 +125,13 @@ class HttpCapability:
         self.attach()
         raw=self.protected.read(binding.request_evidence_id)
         if hashlib.sha256(raw).hexdigest()!=binding.request_sha256:
-            raise D3RecoveryRequired('d20_http_request_evidence_changed')
+            raise ExecutionRecoveryRequired('d20_http_request_evidence_changed')
         value=json.loads(raw)
         request=D7HttpRequest(binding.execution_id,value['method'],value['path_query'],
                               tuple(tuple(h) for h in value['headers']),value['body'])
         method,_,_,_=D7HttpPolicy.for_origin(self.policy()['endpoint']).validate(request)
         if method not in self.app.config.web_authorization.allowed_methods:
-            raise D3RecoveryRequired('d20_http_method_not_authorized')
+            raise ExecutionRecoveryRequired('d20_http_method_not_authorized')
         return request
 
     def result(self,execution_id):
@@ -150,8 +150,8 @@ class HttpCapability:
                     or snapshot['previous_execution_id']!=value['cookie_previous_execution_id']):
                 raise ValueError('cookie binding changed')
             return snapshot
-        except (KeyError, ValueError, TypeError, D7HttpError) as exc:
-            raise D3RecoveryRequired('d20_http_cookie_version_unavailable') from exc
+        except (KeyError, ValueError, TypeError, HttpCapabilityError) as exc:
+            raise ExecutionRecoveryRequired('d20_http_cookie_version_unavailable') from exc
 
     def cookie_history(self):
         """Recheck the complete durable chain, including read-only projections."""
@@ -163,7 +163,7 @@ class HttpCapability:
             value=self.result(binding.execution_id)
             if value is None:continue
             op=self.store.load_d4_operation(binding.execution_id)
-            if op is None:raise D3RecoveryRequired('d20_http_cookie_result_without_start')
+            if op is None:raise ExecutionRecoveryRequired('d20_http_cookie_result_without_start')
             values.append((op.start.base_checkpoint_sequence,value))
         if self.app.config.contract_version == 22:
             for op in self.store.list_d4_operations(self.task.task_run_id):
@@ -178,7 +178,7 @@ class HttpCapability:
         for _,value in sorted(values,key=lambda pair:pair[0]):
             snapshot=self.cookie_snapshot(value)
             if snapshot['previous_execution_id']!=previous:
-                raise D3RecoveryRequired('d20_http_cookie_history_conflict')
+                raise ExecutionRecoveryRequired('d20_http_cookie_history_conflict')
             previous=value['execution_id']
             last=snapshot
         return previous,last
@@ -225,7 +225,7 @@ class HttpCapability:
     def read_verified(self,execution_id,proof_id,*,allow_inactive_plan=False):
         if self.result(proof_id) is None and self.file_proofs is not None:
             return self.file_proofs.read_verified(execution_id,proof_id,allow_inactive_plan=allow_inactive_plan)
-        if execution_id!=proof_id:raise D3RecoveryRequired('d20_http_proof_owner_changed')
+        if execution_id!=proof_id:raise ExecutionRecoveryRequired('d20_http_proof_owner_changed')
         source=self.observation(proof_id,historical=allow_inactive_plan)
         return source,ExecutionEvidence(source.task_run_id,source.endpoint,source.observed_at)
 
@@ -233,11 +233,11 @@ class HttpCapability:
         self.attach()
         execution=next((e for e in self.state.executions if e.execution_id==execution_id),None)
         if execution is None or execution.status is not ExecutionStatus.SUCCEEDED:
-            raise D3RecoveryRequired('d20_http_execution_not_succeeded')
+            raise ExecutionRecoveryRequired('d20_http_execution_not_succeeded')
         binding=self.store.load_d3_plan_binding(execution.plan_id)
         value=self.result(execution_id)
         if not isinstance(binding,HttpPlanBinding) or value is None:
-            raise D3RecoveryRequired('d20_http_result_missing')
+            raise ExecutionRecoveryRequired('d20_http_result_missing')
         request=self.read_request(binding)
         self.cookie_snapshot(value)
         op=self.store.load_d4_operation(execution_id)
@@ -249,10 +249,10 @@ class HttpCapability:
                 or op is None or op.completion is None or op.completion.result_kind!='completed'
                 or op.completion.evidence_sha256!=digest(value)
                 or not self.task.started_at<=value['finished_at']<=self.task.deadline_at):
-            raise D3RecoveryRequired('d20_http_source_binding_changed')
+            raise ExecutionRecoveryRequired('d20_http_source_binding_changed')
         plan=next(p for p in self.state.plans if p.plan_id==binding.plan_id)
         if not historical and plan.status not in {PlanStatus.RUNNING,PlanStatus.COMPLETED}:
-            raise D3RecoveryRequired('d20_http_plan_inactive')
+            raise ExecutionRecoveryRequired('d20_http_plan_inactive')
         return HttpObservation(self.task.task_run_id,binding.turn_id,binding.intent_id,binding.plan_id,
             binding.request_evidence_id,execution_id,execution_id,execution_id,value['body_sha256'],
             value['body_bytes'],value['finished_at'],digest({'binding':asdict(binding),'result':value}),
@@ -298,7 +298,7 @@ class HttpCapability:
             self.store.load_d3_plan_result(prior[-1].plan_id) is not None and
             self.store.load_d3_plan_result(prior[-1].plan_id).outcome == 'no_new_information' and review_id is None)
         rolling = bool(app.config.intent_execution_policy)
-        if len(prior)>=2 and not continuation and not rolling:raise D3RecoveryRequired('d20_http_plan_limit_reached')
+        if len(prior)>=2 and not continuation and not rolling:raise ExecutionRecoveryRequired('d20_http_plan_limit_reached')
         turn=self.store.load_d3_turn_binding(intent.turn_id)
         context=self.plan_context(intent_id)
         request=app._model_request('inner_plan',f'plan:{intent_id}:{len(prior)+1}',context,
@@ -307,7 +307,7 @@ class HttpCapability:
             live=next((i for i in app.state.intents if i.intent_id==intent_id),None)
             if (live is None or live.status.value!='running'
                     or app.state.latest_checkpoint.sequence!=current.base_checkpoint_sequence):
-                raise D3RecoveryRequired('d20_http_plan_scope_changed')
+                raise ExecutionRecoveryRequired('d20_http_plan_scope_changed')
             return current
         def validate(current,proposal):
             from agent_core.http_contracts import HttpPlanProposal
@@ -337,13 +337,13 @@ class HttpCapability:
                     raise ValueError('d22_completion_support_not_visible')
             elif isinstance(proposal, MCPCall):
                 if app.mcp is None:
-                    raise D3RecoveryRequired("mcp.not_enabled")
+                    raise ExecutionRecoveryRequired("mcp.not_enabled")
                 app.mcp.validate(current, proposal)
             elif isinstance(proposal,HttpPlanProposal):
                 _, maximum = app.validator.action_limits(self.task.task_run_id, intent.turn_id, intent_id)
                 app.validator._allowed(self.task.task_run_id, intent.turn_id, intent_id, 'probe', maximum)
             else:
-                raise D3RecoveryRequired('d20_http_plan_proposal_invalid')
+                raise ExecutionRecoveryRequired('d20_http_plan_proposal_invalid')
         decision=await app._propose_inner_plan(request,token,refresh=refresh,validate=validate)
         if decision is None:return
         request_id,proposal=decision
@@ -388,7 +388,7 @@ class HttpCapability:
             self.store.mark_d3_operation_applied(request_id,binding.plan_id)
             app.sessions.reconcile()
             return
-        if not isinstance(proposal,HttpPlanProposal):raise D3RecoveryRequired('d20_http_plan_proposal_invalid')
+        if not isinstance(proposal,HttpPlanProposal):raise ExecutionRecoveryRequired('d20_http_plan_proposal_invalid')
         if continuation and review_id is None and not rolling:
             review_id = next(r.review_request_id for r in self.store.list_d8_conclusions(self.task.task_run_id)
                              if r.plan_id == prior[-1].plan_id and r.outcome == 'no_new_information')
@@ -401,7 +401,7 @@ class HttpCapability:
         if prior and (not rolling or review_id is not None):
             from agent_core.dual_llm_contracts import D3Outcome
             old=prior[-1]
-            if review_id is None:raise D3RecoveryRequired('d20_http_replan_review_required')
+            if review_id is None:raise ExecutionRecoveryRequired('d20_http_replan_review_required')
             changes=(UpsertPlan(old.plan_id,old.intent_id,old.steps,PlanStatus.SUPERSEDED),*changes)
             outcomes=(D3Outcome('plan',old.plan_id,'superseded',
                 'no_new_information' if continuation else 'replanned',(review_id,request_id)),)
@@ -440,13 +440,13 @@ class HttpCapability:
         value=self.result(binding.execution_id)
         operation=self.store.load_d4_operation(binding.execution_id)
         if value is None and operation is not None:
-            raise D3RecoveryRequired('d20_http_outcome_unknown')
+            raise ExecutionRecoveryRequired('d20_http_outcome_unknown')
         if value is None:
             app._check_dispatch()
             _,maximum=app.validator.action_limits(self.task.task_run_id,binding.turn_id,binding.intent_id)
             app.validator._allowed(self.task.task_run_id,binding.turn_id,binding.intent_id,'probe',maximum)
             timeout=min(float(maximum),float(app.config.http_timeout_seconds),self.task.deadline_at-app.clock())
-            if timeout<=0:raise D3RecoveryRequired('d20_http_deadline_reached')
+            if timeout<=0:raise ExecutionRecoveryRequired('d20_http_deadline_reached')
             self.attach()
             previous=self.restore_cookies()
             phase='http_dispatch'
@@ -471,7 +471,7 @@ class HttpCapability:
                         execution_id=binding.execution_id,request_sha256=binding.request_sha256,
                         phase=phase,**safe_failure_details(exc)))
                 except Exception:
-                    raise D3RecoveryRequired('d20_http_failure_diagnostic_write_failed') from exc
+                    raise ExecutionRecoveryRequired('d20_http_failure_diagnostic_write_failed') from exc
                 raise
         if operation is None or operation.completion is None:
             self.store.complete_d4_operation(D4OperationCompletion(binding.execution_id,value['finished_at'],
@@ -503,7 +503,7 @@ class HttpCapability:
                 or op.completion is not None and (op.completion.result_kind != 'rejected'
                     or op.completion.evidence_sha256 != digest(value)
                     or op.completion.evidence_ref != binding.execution_id)):
-            raise D3RecoveryRequired('d20_http_dispatch_stop_binding_changed')
+            raise ExecutionRecoveryRequired('d20_http_dispatch_stop_binding_changed')
         return value
 
     async def dispatch(self,binding,timeout,token):
@@ -520,7 +520,7 @@ class HttpCapability:
         timeout = min(timeout, self.task.deadline_at - app.clock())
         if timeout <= 0:
             app._check_dispatch()
-            raise D3RecoveryRequired('d20_http_deadline_reached')
+            raise ExecutionRecoveryRequired('d20_http_deadline_reached')
         self.http.timeout_seconds=timeout
         self.store.begin_d4_operation(D4OperationStart(binding.execution_id,self.task.task_run_id,
             'tool_dispatch',app.clock(),app.state.latest_checkpoint.sequence,binding.request_sha256,
@@ -539,7 +539,7 @@ class HttpCapability:
             self.store.complete_d4_operation(D4OperationCompletion(binding.execution_id,
                 value['finished_at'], 'rejected', binding.execution_id, digest(value)))
             app._check_dispatch()
-            raise D3RecoveryRequired('d20_http_not_dispatched')
+            raise ExecutionRecoveryRequired('d20_http_not_dispatched')
         threading.Thread(target=send,daemon=True,name='d20-http-request').start()
         expires=time.monotonic()+timeout
         delay=0.001
@@ -550,11 +550,11 @@ class HttpCapability:
                 get_logger('ctrl').warning('http.outcome_unknown', run=binding.task_run_id,
                     intent=binding.intent_id, request=binding.execution_id, phase='http_dispatch',
                     category='technical_wait', code='d4_operation_outcome_unknown')
-                raise D4RecoveryRequired('d4_operation_outcome_unknown')
+                raise OperationRecoveryRequired('d4_operation_outcome_unknown')
             await asyncio.sleep(delay)
             delay=min(0.025, delay*2)
         ok,value=result[0]
-        if not ok:raise D3RecoveryRequired('d20_http_outcome_unknown') from value
+        if not ok:raise ExecutionRecoveryRequired('d20_http_outcome_unknown') from value
         return value
 
     def source(self,reference):
@@ -613,31 +613,31 @@ class HttpCapability:
                 or binding.rule_binding_sha256!=digest(asdict(selected))
                 or binding.plan_id!=self.app._id(f'plan/{binding.intent_id}/{len(prior)+1}')
                 or bool(prior) != (binding.replan_review_id is not None) and not (self.app.config.intent_execution_policy and prior and prior[-1].status is PlanStatus.COMPLETED and binding.replan_review_id is None)):
-            raise D3RecoveryRequired('d21_attachment_plan_source_changed')
+            raise ExecutionRecoveryRequired('d21_attachment_plan_source_changed')
         from agent_core.execution_feasibility import KEY,freeze
         packet=json.loads(frozen['request']['history_context'])
         if packet.get(KEY)!=freeze(self.app,binding.turn_id,binding.intent_id,state=state):
-            raise D3RecoveryRequired('d21_attachment_plan_execution_state_changed')
+            raise ExecutionRecoveryRequired('d21_attachment_plan_execution_state_changed')
         if prior and binding.replan_review_id is not None:
             review=self.store.load_d3_review_application(self.task.task_run_id,binding.replan_review_id)
             if review is None or review.intent_id!=binding.intent_id or review.paused_gate or review.decision!='replan_current_intent':
-                raise D3RecoveryRequired('d21_attachment_replan_review_missing')
+                raise ExecutionRecoveryRequired('d21_attachment_replan_review_missing')
         if binding.observation_mode=='new_observation':
             if any(self.store.load_d3_plan_binding(p.plan_id).artifact_version_id==binding.artifact_version_id for p in state.plans):
-                raise D3RecoveryRequired('d21_attachment_version_reused')
+                raise ExecutionRecoveryRequired('d21_attachment_version_reused')
         else:
             proof=self.file_proofs.proofs.read(binding.source_proof_id)
             original=self.store.load_d3_plan_result(proof.plan_id) if proof else None
             if (original is None or original.supporting_fact_id!=binding.source_fact_id
                     or proof.artifact_version_id!=binding.artifact_version_id):
-                raise D3RecoveryRequired('d21_attachment_saved_proof_changed')
+                raise ExecutionRecoveryRequired('d21_attachment_saved_proof_changed')
 
     def model_context(self,request):
         """Read exact protected sources only while building the actual provider input."""
         key=digest(asdict(request))
         if threading.get_ident()!=self._context_thread:
             if key not in self._context_cache:
-                raise D3RecoveryRequired('d20_http_model_projection_not_frozen')
+                raise ExecutionRecoveryRequired('d20_http_model_projection_not_frozen')
             return self._context_cache[key]
         sources=[]
         context=getattr(request,'context',None)
@@ -689,7 +689,7 @@ class HttpCapability:
         for identity,version in sources:
             observed=self.observation(identity,historical=True)
             if observed.source_version_sha256!=version:
-                raise D3RecoveryRequired('d20_http_model_source_version_changed')
+                raise ExecutionRecoveryRequired('d20_http_model_source_version_changed')
             raw=self.protected.read(observed.response_evidence_id)
             excerpt=raw[:64*1024].decode('utf-8',errors='replace')
             views.append(dict(execution_id=identity,source_version_sha256=version,
@@ -706,7 +706,7 @@ class HttpCapability:
         result={'http_observations':views} if views else {}
         previous=self._context_cache.get(key)
         if previous is not None and previous!=result:
-            raise D3RecoveryRequired('d20_http_frozen_projection_changed')
+            raise ExecutionRecoveryRequired('d20_http_frozen_projection_changed')
         self._context_cache[key]=result
         return result
 
@@ -724,11 +724,11 @@ class HttpCapability:
             if (frozen is None or contract is None or saved['task_run_id']!=task
                     or saved['request_sha256']!=digest(frozen['request'])
                     or contract['source_request_sha256']!=saved['request_sha256']):
-                raise D3RecoveryRequired('d20_http_saved_plan_source_changed')
+                raise ExecutionRecoveryRequired('d20_http_saved_plan_source_changed')
             self.attach()
             protected=self.protected.read(saved['result']['request_evidence_id'])
             if hashlib.sha256(protected).hexdigest()!=saved['result']['request_sha256']:
-                raise D3RecoveryRequired('d20_http_saved_request_changed')
+                raise ExecutionRecoveryRequired('d20_http_saved_request_changed')
             native=self.app.model_evidence.read(identity)
             if native is None:
                 start=operation.start
@@ -748,20 +748,20 @@ class HttpCapability:
             stopped=self.dispatch_stop(binding)
             if stopped is not None:
                 if result is not None:
-                    raise D3RecoveryRequired('d20_http_dispatch_stop_conflicts_with_response')
+                    raise ExecutionRecoveryRequired('d20_http_dispatch_stop_conflicts_with_response')
                 if op.completion is None:
                     self.store.complete_d4_operation(D4OperationCompletion(binding.execution_id,
                         stopped['finished_at'],'rejected',binding.execution_id,digest(stopped)))
                 continue
             if result is not None and (op is None or op.start.task_run_id!=task
                     or op.start.resource_ref!=plan.plan_id or op.start.context_sha256!=binding.request_sha256):
-                raise D3RecoveryRequired('d20_http_result_without_bound_start')
+                raise ExecutionRecoveryRequired('d20_http_result_without_bound_start')
             if result is not None and op.completion is None:
                 self.attach()
                 self.cookie_snapshot(result)
                 body=self.protected.read(result['body_evidence_id'])
                 if hashlib.sha256(body).hexdigest()!=result['body_sha256'] or len(body)!=result['body_bytes']:
-                    raise D3RecoveryRequired('d20_http_saved_response_changed')
+                    raise ExecutionRecoveryRequired('d20_http_saved_response_changed')
                 self.store.complete_d4_operation(D4OperationCompletion(binding.execution_id,result['finished_at'],
                     'completed',binding.execution_id,digest(result)))
 
@@ -779,7 +779,7 @@ class HttpCapability:
             if (saved is None or asdict(proposal)!=saved['result']
                     or proposal.request_evidence_id!=binding.request_evidence_id
                     or proposal.request_sha256!=binding.request_sha256):
-                raise D3RecoveryRequired('d20_http_plan_proposal_changed')
+                raise ExecutionRecoveryRequired('d20_http_plan_proposal_changed')
             self.read_request(binding)
         if mutation.operation in {'append_plan_validation_record','create_execution','start_execution'}:
             change=mutation.state_changes[0]
@@ -793,16 +793,16 @@ class HttpCapability:
             value=self.result(change.execution_id)
             op=self.store.load_d4_operation(change.execution_id)
             if value is None or op is None or op.completion is None or op.completion.evidence_sha256!=digest(value):
-                raise D3RecoveryRequired('d20_http_completed_response_missing')
+                raise ExecutionRecoveryRequired('d20_http_completed_response_missing')
             self.attach()
             raw=self.protected.read(value['body_evidence_id'])
             if hashlib.sha256(raw).hexdigest()!=value['body_sha256']:
-                raise D3RecoveryRequired('d20_http_completed_response_changed')
+                raise ExecutionRecoveryRequired('d20_http_completed_response_changed')
         elif mutation.operation=='complete_d3_plan':
             source=self.observation(metadata.plan_result.proof_id)
             facts=[c for c in mutation.state_changes if isinstance(c,UpsertFact)]
             if metadata.plan_result.evidence_sha256 != source.source_version_sha256:
-                raise D3RecoveryRequired('d20_http_fact_source_changed')
+                raise ExecutionRecoveryRequired('d20_http_fact_source_changed')
             if metadata.plan_result.outcome == 'observed':
                 from agent_core.conclusion_contracts import D8Conclusion
                 for record in mutation.state_changes:
@@ -824,7 +824,7 @@ class HttpCapability:
             if not content_ok and self.app.config.contract_version in {21, 22}:
                 content_ok = bool(facts[0].content.strip())
             if not content_ok or metadata.plan_result.evidence_sha256!=source.source_version_sha256:
-                raise D3RecoveryRequired('d20_http_fact_source_changed')
+                raise ExecutionRecoveryRequired('d20_http_fact_source_changed')
         return True
 
 
@@ -832,7 +832,7 @@ def readonly_capability(directory,store,config):
     from types import SimpleNamespace
     from agent_adapters.output_evidence import FileD8OutputEvidence
     refs=store.list_task_run_refs()
-    if len(refs)!=1:raise D3RecoveryRequired('d20_http_state_owner_unavailable')
+    if len(refs)!=1:raise ExecutionRecoveryRequired('d20_http_state_owner_unavailable')
     rows=store.load_control_state_rows(refs[0])
     app=SimpleNamespace(directory=directory,store=store,config=config,state=rows,
         output_boundary=SimpleNamespace(evidence=FileD8OutputEvidence(directory/'d8-output',create=False)))
@@ -853,7 +853,7 @@ def check_http_task(directory,store,config,*,diagnostics=None):
             if config.contract_version in {21,22} and getattr(binding,'kind',None)=='attachment_observation':
                 store.load_d3_plan_turn_binding(plan.plan_id)
                 continue
-            raise D3RecoveryRequired('d20_http_plan_type_changed')
+            raise ExecutionRecoveryRequired('d20_http_plan_type_changed')
         capability.read_request(binding)
         failure=capability.evidence.read('http-failure',binding.execution_id)
         if failure is not None:
@@ -870,25 +870,25 @@ def check_http_task(directory,store,config,*,diagnostics=None):
                     or any(not isinstance(v,str) or v not in SAFE_EXCEPTION_TYPES for v in failure['exception_types'])
                     or not isinstance(failure['error_codes'],list) or len(failure['error_codes'])>6
                     or any(not isinstance(v,str) or v not in SAFE_HTTP_ERROR_CODES for v in failure['error_codes'])):
-                raise D3RecoveryRequired('d20_http_failure_diagnostic_invalid')
+                raise ExecutionRecoveryRequired('d20_http_failure_diagnostic_invalid')
             if diagnostics is not None:diagnostics.append(failure)
         value=capability.result(binding.execution_id)
         op=store.load_d4_operation(binding.execution_id)
         stopped=capability.dispatch_stop(binding)
         if stopped is not None:
             if value is not None:
-                raise D3RecoveryRequired('d20_http_dispatch_stop_conflicts_with_response')
+                raise ExecutionRecoveryRequired('d20_http_dispatch_stop_conflicts_with_response')
             needs_repair |= op.completion is None
             continue
         execution=next((e for e in capability.app.state.executions if e.execution_id==binding.execution_id),None)
         if value is not None:
-            if op is None:raise D3RecoveryRequired('d20_http_result_without_start')
+            if op is None:raise ExecutionRecoveryRequired('d20_http_result_without_start')
             if op.completion is None:
                 needs_repair=True
             elif execution is not None and execution.status is ExecutionStatus.SUCCEEDED:
                 capability.observation(execution.execution_id,historical=True)
         elif execution is not None and execution.status is ExecutionStatus.SUCCEEDED:
-            raise D3RecoveryRequired('d20_http_execution_result_missing')
+            raise ExecutionRecoveryRequired('d20_http_execution_result_missing')
         elif op is not None and op.completion is None:
             needs_repair=True
     capability.cookie_history()

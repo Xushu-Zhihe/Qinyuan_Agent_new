@@ -124,3 +124,24 @@ def test_command_receipt_replays_only_after_immutable_byte_evidence(tmp_path):
     assert restarted.lookup(item.request_id).task_run_id == item.task_run_id
     with pytest.raises(T6EvidenceError, match="request_id_conflict"):
         restarted.begin(replace(item, script="different"), auth, "sandbox-1")
+
+
+@pytest.mark.parametrize("kind", ["receipt", "model-action", "stage-request"])
+def test_evidence_capacity_is_checked_before_write_and_uses_same_read_bound(tmp_path, kind):
+    from agent_core.command_contracts import T6EvidenceCapacityError
+    recorder = T6CommandRecorder(tmp_path)
+    identity = str(uuid4())
+    maximum = recorder.limit(kind)
+    empty = len(recorder.encode(kind, identity, {"value": ""}))
+    value = {"value": "x" * (maximum - empty)}
+    recorder._write(kind, identity, value)
+    assert recorder._read(kind, identity) == value
+    other = str(uuid4())
+    with pytest.raises(T6EvidenceCapacityError) as caught:
+        recorder._write(kind, other, {"value": value["value"] + "x"})
+    assert caught.value.actual_bytes == maximum + 1 and caught.value.limit_bytes == maximum
+    assert not recorder._path(kind, other).exists() and not list(tmp_path.glob(".pending-*"))
+    recorder._path(kind, other).write_bytes(b"x" * (maximum + 1))
+    with pytest.raises(T6EvidenceCapacityError) as caught:
+        recorder._read(kind, other)
+    assert caught.value.actual_bytes == maximum + 1

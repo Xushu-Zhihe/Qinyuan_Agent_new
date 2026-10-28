@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -140,6 +141,14 @@ def build_application(directory, declaration, operation):
 
 def run_stage_task(directory, declaration, *, operation="start", finalize_export=None,
         competition_request=None, validation_selection=None, validation_checker=None, human_decision=None):
+    return asyncio.run(_run_stage_task(directory, declaration, operation=operation, finalize_export=finalize_export,
+        competition_request=competition_request, validation_selection=validation_selection,
+        validation_checker=validation_checker, human_decision=human_decision))
+
+
+async def _run_stage_task(directory, declaration, *, operation, finalize_export,
+        competition_request, validation_selection, validation_checker, human_decision):
+    """Keep MCP startup, calls and teardown on the same loop and owning task."""
     from agent_adapters.web.task_result import snapshot_v3_task_result
     from agent_core import operator_controls
     if operation != "start":
@@ -200,7 +209,7 @@ def run_stage_task(directory, declaration, *, operation="start", finalize_export
         if operation in {"start", "resume"}:
             while True:
                 try:
-                    report = asyncio.run(app.run(token))
+                    report = await app.run(token)
                 except operator_controls.OperatorPaused:
                     supplemental["dispatch"] = dict(status="paused", reason="operator_paused")
                     break
@@ -220,7 +229,7 @@ def run_stage_task(directory, declaration, *, operation="start", finalize_export
                 task = app.state.task_run
                 if task.status is TaskRunStatus.AWAITING_CONFIRMATION:
                     # The worker remains available; short locked ticks leave manual commands independent.
-                    asyncio.run(app.mcp.close())
+                    await app.mcp.close()
                     while app.state.task_run.status is TaskRunStatus.AWAITING_CONFIRMATION:
                         try:
                             with run_lock(directory):
@@ -232,7 +241,7 @@ def run_stage_task(directory, declaration, *, operation="start", finalize_export
                         except ValueError as error:
                             if str(error) != "task_run_busy":
                                 raise
-                        time.sleep(0.1)
+                        await asyncio.sleep(0.1)
                     continue
                 if report.reason in {"stage.exhausted", "stage.root_planning_exhausted", "stage.root_blocked"}:
                     app.controller._reload_after_commit()
@@ -259,18 +268,40 @@ def run_stage_task(directory, declaration, *, operation="start", finalize_export
                 else:
                     raise ValueError("stage.public_operation_invalid")
         if app.state.task_run.status in TERMINAL_STATUSES:
-            asyncio.run(app.mcp.close())
+            await app.mcp.close()
             from agent_adapters.web.task_result import _cleanup
             with run_lock(directory):
                 app.controller._reload_after_commit()
                 if _cleanup(directory, app.state.task_run)[1] != "confirmed":
                     app.controller.cleanup_sandbox()
     finally:
-        if finalize_export is not None:
-            finalize_export()
-        asyncio.run(app.close())
-        if resources is not None:
-            resources.close()
+        primary = sys.exception()
+        cleanup_errors = []
+        try:
+            if finalize_export is not None:
+                finalize_export()
+        except BaseException as error:
+            cleanup_errors.append(("export", error))
+        try:
+            await app.close()
+        except BaseException as error:
+            cleanup_errors.append(("application", error))
+        try:
+            if resources is not None:
+                resources.close()
+        except BaseException as error:
+            cleanup_errors.append(("resources", error))
+        from agent_adapters.output_evidence import safe_failure_details
+        from qinyuan_core import get_logger
+        for phase, error in cleanup_errors:
+            get_logger("ctrl").error("stage.public_cleanup_failed", phase=phase,
+                **safe_failure_details(error, include_chain=True))
+            if primary is not None:
+                primary.add_note("stage.public_cleanup_failed:" + phase)
+        if primary is None and cleanup_errors:
+            for phase, _ in cleanup_errors[1:]:
+                cleanup_errors[0][1].add_note("stage.public_cleanup_failed:" + phase)
+            raise cleanup_errors[0][1]
     result = snapshot_v3_task_result(directory, declaration)
     result.update(supplemental)
     if result.get("cleanup_status") == "confirmed":

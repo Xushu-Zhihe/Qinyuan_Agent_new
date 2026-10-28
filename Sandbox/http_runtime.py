@@ -56,8 +56,13 @@ _RETURNED_RESPONSE_HEADERS = D7_WEB_RESPONSE_HEADERS
 
 _HTTP_WORKER = r"""import base64,http.client,json,socket,ssl,sys
 
-def fail():
-    print('{"error":"d7_http_transport_failed"}',flush=True)
+phase="input"
+def fail(code=None,error=None):
+    name=type(error).__name__ if error is not None else None
+    if error is not None and name not in {"TimeoutError","ConnectionRefusedError","ConnectionResetError","RemoteDisconnected","IncompleteRead","SSLError","UnicodeEncodeError","InvalidURL","BadStatusLine","OSError","ValueError","TypeError","KeyError"}:
+        name="OtherError"
+    print(json.dumps({"error":"d7_http_transport_failed","phase":phase,
+        "code":"http.worker."+(code or phase+"_failed"),"error_type":name},separators=(",",":")),flush=True)
     raise SystemExit(1)
 
 try:
@@ -71,6 +76,7 @@ try:
     body=base64.b64decode(request["body_b64"],validate=True)
     if len(body)>65536 or request["max_response_bytes"]!=2097152:
         fail()
+    phase="request_prepare"
     host=request["host"]
     port=request["port"]
     timeout=request["timeout_seconds"]
@@ -96,11 +102,15 @@ try:
             continue
         connection.putheader(name,value)
     connection.putheader("Content-Length",str(len(body)))
+    phase="request_send"
     connection.endheaders(body)
+    phase="response_headers"
     response=connection.getresponse()
+    phase="response_body"
     response_body=response.read(request["max_response_bytes"]+1)
     if len(response_body)>request["max_response_bytes"]:
-        fail()
+        fail("response_body_limit")
+    phase="response_validate"
     selected=[]
     total=0
     for name,value in response.getheaders():
@@ -109,18 +119,18 @@ try:
         encoded_name=name.lower().encode("ascii")
         encoded_value=value.encode("latin-1")
         if len(encoded_value)>request["max_header_value_bytes"]:
-            fail()
+            fail("response_header_limit")
         total+=len(encoded_name)+len(encoded_value)+4
         selected.append([name.lower(),value])
         if len(selected)>request["max_header_count"] or total>request["max_header_bytes"]:
-            fail()
+            fail("response_header_limit")
     result={"status":response.status,"headers":selected,"body_b64":base64.b64encode(response_body).decode("ascii")}
     print(json.dumps(result,separators=(",",":"),ensure_ascii=True),flush=True)
     connection.close()
 except SystemExit:
     raise
-except Exception:
-    fail()
+except Exception as error:
+    fail(error=error)
 """
 
 
@@ -142,15 +152,11 @@ def _fail(phase: str, task_run_id: str, sandbox_id: str, exc: Exception | None =
 
 
 def _unknown(
-    phase: str, task_run_id: str, sandbox_id: str, exc: Exception | None = None
+    phase: str, task_run_id: str, sandbox_id: str, exc: Exception | None = None, *, diagnostic=None
 ):
-    raise TaskRunSandboxError(
-        phase,
-        "outcome_unknown",
-        task_run_id,
-        (sandbox_id,),
-        original_error=exc,
-    ) from exc
+    error = TaskRunSandboxError(phase, "outcome_unknown", task_run_id, (sandbox_id,), original_error=exc)
+    error.http_diagnostic = diagnostic
+    raise error from exc
 
 
 def _validate_header_limits(
@@ -298,12 +304,18 @@ class D7SandboxHttpRuntime:
 
         if not binding.execution_lock.acquire(timeout=float(timeout_seconds)):
             _fail("http_dispatch", task_run_id, sandbox_id)
+        diagnostic = {"phase": "admission"}
+        def unknown(branch, error=None):
+            _unknown("http_dispatch", task_run_id, sandbox_id, error,
+                diagnostic={**diagnostic, "branch": branch})
         try:
             with self.sandbox._lock:
                 if not binding.accepting or self.sandbox._closed:
                     _fail("http_dispatch", task_run_id, sandbox_id)
             self.sandbox._verify_active(task_run_id, sandbox_id)
+            diagnostic["phase"] = "network_bind"
             target_network.bind(task_run_id, network_binding, terminal=False)
+            diagnostic["phase"] = "exec_create"
             with self.sandbox._admit(binding):
                 execution = self.sandbox._runtime.client.api.exec_create(
                     container=sandbox_id,
@@ -329,6 +341,7 @@ class D7SandboxHttpRuntime:
             exec_id = execution.get("Id") if isinstance(execution, dict) else None
             if not isinstance(exec_id, str) or not exec_id:
                 _fail("http_dispatch", task_run_id, sandbox_id)
+            diagnostic.update(exec_id=exec_id, phase="exec_start")
             with self.sandbox._admit(binding):
                 sock = self.sandbox._runtime.client.api.exec_start(
                     exec_id, socket=True, tty=False
@@ -350,6 +363,7 @@ class D7SandboxHttpRuntime:
             started = time.monotonic()
             threading.Thread(target=interrupt_wait, daemon=True).start()
             # The worker reads one JSON line; Windows named pipes cannot half-close.
+            diagnostic["phase"] = "worker_io"
             raw.sendall(input_bytes)
             from docker.utils.socket import next_frame_header, read_exactly
 
@@ -360,7 +374,7 @@ class D7SandboxHttpRuntime:
                 if stream < 0:
                     break
                 if stream not in (1, 2) or length < 0:
-                    _unknown("http_dispatch", task_run_id, sandbox_id)
+                    unknown("frame_invalid")
                 target = stdout if stream == 1 else stderr
                 limit = (
                     MAX_D7_HTTP_STDOUT_BYTES
@@ -368,29 +382,46 @@ class D7SandboxHttpRuntime:
                     else MAX_D7_HTTP_STDERR_BYTES
                 )
                 if len(target) + length > limit:
-                    _unknown("http_dispatch", task_run_id, sandbox_id)
+                    unknown("stdout_limit" if stream == 1 else "stderr_limit")
                 target.extend(read_exactly(raw, length))
             if time.monotonic() - started >= timeout_seconds:
-                _unknown("http_dispatch", task_run_id, sandbox_id)
+                unknown("worker_timeout")
+            diagnostic["phase"] = "exec_inspect"
             result = self.sandbox._runtime.client.api.exec_inspect(exec_id)
-            if (
-                result.get("Running") is not False
-                or result.get("ExitCode") != 0
-                or stderr
-            ):
-                _unknown("http_dispatch", task_run_id, sandbox_id)
+            diagnostic.update(running=result.get("Running"), exit_code=result.get("ExitCode"))
+            if result.get("Running") is not False:
+                unknown("worker_still_running")
+            if result.get("ExitCode") != 0:
+                try:
+                    failure = json.loads(stdout)
+                except (ValueError, UnicodeError):
+                    failure = None
+                phases = {"input", "request_prepare", "request_send", "response_headers", "response_body", "response_validate"}
+                codes = {"http.worker." + p + "_failed" for p in phases} | {
+                    "http.worker.response_body_limit", "http.worker.response_header_limit"}
+                errors = {"TimeoutError", "ConnectionRefusedError", "ConnectionResetError", "RemoteDisconnected",
+                    "IncompleteRead", "SSLError", "UnicodeEncodeError", "InvalidURL", "BadStatusLine", "OSError",
+                    "ValueError", "TypeError", "KeyError", "OtherError", None}
+                if (isinstance(failure, dict) and set(failure) == {"error", "phase", "code", "error_type"}
+                        and failure["error"] == "d7_http_transport_failed" and failure["phase"] in phases
+                        and failure["code"] in codes and failure["error_type"] in errors):
+                    diagnostic.update(worker_phase=failure["phase"], worker_code=failure["code"], error_type=failure["error_type"])
+                unknown("worker_exit_nonzero")
+            if stderr:
+                unknown("worker_stderr")
+            diagnostic["phase"] = "response_decode"
             response = json.loads(stdout)
             if not isinstance(response, dict) or set(response) != {
                 "status",
                 "headers",
                 "body_b64",
             }:
-                _unknown("http_dispatch", task_run_id, sandbox_id)
+                unknown("response_envelope_invalid")
 
             try:
                 response_body = base64.b64decode(response["body_b64"], validate=True)
             except (ValueError, TypeError) as exc:
-                _unknown("http_dispatch", task_run_id, sandbox_id, exc)
+                unknown("response_body_encoding_invalid", exc)
             response_headers = response["headers"]
             if (
                 type(response["status"]) is not int
@@ -414,7 +445,7 @@ class D7SandboxHttpRuntime:
                 )
                 > MAX_D7_HTTP_HEADER_BYTES
             ):
-                _unknown("http_dispatch", task_run_id, sandbox_id)
+                unknown("response_limits_or_fields_invalid")
             return D7SandboxHttpResponse(
                 response["status"],
                 tuple((name.lower(), value) for name, value in response_headers),
@@ -423,7 +454,7 @@ class D7SandboxHttpRuntime:
         except TaskRunSandboxError:
             raise
         except Exception as exc:  # noqa: BLE001 - Docker and socket boundary
-            _unknown("http_dispatch", task_run_id, sandbox_id, exc)
+            unknown("runtime_exception", exc)
         finally:
             if "done" in locals():
                 done.set()

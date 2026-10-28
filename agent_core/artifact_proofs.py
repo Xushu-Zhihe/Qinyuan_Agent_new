@@ -15,7 +15,7 @@ from agent_core.attachment_workspace import fixed_digest_script
 from agent_core.domain import ExecutionEvidence, ExecutionStatus, PlanStatus
 from agent_core.dual_llm_contracts import (
     D3PlanBinding,
-    D3RecoveryRequired,
+    ExecutionRecoveryRequired,
     _sha,
     _time,
     _uuid,
@@ -97,11 +97,11 @@ class D3ObservationProofVerifier:
             if item.plan_id == binding.plan_id and item.step_index == step_index
         ]
         if len(matches) != 1 or matches[0].status is not ExecutionStatus.SUCCEEDED:
-            raise D3RecoveryRequired("d3_proof_execution_not_confirmed")
+            raise ExecutionRecoveryRequired("d3_proof_execution_not_confirmed")
         execution = matches[0]
         completed = self.commands.read_completed(execution.execution_id)
         if completed is None or completed.action is not None:
-            raise D3RecoveryRequired("d3_proof_command_receipt_missing")
+            raise ExecutionRecoveryRequired("d3_proof_command_receipt_missing")
         record = completed.record
         command = self.commands.read_command(execution.command_ref)
         operation = self.ledger.load_d3_operation(execution.execution_id)
@@ -135,7 +135,7 @@ class D3ObservationProofVerifier:
             or operation.completion.evidence_sha256 != self._record_digest(record)
             or operation.application_ref != execution.execution_id
         ):
-            raise D3RecoveryRequired("d3_proof_command_evidence_changed")
+            raise ExecutionRecoveryRequired("d3_proof_command_evidence_changed")
         return execution, record
 
     def _observation(self, binding: D3PlanBinding, observation_id: str, *, allow_inactive_plan: bool = False):
@@ -169,7 +169,7 @@ class D3ObservationProofVerifier:
             or binding.rule_binding_sha256 != digest(asdict(turn))
             or turn.task_run_id != binding.task_run_id
         ):
-            raise D3RecoveryRequired("d3_proof_plan_binding_changed")
+            raise ExecutionRecoveryRequired("d3_proof_plan_binding_changed")
         artifact = self.workspace.read_artifact(binding.artifact_version_id)
         artifact_operation = self.ledger.load_d3_operation(binding.artifact_version_id)
         source = self.imports.read_receipt(turn.import_id)
@@ -204,7 +204,7 @@ class D3ObservationProofVerifier:
             or artifact_operation.completion.evidence_sha256 != digest(asdict(artifact))
             or artifact_operation.application_ref != binding.artifact_version_id
         ):
-            raise D3RecoveryRequired("d3_proof_artifact_evidence_changed")
+            raise ExecutionRecoveryRequired("d3_proof_artifact_evidence_changed")
         size_execution_id = None
         sha_step = 0
         if binding.template == "size_then_sha256":
@@ -225,7 +225,7 @@ class D3ObservationProofVerifier:
                 or size.output_sha256 != hashlib.sha256(size_record.stdout).hexdigest()
                 or size.status != "confirmed"
             ):
-                raise D3RecoveryRequired("d3_proof_size_evidence_changed")
+                raise ExecutionRecoveryRequired("d3_proof_size_evidence_changed")
             size_execution_id = size_execution.execution_id
             sha_step = 1
         sha_execution, sha_record = self._execution(
@@ -234,9 +234,9 @@ class D3ObservationProofVerifier:
         try:
             output = json.loads(sha_record.stdout.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
-            raise D3RecoveryRequired("d3_sha_command_output_invalid") from exc
+            raise ExecutionRecoveryRequired("d3_sha_command_output_invalid") from exc
         if output != {"status": "present", "sha256": turn.expected_sha256}:
-            raise D3RecoveryRequired("d3_sha_command_integrity_exception")
+            raise ExecutionRecoveryRequired("d3_sha_command_integrity_exception")
         receipt = self.workspace.read_digest(observation_id)
         operation = self.ledger.load_d3_operation(observation_id)
         if (
@@ -262,7 +262,7 @@ class D3ObservationProofVerifier:
             or operation.completion.evidence_sha256 != digest(asdict(receipt))
             or operation.application_ref != observation_id
         ):
-            raise D3RecoveryRequired("d3_proof_digest_evidence_changed")
+            raise ExecutionRecoveryRequired("d3_proof_digest_evidence_changed")
         return state, turn, sha_execution, size_execution_id, receipt
 
     def issue(
@@ -278,7 +278,7 @@ class D3ObservationProofVerifier:
                 or existing.artifact_version_id != binding.artifact_version_id
                 or existing.observation_id != observation_id
             ):
-                raise D3RecoveryRequired("d3_proof_id_conflict")
+                raise ExecutionRecoveryRequired("d3_proof_id_conflict")
             self.read_verified(existing.source_execution_id, proof_id)
             return existing
         state, turn, execution, size_id, receipt = self._observation(
@@ -286,10 +286,10 @@ class D3ObservationProofVerifier:
         )
         plan = next(item for item in state.plans if item.plan_id == binding.plan_id)
         if plan.status is not PlanStatus.RUNNING:
-            raise D3RecoveryRequired("d3_proof_issue_requires_running_plan")
+            raise ExecutionRecoveryRequired("d3_proof_issue_requires_running_plan")
         now = self.clock()
         if not receipt.completed_at <= now < state.task_run.deadline_at:
-            raise D3RecoveryRequired("d3_proof_issue_outside_task_time")
+            raise ExecutionRecoveryRequired("d3_proof_issue_outside_task_time")
         proof = D3ObservationProof(
             proof_id,
             binding.task_run_id,
@@ -310,10 +310,10 @@ class D3ObservationProofVerifier:
     def read_verified(self, execution_id: str, proof_id: str, *, allow_inactive_plan: bool = False):
         proof = self.proofs.read(proof_id)
         if proof is None or proof.source_execution_id != execution_id:
-            raise D3RecoveryRequired("d3_proof_missing_or_mismatched")
+            raise ExecutionRecoveryRequired("d3_proof_missing_or_mismatched")
         binding = self.ledger.load_d3_plan_binding(proof.plan_id)
         if binding is None:
-            raise D3RecoveryRequired("d3_proof_plan_missing")
+            raise ExecutionRecoveryRequired("d3_proof_plan_missing")
         state, turn, execution, size_id, receipt = self._observation(
             binding, proof.observation_id, allow_inactive_plan=allow_inactive_plan
         )
@@ -344,5 +344,5 @@ class D3ObservationProofVerifier:
             <= proof.verified_at
             <= state.task_run.deadline_at
         ):
-            raise D3RecoveryRequired("d3_proof_binding_changed")
+            raise ExecutionRecoveryRequired("d3_proof_binding_changed")
         return proof, ExecutionEvidence(proof.task_run_id, None, receipt.completed_at)

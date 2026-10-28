@@ -502,7 +502,7 @@ def test_deadline_during_http_admission_has_durable_not_dispatched_receipt(http_
 @pytest.mark.parametrize('outcome,valid', [('observed',True),('satisfied',True),('observed',False)])
 def test_attachment_observation_reuse_keeps_source_validation_without_fact(outcome, valid):
     from agent_adapters.http_capability import HttpCapability
-    from agent_core.dual_llm_contracts import D3TurnBinding,D3RecoveryRequired
+    from agent_core.dual_llm_contracts import D3TurnBinding,ExecutionRecoveryRequired
     from agent_core.hybrid_contracts import HybridTurnBinding,AttachmentPlanBinding
     task,turn,actor,plan,proposal,import_id,proof_id = (str(uuid4()) for _ in range(7))
     attachment = D3TurnBinding(str(uuid4()),task,turn,0,import_id,20,'a'*64,proposal)
@@ -511,7 +511,7 @@ def test_attachment_observation_reuse_keeps_source_validation_without_fact(outco
     checks=[]
     def verified(execution, proof, **kwargs):
         checks.append((execution,proof,kwargs))
-        if not valid:raise D3RecoveryRequired('d3_proof_source_changed')
+        if not valid:raise ExecutionRecoveryRequired('d3_proof_source_changed')
     store=SimpleNamespace(load_d3_turn_binding=lambda _:turn_binding,load_d3_plan_binding=lambda _:binding,
         load_d3_plan_result=lambda _:SimpleNamespace(outcome=outcome,proof_id=proof_id))
     proof=SimpleNamespace(source_execution_id=str(uuid4()))
@@ -525,7 +525,7 @@ def test_attachment_observation_reuse_keeps_source_validation_without_fact(outco
         assert context.file_proof_sources == ((0,proof_id),)
         assert context.reusable_proof_ids == (proof_id,)
     else:
-        with pytest.raises(D3RecoveryRequired,match='source_changed'):
+        with pytest.raises(ExecutionRecoveryRequired,match='source_changed'):
             HttpCapability.plan_context(capability,actor)
     assert checks == [(proof.source_execution_id,proof_id,{'allow_inactive_plan':True})]
 
@@ -555,8 +555,8 @@ def test_not_dispatched_receipt_repairs_completion_without_send(http_case, monke
     read=c.app.web.evidence.read
     monkeypatch.setattr(c.app.web.evidence,'read',lambda kind,identity:
         {**read(kind,identity),'request_sha256':'f'*64} if kind=='http-dispatch-stop' else read(kind,identity))
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
-    with pytest.raises(D3RecoveryRequired,match='binding_changed'):c.app.web.reconcile()
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+    with pytest.raises(ExecutionRecoveryRequired,match='binding_changed'):c.app.web.reconcile()
     assert not c.sends
 
 

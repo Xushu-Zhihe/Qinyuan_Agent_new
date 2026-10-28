@@ -17,7 +17,7 @@ from agent_core.goal_feedback import (
     external_validation_feedback_from_json,
     project_candidate_feedback,
 )
-from agent_core.operation_accounting import D4RecoveryRequired
+from agent_core.operation_accounting import OperationRecoveryRequired
 from agent_core.runtime import TaskRunStatus
 
 
@@ -118,7 +118,7 @@ def test_deadline_does_not_start_new_conflict_query(tmp_path):
         _, _, request = setup_conflict(app, token)
         app.controller._clock = lambda: app.state.task_run.deadline_at
         checker = Checker("accepted")
-        with pytest.raises(D4RecoveryRequired, match="deadline_unknown_retained"):
+        with pytest.raises(OperationRecoveryRequired, match="deadline_unknown_retained"):
             app.controller.run_external_validation_check(request, checker)
         assert checker.calls == 0
     finally:

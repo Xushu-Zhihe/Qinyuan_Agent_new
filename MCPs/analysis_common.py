@@ -6,9 +6,13 @@ from typing import Iterable
 
 MAX_SCRIPT_BYTES = 64 * 1024
 MAX_ARGUMENT_BYTES = 16 * 1024
+SANDBOX_INPUT_ROOT = "/workspace/input"
+SANDBOX_WORK_ROOT = "/workspace/work"
+SANDBOX_TEMP_ROOT = "/tmp"
+SANDBOX_PATH_HELP = "Paths are inside this TaskRun sandbox: /workspace/input is read-only; /workspace/work and /tmp are writable. Relative analysis-tool path arguments resolve below /workspace/work."
 
 
-def validate_sandbox_path(value: str, *, label: str = "path") -> str:
+def validate_sandbox_path(value: str, *, label: str = "path", writable: bool = False) -> str:
     """Allow only paths visible inside the Agent sandbox."""
 
     if not isinstance(value, str):
@@ -24,14 +28,13 @@ def validate_sandbox_path(value: str, *, label: str = "path") -> str:
     path = PurePosixPath(candidate)
     if ".." in path.parts:
         raise ValueError(f"{label} must not contain traversal")
-    if path.is_absolute() and not (
-        candidate == "/challenge"
-        or candidate.startswith("/challenge/")
-        or candidate == "/work"
-        or candidate.startswith("/work/")
-    ):
-        raise ValueError(f"{label} must be under /challenge or /work")
-    return candidate
+    if not path.is_absolute():
+        path = PurePosixPath(SANDBOX_WORK_ROOT) / path
+    roots = (SANDBOX_WORK_ROOT, SANDBOX_TEMP_ROOT) if writable else (
+        SANDBOX_INPUT_ROOT, SANDBOX_WORK_ROOT, SANDBOX_TEMP_ROOT)
+    if not any(path == PurePosixPath(root) or PurePosixPath(root) in path.parents for root in roots):
+        raise ValueError(f"{label} is outside the TaskRun sandbox paths")
+    return str(path)
 
 
 def validate_timeout(value: int) -> int:

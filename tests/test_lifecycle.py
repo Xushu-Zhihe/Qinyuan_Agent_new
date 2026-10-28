@@ -8,7 +8,7 @@ import pytest
 from test_chain_operation import close_scenario, make_d4_scenario, reopen_scenario
 
 from agent_core.controller import CommittedStateReloadError
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 
 
 @pytest.fixture
@@ -86,7 +86,7 @@ def test_d4_failed_terminal_reload_never_starts_cleanup(
     assert not any(
         event.category == "cleanup_started" for event in _events(app, task_run_id)
     )
-    with pytest.raises(D3RecoveryRequired, match="d4_cleanup_reload_failed"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d4_cleanup_reload_failed"):
         app.resume_cleanup(task_run_id)
     assert not sandbox.destroyed
     assert not any(

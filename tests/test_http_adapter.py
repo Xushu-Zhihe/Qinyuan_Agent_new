@@ -10,7 +10,7 @@ import pytest
 
 from agent_adapters.web.http_adapter import (
     D7HttpAdapter,
-    D7HttpError,
+    HttpCapabilityError,
     D7HttpEvidenceMetadata,
     D7HttpRequest,
     D7HttpResponseEvidenceStore,
@@ -99,7 +99,7 @@ def test_wire_header_limits_include_injected_cookie_and_encoding_headers():
     assert evidence.saved == [b"login"]
 
     large_headers = tuple((f"X-{index}", "v" * 8192) for index in range(7))
-    with pytest.raises(D7HttpError) as error:
+    with pytest.raises(HttpCapabilityError) as error:
         adapter.execute(_request(headers=large_headers, path="/next"))
 
     assert error.value.code == "d7_http_headers_too_large"
@@ -129,7 +129,7 @@ def test_untrusted_transport_response_headers_are_rejected_before_cookie_or_evid
         transport=transport,
     )
 
-    with pytest.raises(D7HttpError):
+    with pytest.raises(HttpCapabilityError):
         adapter.execute(_request(path="/login"))
 
     assert evidence.saved == []
@@ -140,9 +140,9 @@ def test_user_cannot_supply_cookie_or_oversized_request_headers():
     transport = FakeTransport(D7HttpWireResponse(200, (), b"ok"))
     adapter, evidence = _adapter(transport)
 
-    with pytest.raises(D7HttpError, match="d7_http_header_rejected"):
+    with pytest.raises(HttpCapabilityError, match="d7_http_header_rejected"):
         adapter.execute(_request(headers=(("Cookie", "external=session"),)))
-    with pytest.raises(D7HttpError, match="d7_http_headers_too_many"):
+    with pytest.raises(HttpCapabilityError, match="d7_http_headers_too_many"):
         adapter.execute(_request(headers=tuple((f"X-{i}", "v") for i in range(101))))
 
     assert transport.calls == []
@@ -165,14 +165,14 @@ def test_response_evidence_lookup_is_idempotent_taskrun_scoped_and_integrity_che
     assert store.save(operation_id, body) == first
     assert store.find_by_operation(operation_id) == first
     assert store.read(first.evidence_id) == body
-    with pytest.raises(D7HttpError, match="operation_conflict"):
+    with pytest.raises(HttpCapabilityError, match="operation_conflict"):
         store.save(operation_id, b"different body")
 
     cipher = store.directory / f"{first.evidence_id}.cipher"
     cipher.write_bytes(cipher.read_bytes() + b"tamper")
-    with pytest.raises(D7HttpError, match="integrity_failed"):
+    with pytest.raises(HttpCapabilityError, match="integrity_failed"):
         store.find_by_operation(operation_id)
-    with pytest.raises(D7HttpError, match="integrity_failed"):
+    with pytest.raises(HttpCapabilityError, match="integrity_failed"):
         store.read(first.evidence_id)
 
 
@@ -195,5 +195,5 @@ def test_duplicate_evidence_operation_records_are_a_conflict(tmp_path):
         json.dumps(duplicate), encoding="utf-8"
     )
 
-    with pytest.raises(D7HttpError, match="operation_conflict"):
+    with pytest.raises(HttpCapabilityError, match="operation_conflict"):
         store.find_by_operation(operation_id)

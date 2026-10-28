@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from agent_core.actions import MCPCall
+from agent_core.actions import MCPCall, PUBLIC_REFERENCE_TOOLS
 from agent_core.domain import IntentStatus
 from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8RevisionTarget
 from agent_core.output_contracts import D8ModelResponse, D8FormatIssue, array, obj, tagged, text, decode_response
@@ -10,6 +10,7 @@ from agent_core.stage_contracts import (
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot,
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete, StageSessionSummary, StageStrategyAdvice, StageTurnSnapshot, TurnAchievement, TurnCompletion, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, TurnPlanningState, StagePlanningDecision,
+    StageToolBatch, MAX_IN_FLIGHT_TOOLS,
 )
 from agent_core.handoff_contracts import D8HistoryItem
 
@@ -31,16 +32,17 @@ class StageModelRequest:
     capacity_recovery_of: str | None = None
     frozen_contract_ref: str | None = None
     history_catalog: tuple[dict, ...] = ()
+    execution_context: dict | None = None
 
 
 RULES = {
-    "stage_continuation": "Plan from this achieved Turn in its retained Inner session. Propose only the next Turn's goal/criterion/premises; its own Inner will plan its Roads. Alternatively select an existing pending own Road, propose own Roads retaining all pending candidates, report known settled blockage, or request independent final validation. Exhaustion here concerns available continuation, not historical achievement or unexecuted Road failure. Child feedback is scoped evidence, not proof that the parent goal failed. Never replay closed Roads or unknown operations.",
-    "stage_intent": "Propose the current stage deliverable and its completion criterion, within TaskRun goal and authority. Known premises are optional; never invent future evidence. This root proposal belongs to its preallocated planning session.",
-    "stage_roads": "Propose this Turn's independent alternative solution chains, in execution priority order. Do not propose another stage's Roads. A different tool, URL or parameter alone is not a new chain. Retain all existing pending candidates when updating their order; closed Roads keep their identities and outcomes. Business re-exploration with new premises creates a new Road. No fixed candidate count. Known settled blockage can be reviewed with return_to_parent; technical waiting alone is not business exhaustion.",
-    "stage_review": "Review the exact bound proposal: accept, revise or reject. Explain substantive revisions to its original Inner; do not silently replace it. For Roads select original indices in execution priority order. A stage completion proposal must satisfy the immutable completion_criterion; Road success and TaskRun success are separate. Review a Fact candidate against its own claim, declared scope and cited sources, not the whole Turn completion criterion. Accept a supported partial observation without demanding that one Fact contain every stage deliverable. Keep observed claims separate from inferred explanations; an accepted inference remains inference, never verified Fact. Request revisions only for gaps in the proposed claim, not to expand it into a complete stage report.",
-    "stage_action": "Explore only this Road in its own continuous conversation. Tools return observations, never automatic Facts. Propose a concise formal conclusion only when useful, with original support refs; label inference. Road resolution concerns its own result. Stage completion requires the Turn criterion and current formal support. Use only declared tools and current authority. Tool errors are not target counterevidence; unknown operations are never replayed.",
+    "stage_continuation": "Plan from this achieved Turn in its retained Inner session. Commit only the next useful, independently checkable deliverable and its criterion/premises; its own Inner will plan its Roads. Once a grounded proposal can begin, submit it without pre-solving that stage or the whole TaskRun. A brief revisable longer-term outlook may appear in the existing description/reason, but is not a registered future-stage commitment. Alternatively select an existing pending own Road, propose own Roads retaining all pending candidates, report known settled blockage, or request independent final validation. Exhaustion here concerns available continuation, not historical achievement or unexecuted Road failure. Child feedback is scoped evidence, not proof that the parent goal failed. Never replay closed Roads or unknown operations.",
+    "stage_intent": "Choose the next smallest useful, independently checkable stage deliverable. Distinguish this Turn's result from the overall TaskRun goal: do not bundle reconnaissance, analysis and final exploitation into one stage by default. A simple direct task may legitimately finish in one Turn; never invent stage quotas. Propose the current stage deliverable and its completion criterion, within TaskRun goal and authority. Known premises are optional; never invent future evidence. Keep the TaskRun goal as direction; a brief revisable outlook is allowed in the existing description, but commit only this stage. Submit once its useful deliverable and checkable criterion are clear; do not require a complete future solution first. This root proposal belongs to its preallocated planning session.",
+    "stage_roads": "Keep every Road within this Turn's fixed deliverable. Alternative Roads are different ways to obtain that deliverable, not successive future-stage goals. Propose this Turn's independent alternative solution chains, in execution priority order. Do not propose another stage's Roads. A different tool, URL or parameter alone is not a new chain. Retain all existing pending candidates when updating their order; closed Roads keep their identities and outcomes. Business re-exploration with new premises creates a new Road. No fixed candidate count; generate only currently grounded alternatives, never fill a quota. Keep the complete approach or hypothesis, main method and what observations would distinguish it in the existing description. Detail enough to begin; tool parameters and contingent branches belong to execution as observations arrive. Do not precompute every possible failure and fallback. Known settled blockage can be reviewed with return_to_parent; technical waiting alone is not business exhaustion.",
+    "stage_review": "Review the exact bound proposal: accept, revise or reject. Explain substantive revisions to its original Inner; do not silently replace it. For Roads select original indices in execution priority order. A coherent, grounded approach sufficient to begin does not need every future tool parameter or observation decided in advance. A stage completion proposal must satisfy the immutable completion_criterion; Road success and TaskRun success are separate. Review a Fact candidate against its own claim, declared scope and cited sources, not the whole Turn completion criterion. Accept a supported partial observation without demanding that one Fact contain every stage deliverable. Keep observed claims separate from inferred explanations; an accepted inference remains inference, never verified Fact. Request revisions only for gaps in the proposed claim, not to expand it into a complete stage report.",
+    "stage_action": "Before proposing another tool, compare current formal Facts with this Turn's immutable completion_criterion. If they already support it, prefer turn_completion; do not keep expanding this Road toward a later deliverable. A newly accepted Fact alone does not automatically prove completion. If something is missing, pursue the specific missing observation within this stage. When this Road has just supplied the approved stage achievement, resolve it truthfully through road_resolution before retained Turn planning proposes a successor; achievement does not automatically mean Road or TaskRun success. Explore only this Road in its own continuous conversation. Tools return observations, never automatic Facts. Propose a concise formal conclusion only when useful, with original support refs; label inference. Road resolution concerns its own result. Stage completion requires the Turn criterion and current formal support. Use only declared tools and current authority. Tool errors are not target counterevidence; unknown operations are never replayed.",
     "stage_completion": "Check this Turn's original completion criterion after Road review. Propose completion only with actual current formal support, or explain why it remains incomplete. Do not add stronger criteria or treat a single Road success as automatic stage completion.",
-    "stage_supervision": "Provide read-only strategy advice using current observations and alternatives. Return continue_current_intent or request_intent_resolution with reason and support_refs. Advice never changes a Road result, stage goal, authorization or TaskRun success.",
+    "stage_supervision": "First compare the fixed Turn goal/criterion with effective formal Facts: check whether the current Road is pursuing a later-stage deliverable after this stage already has support. If so, request_intent_resolution and recommend an explicit stage completion application and truthful Road closure under the original reviews. Do not demand a final answer to finish an intermediate stage or strengthen its criterion. Provide read-only strategy advice using current observations and alternatives. Return continue_current_intent or request_intent_resolution with reason and support_refs. Advice never changes a Road result, stage goal, authorization or TaskRun success.",
     "stage_summary": "Summarize only the supplied covered conversation prefix. Preserve the original goal and criterion, observations, hypotheses and uncertainty, negative findings, review feedback and open issues. Keep references and distinguish formal Fact from inference. This is an unverified conversation index, never new evidence, permission or success. Do not imply an omitted check never happened. Coverage is fixed by trusted metadata; do not invent it.",
 }
 KNOWLEDGE_GUIDANCE = (
@@ -50,6 +52,8 @@ KNOWLEDGE_GUIDANCE = (
     "superseded or conflicted premises cannot support execution or completion. effective_support_refs records only "
     "explicit reviewed replacements; never silently substitute a new version or overwrite a fixed goal. "
     "A new combined assertion requires fact_candidate review. A formal Fact still requires own-Road original observation; "
+    "its support_refs may additionally cite current formal Facts, but not attachment import receipts, feedback, "
+    "other Roads' raw observations or reviewed inferences. Import receipts establish input provenance, not a Road observation. "
     "Keep each claim concise and separate directly observed claims from inferred explanations; do not label an entire "
     "observed result as inference merely because a possible explanation remains untested. "
     "reasoning from other Facts is reviewed inference, not verified Fact. Stage completion cites actual effective formal "
@@ -68,7 +72,10 @@ EXPLORATION_GUIDANCE = (
     "endorse a direction. Use existing explanations when useful; add no fields or calls just to discuss this. "
 )
 TOOL_CONCURRENCY_GUIDANCE = (
-    " Each decision submits one action. Up to two tool actions can be in flight in this Road; "
+    " Submit one decision: mcp_call for one tool, or mcp_calls with two useful independent calls when declared. "
+    "Use the batch when both arguments are already known; never guess a dependency on another call's result. "
+    "After dispatch the runtime waits for the first result before requesting another decision. "
+    "Up to two tool actions can be in flight in this Road; "
     "public-reference tools may overlap, while sandbox/target tools share one serial slot. "
     "pending_tools entries and pending_operation_ids identify unfinished work, never observations or Facts. "
     "Use a free slot only for a useful action independent of unfinished results and shared mutable state. "
@@ -147,16 +154,63 @@ def formal_support_refs(request):
     return [i.ref for i in request.context.history if i.record_type == "verified_fact" and ConclusionRevisions.reliable(i)]
 
 
+def fact_support_refs(request, *, inferred):
+    """Project existing Fact source rules onto the frozen input; commits recheck originals."""
+    from agent_core.conclusion_revisions import ConclusionRevisions
+    scope, turn = request.context.session, request.context.turn
+    return [i.ref for i in request.context.history if i.task_run_id == request.task_run_id
+        and ConclusionRevisions.reliable(i) and (
+            i.record_type == "verified_fact" or inferred and i.record_type == "reviewed_inference"
+            or i.record_type == "progress" and scope.scope == "road_execution" and turn is not None
+            and i.turn_id == turn.turn_id and i.intent_id == scope.owner_id
+            and i.identity in {"tool_observation_not_fact", "public_reference_not_target_observation"})]
+
+
+def fact_source_issues(request, value, *, native=False):
+    if value.get("kind") != "fact_candidate" or type(value.get("inferred")) is not bool:
+        return []
+    refs = value.get("support_refs")
+    if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
+        return []  # Shape errors remain in the ordinary schema diagnostics.
+    path = "$/result/support_refs" if native else "$/support_refs"
+    eligible = fact_support_refs(request, inferred=value["inferred"])
+    invalid = next((ref for ref in refs if ref not in eligible), None)
+    if invalid is not None:
+        item = next((i for i in request.context.history if i.ref == invalid), None)
+        return [D8FormatIssue("stage.fact_source_ineligible", f"{path}/{refs.index(invalid)}",
+            "current_formal_fact_or_own_road_tool_observation; inference_may_also_cite_reviewed_inference",
+            (item.ref + ";identity=" + item.identity) if item else "not_in_frozen_history")]
+    if not value["inferred"] and not any(i.ref in refs and i.record_type == "progress" for i in request.context.history):
+        return [D8FormatIssue("stage.formal_fact_requires_own_observation", path,
+            "at_least_one_own_road_tool_observation", "missing")]
+    return []
+
+
+BUSINESS_ISSUE_CODES = {"stage.formal_fact_required", "stage.fact_source_ineligible",
+    "stage.formal_fact_requires_own_observation", "stage.tool_batch_resource_conflict"}
+
+
 def stage_output_issues(request, raw):
     """Explain known business rejection alongside format errors; never grant acceptance."""
     _, issues, terminal, _ = decode_stage_response(request, raw)
-    if terminal or request.stage not in {"stage_action", "stage_completion", "stage_continuation"}:
+    if terminal or request.stage not in {"stage_roads", "stage_action", "stage_completion", "stage_continuation"}:
         return issues
     value, loose_issues, _, _ = decode_stage_response(request, raw,
         result_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": True})
     if loose_issues or value is None:
         return issues
     kind = value.get("kind")
+    fact_issues = fact_source_issues(request, value, native=isinstance(raw, D8ModelResponse) and raw.tool_calls is not None)
+    if fact_issues:
+        return fact_issues
+    if kind == "mcp_calls":
+        calls = value.get("calls")
+        if (isinstance(calls, list) and len(calls) == 2 and all(isinstance(c, dict)
+                and c.get("tool_name") in {t["qualified_name"] for t in request.tools} for c in calls)
+                and sum(c["tool_name"] not in PUBLIC_REFERENCE_TOOLS for c in calls) > 1):
+            path = "$/result/calls" if isinstance(raw, D8ModelResponse) and raw.tool_calls is not None else "$/calls"
+            return [D8FormatIssue("stage.tool_batch_resource_conflict", path,
+                "at_most_one_sandbox_or_target_action; public_reference_actions_may_overlap", "two_private_actions")]
     required = kind in {"turn_completion", "request_final_validation"}
     if required or kind == "road_resolution" and value.get("outcome") == "succeeded":
         refs = value.get("support_refs")
@@ -170,7 +224,15 @@ def stage_output_issues(request, raw):
 
 
 def model_contract(request):
-    return {"schema": schema(request), "output_tool": output_tool(request), "rules": RULES[request.stage] + (KNOWLEDGE_GUIDANCE if request.stage in {"stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation"} else "")
+    turn_review = (" Review this as one current-stage deliverable, not a duplicate of the whole TaskRun. "
+        "If it unnecessarily bundles successive independent deliverables, request a focused proposal from the same Inner. "
+        "Do not require extra stages for a simple direct task or accept reporting progress as proof of a missing final result. Judge whether the proposed stage can usefully begin and has a checkable result, not whether it already solves all later stages or is globally optimal. A tentative longer-term outlook is background, not another registered stage. "
+        if request.stage == "stage_review" and isinstance(request.proposal, TurnIntent) else "")
+    closure = (" This Turn already has reviewed achievement. If this Road just supplied that achievement, prioritize its truthful closure. "
+        "A resumed parent may deliberately select another own Road after child feedback; respect that reviewed selection "
+        "without changing the historical achievement. New-stage goals belong to retained Turn planning. "
+        if request.stage == "stage_action" and request.context.turn is not None and request.context.turn.achievement is not None else "")
+    return {"schema": schema(request), "output_tool": output_tool(request), "rules": RULES[request.stage] + turn_review + closure + (KNOWLEDGE_GUIDANCE if request.stage in {"stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation"} else "")
             + (TOOL_CONCURRENCY_GUIDANCE if request.stage == "stage_action" else "")
             + (EXPLORATION_GUIDANCE + PUBLIC_REFERENCE_GUIDANCE if request.stage in {
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
@@ -189,7 +251,7 @@ def model_contract(request):
             " Input $input_ref objects are JSON Pointers into the same-request document formed by history and current; "
             "resolve them to the included original value. Only the current runtime contract grants choices; "
             "the provider tool describes structure, not the current allowed reference set."
-            + (" This is the only format correction; preserve the original decision scope."
+            + (" This is the only shared format/business correction; preserve the original decision scope."
                if request.correction_of_model_request_id else "")}
 
 
@@ -252,9 +314,16 @@ def schema(request):
     from agent_core.conclusion_revisions import ConclusionRevisions
     by_ref = {item.ref: item for item in request.context.history}
     ready = all(ConclusionRevisions.reliable(by_ref.get(ref)) for ref in request.context.effective_support_refs)
-    calls = [tagged("mcp_call", {"tool_name": {"type": "string", "const": tool["qualified_name"]},
+    selections = [obj({"tool_name": {"type": "string", "const": tool["qualified_name"]},
         "arguments": {"$schema": "https://json-schema.org/draft/2020-12/schema",
             **tool["input_schema"]}}) for tool in request.tools] if ready else []
+    calls = [tagged("mcp_call", selection["properties"]) for selection in selections]
+    public = sorted(t["qualified_name"] for t in request.tools if t["qualified_name"] in PUBLIC_REFERENCE_TOOLS)
+    if selections and public and not request.context.pending_operation_ids:
+        calls.append(tagged("mcp_calls", {"calls": {**array({"anyOf": selections}, minimum=2,
+            maximum=MAX_IN_FLIGHT_TOOLS), "uniqueItems": True,
+            "contains": {"type": "object", "properties": {"tool_name": {"type": "string", "enum": public}},
+                         "required": ["tool_name"], "additionalProperties": True}}}))
     if request.context.pending_operation_ids:
         calls.append(tagged("wait_for_tools", {"reason": text()}))
     resolutions = [tagged("road_resolution", {"outcome": {"type": "string", "const": "succeeded"},
@@ -279,13 +348,10 @@ def knowledge_actions(request):
     refs = {**array(reference(i.ref for i in request.context.history), maximum=8), "uniqueItems": True}
     branches = [tagged("select_facts", {"support_refs": {**array(reference(formal)), "uniqueItems": True}}),
         tagged("history_details", {"refs": {**array(reference(entries), minimum=1, maximum=2), "uniqueItems": True}})]
-    sources = [i.ref for i in request.context.history if i.record_type in {"verified_fact", "reviewed_inference"}
-               or i.record_type == "progress" and not i.record_id.startswith("revision/")]
-    inferred = {"type": "boolean"}
-    if request.context.session.scope == "turn_planning":
-        inferred["const"] = True
-    branches.append(tagged("fact_candidate", {"content": text(256), "reason": text(),
-        "support_refs": {**array(reference(sources), minimum=1, maximum=8), "uniqueItems": True}, "inferred": inferred}))
+    for inferred in ((True,) if request.context.session.scope == "turn_planning" else (False, True)):
+        branches.append(tagged("fact_candidate", {"content": text(256), "reason": text(),
+            "support_refs": {**array(reference(fact_support_refs(request, inferred=inferred)), minimum=1, maximum=8),
+                "uniqueItems": True}, "inferred": {"type": "boolean", "const": inferred}}))
     for operation in ("correct", "withdraw", "restore", "report_conflict", "resolve_conflict", "replace_support", "link_verified"):
         properties = {"operation": {"type": "string", "const": operation}, "target_refs": {**array(reference(conclusions),
             minimum=2 if operation in {"report_conflict", "resolve_conflict"} else 1,
@@ -347,6 +413,8 @@ def parse(request, raw):
     if request.stage == "stage_supervision":
         return StageStrategyAdvice(value["decision"], checked(value, "reason"), refs)
     kind = value["kind"]
+    if kind == "mcp_calls":
+        return StageToolBatch(tuple(MCPCall(item["tool_name"], item["arguments"]) for item in value["calls"]))
     if kind in {"select_road", "return_to_parent", "request_final_validation", "wait_for_tools"}:
         return StagePlanningDecision(kind, checked(value, "reason"), refs, value.get("road_id"), value.get("candidate"), value.get("source_ref"))
     if kind == "select_facts":
@@ -378,6 +446,8 @@ def parse(request, raw):
     if kind == "road_resolution":
         return RoadResolution(IntentStatus(value["outcome"]), checked(value, "reason"), refs)
     if kind == "fact_candidate":
+        if fact_source_issues(request, value):
+            raise ValueError("stage.fact_source_ineligible")
         return StageFactProposal(checked(value, "content"), checked(value, "reason"), refs, value["inferred"])
     return MCPCall(value["tool_name"], value["arguments"])
 

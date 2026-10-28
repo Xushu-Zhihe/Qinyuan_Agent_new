@@ -239,18 +239,18 @@ def test_real_sqlite_exclusive_lock_is_busy_and_has_numeric_exception_chain(tmp_
 
 def test_state_read_exception_chain_keeps_codes_without_message_or_debug_leak(tmp_path, monkeypatch, capsys):
     from agent_adapters.web import task_result as projection
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     def read(*args):
         try:
             raise PermissionError(13, "PRIVATE_PATH_AND_KEY")
         except PermissionError as exc:
-            raise D3RecoveryRequired("d8_handoff_evidence_unavailable") from exc
+            raise ExecutionRecoveryRequired("d8_handoff_evidence_unavailable") from exc
     monkeypatch.setenv("QINYUAN_DEBUG_ERRORS", "1")
     monkeypatch.setattr(projection, "_snapshot_v3_task_result", read)
     monkeypatch.setattr(projection.time, "sleep", lambda _: pytest.fail("permanent errors must not be retried"))
     result = projection.snapshot_v3_task_result(tmp_path, dict(protocol_version=3, task_run_id=str(uuid4()), mode="simulated"))
     error = result["errors"][0]
-    assert error["exception_types"] == ["D3RecoveryRequired", "PermissionError"]
+    assert error["exception_types"] == ["ExecutionRecoveryRequired", "PermissionError"]
     assert error["exception_chain"][1]["errno"] == 13
     assert error["error_codes"] == ["d8_handoff_evidence_unavailable"]
     assert "PRIVATE" not in str(result) + capsys.readouterr().err

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from agent_adapters.command_recorder import T6CommandRecorder
 from agent_core.command_contracts import T6EvidenceError
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.dual_llm_modeling import D3ModelEvidence, D3ModelRejection
 from agent_core.turn_contracts import D1RecoveryRequired
 from agent_core.turn_modeling import (
@@ -100,12 +100,12 @@ class FileD3ModelEvidence:
                 raise ValueError("D3 model evidence owner mismatch")
             return evidence
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_model_evidence_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_model_evidence_unavailable") from exc
 
     def save_rejection(self, rejection: D3ModelRejection) -> None:
         evidence = self.read(rejection.model_request_id)
         if evidence is None or evidence.outcome != "accepted":
-            raise D3RecoveryRequired("d3_rejection_requires_saved_proposal")
+            raise ExecutionRecoveryRequired("d3_rejection_requires_saved_proposal")
         self.records._write(
             "d3-model-rejection", rejection.model_request_id, asdict(rejection)
         )
@@ -120,4 +120,4 @@ class FileD3ModelEvidence:
                 raise ValueError("D3 model rejection owner mismatch")
             return rejection
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_model_rejection_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_model_rejection_unavailable") from exc

@@ -5,16 +5,26 @@ from agent_core.model_call_phase import MODEL_CALL_PHASES
 
 
 SAFE_EXCEPTION_TYPES = frozenset({
-    "D3RecoveryRequired", "D4RecoveryRequired", "D7HttpError", "TaskRunSandboxError",
+    # Historical diagnostics remain readable; new exceptions use business names.
+    "D3RecoveryRequired", "D4RecoveryRequired", "D7HttpError",
+    "OperationBudgetExhausted", "OperationIdentityConflict", "ExecutionBudgetExhausted", "ExecutionStateConflict",
+    "ExecutionRecoveryRequired", "OperationRecoveryRequired", "HttpCapabilityError", "TaskRunSandboxError",
     "TimeoutError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
     "BrokenPipeError", "OSError", "PermissionError", "FileNotFoundError", "TypeError",
     "ValueError", "RuntimeError", "APIError", "DockerException", "HTTPError",
     "ReadTimeout", "ConnectTimeout", "SSLError", "gaierror", "OtherError",
     "AttributeError", "KeyError", "IndexError", "CancelledError", "UnboundLocalError", "ProgrammingError",
     "OperationalError", "IntegrityError", "D5EvidenceError", "D5SensitiveDataError", "T6TargetNetworkError",
-    "StorageError", "T6EvidenceError", "JSONDecodeError", "IncompleteRead",
+    "StorageError", "T6EvidenceError", "T6EvidenceCapacityError", "StageStateError", "StageRecoveryRequired",
+    "JSONDecodeError", "IncompleteRead", "MCPClientError", "MCPCommandPlanError", "MCPCommandExecutionTimeout",
 })
 SAFE_HTTP_ERROR_CODES = frozenset({
+    "operation.result_unconfirmed", "operation.budget_exhausted", "operation.identity_conflict",
+    "execution.recovery_required", "execution.budget_exhausted", "execution.state_conflict",
+    "mcp.outcome_unknown", "mcp.planner_rejected", "mcp.command_rejected",
+    "stage.operation_outcome_unknown", "stage.model_outcome_unknown", "stage.dispatch_stopped",
+    "stage.evidence_capacity_exceeded", "stage.evidence_corrupt", "stage.evidence_io_failed",
+    "evidence_capacity_exceeded",
     "d20_http_outcome_unknown", "d20_http_cancelled_after_result",
     "d20_http_failure_diagnostic_write_failed", "outcome_unknown",
     "d7_http_dispatch_rejected", "d7_http_transport_failed", "d7_http_session_closed",
@@ -90,10 +100,16 @@ def safe_failure_details(error, *, include_chain=False):
         import traceback
         traceback.print_exception(type(error), error, error.__traceback__)
     kinds, codes, seen, chain = [], [], set(), []
+    capacity, http_diagnostic, operation_context = None, None, None
+    fact_source, operation_admission = None, None
     current = error
     while current is not None and id(current) not in seen and len(kinds) < 6:
         seen.add(id(current))
         name = type(current).__name__
+        if name == "TaskRunSandboxError" and getattr(current, "http_diagnostic", None) is not None:
+            http_diagnostic = current.http_diagnostic
+        if name == "ExecutionRecoveryRequired" and getattr(current, "operation_context", None) is not None:
+            operation_context = current.operation_context
         kinds.append(name if name in SAFE_EXCEPTION_TYPES else "OtherError")
         if name == "TaskRunSandboxError" and getattr(current, "outcome", None) == "outcome_unknown":
             code = {"experiment_start": "sandbox_experiment_start_unknown",
@@ -101,6 +117,13 @@ def safe_failure_details(error, *, include_chain=False):
             if code is not None and code not in codes:
                 codes.append(code)
         resource_code = getattr(current, "code", None)
+        if name == "OperationRecoveryRequired":
+            operation_admission = {k: v for k, v in current.context.items()
+                if k in {"operation_id", "blocking_count", "blocking_operations"}}
+        if name == "StageStateError" and resource_code == "stage.fact_source_scope_changed":
+            fact_source = current.context.get("fact_source")
+        if resource_code == "stage.evidence_capacity_exceeded":
+            capacity = current.evidence_capacity
         if resource_code in SAFE_HTTP_ERROR_CODES and resource_code not in codes:
             codes.append(resource_code)
         if len(current.args) == 1 and isinstance(current.args[0], str):
@@ -119,7 +142,7 @@ def safe_failure_details(error, *, include_chain=False):
             frame = current.__traceback__
             while frame is not None:
                 module = frame.tb_frame.f_globals.get("__name__", "")
-                if isinstance(module, str) and module.startswith(("agent_core.", "agent_adapters.", "Sandbox.")):
+                if isinstance(module, str) and module.startswith(("agent_core.", "agent_adapters.", "Sandbox.", "MCPs.")):
                     location = {"module": module, "line": frame.tb_lineno}
                 frame = frame.tb_next
             code = current.args[0] if len(current.args) == 1 and isinstance(current.args[0], str) else None
@@ -138,6 +161,16 @@ def safe_failure_details(error, *, include_chain=False):
             chain.append(node)
         current = current.__cause__ or current.__context__
     result = {"exception_types": kinds, "error_codes": codes}
+    if capacity is not None:
+        result["evidence_capacity"] = capacity
+    if http_diagnostic is not None:
+        result["http_diagnostic"] = http_diagnostic
+    if operation_context is not None:
+        result["operation_context"] = operation_context
+    if fact_source is not None:
+        result["fact_source"] = fact_source
+    if operation_admission:
+        result["operation_admission"] = operation_admission
     if include_chain:
         result["exception_chain"] = chain
     return result
@@ -147,7 +180,7 @@ class FileD8OutputEvidence(FileD8HandoffEvidence):
     # Session envelopes reuse this immutable evidence store, not new tables.
     KINDS = {"model-timeouts", "provider-request", "provider-result", "input-measurement", "mcp-registry", "mcp-catalog", "mcp-download", "mcp-call", "mcp-result", "contract", "diagnostic", "review-root", "business-diagnostic", "review-request", "review-binding", "review-result", "fixed-probe-binding", "planning-binding", "fact-assertion-binding", "evaluation-binding", "evaluation-diagnostic", "candidate-binding", "selection-request", "selection-binding", "answer-decision", "http-plan-binding", "http-result", "http-failure", "http-dispatch-stop", "review-failure"}
 
-    KINDS = KINDS | {"experiment-session", "experiment-process", "experiment-result", "experiment-stop", "experiment-failure", "call-interruption"}
+    KINDS = KINDS | {"experiment-session", "experiment-process", "experiment-result", "experiment-stop", "experiment-failure", "call-interruption", "mcp-failure"}
 
     @staticmethod
     def describe_failure(error):
@@ -193,7 +226,7 @@ class FileD8OutputEvidence(FileD8HandoffEvidence):
 
     def review_failures(self, operations):
         import re
-        from agent_core.dual_llm_contracts import D3RecoveryRequired
+        from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 
         rows = []
         fields = {"diagnostic_version", "task_run_id", "model_request_id", "request_sha256",
@@ -216,12 +249,12 @@ class FileD8OutputEvidence(FileD8HandoffEvidence):
                     or any(not isinstance(v, str) or v not in SAFE_EXCEPTION_TYPES for v in value["exception_types"])
                     or not isinstance(value["error_codes"], list) or len(value["error_codes"]) > 7
                     or any(not isinstance(v, str) or safe_model_error_code(v) != v for v in value["error_codes"])):
-                raise D3RecoveryRequired("d8_review_diagnostic_binding_changed")
+                raise ExecutionRecoveryRequired("d8_review_diagnostic_binding_changed")
             location = value["source_location"]
             if location is not None and (not isinstance(location, dict) or set(location) != {"module", "line"}
                     or not isinstance(location["module"], str) or len(location["module"]) > 160
                     or re.fullmatch(r"(?:agent_core|agent_adapters|Sandbox)\.[A-Za-z0-9_.]+", location["module"]) is None
                     or type(location["line"]) is not int or location["line"] < 1):
-                raise D3RecoveryRequired("d8_review_diagnostic_binding_changed")
+                raise ExecutionRecoveryRequired("d8_review_diagnostic_binding_changed")
             rows.append(value)
         return rows

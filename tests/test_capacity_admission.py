@@ -80,7 +80,7 @@ def test_continuous_session_compacts_before_freezing_full_request(http_case,monk
     from uuid import uuid4
     from test_exploration_loop import install
     from agent_core.handoff_contracts import handoff_json
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     c=http_case
     install(c,steps=5,stop='inconclusive')
     assert not asyncio.run(c.app._run_once(c.token)).recovery_required
@@ -141,7 +141,7 @@ def test_continuous_session_compacts_before_freezing_full_request(http_case,monk
             return data
         monkeypatch.setattr(c.app.sessions.evidence,'read',previously_compacted)
     if trigger=='still_too_large':
-        with pytest.raises(D3RecoveryRequired,match='capacity_paused'):
+        with pytest.raises(ExecutionRecoveryRequired,match='capacity_paused'):
             c.app.sessions.wrap(draft)
         assert c.app.sessions.evidence.read('request',draft.model_request_id) is None
         assert c.app.output_boundary.evidence.read('input-measurement',draft.model_request_id) is None

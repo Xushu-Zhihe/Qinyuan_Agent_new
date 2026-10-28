@@ -27,7 +27,7 @@ from agent_core.dual_llm_contracts import (
     D3OperationCompletion,
     D3OperationStart,
     D3PlanBinding,
-    D3RecoveryRequired,
+    ExecutionRecoveryRequired,
     D3RunConfig,
     D3TurnBinding,
 )
@@ -272,9 +272,9 @@ class D3FixedCommandGateway:
             or record.plan_id != request.plan_id
             or record.step_index != request.step_index
         ):
-            raise D3RecoveryRequired("d3_tool_evidence_mismatch")
+            raise ExecutionRecoveryRequired("d3_tool_evidence_mismatch")
         if record.status == "outcome_unknown":
-            raise D3RecoveryRequired("d3_tool_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_tool_outcome_unknown")
         if operation.completion is None:
             self.ledger.complete_d3_operation(
                 D3OperationCompletion(
@@ -291,7 +291,7 @@ class D3FixedCommandGateway:
             operation.completion.evidence_sha256 != _record_digest(record)
             or operation.completion.evidence_ref != request.request_id
         ):
-            raise D3RecoveryRequired("d3_tool_completion_mismatch")
+            raise ExecutionRecoveryRequired("d3_tool_completion_mismatch")
         execution = next(
             (
                 item
@@ -306,7 +306,7 @@ class D3FixedCommandGateway:
             ExecutionStatus.FAILED,
             ExecutionStatus.TIMED_OUT,
         }:
-            raise D3RecoveryRequired("d3_tool_execution_unavailable")
+            raise ExecutionRecoveryRequired("d3_tool_execution_unavailable")
         if execution.status is ExecutionStatus.RUNNING:
             if record.status == "completed" and record.exit_code == 0:
                 self._commit_work(
@@ -338,7 +338,7 @@ class D3FixedCommandGateway:
                     ),
                 )
         if record.status != "completed" or record.exit_code != 0:
-            raise D3RecoveryRequired("d3_fixed_tool_failed")
+            raise ExecutionRecoveryRequired("d3_fixed_tool_failed")
         self.ledger.mark_d3_operation_applied(request.request_id, request.request_id)
         return completed
 
@@ -354,14 +354,14 @@ class D3FixedCommandGateway:
             or state.task_run.status is not TaskRunStatus.RUNNING
             or self.clock() >= state.task_run.deadline_at
         ):
-            raise D3RecoveryRequired("d3_tool_dispatch_stopped")
+            raise ExecutionRecoveryRequired("d3_tool_dispatch_stopped")
         existing = self.ledger.load_d3_operation(request.request_id)
         completed = self.commands.read_completed(request.request_id)
         if existing is not None:
             if completed is None:
                 record = self.commands.read_record(request.request_id)
                 if record is None or record.status == "outcome_unknown":
-                    raise D3RecoveryRequired("d3_tool_outcome_unknown")
+                    raise ExecutionRecoveryRequired("d3_tool_outcome_unknown")
                 completed = SandboxCommandResult(record)
                 self.commands.finish(completed)
             self.commands.replay(request, authorization, state.task_run.sandbox_id)
@@ -370,7 +370,7 @@ class D3FixedCommandGateway:
             completed is not None
             or self.commands.read_record(request.request_id) is not None
         ):
-            raise D3RecoveryRequired("d3_tool_record_without_start")
+            raise ExecutionRecoveryRequired("d3_tool_record_without_start")
         approved = self.policy.authorize(
             request,
             authorization,

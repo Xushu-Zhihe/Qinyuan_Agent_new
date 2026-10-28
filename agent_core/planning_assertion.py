@@ -4,7 +4,7 @@ from dataclasses import asdict
 import json
 import math
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.handoff_contracts import D8HandoffRequest
 from agent_core.operation_accounting import D4OperationStart, D4OperationCompletion
 from agent_core.turn_modeling import digest, stable_id
@@ -26,7 +26,7 @@ def planning_policy(request):
                 or not isinstance(policy["imports"], list) or len(policy["imports"]) != len(indices)):
             raise ValueError("policy")
     except (ValueError, TypeError, KeyError) as exc:
-        raise D3RecoveryRequired("s2_planning_policy_invalid") from exc
+        raise ExecutionRecoveryRequired("s2_planning_policy_invalid") from exc
     return policy
 
 
@@ -42,7 +42,7 @@ def freeze_planning_policy(app):
                 or op.start.category != "attachment_import" or op.start.task_run_id != task
                 or op.start.resource_ref != receipt.sandbox_path
                 or op.completion.evidence_sha256 != digest(asdict(receipt))):
-            raise D3RecoveryRequired("s2_planning_import_unavailable")
+            raise ExecutionRecoveryRequired("s2_planning_import_unavailable")
         imports.append({"attachment_index": index, "import_id": identity, "receipt_sha256": digest(asdict(receipt))})
     return {"rule_id": RULE_ID, "rule_version": RULE_VERSION,
             "attachment_indices": list(app.config.authorization.attachment_indices),
@@ -71,7 +71,7 @@ def materialize(request, wire):
         return json.loads(json.dumps(wire, ensure_ascii=False))
     raw, issues, terminal, _ = decode_response(wire, output_schema(request, contract_version=12)[1])
     if issues or terminal:
-        raise D3RecoveryRequired("s2_wire_not_validated")
+        raise ExecutionRecoveryRequired("s2_wire_not_validated")
     # Work on a detached JSON value; never mutate the model's chosen references.
     canonical = json.loads(json.dumps(raw, ensure_ascii=False))
     if request.stage == "tree_planning" and raw["kind"] == "candidates":
@@ -98,7 +98,7 @@ class PlanningAssertionBindings:
         else:
             request = self.conclusions.read_request(identity)
         if request is None or request.model_request_id != identity or request.stage != stage:
-            raise D3RecoveryRequired("s2_binding_request_missing")
+            raise ExecutionRecoveryRequired("s2_binding_request_missing")
         return request
 
     def _operation(self, request, finished):
@@ -110,7 +110,7 @@ class PlanningAssertionBindings:
                 request.context_sha256, resource, self.config.d4_budget.budget_policy_ref,
                 "outer_planning" if planning else "inner_action", request.role_config_ref)
                 or finished < op.start.started_at):
-            raise D3RecoveryRequired("s2_binding_operation_changed")
+            raise ExecutionRecoveryRequired("s2_binding_operation_changed")
         return op
 
     def _base(self, request, finished):
@@ -129,7 +129,7 @@ class PlanningAssertionBindings:
                 or contract.get("root_request_id") != root
                 or contract.get("correction_of_model_request_id") != request.correction_of_model_request_id
                 or not matches_output_contract(contract.get("output_contract"), request.stage, output_schema(request, contract_version=self.config.contract_version)[1], self.config.contract_version)):
-            raise D3RecoveryRequired("s2_binding_contract_changed")
+            raise ExecutionRecoveryRequired("s2_binding_contract_changed")
         self._operation(request, finished)
         policy = planning_policy(request) if request.stage == "tree_planning" else {
             "rule_id": RULE_ID, "rule_version": RULE_VERSION,
@@ -139,7 +139,7 @@ class PlanningAssertionBindings:
         if request.stage == "tree_planning":
             if (policy["authorization_sha256"] != digest(asdict(self.config.authorization))
                     or policy["attachment_indices"] != list(self.config.authorization.attachment_indices)):
-                raise D3RecoveryRequired("s2_planning_authorization_changed")
+                raise ExecutionRecoveryRequired("s2_planning_authorization_changed")
             for index, item in zip(policy["attachment_indices"], policy["imports"], strict=True):
                 import_id = stable_id(request.task_run_id, f"d3/import/{index}")
                 receipt = self.imports.read_receipt(import_id)
@@ -152,7 +152,7 @@ class PlanningAssertionBindings:
                         or op.start.category != "attachment_import" or op.start.task_run_id != request.task_run_id
                         or op.start.resource_ref != receipt.sandbox_path
                         or op.completion.evidence_sha256 != expected["receipt_sha256"]):
-                    raise D3RecoveryRequired("s2_planning_import_changed")
+                    raise ExecutionRecoveryRequired("s2_planning_import_changed")
         if root != identity:
             original = self._request(request.stage, root)
             excluded = {"model_request_id", "correction_of_model_request_id", "rejection_code"}
@@ -162,11 +162,11 @@ class PlanningAssertionBindings:
                     != {k: v for k, v in asdict(request).items() if k not in excluded}
                     or identity != stable_id(request.task_run_id,
                         f"{'d8-2' if request.stage == 'tree_planning' else 'd8'}/correction/{root}")):
-                raise D3RecoveryRequired("s2_binding_root_changed")
+                raise ExecutionRecoveryRequired("s2_binding_root_changed")
             root_contract = self.output.read("contract", root)
             if (not isinstance(root_contract, dict) or root_contract.get("source_request_sha256") != digest(asdict(original))
                     or root_contract.get("contract_version") != self.config.contract_version or root_contract.get("root_request_id") != root):
-                raise D3RecoveryRequired("s2_binding_root_contract_changed")
+                raise ExecutionRecoveryRequired("s2_binding_root_contract_changed")
             self._base(original, finished)
             from types import SimpleNamespace
             from agent_core.structured_output import StructuredOutput
@@ -176,7 +176,7 @@ class PlanningAssertionBindings:
                 business_diagnostics=BusinessDiagnostics(self.config, self.output, self.handoff, self.store),
                 fact_business_diagnostics=FactBusinessDiagnostics(self.config, self.output, self.conclusions, self.store)), self.output)
             if contract.get("correction") != boundary._error(root):
-                raise D3RecoveryRequired("s2_binding_correction_changed")
+                raise ExecutionRecoveryRequired("s2_binding_correction_changed")
         return {"binding_version": 1, "contract_version": self.config.contract_version, "stage": request.stage,
                 "task_run_id": request.task_run_id, "model_request_id": identity,
                 "root_request_id": root, "role_config_ref": request.role_config_ref,
@@ -186,7 +186,7 @@ class PlanningAssertionBindings:
 
     def save(self, request, wire, result):
         if result["outcome"] != "valid" or result["raw"] != materialize(request, wire):
-            raise D3RecoveryRequired("s2_binding_result_not_valid")
+            raise ExecutionRecoveryRequired("s2_binding_result_not_valid")
         record = {**self._base(request, result["finished_at"]), "wire_response": wire,
                   "canonical_response": result["raw"], "canonical_sha256": digest(result["raw"]),
                   "rejected_candidate_indices": result.get("rejected_candidate_indices", [])}
@@ -207,36 +207,36 @@ class PlanningAssertionBindings:
         if record is None:
             return None
         if not isinstance(record, dict):
-            raise D3RecoveryRequired("s2_binding_invalid")
+            raise ExecutionRecoveryRequired("s2_binding_invalid")
         canonical = materialize(request, record.get("wire_response"))
         indices = record.get("rejected_candidate_indices")
         if (not isinstance(indices, list) or any(type(i) is not int or i < 0
                 or self.config.contract_version != 22 and i not in {0, 1} for i in indices)
                 or len(indices) != len(set(indices))
                 or request.stage == "fact_proposal" and indices):
-            raise D3RecoveryRequired("s2_binding_indices_invalid")
+            raise ExecutionRecoveryRequired("s2_binding_indices_invalid")
         expected = {**self._base(request, record.get("finished_at")), "wire_response": record["wire_response"],
                     "canonical_response": canonical, "canonical_sha256": digest(canonical),
                     "rejected_candidate_indices": indices}
         if (record != expected or any(self.output.read(k, request.model_request_id) is not None
                 for k in ("diagnostic", "business-diagnostic"))):
-            raise D3RecoveryRequired("s2_binding_changed_or_diagnostic_conflict")
+            raise ExecutionRecoveryRequired("s2_binding_changed_or_diagnostic_conflict")
         return record
 
     def verify_result(self, request, result):
         record = self.read(request)
         if record is None:
             if result["outcome"] == "valid" or "assembly_sha256" in result:
-                raise D3RecoveryRequired("s2_binding_required")
+                raise ExecutionRecoveryRequired("s2_binding_required")
         elif result != self.result(request, record):
-            raise D3RecoveryRequired("s2_bound_result_changed")
+            raise ExecutionRecoveryRequired("s2_bound_result_changed")
         if record is not None and request.stage == "fact_proposal":
             from agent_core.conclusion_contracts import parse_d8_proposal
             try:
                 from agent_core.intent_execution import parse_working
                 parse_working(request, record["canonical_response"]) or parse_d8_proposal(record["canonical_response"])
             except (ValueError, TypeError, KeyError) as exc:
-                raise D3RecoveryRequired("s2_saved_fact_business_invalid") from exc
+                raise ExecutionRecoveryRequired("s2_saved_fact_business_invalid") from exc
         if record is not None and request.stage == "tree_planning":
             from agent_core.handoff_contracts import checked_refs
             from agent_core.dual_llm_modeling import parse_d3_turn_proposal
@@ -258,7 +258,7 @@ class PlanningAssertionBindings:
                                            "completion_rule": raw["completion_rule"], "intents": kept},
                                           maximum=None)
             except (ValueError, TypeError, KeyError) as exc:
-                raise D3RecoveryRequired("s2_saved_planning_business_invalid") from exc
+                raise ExecutionRecoveryRequired("s2_saved_planning_business_invalid") from exc
         return record
 
     def known_result(self, request):
@@ -270,7 +270,7 @@ class PlanningAssertionBindings:
         op = self._operation(request, record["finished_at"])
         if op.completion is not None and op.completion != D4OperationCompletion(request.model_request_id,
                 expected["finished_at"], "completed", request.model_request_id, digest(expected)):
-            raise D3RecoveryRequired("s2_binding_completion_changed")
+            raise ExecutionRecoveryRequired("s2_binding_completion_changed")
         return expected
 
     def check_task(self, task):
@@ -285,9 +285,9 @@ class PlanningAssertionBindings:
                             else fact_request.stage if fact_request is not None else None)
             stage = contract.get("stage") if isinstance(contract, dict) else source_stage
             if source_stage in KINDS and stage != source_stage:
-                raise D3RecoveryRequired("s2_binding_contract_stage_changed")
+                raise ExecutionRecoveryRequired("s2_binding_contract_stage_changed")
             if present and (len(present) != 1 or present[0] != stage):
-                raise D3RecoveryRequired("s2_binding_stage_changed")
+                raise ExecutionRecoveryRequired("s2_binding_stage_changed")
             if stage not in KINDS:
                 continue
             request = self._request(stage, identity)
@@ -298,8 +298,8 @@ class PlanningAssertionBindings:
                 self.verify_result(request, expected)
                 if op.completion is not None and op.completion != D4OperationCompletion(identity, expected["finished_at"],
                         "completed" if expected["outcome"] == "valid" else "rejected", identity, digest(expected)):
-                    raise D3RecoveryRequired("s2_binding_completion_changed")
+                    raise ExecutionRecoveryRequired("s2_binding_completion_changed")
                 needs_repair |= result is None or op.completion is None
             elif op.completion is not None:
-                raise D3RecoveryRequired("s2_completed_result_missing")
+                raise ExecutionRecoveryRequired("s2_completed_result_missing")
         return needs_repair

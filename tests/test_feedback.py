@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from agent_core.goal_feedback import ExternalValidationFeedback
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_adapters.web import candidate_evidence
 from test_candidate_evidence import _TestOnlyProtection
 from test_output import output_case, EnvelopeModel, run as run_output
@@ -304,7 +304,7 @@ def test_public_check_rejects_untrusted_fields_and_wrong_bindings(public_candida
     elif bad == 'candidate': picked['candidate_id'] = str(uuid4())
     elif bad == 'version': picked['evidence_version'] = '0' * 64
     else: picked['submission_operation_id'] = str(uuid4())
-    with pytest.raises((ValueError, D3RecoveryRequired)):
+    with pytest.raises((ValueError, ExecutionRecoveryRequired)):
         dispatch_check(case.directory, case.declaration, picked)
     assert case.app.store.list_d7_external_validation_checks(case.task) == ()
 
@@ -439,7 +439,7 @@ def test_cancellation_and_deadline_do_not_achieve_goal(output_case, candidate_mo
     before = len(candidate_model['calls'])
     if stop == 'cancel':
         case.token.is_cancelled = True
-        with pytest.raises(D3RecoveryRequired, match='cancelled_before_application'):
+        with pytest.raises(ExecutionRecoveryRequired, match='cancelled_before_application'):
             asyncio.run(case.app.answers.apply_feedback(feedback(case, candidate, 'accepted'), case.token))
         case.app.cancel(case.task)
         assert case.app.state.task_run.status.value == 'cancelled'

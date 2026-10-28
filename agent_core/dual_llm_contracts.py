@@ -8,6 +8,7 @@ import math
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Literal
 from uuid import UUID
+from qinyuan_core import QinyuanError, Category, Layer
 
 from agent_core.execution_authorization import D6Authorization
 from agent_core.target_contracts import TcpAuthorization, TcpTurnBinding
@@ -788,13 +789,19 @@ class D3CommitMetadata:
             raise ValueError("duplicate D3 outcome owner")
 
 
-class D3RecoveryRequired(RuntimeError):
-    pass
+class ExecutionRecoveryRequired(QinyuanError, RuntimeError):
+    category = Category.UNKNOWN
+    layer = Layer.EXEC
+    code = "execution.recovery_required"
 
 
-class D3BudgetExhausted(RuntimeError):
-    pass
+class ExecutionBudgetExhausted(QinyuanError, RuntimeError):
+    category = Category.CAPACITY
+    layer = Layer.CTRL
+    code = "execution.budget_exhausted"
 
 
-class D3OperationConflict(RuntimeError):
-    pass
+class ExecutionStateConflict(QinyuanError, RuntimeError):
+    category = Category.CONFLICT
+    layer = Layer.CTRL
+    code = "execution.state_conflict"

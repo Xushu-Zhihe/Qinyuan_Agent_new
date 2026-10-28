@@ -24,8 +24,8 @@ from agent_core.dual_llm_contracts import (
     D3OperationStart,
     D3PlanBinding,
     D3PlanResult,
-    D3RecoveryRequired,
-    D3BudgetExhausted,
+    ExecutionRecoveryRequired,
+    ExecutionBudgetExhausted,
     D3RunConfig,
     D3TurnBinding,
 )
@@ -41,7 +41,7 @@ from agent_core.modeling import (
 from agent_core.turn_contracts import D1RoleConfig
 from agent_core.turn_modeling import digest, stable_id
 from agent_core.competition_candidates import MCPAnswerCandidateContext
-from agent_core.operation_accounting import D4RecoveryRequired, D4BudgetExhausted
+from agent_core.operation_accounting import OperationRecoveryRequired, OperationBudgetExhausted
 
 D3ModelStage = Literal[
     "outer_turn",
@@ -68,7 +68,7 @@ def _resolution_rejection_code(exc):
     return "d22_resolution_invalid"
 
 
-class D3ProposalRejected(ValueError):
+class ExecutionProposalRejected(ValueError):
     def __init__(
         self,
         code: str,
@@ -86,7 +86,7 @@ class D3ProposalRejected(ValueError):
 
 def _fields(raw: object, required: set[str]) -> Mapping[str, object]:
     if not isinstance(raw, Mapping) or set(raw) != required:
-        raise D3ProposalRejected("d3_proposal_fields_invalid", structural=True)
+        raise ExecutionProposalRejected("d3_proposal_fields_invalid", structural=True)
     return raw
 
 
@@ -101,21 +101,21 @@ def parse_d3_turn_proposal(raw: object, *, maximum=2) -> D3TurnProposal:
     value = _fields(raw, {"turn_target", "completion_rule", "intents"})
     target = value["turn_target"]
     if not isinstance(target, str) or not target.strip() or len(target.encode()) > 4096:
-        raise D3ProposalRejected("d3_turn_target_invalid", structural=True)
+        raise ExecutionProposalRejected("d3_turn_target_invalid", structural=True)
     rule = _fields(value["completion_rule"], {"rule_id", "version", "parameters"})
     if (
         rule["rule_id"] != "attachment_copy_sha256"
         or type(rule["version"]) is not int
         or rule["version"] != 1
     ):
-        raise D3ProposalRejected("d3_completion_rule_unregistered")
+        raise ExecutionProposalRejected("d3_completion_rule_unregistered")
     parameters = _fields(rule["parameters"], {"attachment_index"})
     index = parameters["attachment_index"]
     if type(index) is not int or index not in {0, 1}:
-        raise D3ProposalRejected("d3_attachment_index_invalid")
+        raise ExecutionProposalRejected("d3_attachment_index_invalid")
     candidates = value["intents"]
     if not isinstance(candidates, list) or not candidates or maximum is not None and len(candidates) > maximum:
-        raise D3ProposalRejected("d3_intent_count_invalid")
+        raise ExecutionProposalRejected("d3_intent_count_invalid")
     parsed = []
     for candidate in candidates:
         item = _fields(candidate, {"description", "intent_type"})
@@ -124,11 +124,11 @@ def parse_d3_turn_proposal(raw: object, *, maximum=2) -> D3TurnProposal:
             or item["intent_type"] is not None
             and not isinstance(item["intent_type"], str)
         ):
-            raise D3ProposalRejected("d3_intent_structure_invalid", structural=True)
+            raise ExecutionProposalRejected("d3_intent_structure_invalid", structural=True)
         try:
             parsed.append(IntentCandidate(item["description"], item["intent_type"]))
         except (TypeError, ValueError) as exc:
-            raise D3ProposalRejected(
+            raise ExecutionProposalRejected(
                 "d3_intent_structure_invalid", structural=True
             ) from exc
     return D3TurnProposal(target, index, tuple(parsed))
@@ -147,18 +147,18 @@ def parse_d3_plan_proposal(raw: object) -> D3PlanProposal:
     if isinstance(raw,dict) and raw.get("kind")=="fact_candidate":
         from agent_core.evidence_conclusions import EvidenceCandidate
         try:return EvidenceCandidate.parse(raw)
-        except (ValueError,TypeError) as exc:raise D3ProposalRejected("d22_evidence_candidate_invalid",structural=True) from exc
+        except (ValueError,TypeError) as exc:raise ExecutionProposalRejected("d22_evidence_candidate_invalid",structural=True) from exc
     if isinstance(raw, dict) and raw.get("kind") == "request_completion":
         from agent_core.actions import CompleteIntentAction
         if set(raw) != {"kind", "fact_id"} or not isinstance(raw["fact_id"], str):
-            raise D3ProposalRejected("d22_completion_selection_invalid", structural=True)
+            raise ExecutionProposalRejected("d22_completion_selection_invalid", structural=True)
         return CompleteIntentAction((raw["fact_id"],))
     if isinstance(raw, dict) and raw.get("kind") == "mcp_call":
         from agent_core.actions import MCPCall
         if (set(raw) != {"kind", "tool_name", "arguments"}
                 or not isinstance(raw["tool_name"], str) or not raw["tool_name"]
                 or not isinstance(raw["arguments"], dict)):
-            raise D3ProposalRejected("mcp.call_structure_invalid", structural=True)
+            raise ExecutionProposalRejected("mcp.call_structure_invalid", structural=True)
         return MCPCall(raw["tool_name"], raw["arguments"])
     if isinstance(raw, dict) and raw.get('kind') == 'attachment_observation':
         from agent_core.hybrid_contracts import AttachmentPlanProposal
@@ -176,20 +176,20 @@ def parse_d3_plan_proposal(raw: object) -> D3PlanProposal:
         "new_observation",
         "reuse_saved_proof",
     }:
-        raise D3ProposalRejected("d3_plan_template_invalid")
+        raise ExecutionProposalRejected("d3_plan_template_invalid")
     if template == "size_then_sha256" and mode != "new_observation":
-        raise D3ProposalRejected("d3_initial_plan_requires_observation")
+        raise ExecutionProposalRejected("d3_initial_plan_requires_observation")
     if mode == "reuse_saved_proof":
         if not isinstance(proof_id, str):
-            raise D3ProposalRejected("d3_reused_proof_id_invalid")
+            raise ExecutionProposalRejected("d3_reused_proof_id_invalid")
         try:
             parsed = UUID(proof_id)
         except (TypeError, ValueError, AttributeError) as exc:
-            raise D3ProposalRejected("d3_reused_proof_id_invalid") from exc
+            raise ExecutionProposalRejected("d3_reused_proof_id_invalid") from exc
         if parsed.version not in {4, 5} or str(parsed) != proof_id:
-            raise D3ProposalRejected("d3_reused_proof_id_invalid")
+            raise ExecutionProposalRejected("d3_reused_proof_id_invalid")
     elif proof_id is not None:
-        raise D3ProposalRejected("d3_new_observation_cannot_select_proof")
+        raise ExecutionProposalRejected("d3_new_observation_cannot_select_proof")
     return D3PlanProposal(template, mode, proof_id)
 
 
@@ -215,11 +215,11 @@ class D8CompleteProposal(D3ActionProposal):
 def parse_session_completion(raw, visible, *, maximum=2):
     from agent_core.session_contracts import parse_next_intents
     if not isinstance(raw, dict) or "next_intent_candidates" not in raw:
-        raise D3ProposalRejected("d8_next_intents_field_required", structural=True)
+        raise ExecutionProposalRejected("d8_next_intents_field_required", structural=True)
     try:
         suggestions = parse_next_intents(raw["next_intent_candidates"], visible, maximum=maximum)
     except (TypeError, ValueError) as exc:
-        raise D3ProposalRejected("d8_next_intents_invalid", structural=True) from exc
+        raise ExecutionProposalRejected("d8_next_intents_invalid", structural=True) from exc
     base = parse_d3_action({k: v for k, v in raw.items() if k != "next_intent_candidates"}, "inner_complete")
     return D8CompleteProposal(base.action, base.review_requested, suggestions)
 
@@ -231,11 +231,11 @@ def _candidate_text(value: object, *, code: str, nonblank: bool) -> str:
         or (nonblank and not value.strip())
         or "\x00" in value
     ):
-        raise D3ProposalRejected(code)
+        raise ExecutionProposalRejected(code)
     try:
         value.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise D3ProposalRejected(code) from exc
+        raise ExecutionProposalRejected(code) from exc
     return value
 
 
@@ -243,29 +243,29 @@ def _parse_d3_candidate_action(raw: object, *, mcp=False) -> D3ActionProposal:
     envelope = _fields(raw, {"action", "review_requested"})
     review_requested = envelope["review_requested"]
     if type(review_requested) is not bool:
-        raise D3ProposalRejected("d3_review_requested_invalid", structural=True)
+        raise ExecutionProposalRejected("d3_review_requested_invalid", structural=True)
     action = _fields(
         envelope["action"],
         {"kind", "value", "execution_id", "evidence_version", "source_ref"},
     )
     if action["kind"] != "candidate_flag":
-        raise D3ProposalRejected("d3_candidate_action_required")
+        raise ExecutionProposalRejected("d3_candidate_action_required")
 
     value = _candidate_text(
         action["value"], code="d3_candidate_value_invalid", nonblank=False
     )
     if len(value.encode("utf-8")) > MAX_D3_CANDIDATE_VALUE_BYTES:
-        raise D3ProposalRejected("d3_candidate_value_too_large")
+        raise ExecutionProposalRejected("d3_candidate_value_too_large")
 
     execution_id = action["execution_id"]
     if mcp:
-        if execution_id is not None:raise D3ProposalRejected("mcp_candidate_must_not_fabricate_execution")
+        if execution_id is not None:raise ExecutionProposalRejected("mcp_candidate_must_not_fabricate_execution")
     else:
         execution_id = _candidate_text(execution_id,code="d3_candidate_execution_id_invalid",nonblank=True)
         try:parsed_execution_id = UUID(execution_id)
-        except (TypeError,ValueError,AttributeError) as exc:raise D3ProposalRejected("d3_candidate_execution_id_invalid") from exc
+        except (TypeError,ValueError,AttributeError) as exc:raise ExecutionProposalRejected("d3_candidate_execution_id_invalid") from exc
         if parsed_execution_id.version != 4 or str(parsed_execution_id) != execution_id:
-            raise D3ProposalRejected("d3_candidate_execution_id_invalid")
+            raise ExecutionProposalRejected("d3_candidate_execution_id_invalid")
 
     evidence_version = action["evidence_version"]
     if (
@@ -273,7 +273,7 @@ def _parse_d3_candidate_action(raw: object, *, mcp=False) -> D3ActionProposal:
         or len(evidence_version) != 64
         or any(character not in "0123456789abcdef" for character in evidence_version)
     ):
-        raise D3ProposalRejected("d3_candidate_evidence_version_invalid")
+        raise ExecutionProposalRejected("d3_candidate_evidence_version_invalid")
 
     source_ref = _candidate_text(
         action["source_ref"], code="d3_candidate_source_ref_invalid", nonblank=True
@@ -302,7 +302,7 @@ def parse_d3_action(raw: object, stage: D3ModelStage) -> D3ActionProposal:
                 indices = []
                 for condition in conditions:
                     if not isinstance(condition, Mapping):
-                        raise D3ProposalRejected(
+                        raise ExecutionProposalRejected(
                             "d3_condition_step_invalid", structural=True
                         )
                     index = condition.get("step_index")
@@ -311,7 +311,7 @@ def parse_d3_action(raw: object, stage: D3ModelStage) -> D3ActionProposal:
                         or isinstance(index, bool)
                         or index not in {0, 1}
                     ):
-                        raise D3ProposalRejected(
+                        raise ExecutionProposalRejected(
                             "d3_condition_step_invalid", structural=True
                         )
                     indices.append(index)
@@ -327,9 +327,9 @@ def parse_d3_action(raw: object, stage: D3ModelStage) -> D3ActionProposal:
                 }
         envelope = parse_d2_action_envelope(candidate)
     except (TypeError, ValueError) as exc:
-        if isinstance(exc, D3ProposalRejected):
+        if isinstance(exc, ExecutionProposalRejected):
             raise
-        raise D3ProposalRejected(
+        raise ExecutionProposalRejected(
             "d3_action_structure_invalid", structural=True
         ) from exc
     action = envelope.action
@@ -344,9 +344,9 @@ def parse_d3_action(raw: object, stage: D3ModelStage) -> D3ActionProposal:
             ),
         )
     if stage in {"inner_size", "inner_sha256"} and not isinstance(action, ProbeAction):
-        raise D3ProposalRejected("d3_probe_action_required")
+        raise ExecutionProposalRejected("d3_probe_action_required")
     if stage == "inner_complete" and not isinstance(action, CompleteIntentAction):
-        raise D3ProposalRejected("d3_complete_action_required")
+        raise ExecutionProposalRejected("d3_complete_action_required")
     return D3ActionProposal(action, envelope.review_requested)
 
 
@@ -484,12 +484,12 @@ class D8HistoryReadAction:
         value = _fields(raw, {"kind", key})
         if key == "query":
             if not isinstance(value[key], dict) or set(value[key]) - {"turn_id", "intent_id", "artifact_version_id", "record_type"}:
-                raise D3ProposalRejected("d8_history_query_invalid", structural=True)
+                raise ExecutionProposalRejected("d8_history_query_invalid", structural=True)
         elif key == "refs":
             if not isinstance(value[key], list) or not 1 <= len(value[key]) <= 2 or any(not isinstance(i, str) for i in value[key]) or len(set(value[key])) != len(value[key]):
-                raise D3ProposalRejected("d8_history_details_invalid", structural=True)
+                raise ExecutionProposalRejected("d8_history_details_invalid", structural=True)
         elif not isinstance(value[key], str):
-            raise D3ProposalRejected("d8_history_cursor_invalid", structural=True)
+            raise ExecutionProposalRejected("d8_history_cursor_invalid", structural=True)
         return cls(value["kind"], value[key])
 
 
@@ -572,7 +572,7 @@ class D3AuditedModel:
             try:
                 change = D8ConclusionChange.parse_action(raw)
             except (ValueError, TypeError) as exc:
-                raise D3ProposalRejected("d8_change_structure_invalid", structural=True) from exc
+                raise ExecutionProposalRejected("d8_change_structure_invalid", structural=True) from exc
             if change is not None:
                 return change
         if request.stage == "inner_plan":
@@ -580,18 +580,18 @@ class D3AuditedModel:
             try:
                 yielded = parse_yield(request, raw)
             except ValueError as exc:
-                raise D3ProposalRejected(str(exc), structural=True) from exc
+                raise ExecutionProposalRejected(str(exc), structural=True) from exc
             if yielded is not None:
                 return yielded
             from agent_core.intent_execution import parse_working
             try:
                 note = parse_working(request, raw)
             except ValueError as exc:
-                raise D3ProposalRejected("d22_working_record_invalid", structural=True) from exc
+                raise ExecutionProposalRejected("d22_working_record_invalid", structural=True) from exc
             if note is not None:
                 return note
             if isinstance(raw,dict) and raw.get("kind")=="fact_candidate" and self.config.contract_version!=22:
-                raise D3ProposalRejected("d3_plan_fields_invalid",structural=True)
+                raise ExecutionProposalRejected("d3_plan_fields_invalid",structural=True)
             if self.config.intent_execution_policy and isinstance(raw, dict) and raw.get("kind") == "intent_resolution":
                 from agent_core.intent_execution import parse_resolution
                 try:
@@ -610,12 +610,12 @@ class D3AuditedModel:
                               file=_sys.stderr, flush=True)
                     # Keep the field-level code: it is persisted as the evidence reason and
                     # rides the single correction request, so the model learns what to fix.
-                    raise D3ProposalRejected(code, structural=True) from exc
+                    raise ExecutionProposalRejected(code, structural=True) from exc
             if self.config.contract_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
                 try:
                     read = D8HistoryReadAction.parse(raw)
                 except (ValueError, TypeError) as exc:
-                    raise D3ProposalRejected("d8_history_read_structure_invalid", structural=True) from exc
+                    raise ExecutionProposalRejected("d8_history_read_structure_invalid", structural=True) from exc
                 if read is not None:
                     return read
             return parse_d3_plan_proposal(raw)
@@ -625,14 +625,14 @@ class D3AuditedModel:
                                             maximum=None if self.config.contract_version == 22 else 2)
         if self.config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and request.stage in {"inner_size", "inner_sha256"}:
             if raw is None:
-                raise D3ProposalRejected("d3_action_structure_invalid", structural=True)
+                raise ExecutionProposalRejected("d3_action_structure_invalid", structural=True)
             return self.output_boundary.app.fixed_probe_bindings.proposal(
                 request.model_request_id, request=request, wire=raw, check_operation=False)
         return parse_d3_action(raw, request.stage)
 
     def _check(self, request: D3ModelRequest) -> None:
         if self.config.contract_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and self.output_boundary is None:
-            raise D3RecoveryRequired("d8_output_boundary_required")
+            raise ExecutionRecoveryRequired("d8_output_boundary_required")
         expected = (
             self.config.outer_role
             if request.stage == "outer_turn"
@@ -655,7 +655,7 @@ class D3AuditedModel:
             or not isinstance(request.context, context_type)
             or request.task_run_id != self.controller.control_state.task_run.task_run_id
         ):
-            raise D3RecoveryRequired("d3_model_configuration_or_context_changed")
+            raise ExecutionRecoveryRequired("d3_model_configuration_or_context_changed")
 
     async def propose_candidate(
         self,
@@ -673,11 +673,11 @@ class D3AuditedModel:
         if request.stage != "inner_candidate" or not isinstance(
             request.context, (D3CandidateContext,MCPAnswerCandidateContext)
         ):
-            raise D3RecoveryRequired("d3_candidate_request_invalid")
+            raise ExecutionRecoveryRequired("d3_candidate_request_invalid")
         if not callable(getattr(protected, "save_pending", None)) or not callable(
             getattr(protected, "load_pending_for_request", None)
         ):
-            raise D3RecoveryRequired("d3_candidate_protected_store_required")
+            raise ExecutionRecoveryRequired("d3_candidate_protected_store_required")
         self._check(request)
 
         context = request.context
@@ -687,7 +687,7 @@ class D3AuditedModel:
             evidence, record = self._saved(request)
             if evidence.outcome == "accepted" and evidence.raw == {"action": {"kind": "no_candidate"}}:
                 if protected.load_pending_for_request(request.model_request_id) is not None:
-                    raise D3RecoveryRequired("d9_candidate_result_conflict")
+                    raise ExecutionRecoveryRequired("d9_candidate_result_conflict")
                 return request.model_request_id, None
         expected_start = D3OperationStart(
             request.model_request_id,
@@ -713,17 +713,17 @@ class D3AuditedModel:
                 or start.role != expected_start.role
                 or start.role_config_ref != expected_start.role_config_ref
             ):
-                raise D3RecoveryRequired("d3_candidate_call_identity_changed")
+                raise ExecutionRecoveryRequired("d3_candidate_call_identity_changed")
 
         pending = None
         if record is None:
             pending = protected.load_pending_for_request(request.model_request_id)
             if pending is not None:
-                raise D3RecoveryRequired("d3_candidate_result_without_started_call")
+                raise ExecutionRecoveryRequired("d3_candidate_result_without_started_call")
         elif record.completion is None:
             pending = protected.load_pending_for_request(request.model_request_id)
             if pending is None:
-                raise D3RecoveryRequired("d3_candidate_model_call_outcome_unknown")
+                raise ExecutionRecoveryRequired("d3_candidate_model_call_outcome_unknown")
         if record is None:
             state = self.controller.control_state
             if (
@@ -733,7 +733,7 @@ class D3AuditedModel:
                 or state.latest_checkpoint.sequence
                 != request.base_checkpoint_sequence
             ):
-                raise D3RecoveryRequired("d3_candidate_dispatch_stopped")
+                raise ExecutionRecoveryRequired("d3_candidate_dispatch_stopped")
             self.ledger.begin_d3_operation(expected_start)
             raw = await self._invoke(
                 request,
@@ -757,16 +757,16 @@ class D3AuditedModel:
                 proposal = _parse_d3_candidate_action(raw,mcp=isinstance(context,MCPAnswerCandidateContext))
                 action = proposal.action
                 if not isinstance(action, D3CandidateFlagAction):
-                    raise D3ProposalRejected("d3_candidate_action_required")
+                    raise ExecutionProposalRejected("d3_candidate_action_required")
                 if proposal.review_requested:
-                    raise D3ProposalRejected("d3_candidate_review_not_supported")
+                    raise ExecutionProposalRejected("d3_candidate_review_not_supported")
                 if (
                     action.execution_id != source["execution_id"]
                     or action.evidence_version != source["evidence_version"]
                     or action.source_ref != source["source_ref"]
                 ):
-                    raise D3ProposalRejected("d3_candidate_binding_rejected")
-            except D3ProposalRejected as exc:
+                    raise ExecutionProposalRejected("d3_candidate_binding_rejected")
+            except ExecutionProposalRejected as exc:
                 safe_raw = {
                     "outcome": "rejected",
                     "reason": exc.code,
@@ -797,7 +797,7 @@ class D3AuditedModel:
                         checksum,
                     )
                 )
-                raise D3ProposalRejected(
+                raise ExecutionProposalRejected(
                     exc.code,
                     structural=exc.structural,
                     retryable=exc.retryable,
@@ -874,10 +874,10 @@ class D3AuditedModel:
             record = self.ledger.load_d3_operation(request.model_request_id)
 
         if record is None or record.completion is None:
-            raise D3RecoveryRequired("d3_candidate_call_completion_missing")
+            raise ExecutionRecoveryRequired("d3_candidate_call_completion_missing")
         evidence = self.evidence.read(request.model_request_id)
         if evidence is None:
-            raise D3RecoveryRequired("d3_candidate_call_evidence_missing")
+            raise ExecutionRecoveryRequired("d3_candidate_call_evidence_missing")
         if record.completion.result_kind == "rejected":
             rejection = evidence.raw
             if (
@@ -905,8 +905,8 @@ class D3AuditedModel:
                 or record.completion.evidence_ref != request.model_request_id
                 or record.completion.evidence_sha256 != digest(asdict(evidence))
             ):
-                raise D3RecoveryRequired("d3_candidate_rejection_evidence_changed")
-            raise D3ProposalRejected(
+                raise ExecutionRecoveryRequired("d3_candidate_rejection_evidence_changed")
+            raise ExecutionProposalRejected(
                 evidence.reason,
                 structural=rejection["structural"],
                 retryable=rejection["retryable"],
@@ -914,7 +914,7 @@ class D3AuditedModel:
             )
         pending = protected.load_pending_for_request(request.model_request_id)
         if record.completion.result_kind != "completed" or pending is None:
-            raise D3RecoveryRequired("d3_candidate_protected_result_missing")
+            raise ExecutionRecoveryRequired("d3_candidate_protected_result_missing")
         candidate, metadata = pending
         self._validate_pending_candidate(request, candidate, metadata)
         if (
@@ -933,12 +933,12 @@ class D3AuditedModel:
             or record.completion.evidence_ref != request.model_request_id
             or record.completion.evidence_sha256 != digest(asdict(evidence))
         ):
-            raise D3RecoveryRequired("d3_candidate_completion_evidence_changed")
+            raise ExecutionRecoveryRequired("d3_candidate_completion_evidence_changed")
         return request.model_request_id, candidate
 
     def _candidate_safe_raw(self, candidate: object, metadata: Mapping[str, object], request):
         if not isinstance(metadata, Mapping):
-            raise D3RecoveryRequired("d3_candidate_protected_metadata_invalid")
+            raise ExecutionRecoveryRequired("d3_candidate_protected_metadata_invalid")
         body_sha256 = metadata.get("body_sha256")
         byte_size = metadata.get("byte_size")
         if (
@@ -948,7 +948,7 @@ class D3AuditedModel:
             or type(byte_size) is not int
             or byte_size <= 0
         ):
-            raise D3RecoveryRequired("d3_candidate_protected_metadata_invalid")
+            raise ExecutionRecoveryRequired("d3_candidate_protected_metadata_invalid")
         safe = {
             "candidate_id": getattr(candidate, "candidate_id", None),
             "evidence_version": getattr(candidate, "evidence_version", None),
@@ -970,7 +970,7 @@ class D3AuditedModel:
     ) -> None:
         context = request.context
         if not isinstance(context, (D3CandidateContext,MCPAnswerCandidateContext)):
-            raise D3RecoveryRequired("d3_candidate_context_invalid")
+            raise ExecutionRecoveryRequired("d3_candidate_context_invalid")
         from agent_core.competition_candidates import provenance
         source=provenance(context)
         if (
@@ -983,7 +983,7 @@ class D3AuditedModel:
             or metadata.get("execution_id") != source["execution_id"]
             or metadata.get("evidence_version") != source["evidence_version"]
         ):
-            raise D3RecoveryRequired("d3_candidate_protected_binding_changed")
+            raise ExecutionRecoveryRequired("d3_candidate_protected_binding_changed")
 
     def _saved(
         self, request: D3ModelRequest
@@ -994,7 +994,7 @@ class D3AuditedModel:
         evidence = self.evidence.read(request.model_request_id)
         if record is None:
             if evidence is not None:
-                raise D3RecoveryRequired("d3_model_evidence_without_call")
+                raise ExecutionRecoveryRequired("d3_model_evidence_without_call")
             return None, None
         start = record.start
         if (
@@ -1007,7 +1007,7 @@ class D3AuditedModel:
             or start.role != request.role
             or start.role_config_ref != request.role_config_ref
         ):
-            raise D3RecoveryRequired("d3_model_call_identity_changed")
+            raise ExecutionRecoveryRequired("d3_model_call_identity_changed")
         if evidence is None:
             if (self.config.contract_version in {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and request.stage in {"inner_size", "inner_sha256"}
                     and self.output_boundary.evidence.read("fixed-probe-binding", request.model_request_id) is not None):
@@ -1025,7 +1025,7 @@ class D3AuditedModel:
                     raw, reason, failure["finished_at"])
                 self.evidence.save(evidence)
         if evidence is None:
-            raise D3RecoveryRequired("d3_model_call_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_model_call_outcome_unknown")
         if (
             evidence.model_request_id != request.model_request_id
             or evidence.task_run_id != request.task_run_id
@@ -1037,7 +1037,7 @@ class D3AuditedModel:
             or evidence.correction_of_model_request_id
             != request.correction_of_model_request_id
         ):
-            raise D3RecoveryRequired("d3_model_evidence_identity_changed")
+            raise ExecutionRecoveryRequired("d3_model_evidence_identity_changed")
         if record.completion is None:
             self.ledger.complete_d3_operation(
                 D3OperationCompletion(
@@ -1054,7 +1054,7 @@ class D3AuditedModel:
             or (record.completion.result_kind == "completed")
             != (evidence.outcome == "accepted")
         ):
-            raise D3RecoveryRequired("d3_model_completion_evidence_changed")
+            raise ExecutionRecoveryRequired("d3_model_completion_evidence_changed")
         return evidence, record
 
     async def _invoke(
@@ -1124,7 +1124,7 @@ class D3AuditedModel:
                         await asyncio.sleep(0.01)
                     if not finished.is_set():
                         log.error("call.exit_unconfirmed", **ids, code="d3_model_call_outcome_unknown")
-                        raise D3RecoveryRequired("d3_model_call_outcome_unknown")
+                        raise ExecutionRecoveryRequired("d3_model_call_outcome_unknown")
                     break
                 if self.output_boundary is not None and self.output_boundary.app.sessions is not None:
                     phase = "supervision_poll"
@@ -1135,8 +1135,8 @@ class D3AuditedModel:
             succeeded, raw = values[0]
             if not succeeded:
                 if isinstance(raw, BaseException):
-                    raise D3RecoveryRequired("d3_model_call_outcome_unknown") from raw
-                raise D3RecoveryRequired("d3_model_call_outcome_unknown")
+                    raise ExecutionRecoveryRequired("d3_model_call_outcome_unknown") from raw
+                raise ExecutionRecoveryRequired("d3_model_call_outcome_unknown")
             if stopped.is_set() and not isinstance(raw, ModelError):
                 # A late decision must not be applied after cancellation.
                 raw = (ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout") if timed_out.is_set()
@@ -1188,8 +1188,8 @@ class D3AuditedModel:
                 code="d3_model_call_interrupted" if known else "d3_model_call_outcome_unknown",
                 adapter_exit_confirmed=finished.is_set(), **failure)
             if phase == "supervision_poll" and isinstance(error, Exception) and not isinstance(error, (
-                    D3RecoveryRequired, D3BudgetExhausted, D3ProposalRejected, D4RecoveryRequired, D4BudgetExhausted)):
-                raise D3RecoveryRequired("d22_strategy_result_processing_failed") from error
+                    ExecutionRecoveryRequired, ExecutionBudgetExhausted, ExecutionProposalRejected, OperationRecoveryRequired, OperationBudgetExhausted)):
+                raise ExecutionRecoveryRequired("d22_strategy_result_processing_failed") from error
             raise
         finally:
             watchdog.cancel()
@@ -1206,11 +1206,11 @@ class D3AuditedModel:
         validate: Callable[[D3ModelRequest, object], None] | None = None,
     ):
         if request.stage == "inner_candidate":
-            raise D3RecoveryRequired("d3_candidate_protected_store_required")
+            raise ExecutionRecoveryRequired("d3_candidate_protected_store_required")
         self._check(request)
         d4_enabled = self.config.d4_budget is not None
         if d4_enabled and (refresh is None or validate is None):
-            raise D3RecoveryRequired("d4_model_refresh_and_validation_required")
+            raise ExecutionRecoveryRequired("d4_model_refresh_and_validation_required")
         current = request
         d4_refinement = d4_enabled and refresh is not None
         refinement_used = False
@@ -1226,7 +1226,7 @@ class D3AuditedModel:
                     or state.latest_checkpoint.sequence
                     != current.base_checkpoint_sequence
                 ):
-                    raise D3RecoveryRequired("d3_model_dispatch_stopped")
+                    raise ExecutionRecoveryRequired("d3_model_dispatch_stopped")
                 if self.request_capacity_check is not None:
                     self.request_capacity_check(current)
                 self.ledger.begin_d3_operation(
@@ -1267,7 +1267,7 @@ class D3AuditedModel:
                 elif reason is None:
                     try:
                         self._parse(current, raw)
-                    except D3ProposalRejected as exc:
+                    except ExecutionProposalRejected as exc:
                         outcome = "invalid_structure" if exc.structural else "rejected"
                         reason = exc.code
                         if change_response:
@@ -1318,7 +1318,7 @@ class D3AuditedModel:
                 self.output_boundary.terminal_check(current)
             rejection_code = evidence.reason
             if evidence.reason == "d8_change_sensitive_rejected":
-                raise D3ProposalRejected(evidence.reason, retryable=False, model_request_id=current.model_request_id)
+                raise ExecutionProposalRejected(evidence.reason, retryable=False, model_request_id=current.model_request_id)
             retryable = False
             if evidence.outcome == "accepted":
                 rejection = self.evidence.read_rejection(current.model_request_id)
@@ -1330,12 +1330,12 @@ class D3AuditedModel:
                     if validate is not None:
                         try:
                             validate(current, proposal)
-                        except (D3ProposalRejected, D3RecoveryRequired) as exc:
-                            if isinstance(exc, D3RecoveryRequired):
+                        except (ExecutionProposalRejected, ExecutionRecoveryRequired) as exc:
+                            if isinstance(exc, ExecutionRecoveryRequired):
                                 if str(exc) != "d3_action_rejected_by_review_constraint":
                                     raise
                                 # Only this known pre-application proposal rejection can use the existing correction.
-                                exc = D3ProposalRejected(str(exc))
+                                exc = ExecutionProposalRejected(str(exc))
                             self.reject(
                                 current.model_request_id,
                                 exc.code,
@@ -1351,10 +1351,10 @@ class D3AuditedModel:
             elif evidence.outcome in {"invalid_structure", "rejected"}:
                 try:
                     self._parse(current, evidence.raw)
-                except D3ProposalRejected as exc:
+                except ExecutionProposalRejected as exc:
                     retryable = exc.retryable
             else:
-                raise D3ProposalRejected(
+                raise ExecutionProposalRejected(
                     rejection_code or evidence.outcome,
                     model_request_id=current.model_request_id,
                 )
@@ -1380,7 +1380,7 @@ class D3AuditedModel:
             if can_refine:
                 if d4_refinement:
                     if refresh is None:
-                        raise D3RecoveryRequired("d4_model_refresh_unavailable")
+                        raise ExecutionRecoveryRequired("d4_model_refresh_unavailable")
                     refreshed = refresh(request)
                 else:
                     refreshed = request
@@ -1393,7 +1393,7 @@ class D3AuditedModel:
                     or refreshed.resource_ref != request.resource_ref
                     or refreshed.correction_of_model_request_id is not None
                 ):
-                    raise D3RecoveryRequired("d3_refreshed_request_scope_changed")
+                    raise ExecutionRecoveryRequired("d3_refreshed_request_scope_changed")
                 refinement_id = stable_id(
                     request.task_run_id,
                     f"d3/{request.model_request_id}/correction",
@@ -1416,26 +1416,26 @@ class D3AuditedModel:
                     and current.base_checkpoint_sequence
                     != self.controller.control_state.latest_checkpoint.sequence
                 ):
-                    raise D3RecoveryRequired("d3_refreshed_request_checkpoint_stale")
+                    raise ExecutionRecoveryRequired("d3_refreshed_request_checkpoint_stale")
                 refinement_used = True
                 continue
             if evidence.outcome == "accepted" and rejection_code is not None:
-                raise D3ProposalRejected(
+                raise ExecutionProposalRejected(
                     rejection_code, model_request_id=current.model_request_id
                 )
             if evidence.outcome != "accepted":
-                raise D3ProposalRejected(
+                raise ExecutionProposalRejected(
                     rejection_code or evidence.outcome,
                     model_request_id=current.model_request_id,
                 )
-            raise D3RecoveryRequired("d3_model_refinement_unavailable")
+            raise ExecutionRecoveryRequired("d3_model_refinement_unavailable")
 
     def reject(
         self, model_request_id: str, code: str, *, retryable: bool = False
     ) -> None:
         evidence = self.evidence.read(model_request_id)
         if evidence is None or evidence.outcome != "accepted":
-            raise D3RecoveryRequired("d3_rejection_requires_known_model_result")
+            raise ExecutionRecoveryRequired("d3_rejection_requires_known_model_result")
         self.evidence.save_rejection(
             D3ModelRejection(model_request_id, code, self.clock(), retryable)
         )

@@ -9,7 +9,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from agent_core.actions import MCPCall
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.operation_accounting import D4OperationStart, D4OperationCompletion
 from agent_core.turn_modeling import digest
 from qinyuan_core import get_logger
@@ -70,7 +70,7 @@ def _is_operation_id(value):
 
 
 class MCPPlanExecutor:
-    """One invocation per inner decision; tool success never creates a Fact."""
+    """Each admitted call keeps its own receipt; tool success never creates a Fact."""
 
     def __init__(self, app, manager=None, *, public_web=None):
         self.app, self.manager = app, manager
@@ -100,6 +100,31 @@ class MCPPlanExecutor:
     def enabled(self, task_id):
         return self.evidence.read("mcp-registry", task_id) is not None
 
+    def execution_context(self):
+        """Describe this execution profile, never infer topology from target files."""
+        from MCPs.analysis_common import SANDBOX_PATH_HELP
+        frozen = self.evidence.read("mcp-registry", self.app.state.task_run.task_run_id) or {}
+        return {
+            "authorized_target": (self.app.config.web_authorization.allowed_origin if self.app.config.web_authorization else
+                self.app.config.tcp_authorization.allowed_endpoint if self.app.config.tcp_authorization else None),
+            "sandbox": "TaskRun sandbox has no external network (network_mode=none). "
+                "localhost and private addresses refer to the sandbox, not the remote target. "
+                "Ports in attachments describe that deployment, not a local running service. "
+                "Local reproduction is possible only when you actually start and observe a local service. " + SANDBOX_PATH_HELP,
+            "target_http": ("When declared, http.run_experiment uses request(method, path_query, headers={}, body='') "
+                "to reach only the authorized origin through the trusted forwarder. Its Python script cannot create "
+                "sockets or subprocesses. shell/curl/httpx/nuclei planners run inside the sandbox and cannot replace "
+                "this target channel. HTTP evidence is saved per request."
+                if self.experiments.enabled else "No http.run_experiment target channel is enabled in this profile."),
+            "public_reference": ("When declared, web.search/web.fetch use an external trusted adapter for public "
+                "references, not target experiments or sandbox networking."
+                if frozen.get("public_web") else "No public-reference adapter is enabled."),
+            "tool_preparation": "When declared, download.install_tool prepares allowlisted tool artifacts through "
+                "the trusted installer, not a general target/public-network channel. The execution sandbox stays networkless.",
+            "boundary": "Only the current tool catalog and authorization permit dispatch. A tool or bridge error "
+                "does not prove target behavior; inspect its category, phase and original request receipts.",
+        }
+
     async def open(self):
         _trace("mcp.open.enter", instance=id(self) % 100000,
                has_client=self.client is not None, has_manager=self.manager is not None)
@@ -109,10 +134,10 @@ class MCPPlanExecutor:
         frozen = self.evidence.read("mcp-registry", task.task_run_id)
         expected = hashlib.sha256(self.registry_path().read_bytes()).hexdigest()
         if frozen is None or frozen["registry_sha256"] != expected:
-            raise D3RecoveryRequired("mcp.registry_binding_changed")
+            raise ExecutionRecoveryRequired("mcp.registry_binding_changed")
         retrieval = frozen.get("public_web")
         if retrieval is not None and (self.public_web is None or self.public_web.binding != retrieval):
-            raise D3RecoveryRequired("retrieval.configuration_unavailable")
+            raise ExecutionRecoveryRequired("retrieval.configuration_unavailable")
         if self.manager is None:
             from MCPs.Mcp_client.client import MCPManager, load_registry
             from agent_adapters.sandbox_adapter import D8SandboxAdapter
@@ -131,7 +156,14 @@ class MCPPlanExecutor:
             await self.manager.start_all()
             names = [m.qualified_name for m in self.manager.list_registered_tools()]
             self.client = self.manager.bind_agent(task.task_run_id, allowed_tools=names)
-            self.tools = self.client.list_tool_specs()
+            from MCPs.analysis_common import SANDBOX_PATH_HELP
+            self.tools = [{**tool, "tags": [*tool.get("tags", ()),
+                    "tool-preparation" if tool["qualified_name"] == "download.install_tool" else "sandbox-only"],
+                "description": ("[trusted tool preparation; not target egress] "
+                    if tool["qualified_name"] == "download.install_tool" else "[sandbox-only; no external network] ")
+                    + tool.get("description", "") + (" " + SANDBOX_PATH_HELP
+                        if tool["qualified_name"].split(".")[0] in {"binutils", "gdb", "jadx", "php"} else "")}
+                for tool in self.client.list_tool_specs()]
             if self.experiments.enabled:
                 from agent_adapters.http_experiments import SPEC
                 self.tools = [*self.tools, SPEC]
@@ -139,17 +171,17 @@ class MCPPlanExecutor:
                 from agent_adapters.public_web import SPECS
                 self.tools = [*self.tools, *SPECS]
             if not self.tools:
-                raise D3RecoveryRequired("mcp.no_tools_available")
+                raise ExecutionRecoveryRequired("mcp.no_tools_available")
             # Drift is rejected on recovery; no silent replacement of a frozen catalog.
             self.evidence.save("mcp-catalog", task.task_run_id, {"tools": self.tools})
         except BaseException as exc:
             await self.manager.stop_all()
             self.client = None
-            if isinstance(exc, Exception) and not isinstance(exc, D3RecoveryRequired):
+            if isinstance(exc, Exception) and not isinstance(exc, ExecutionRecoveryRequired):
                 self._log.error("mcp.discovery_failed", run=task.task_run_id,
                                 code="mcp.discovery_failed", category="dependency",
                                 error_type=type(exc).__name__)
-                raise D3RecoveryRequired("mcp.discovery_failed") from None
+                raise ExecutionRecoveryRequired("mcp.discovery_failed") from None
             raise
         self._log.info("mcp.connected", run=task.task_run_id, tool_count=len(self.tools))
 
@@ -197,23 +229,23 @@ class MCPPlanExecutor:
         if (operation is None or claim is None
                 or operation.start.context_sha256 != digest(claim)
                 or result["request_sha256"] != digest(claim)):
-            raise D3RecoveryRequired("mcp.result_binding_changed")
+            raise ExecutionRecoveryRequired("mcp.result_binding_changed")
         if 'experiment_request' in claim:
             self.experiments.validate_receipt(operation,claim,result)
         from agent_adapters.public_web import IDENTITY, NAMES, preview
         if (claim['call']['tool_name'] in NAMES and operation.completion is not None
                 and (operation.completion.evidence_sha256 != digest(result)
                      or operation.completion.evidence_ref != 'mcp-result/' + operation_id)):
-            raise D3RecoveryRequired("mcp.result_binding_changed")
+            raise ExecutionRecoveryRequired("mcp.result_binding_changed")
         payload = result["payload"]
         return preview(payload, operation_id, claim) if payload.get("identity") == IDENTITY else payload
 
     def _apply(self, operation, claim, result):
         if operation.start.context_sha256 != digest(claim) or result["request_sha256"] != digest(claim):
-            raise D3RecoveryRequired("mcp.result_binding_changed")
+            raise ExecutionRecoveryRequired("mcp.result_binding_changed")
         payload = result["payload"]
         if payload["status"] not in {"completed", "failed", "rejected"}:
-            raise D3RecoveryRequired("mcp.outcome_unknown")
+            raise ExecutionRecoveryRequired("mcp.outcome_unknown")
         if 'experiment_request' in claim:
             self.experiments.validate_receipt(operation,claim,result)
         completion = D4OperationCompletion(
@@ -224,10 +256,14 @@ class MCPPlanExecutor:
         if operation.completion is None:
             self.app.store.complete_d4_operation(completion)
         elif operation.completion != completion:
-            raise D3RecoveryRequired("mcp.completion_binding_changed")
+            raise ExecutionRecoveryRequired("mcp.completion_binding_changed")
         if 'experiment_request' not in claim:
             if self.app.store.load_stage_run_config(claim["task_run_id"]) is not None:
-                self.app.store.mark_d4_operation_applied(claim["model_request_id"], operation.start.operation_id)
+                from agent_core.stage_contracts import StageToolBatch
+                parent = self.app.store.load_d4_operation(claim["model_request_id"])
+                batch = isinstance(self.evidence.read_model_result(parent).result, StageToolBatch)
+                self.app.store.mark_d4_operation_applied(claim["model_request_id"],
+                    claim["model_request_id"] if batch else operation.start.operation_id)
             else:
                 self.app.store.mark_d3_operation_applied(claim["model_request_id"], operation.start.operation_id)
         if payload["status"] == "completed":
@@ -240,7 +276,7 @@ class MCPPlanExecutor:
             result = self.evidence.read("mcp-result", operation.start.operation_id)
             if result is not None:
                 if claim is None:
-                    raise D3RecoveryRequired("mcp.call_evidence_missing")
+                    raise ExecutionRecoveryRequired("mcp.call_evidence_missing")
                 try:
                     self._apply(operation, claim, result)
                 except Exception as error:
@@ -264,27 +300,32 @@ class MCPPlanExecutor:
             frozen = self.evidence.read("mcp-registry", self.app.state.task_run.task_run_id)
             if (self.public_web is None or frozen is None
                     or frozen.get("public_web") != self.public_web.binding):
-                raise D3RecoveryRequired("retrieval.configuration_unavailable")
+                raise ExecutionRecoveryRequired("retrieval.configuration_unavailable")
             self.public_web.validate(call)
-        identity = self.app._id("mcp/" + request_id)
+        key = request_id
+        if self.app.store.load_stage_run_config(self.app.state.task_run.task_run_id) is not None:
+            from agent_core.stage_contracts import tool_call_key
+            proposal = self.evidence.read_model_result(self.app.store.load_d4_operation(request_id)).result
+            key = tool_call_key(request_id, proposal, call)
+        identity = self.app._id("mcp/" + key)
         claim = {"task_run_id": self.app.state.task_run.task_run_id,
                  "intent_id": intent_id, "model_request_id": request_id, "call": asdict(call)}
         prior = self.app.store.load_d4_operation(identity)
         if prior is not None:
             result = self.evidence.read("mcp-result", identity)
             if result is None:
-                raise D3RecoveryRequired("mcp.outcome_unknown")
+                raise ExecutionRecoveryRequired("mcp.outcome_unknown")
             self._apply(prior, claim, result)
             return
         stage_config = self.app.store.load_stage_run_config(claim["task_run_id"])
         stage_turn = next((t for t in self.app.store.list_stage_turns(claim["task_run_id"])
             if any(r.road_id == intent_id for r in t.roads)), None) if stage_config is not None else None
         if stage_config is not None and stage_turn is None:
-            raise D3RecoveryRequired("stage.tool_road_not_running")
+            raise ExecutionRecoveryRequired("stage.tool_road_not_running")
         if stage_turn is not None:
             from agent_core.domain import IntentStatus
             if not any(r.road_id == intent_id and r.status is IntentStatus.RUNNING for r in stage_turn.roads):
-                raise D3RecoveryRequired("stage.tool_road_not_running")
+                raise ExecutionRecoveryRequired("stage.tool_road_not_running")
             from types import SimpleNamespace
             intent = SimpleNamespace(turn_id=stage_turn.turn_id)
         else:
@@ -293,10 +334,10 @@ class MCPPlanExecutor:
             claim["task_run_id"], intent.turn_id, intent_id)
         # Reuse the existing execution permission; completion-only reviews forbid tools.
         if "probe" not in allowed:
-            raise D3RecoveryRequired("mcp.execution_blocked_by_review")
+            raise ExecutionRecoveryRequired("mcp.execution_blocked_by_review")
         remaining = int(self.app.state.task_run.deadline_at - self.app.clock())
         if remaining < 1:
-            raise D3RecoveryRequired("mcp.deadline_insufficient")
+            raise ExecutionRecoveryRequired("mcp.deadline_insufficient")
         if not public and self.service is not None:
             self.service.maximum_timeout_seconds = min(maximum, remaining)
         self.evidence.save("mcp-call", identity, claim)
@@ -367,20 +408,22 @@ class MCPPlanExecutor:
                         break  # Confirmed preparation stop; no installer was dispatched.
                     except BaseException:
                         pass
-                    raise D3RecoveryRequired("mcp.outcome_unknown")
+                    raise ExecutionRecoveryRequired("mcp.outcome_unknown")
             response = pending.result()
             if not public and (response.agent_id != claim["task_run_id"]
                     or response.sandbox_id != self.app.state.task_run.sandbox_id
                     or response.qualified_name != call.tool_name):
-                raise D3RecoveryRequired("mcp.execution_binding_changed")
+                raise ExecutionRecoveryRequired("mcp.execution_binding_changed")
             payload = self.app.redactor.redact_value(response if public else response.to_tool_payload())
         except ToolDownloadError as exc:
             payload = {"ok": False, "status": "failed", "tool": call.tool_name,
                        "code": str(exc), "category": ("integrity" if "sha256" in str(exc) else
                            "authorization" if "not_allowed" in str(exc) or "non_public" in str(exc) else "dependency")}
-        except (MCPCommandPlanError, SandboxPolicyError):
+        except (MCPCommandPlanError, SandboxPolicyError) as exc:
+            planner_rejected = isinstance(exc, MCPCommandPlanError) and exc.args == ("mcp.planner_rejected",)
             payload = {"ok": False, "status": "rejected",
-                       "tool": call.tool_name, "code": "mcp.command_rejected"}
+                       "tool": call.tool_name, "code": "mcp.planner_rejected" if planner_rejected else "mcp.command_rejected",
+                       "category": "input" if planner_rejected else "policy"}
         except BaseException as exc:
             if not pending.done():
                 pending.cancel()
@@ -389,12 +432,18 @@ class MCPPlanExecutor:
                 except BaseException:
                     pass
             code = str(exc) if isinstance(exc, ToolDownloadUnknown) else "retrieval.outcome_unknown" if public else "mcp.outcome_unknown"
-            if public and isinstance(exc, D3RecoveryRequired) and exc.args == ("retrieval.worker_stop_unconfirmed",):
+            if public and isinstance(exc, ExecutionRecoveryRequired) and exc.args == ("retrieval.worker_stop_unconfirmed",):
                 code = "retrieval.worker_stop_unconfirmed"
             self._log.error("mcp.call_unknown", run=claim["task_run_id"], intent=intent_id,
-                            exec=identity, tool=call.tool_name, code=code, category="unknown",
+                            exec=identity, tool=call.tool_name, code=code, category="unknown", phase="mcp_call",
                             error_type=type(exc).__name__)
-            raise D3RecoveryRequired(code) from None
+            from agent_adapters.output_evidence import safe_failure_details
+            context = dict(operation_id=identity, resource_ref="mcp/" + intent_id + "/" + request_id, road_id=intent_id)
+            self.evidence.save("mcp-failure", identity, dict(request_sha256=digest(claim), code=code,
+                operation_context=context, **safe_failure_details(exc, include_chain=True)))
+            failure = ExecutionRecoveryRequired(code)
+            failure.operation_context = context
+            raise failure from exc
         result = {"request_sha256": digest(claim), "payload": payload, "finished_at": self.app.clock()}
         self.evidence.save("mcp-result", identity, result)
         self._apply(self.app.store.load_d4_operation(identity), claim, result)

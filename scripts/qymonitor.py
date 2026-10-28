@@ -12,6 +12,7 @@ and never writes to the run directory.
     python scripts/qymonitor.py events runs117 --tail 40 # committed events
     python scripts/qymonitor.py calls runs117            # per-call table
     python scripts/qymonitor.py cache runs117            # prompt-cache by stage
+    python scripts/qymonitor.py planning RUN --json      # planning cost and observed outcomes
     python scripts/qymonitor.py tree  runs117            # Turn / Intent structure
     python scripts/qymonitor.py facts runs117            # facts and their turn
     python scripts/qymonitor.py sql   runs117 "select ..." --limit 20
@@ -294,22 +295,28 @@ def offered_tools(run_dir: Path) -> list[str]:
 
 
 def tool_usage(run_dir: Path) -> tuple[Counter, dict]:
-    """Called tools -> count, plus the last argument snippet per tool."""
+    """Valid proposed tools, including batch members; not physical dispatch counts."""
     counts: Counter = Counter()
     last: dict[str, str] = {}
     for _, payload in stage_result_payloads(run_dir):
-        for call in (payload.get("tool_calls") or []):
-            raw = ((call.get("function") or {}).get("arguments")) or "{}"
+        if payload.get('outcome') != 'valid':
+            continue
+        arguments = [((call.get('function') or {}).get('arguments')) or '{}'
+            for call in (payload.get('tool_calls') or [])] or [payload.get('content')]
+        for raw in arguments:
             try:
-                obj = json.loads(raw)
+                obj = json.loads(raw) if isinstance(raw, str) else raw
             except (TypeError, json.JSONDecodeError):
                 continue
-            result = obj.get("result") if isinstance(obj.get("result"), dict) else obj
-            if result.get("kind") != "mcp_call":
+            if not isinstance(obj, dict):
                 continue
-            name = result.get("tool_name") or "?"
-            counts[name] += 1
-            last[name] = json.dumps(result.get("arguments"), ensure_ascii=False)[:110]
+            result = obj.get("result") if isinstance(obj.get("result"), dict) else obj
+            proposed = ([result] if result.get('kind') == 'mcp_call' else
+                result.get('calls', []) if result.get('kind') == 'mcp_calls' else [])
+            for selection in proposed:
+                name = selection.get('tool_name') or '?'
+                counts[name] += 1
+                last[name] = json.dumps(selection.get('arguments'), ensure_ascii=False)[:110]
     return counts, last
 
 
@@ -334,7 +341,7 @@ def load_calls(run_dir: Path, con: sqlite3.Connection | None = None) -> list[dic
     ledger = {}
     if con is not None:
         for row in query(con, "select operation_id, category, start_json, completion_json from d4_operations"):
-            role = started = finished = None
+            role = started = finished = result_kind = None
             try:
                 start = json.loads(row["start_json"] or "{}")
                 role = start.get("role")
@@ -342,11 +349,12 @@ def load_calls(run_dir: Path, con: sqlite3.Connection | None = None) -> list[dic
             except (TypeError, json.JSONDecodeError):
                 pass
             try:
-                finished = json.loads(row["completion_json"] or "{}").get("finished_at")
+                completion = json.loads(row["completion_json"] or "{}")
+                finished, result_kind = completion.get("finished_at"), completion.get("result_kind")
             except (TypeError, json.JSONDecodeError):
                 pass
             ledger[row["operation_id"]] = dict(category=row["category"], role=role,
-                                              started_at=started, finished_at=finished)
+                                              started_at=started, finished_at=finished, result_kind=result_kind)
 
     calls = []
     for identity, path in provider_results(run_dir):
@@ -381,9 +389,136 @@ def load_calls(run_dir: Path, con: sqlite3.Connection | None = None) -> list[dic
             http=transport.get("http_status"),
             stream_end=transport.get("transport_end"),
             error=result.get("error"),
+            finished=entry.get("finished_at"),
+            usage=usage,
+            ledger_state=entry.get("result_kind"),
+            ledger_known=identity in ledger,
+            started_known=entry.get("started_at") is not None,
         ))
     calls.sort(key=lambda row: row["started"])
     return calls
+
+
+def interval_seconds(intervals) -> float:
+    """Union of observed intervals; parallel calls are not counted twice."""
+    total, end = 0.0, None
+    for begin, finish in sorted(intervals):
+        total += max(0.0, finish - max(begin, end if end is not None else begin))
+        end = max(finish, end if end is not None else finish)
+    return total
+
+
+def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
+    """Read-only observations for comparison, not a causal ROI/quality score."""
+    calls = {c["id"]: c for c in load_calls(run_dir, con)}
+    unreadable_rows = 0
+    for row in query(con, "select operation_id, start_json, completion_json, application_ref from d4_operations"):
+        try:
+            start = json.loads(row["start_json"])
+            completion = json.loads(row["completion_json"] or "{}")
+            if not isinstance(start, dict) or not isinstance(completion, dict):
+                raise ValueError("invalid operation record")
+        except (TypeError, ValueError):
+            unreadable_rows += 1
+            continue
+        if start.get("category") == "tool_dispatch" or start.get("role") not in {"inner_action", "outer_planning"}:
+            continue
+        identity = row["operation_id"]
+        saved = read_payload(run_dir / "stage-evidence" / ("stage-request-" + identity + ".json"))
+        request = saved.get("request") or {}
+        call = calls.setdefault(identity, dict(id=identity, stage=request.get("stage") or start["category"],
+            started=start.get("started_at"), duration=None, usage={}, correction=bool(request.get("correction_of_model_request_id")),
+            error=None, finish="-"))
+        call.update(finished=completion.get("finished_at"), ledger_state=completion.get("result_kind"),
+            applied=row["application_ref"] is not None, ledger_known=True, started_known=start.get("started_at") is not None)
+    planning = {"stage_intent", "stage_roads", "stage_continuation"}
+    grouped, intervals, plan_intervals = {}, [], []
+    for call in calls.values():
+        group = grouped.setdefault(call["stage"], dict(calls=0, cumulative_seconds=0.0,
+            timing_known=0, corrections=0, errors=0, unsettled=0, ledger_unknown=0, applied=0, tokens={}))
+        group["calls"] += 1
+        group["corrections"] += bool(call["correction"])
+        group["errors"] += bool(call["error"] or call.get("ledger_state") in {"failed", "rejected"})
+        group["unsettled"] += bool(call.get("ledger_known") and call.get("ledger_state") is None)
+        group["ledger_unknown"] += not call.get("ledger_known", False)
+        group["applied"] += bool(call.get("applied"))
+        begin, finish, duration = call["started"], call.get("finished"), call["duration"]
+        if begin is not None and finish is not None:
+            duration = max(0.0, finish - begin)
+        if duration is not None:
+            group["cumulative_seconds"] += duration
+            group["timing_known"] += 1
+            if begin is not None and call.get("started_known"):
+                span = (begin, begin + duration)
+                intervals.append(span)
+                if call["stage"] in planning:
+                    plan_intervals.append(span)
+        usage = call.get("usage") or {}
+        for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens"):
+            value = ((usage.get("completion_tokens_details") or {}).get(key) if key == "reasoning_tokens" else usage.get(key))
+            metric = group["tokens"].setdefault(key, dict(known_calls=0, total=None))
+            if type(value) is int and value >= 0:
+                metric["known_calls"] += 1
+                metric["total"] = (metric["total"] or 0) + value
+    turns = query(con, "select turn_id, achievement_json from stage_turns")
+    outcomes = dict(stage_data_available=bool(query(con, "select name from sqlite_master where name='stage_turns'")),
+        turns=len(turns), achieved_turns=sum(bool(r["achievement_json"]) for r in turns),
+        roads={r[0]: r[1] for r in query(con, "select status, count(*) from stage_roads group by status")},
+        stored_verified_facts=scalar(con, "select count(*) from facts where status='verified'"),
+        task_status=load_task(con).get("status"))
+    result = find_result(run_dir, run_dir.name)
+    outcomes["overall_goal"] = (result.get("overall_goal") or {}).get("outcome") if result else None
+    stops = sorted(run_dir.glob("dispatch-stop-*.json"), key=lambda p: p.stat().st_mtime)
+    stop = read_payload(stops[-1]) if stops else {}
+    outcomes["recorded_stop"] = stop.get("stop")
+    outcomes["stop_cause"] = (stop.get("diagnostic") or {}).get("cause_code") or stop.get("reason")
+    for group in grouped.values():
+        if not group["timing_known"]:
+            group["cumulative_seconds"] = None
+    model_union = interval_seconds(intervals) if intervals else None
+    plan_union = interval_seconds(plan_intervals) if intervals else None
+    return dict(stages=grouped, planning_stages=sorted(planning), outcomes=outcomes,
+        unreadable_ledger_rows=unreadable_rows,
+        model_interval_union_seconds=model_union, planning_interval_union_seconds=plan_union,
+        planning_share_of_observed_model_time=plan_union / model_union if model_union else None,
+        notes=["Cumulative call time may overlap; interval union removes overlap. Missing timing/usage is unknown, not zero.",
+            "Planning = stage_intent/roads/continuation. Reviews and completion checks are listed separately.",
+            "Applied includes consumed rejected proposals; it does not mean accepted or successful.",
+            "Achievements/Facts are stored records, not a fresh validity judgment; task_status may lag a recorded stop.",
+            "Outcomes are observations, not proof that planning caused improvement; compare matched tasks/configurations.",
+            "Reasoning tokens are part of completion tokens; never add them again.",
+            "Semantic duplicate work and exploration beyond the criterion are not inferred from counts.",
+            "Tolerant monitor: evidence is not binding-validated; use analyze_run_timing.py for strict reports."])
+
+
+def cmd_planning(args) -> int:
+    run_dir = resolve_run(args.run, state_dir(args.state_dir))
+    con = connect(run_dir / "control.sqlite")
+    try:
+        report = planning_report(run_dir, con)
+    finally:
+        con.close()
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    print("%-22s %5s %9s %7s %5s %5s %9s" % ("stage", "calls", "sum(s)", "timed", "corr", "error", "unsettled"))
+    for stage, group in sorted(report["stages"].items()):
+        print("%-22s %5d %9s %3d/%-3d %5d %5d %9d" % (stage, group["calls"],
+            "%.1f" % group["cumulative_seconds"] if group["timing_known"] else "unknown",
+            group["timing_known"], group["calls"], group["corrections"], group["errors"], group["unsettled"]))
+        print("  tokens " + " | ".join("%s=%s (%d/%d calls)" % (name, fmt_int(metric["total"]), metric["known_calls"], group["calls"])
+            for name, metric in group["tokens"].items()))
+    share = report["planning_share_of_observed_model_time"]
+    print("observed model union %ss | planning union %ss | share %s" % (
+        "%.1f" % report["model_interval_union_seconds"] if report["model_interval_union_seconds"] is not None else "unknown",
+        "%.1f" % report["planning_interval_union_seconds"] if report["planning_interval_union_seconds"] is not None else "unknown",
+        "%.1f%%" % (share * 100) if share is not None else "unknown"))
+    print("outcomes " + json.dumps(report["outcomes"], ensure_ascii=False))
+    print("unknown ledger %d calls | unreadable ledger %d rows" % (
+        sum(g["ledger_unknown"] for g in report["stages"].values()), report["unreadable_ledger_rows"]))
+    for note in report["notes"]:
+        print("note " + note)
+    return 0
 
 
 def last_file_activity(run_dir: Path) -> float | None:
@@ -846,7 +981,7 @@ def cmd_tools(args) -> int:
         print("  %-12s %s" % (prefix, ", ".join(sorted(grouped[prefix]))))
 
     print()
-    print("called     %d times" % sum(used.values()))
+    print("proposed   %d tool actions (valid decisions; inspect receipts for dispatch)" % sum(used.values()))
     if not used:
         print("  (no mcp_call recorded)")
     for name, count in used.most_common():
@@ -949,6 +1084,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cache", help="prompt-cache report by stage")
     p.add_argument("run", nargs="?", default="latest")
     p.set_defaults(func=cmd_cache)
+
+    p = sub.add_parser("planning", help="planning investment and observed outcomes; no causal quality score")
+    p.add_argument("run", nargs="?", default="latest")
+    p.add_argument("--json", action="store_true", help="structured observations for matched comparisons")
+    p.set_defaults(func=cmd_planning)
 
     p = sub.add_parser("tree", help="Turn / Intent structure")
     p.add_argument("run", nargs="?", default="latest")

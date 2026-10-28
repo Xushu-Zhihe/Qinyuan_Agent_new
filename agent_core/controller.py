@@ -90,7 +90,7 @@ from agent_core.operation_accounting import (
     D4AuditCategory,
     D4AuditEvent,
     D4AuditOutcome,
-    D4RecoveryRequired,
+    OperationRecoveryRequired,
 )
 from agent_core.process_facts import D5ProcessFact
 from agent_core.runtime import (
@@ -303,7 +303,7 @@ class TaskRunController(LegacyTaskRunController):
         d3_config = load_d3(task_run_id) if callable(load_d3) else None
         web_config = load_web(task_run_id) if callable(load_web) else None
         if d3_config is not None and web_config is not None:
-            raise D4RecoveryRequired("d4_run_configuration_ambiguous")
+            raise OperationRecoveryRequired("d4_run_configuration_ambiguous")
         config = d3_config if d3_config is not None else web_config
         if config is None or getattr(config, "d4_budget", None) is None:
             return None
@@ -321,7 +321,7 @@ class TaskRunController(LegacyTaskRunController):
         load = getattr(deps.store, "load_d4_audit_event", None)
         events = getattr(deps.store, "list_d4_audit_events", None)
         if not all(callable(item) for item in (record, load, events)):
-            raise D4RecoveryRequired("d4_audit_store_unavailable")
+            raise OperationRecoveryRequired("d4_audit_store_unavailable")
         return task_run_id, record, load, events
 
     def _record_d4_audit(
@@ -359,7 +359,7 @@ class TaskRunController(LegacyTaskRunController):
             related_ref,
         )
         if existing is not None and existing != event:
-            raise D4RecoveryRequired("d4_audit_event_binding_changed")
+            raise OperationRecoveryRequired("d4_audit_event_binding_changed")
         return record(event)
 
     def _d4_cleanup_state(self, resource_ref: str) -> tuple[str, str | None]:
@@ -2023,7 +2023,7 @@ class TaskRunController(LegacyTaskRunController):
             records = deps.store.list_d7_validation_feedback(request.task_run_id, request.candidate_id, request.evidence_version)
             validate_external_check_binding(request, records)
             if self._now_utc() >= task_run.deadline_at:
-                raise D4RecoveryRequired("d7_external_check_deadline_unknown_retained")
+                raise OperationRecoveryRequired("d7_external_check_deadline_unknown_retained")
             if request.checkpoint_sequence != state.latest_checkpoint.sequence + 1:
                 raise InvalidTransition(
                     "external check must bind the checkpoint created by its start record"
@@ -2043,7 +2043,7 @@ class TaskRunController(LegacyTaskRunController):
             return record
 
         if self._now_utc() >= task_run.deadline_at:
-            raise D4RecoveryRequired("d7_external_check_deadline_unknown_retained")
+            raise OperationRecoveryRequired("d7_external_check_deadline_unknown_retained")
 
         result = check(request)
         if not isinstance(result, ExternalValidationCheckResult):
@@ -2425,15 +2425,15 @@ class TaskRunController(LegacyTaskRunController):
             list_unresolved = getattr(deps.store, "blocking_d4_operations", None) or getattr(
                 deps.store, "list_d4_unresolved_operations", None)
             if not callable(list_unresolved):
-                raise D4RecoveryRequired("d4_operation_ledger_unavailable")
+                raise OperationRecoveryRequired("d4_operation_ledger_unavailable")
             unresolved = list_unresolved(task_run.task_run_id)
             if any(
                 item.start.task_run_id != task_run.task_run_id
                 for item in unresolved
             ):
-                raise D4RecoveryRequired("d4_operation_owner_changed")
+                raise OperationRecoveryRequired("d4_operation_owner_changed")
             if unresolved:
-                raise D4RecoveryRequired("d4_operation_outcome_unknown")
+                raise OperationRecoveryRequired("d4_operation_outcome_unknown")
         change = UpsertTaskRun(
             task_run_id=task_run.task_run_id,
             request=task_run.request,
@@ -2587,7 +2587,7 @@ class TaskRunController(LegacyTaskRunController):
                         raise SandboxCleanupError(
                             task_run.sandbox_id,
                             "prior cleanup outcome remains unknown",
-                            cleanup_error=D4RecoveryRequired(
+                            cleanup_error=OperationRecoveryRequired(
                                 "d4_cleanup_presence_unknown"
                             ),
                         )
@@ -2938,17 +2938,17 @@ class TaskRunController(LegacyTaskRunController):
                 or getattr(config, "d4_budget", None) is None
                 or not callable(list_unresolved)
             ):
-                raise D4RecoveryRequired("d7_feedback_wait_recovery_evidence_unavailable")
+                raise OperationRecoveryRequired("d7_feedback_wait_recovery_evidence_unavailable")
             unresolved = list_unresolved(task_run_id)
             if any(item.start.task_run_id != task_run_id for item in unresolved):
-                raise D4RecoveryRequired("d7_feedback_wait_operation_owner_changed")
+                raise OperationRecoveryRequired("d7_feedback_wait_operation_owner_changed")
             if unresolved:
-                raise D4RecoveryRequired("d7_feedback_wait_has_unresolved_operation")
+                raise OperationRecoveryRequired("d7_feedback_wait_has_unresolved_operation")
             if any(
                 execution.status is ExecutionStatus.RUNNING
                 for execution in state.executions
             ):
-                raise D4RecoveryRequired("d7_feedback_wait_has_running_execution")
+                raise OperationRecoveryRequired("d7_feedback_wait_has_running_execution")
         elif state.task_run.status not in TERMINAL_STATUSES:
             raise InvalidTransition(
                 "close requires a terminal TaskRun or a quiescent external-feedback wait"

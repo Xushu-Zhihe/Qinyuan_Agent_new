@@ -7,6 +7,7 @@ from time import monotonic
 from dataclasses import asdict, replace
 
 from agent_adapters.command_recorder import T6CommandRecorder, T6EvidenceError
+from agent_core.command_contracts import T6EvidenceCapacityError
 from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.conclusion_revision_contracts import D8ChangeDecision
 from agent_core.modeling import CancellationToken, ModelError, ModelErrorKind, model_call_timeout
@@ -17,8 +18,8 @@ from agent_core.stage_contracts import (
     StageFactProposal, StageModelEvidence, StageSessionSummary, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, StagePlanningDecision,
 )
-from agent_core.stage_planning import INNER_STAGES, StageModelRequest, model_contract, stage_output_issues, parse, request_from_dict
-from agent_core.stage_storage import StageRecoveryRequired, StageStateError, proposal_digest, _fail
+from agent_core.stage_planning import BUSINESS_ISSUE_CODES, INNER_STAGES, StageModelRequest, model_contract, stage_output_issues, parse, request_from_dict
+from agent_core.stage_storage import StageRecoveryRequired, StageStateError, proposal_digest, fact_scope_failure, _fail
 from agent_core.turn_modeling import digest, stable_id
 from qinyuan_core import Category, get_logger
 
@@ -30,8 +31,24 @@ class StageEvidence:
         self.http_validator = None
 
     def save(self, kind, identity, value):
-        self.records._write("stage-" + kind, identity,
-            json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False)))
+        try:
+            self.records._write("stage-" + kind, identity,
+                json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False)))
+        except T6EvidenceCapacityError as error:
+            self.capacity_error(error)
+        except T6EvidenceError as error:
+            if isinstance(error.__cause__, OSError):
+                _fail("stage.evidence_io_failed", Category.DEPENDENCY)
+            raise
+
+    def capacity_error(self, error):
+        operation = self.store.load_d4_operation(error.record_id)
+        failure = StageStateError("stage.evidence_capacity_exceeded", code="stage.evidence_capacity_exceeded")
+        failure.category = Category.CAPACITY
+        failure.evidence_capacity = dict(record_kind=error.record_kind, record_id=error.record_id,
+            actual_bytes=error.actual_bytes, limit_bytes=error.limit_bytes, dispatched=operation is not None)
+        get_logger("store").warning(failure.code, category="capacity", **failure.evidence_capacity)
+        raise failure from error
 
     def bind_http_reader(self, task_id):
         from types import SimpleNamespace
@@ -56,7 +73,11 @@ class StageEvidence:
     def read(self, kind, identity):
         try:
             return self.records._read("stage-" + kind, identity)
-        except T6EvidenceError:
+        except T6EvidenceCapacityError as error:
+            self.capacity_error(error)
+        except T6EvidenceError as error:
+            if isinstance(error.__cause__, OSError):
+                _fail("stage.evidence_io_failed", Category.DEPENDENCY)
             _fail("stage.evidence_corrupt", Category.UNKNOWN)
 
     def request(self, identity):
@@ -92,7 +113,7 @@ class StageEvidence:
                 _fail("stage.correction_binding_changed", Category.UNKNOWN)
             issues = stage_output_issues(source, D8ModelResponse(result["content"], result["finish_reason"], result.get("tool_calls")))
             feedback = {"correction_of_model_request_id": source_id, "source_result_sha256": digest(result),
-                "reason": "output_business_invalid" if any(i.code == "stage.formal_fact_required" for i in issues) else "output_format_invalid",
+                "reason": "output_business_invalid" if any(i.code in BUSINESS_ISSUE_CODES for i in issues) else "output_format_invalid",
                 "issues": [asdict(i) for i in issues]
                     or [{"code": "stage_value_invalid", "path": "$", "expected": "valid_stage_value", "actual": "invalid"}]}
         return {**model_contract(request), "correction": feedback}
@@ -244,7 +265,8 @@ class StageEvidence:
             for ref in candidate.support_refs:
                 item = resolve(ref)
                 if item.record_type == "progress" and (item.intent_id != reviewed.session.owner_id or item.turn_id != turn.turn_id):
-                    _fail("stage.fact_source_scope_changed", Category.POLICY)
+                    fact_scope_failure(item, reviewed.session, expected_turn_id=turn.turn_id,
+                        fact_id=identity if row else None, proposal_id=reviewed.proposal_operation_id, review_id=review_id)
                 supports.append(item)
             observations = [i for i in supports if i.record_type == "progress"]
             if row and (not observations or observations[0].record_id != row["source_ref"]
@@ -379,6 +401,7 @@ class StageModelCalls:
         self.capacity_port, self.capacity_config = capacity_port, capacity_config
         self.messages = lambda session: ()
         self.recover_capacity = None
+        self.live_operations = set()
 
     def _port_request(self, stage, context, operation_id, proposal_id=None, proposal=None):
         config = self.store.load_stage_run_config(context.task_run_id)
@@ -461,15 +484,20 @@ class StageModelCalls:
                 values.append((False, type(exc).__name__))
             finally:
                 finished.set()
-        threading.Thread(target=invoke, daemon=True, name="qinyuan-stage-model").start()
-        while not finished.is_set():
-            await asyncio.sleep(0.02)
-            if token.is_cancelled or self.clock() >= deadline or monotonic() >= expires:
+        identity = envelope.request.model_request_id
+        self.live_operations.add(identity)
+        try:
+            threading.Thread(target=invoke, daemon=True, name="qinyuan-stage-model").start()
+            while not finished.is_set():
+                await asyncio.sleep(0.02)
+                if token.is_cancelled or self.clock() >= deadline or monotonic() >= expires:
+                    raise StageRecoveryRequired("stage.model_outcome_unknown")
+            okay, value = values[0]
+            if not okay:
                 raise StageRecoveryRequired("stage.model_outcome_unknown")
-        okay, value = values[0]
-        if not okay:
-            raise StageRecoveryRequired("stage.model_outcome_unknown")
-        return value
+            return value
+        finally:
+            self.live_operations.discard(identity)
 
     async def call(self, request, token):
         request = self._freeze(request)
@@ -516,11 +544,23 @@ class StageModelCalls:
                 envelope = D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": contract["schema"]},
                     contract["instruction"], contract["correction"])
                 policy = self.capacity_config.inner_capacity if inner else self.capacity_config.outer_capacity
-                if not self.capacity_port.fits(envelope, policy):
+                storage_error = None
+                try:
+                    self.evidence.records.encode("stage-request", identity,
+                        {"request": asdict(request), "proposal_kind": type(request.proposal).__name__}, limit=1024 * 1024)
+                except T6EvidenceCapacityError as error:
+                    storage_error = error
+                if storage_error is not None or not self.capacity_port.fits(envelope, policy):
+                    if storage_error is not None:
+                        get_logger("store").info("stage.evidence_compaction_required", category="capacity",
+                            record_kind=storage_error.record_kind, record_id=identity,
+                            actual_bytes=storage_error.actual_bytes, limit_bytes=storage_error.limit_bytes, dispatched=False)
                     if request.stage != "stage_summary" and request.capacity_recovery_of is None and self.recover_capacity is not None:
                         recovered = await self.recover_capacity(request, token)
                         if recovered is not None:
                             return await self.call(recovered, token)
+                    if storage_error is not None:
+                        self.evidence.capacity_error(storage_error)
                     _fail("stage.model_capacity_blocked", Category.CAPACITY)
                 start = D4OperationStart(identity, request.task_run_id, category, self.clock(),
                     request.base_checkpoint_sequence, digest(asdict(request)),
@@ -547,7 +587,7 @@ class StageModelCalls:
                         outcome = "invalid"
                         code = "stage.output_envelope_invalid" if error.args == ("stage.output_envelope_invalid",) else "stage.output_invalid"
                         issues = stage_output_issues(request, D8ModelResponse(content, finish, tool_calls))
-                        if any(i.code == "stage.formal_fact_required" for i in issues):
+                        if any(i.code in BUSINESS_ISSUE_CODES for i in issues):
                             code = "stage.proposal_business_invalid"
                         get_logger("model").warning("stage.output_rejected", run=request.task_run_id,
                             operation=identity, phase=request.stage, code=code, category="input",

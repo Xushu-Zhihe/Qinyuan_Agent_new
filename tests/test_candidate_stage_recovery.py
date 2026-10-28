@@ -13,8 +13,8 @@ from test_turn_budget import make_case
 
 from agent_adapters.web import candidate_evidence
 from agent_adapters.web.candidate_evidence import D7CandidateEvidenceService
-from agent_core.dual_llm_contracts import D3RecoveryRequired
-from agent_core.dual_llm_modeling import D3ProposalRejected
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+from agent_core.dual_llm_modeling import ExecutionProposalRejected
 from agent_core.runtime import TaskRunStatus
 
 
@@ -90,7 +90,7 @@ def test_candidate_stage_rejects_unsupported_review_signal_without_saving_body(
     value = "review-signal-private-value"
     app, token, service, model = _make_run(tmp_path, monkeypatch, value)
     model.candidate_review_requested = True
-    with pytest.raises(D3ProposalRejected, match="d3_candidate_review_not_supported"):
+    with pytest.raises(ExecutionProposalRejected, match="d3_candidate_review_not_supported"):
         asyncio.run(app.propose_d7_candidate(token, service))
 
     assert app.store.list_d7_answer_candidates(app.state.task_run.task_run_id) == ()
@@ -117,10 +117,10 @@ def test_unknown_candidate_model_call_is_never_redispatched(tmp_path, monkeypatc
         return original_invoke(request, *args)
 
     monkeypatch.setattr(model, "invoke", lose_candidate_response)
-    with pytest.raises(D3RecoveryRequired, match="d3_model_call_outcome_unknown"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_model_call_outcome_unknown"):
         asyncio.run(app.propose_d7_candidate(token, service))
     with pytest.raises(
-        D3RecoveryRequired, match="d3_candidate_model_call_outcome_unknown"
+        ExecutionRecoveryRequired, match="d3_candidate_model_call_outcome_unknown"
     ):
         asyncio.run(app.propose_d7_candidate(token, service))
 

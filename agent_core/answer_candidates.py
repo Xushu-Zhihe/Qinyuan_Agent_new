@@ -4,7 +4,7 @@ from agent_core.http_contracts import plan_turn_binding
 from dataclasses import asdict, dataclass
 
 from agent_core.domain import IntentStatus, ExecutionStatus, PlanStatus
-from agent_core.dual_llm_contracts import D3PlanBinding, D3PlanResult, D3TurnBinding, D3RecoveryRequired
+from agent_core.dual_llm_contracts import D3PlanBinding, D3PlanResult, D3TurnBinding, ExecutionRecoveryRequired
 from agent_core.turn_modeling import digest
 from agent_core.dual_llm_modeling import D3CandidateContext, D3ModelRequest, D8SessionExecutionRequest
 from agent_core.goal_feedback import project_candidate_feedback
@@ -37,16 +37,16 @@ class AnswerCandidates:
                 data['process_facts'] = tuple(data['process_facts'])
                 request = D8SessionExecutionRequest(**data)
             except (TypeError, ValueError, KeyError) as exc:
-                raise D3RecoveryRequired('d9_candidate_request_invalid') from exc
+                raise ExecutionRecoveryRequired('d9_candidate_request_invalid') from exc
             if (request.model_request_id != identity or request.task_run_id != self.app.state.task_run.task_run_id
                     or provenance(request.context)['intent_id'] != intent.intent_id
                     or provenance(request.context)['turn_id'] != intent.turn_id
                     or request.context.goal != self.app.state.task_run.request.goal):
-                raise D3RecoveryRequired('d9_candidate_request_binding_changed')
+                raise ExecutionRecoveryRequired('d9_candidate_request_binding_changed')
             self.app.sessions.freeze(request)
             return request
         if self.store.load_d3_operation(identity) is not None:
-            raise D3RecoveryRequired('d9_candidate_frozen_request_missing')
+            raise ExecutionRecoveryRequired('d9_candidate_frozen_request_missing')
         state = self.app.state
         plans = {p.plan_id: p for p in state.plans
                  if p.intent_id == intent.intent_id and p.status is PlanStatus.COMPLETED}
@@ -62,7 +62,7 @@ class AnswerCandidates:
         # absent ExecutionSnapshot.finished_at or ambiguous equal timestamps.
         order = {r.start.operation_id: n for n, r in enumerate(operations)} if latest else {}
         if latest is not None and execution is not None and execution.execution_id not in order:
-            raise D3RecoveryRequired('d9_candidate_source_missing')
+            raise ExecutionRecoveryRequired('d9_candidate_source_missing')
         if latest is not None and (execution is None or order[latest.start.operation_id] > order[execution.execution_id]):
             context=MCPAnswerCandidateContext(state.task_run.request.goal,
                 state.task_run.task_run_id,intent.turn_id,intent.intent_id,
@@ -75,13 +75,13 @@ class AnswerCandidates:
                         (r.start.resource_ref or '').startswith('mcp/'+intent.intent_id+'/experiment/')
                         and r.completion is not None and r.completion.result_kind == 'completed' for r in operations):
                     return None  # Known unsupported source; local progress still reaches planning.
-                raise D3RecoveryRequired('d9_candidate_source_missing')
+                raise ExecutionRecoveryRequired('d9_candidate_source_missing')
             binding = self.store.load_d3_plan_binding(execution.plan_id)
             result = self.store.load_d3_plan_result(execution.plan_id)
             turn = plan_turn_binding(self.store,binding) if binding else None
             if (binding is None or result is None or turn is None or result.outcome not in
                     ({'satisfied','no_new_information','observed'} if self.app.config.contract_version==22 else {'satisfied'})):
-                raise D3RecoveryRequired('d9_candidate_source_not_satisfied')
+                raise ExecutionRecoveryRequired('d9_candidate_source_not_satisfied')
             context = AnswerCandidateContext(turn, binding, execution.execution_id, result, state.task_run.request.goal)
         role = self.app.config.inner_role
         request = D3ModelRequest(identity, state.task_run.task_run_id, state.latest_checkpoint.sequence,
@@ -90,7 +90,7 @@ class AnswerCandidates:
 
     async def after_success(self, intent, token):
         if intent.status is not IntentStatus.SUCCEEDED:
-            raise D3RecoveryRequired('d9_candidate_requires_local_success')
+            raise ExecutionRecoveryRequired('d9_candidate_requires_local_success')
         request = self._request(intent)
         if request is None:
             from qinyuan_core import get_logger
@@ -99,7 +99,7 @@ class AnswerCandidates:
             return False
         identity, candidate = await self.app.inner.propose_candidate(request, token, self.protected_factory())
         if token.is_cancelled:
-            raise D3RecoveryRequired('d9_candidate_registration_cancelled')
+            raise ExecutionRecoveryRequired('d9_candidate_registration_cancelled')
         model = self.app.model_evidence.read(identity)
         decision = {'version': 1, 'task_run_id': request.task_run_id, 'intent_id': intent.intent_id,
                     'model_request_id': identity, 'request_sha256': digest(asdict(request)),
@@ -117,7 +117,7 @@ class AnswerCandidates:
             if self.store.load_d7_answer_candidate(candidate.candidate_id) is None:
                 return True
         elif registered != candidate:
-            raise D3RecoveryRequired('d9_registered_candidate_changed')
+            raise ExecutionRecoveryRequired('d9_registered_candidate_changed')
         self.store.mark_d3_operation_applied(identity, candidate.candidate_id)
         if self.app.state.task_run.status.value == 'running':
             self.app.sessions.reconcile()
@@ -134,14 +134,14 @@ class AnswerCandidates:
         for operation in self.store.list_d3_operations(self.app.state.task_run.task_run_id):
             if (operation.application_ref is not None and operation.start.resource_ref.startswith('answer-candidate/')
                     and self.evidence.read('answer-decision', operation.start.operation_id) is None):
-                raise D3RecoveryRequired('d9_candidate_decision_missing')
+                raise ExecutionRecoveryRequired('d9_candidate_decision_missing')
             if (operation.start.category == 'inner_model'
                     and operation.start.resource_ref.startswith('answer-candidate/')
                     and operation.application_ref is None):
                 intent_id = operation.start.resource_ref.removeprefix('answer-candidate/')
                 intent = next((i for i in self.app.state.intents if i.intent_id == intent_id), None)
                 if intent is None or operation.start.operation_id != self._identity(intent_id):
-                    raise D3RecoveryRequired('d9_candidate_operation_owner_changed')
+                    raise ExecutionRecoveryRequired('d9_candidate_operation_owner_changed')
                 await self.after_success(intent, token)
 
     def feedback_history(self):
@@ -157,7 +157,7 @@ class AnswerCandidates:
     async def apply_feedback(self, feedback, token):
         """Trusted in-process adapter boundary; never accepts a public verdict file."""
         if token.is_cancelled:
-            raise D3RecoveryRequired('d9_feedback_cancelled_before_application')
+            raise ExecutionRecoveryRequired('d9_feedback_cancelled_before_application')
         from agent_core.controller import CommittedStateReloadError
         try:
             self.app.controller.apply_external_validation_feedback(feedback)
@@ -182,11 +182,11 @@ def check_request(store, task, selection, checkpoint):
     if prior is not None:
         request = prior.request
         if any(getattr(request, k) != v for k, v in selection.items()) or request.task_run_id != task:
-            raise D3RecoveryRequired('d9_validation_query_identity_changed')
+            raise ExecutionRecoveryRequired('d9_validation_query_identity_changed')
     else:
         candidate = store.load_d7_answer_candidate(selection['candidate_id'])
         if candidate is None or candidate.task_run_id != task or candidate.evidence_version != selection['evidence_version']:
-            raise D3RecoveryRequired('d9_validation_candidate_binding_changed')
+            raise ExecutionRecoveryRequired('d9_validation_candidate_binding_changed')
         records = store.list_d7_validation_feedback(task, candidate.candidate_id, candidate.evidence_version)
         projection = project_candidate_feedback(task, candidate.candidate_id, candidate.evidence_version, records)
         by_id = {r.operation_id: r for r in records}
@@ -204,7 +204,7 @@ def check_no_candidate(config, output, sessions, native, operation):
     frozen = sessions.read('request', identity)
     contract = output.read('contract', identity)
     if not isinstance(frozen, dict) or not isinstance(contract, dict):
-        raise D3RecoveryRequired('d9_candidate_frozen_request_missing')
+        raise ExecutionRecoveryRequired('d9_candidate_frozen_request_missing')
     request = frozen['request']
     if (contract.get('source_request_sha256') != digest(request)
             or native.model_request_id != identity or native.task_run_id != operation.start.task_run_id
@@ -212,18 +212,18 @@ def check_no_candidate(config, output, sessions, native, operation):
             or native.context_sha256 != operation.start.context_sha256
             or native.base_checkpoint_sequence != operation.start.base_checkpoint_sequence
             or native.resource_ref != operation.start.resource_ref):
-        raise D3RecoveryRequired('d9_no_candidate_binding_changed')
+        raise ExecutionRecoveryRequired('d9_no_candidate_binding_changed')
     completion = operation.completion
     if completion is not None and (completion.result_kind != 'completed'
             or completion.evidence_ref != identity or completion.evidence_sha256 != digest(asdict(native))):
-        raise D3RecoveryRequired('d9_no_candidate_completion_changed')
+        raise ExecutionRecoveryRequired('d9_no_candidate_completion_changed')
     decision = output.read('answer-decision', identity)
     expected = {'version': 1, 'task_run_id': operation.start.task_run_id,
                 'intent_id': request['context'].get('intent_id') or request['context']['plan_binding']['intent_id'],
                 'model_request_id': identity, 'request_sha256': digest(request),
                 'result_sha256': digest(asdict(native)), 'candidate': None}
     if decision is not None and decision != expected:
-        raise D3RecoveryRequired('d9_candidate_decision_changed')
+        raise ExecutionRecoveryRequired('d9_candidate_decision_changed')
     if operation.application_ref is not None and operation.application_ref != 'd9_no_candidate':
-        raise D3RecoveryRequired('d9_candidate_application_changed')
+        raise ExecutionRecoveryRequired('d9_candidate_application_changed')
     return completion is None or decision is None or operation.application_ref is None

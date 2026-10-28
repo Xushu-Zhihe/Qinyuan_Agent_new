@@ -47,7 +47,7 @@ from agent_core.goal_candidates import D7AnswerCandidate
 from agent_core.operation_accounting import (
     D4OperationCompletion,
     D4OperationStart,
-    D4RecoveryRequired,
+    OperationRecoveryRequired,
 )
 from agent_core.modeling import IntentCandidate, ModelError, ModelErrorKind
 from agent_core.runtime import TERMINAL_STATUSES, TaskRunStatus
@@ -270,7 +270,7 @@ class D7WebApplication:
                         for item in self.store.list_d7_web_executions(self.task_run_id)
                     )
                     if pending or started_http:
-                        raise D4RecoveryRequired("d7_web_started_operation_outcome_unknown")
+                        raise OperationRecoveryRequired("d7_web_started_operation_outcome_unknown")
                     if self.controller.status() is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK:
                         pass
                     elif not self.state.turns and not self.store.list_d4_operations(self.task_run_id):
@@ -280,7 +280,7 @@ class D7WebApplication:
                         self._attach_http()
                         self._execute_turn()
                     else:
-                        raise D4RecoveryRequired("d7_web_resume_checkpoint_not_replayable")
+                        raise OperationRecoveryRequired("d7_web_resume_checkpoint_not_replayable")
             else:
                 raise ValueError("unsupported_v3_operation")
             from agent_adapters.web.task_result import snapshot_v3_task_result
@@ -296,7 +296,7 @@ class D7WebApplication:
 
     def _invoke(self, role, stage: str, context: dict, resource_ref: str) -> tuple[dict, str]:
         if self.token.is_cancelled:
-            raise D4RecoveryRequired("d7_cancel_requested_before_model_dispatch")
+            raise OperationRecoveryRequired("d7_cancel_requested_before_model_dispatch")
         category = "planning" if role.role == "outer_planning" else "action"
         prior = [
             record
@@ -306,7 +306,7 @@ class D7WebApplication:
             and record.start.role_config_ref == role.role_config_ref
         ]
         if any(record.completion is None for record in prior):
-            raise D4RecoveryRequired("d7_model_started_operation_outcome_unknown")
+            raise OperationRecoveryRequired("d7_model_started_operation_outcome_unknown")
         attempt = len(prior) + 1
         material = (
             f"qinyuan:d7-web:model:{self.task_run_id}:"
@@ -329,7 +329,7 @@ class D7WebApplication:
         )
         existing = self.store.begin_d4_operation(start)
         if existing is not None:
-            raise D4RecoveryRequired("d7_model_operation_result_requires_reconciliation")
+            raise OperationRecoveryRequired("d7_model_operation_result_requires_reconciliation")
         result = invoke_d7_web_role(
             role,
             self._role_settings(role),
@@ -485,7 +485,7 @@ class D7WebApplication:
                 finished_at=time.time(),
             )
             self.store.complete_d7_web_execution(unknown)
-            raise D4RecoveryRequired("d7_http_execution_outcome_unknown")
+            raise OperationRecoveryRequired("d7_http_execution_outcome_unknown")
         completed = replace(
             started,
             state="completed",
@@ -571,7 +571,7 @@ class D7WebApplication:
             if item.turn_id == turn.turn_id and item.status is IntentStatus.RUNNING
         ]
         if len(running_intents) > 1:
-            raise D4RecoveryRequired("d7_web_multiple_running_intents")
+            raise OperationRecoveryRequired("d7_web_multiple_running_intents")
         if not running_intents:
             self._select_intent(turn.turn_id)
             intent = next(
@@ -635,7 +635,7 @@ class D7WebApplication:
             if action["kind"] == "stop":
                 self._commit(lambda working: working.mark_intent_inconclusive(intent_id=intent.intent_id))
                 return False
-        raise D4RecoveryRequired("d7_web_action_loop_budget_exhausted")
+        raise OperationRecoveryRequired("d7_web_action_loop_budget_exhausted")
 
     def _execute(self) -> None:
         for _ in range(16):
@@ -646,7 +646,7 @@ class D7WebApplication:
                 return
             if self.state.turns[-1].status not in {TurnStatus.COMPLETED, TurnStatus.INCONCLUSIVE, TurnStatus.FAILED}:
                 return
-        raise D4RecoveryRequired("d7_web_turn_budget_exhausted")
+        raise OperationRecoveryRequired("d7_web_turn_budget_exhausted")
 
 
 def run_d7_web_task(directory: Path, declaration: dict, *, operation: str, settings: DeepSeekSettings | None) -> dict:

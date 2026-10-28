@@ -19,7 +19,7 @@ mcp = FastMCP(
     instructions=(
         "Prepare general PHP CLI commands for execution inside the current "
         "Agent sandbox. Use run_php for code without PHP opening or closing "
-        "tags, and run_php_file for a PHP file under /challenge or /work. "
+        "tags, and run_php_file for a PHP file under /workspace/input, /workspace/work or /tmp. "
         "This server never executes PHP itself."
     ),
     json_response=True,
@@ -68,7 +68,7 @@ def run_php_file(
     arguments: list[str] | None = None,
     timeout_seconds: int = 60,
 ) -> dict[str, Any]:
-    """Run a PHP file under /challenge or /work with optional arguments."""
+    """Run a PHP file under /workspace/input, /workspace/work or /tmp with optional arguments."""
 
     normalized_path = validate_sandbox_path(path)
     normalized_arguments = _validate_arguments(

@@ -10,7 +10,7 @@ from agent_adapters import task_cli
 from agent_adapters.deepseek_roles import build_payload, role_config
 from agent_adapters.output_evidence import FileD8OutputEvidence
 from agent_core.conclusion_contracts import D16Observation, D8ModelRequest
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.output_contracts import decode_response, output_schema, D8ModelResponse
 from agent_core.plan_policy import policy_for, plan_schema, validate
 from agent_core.turn_modeling import digest
@@ -85,11 +85,11 @@ def test_reuse_requires_explicit_member_of_frozen_proof_choices(case16):
         prior_plan_ids=(c.app.state.plans[0].plan_id,), reusable_proof_ids=(proof,)))
     choice = {'template': 'sha256_only', 'observation_mode': 'reuse_saved_proof', 'source_proof_id': proof}
     assert not decode_response(choice, plan_schema(req))[1]
-    from agent_core.dual_llm_modeling import parse_d3_plan_proposal, D3ProposalRejected
+    from agent_core.dual_llm_modeling import parse_d3_plan_proposal, ExecutionProposalRejected
     validate(req, parse_d3_plan_proposal(choice))
     foreign = {**choice, 'source_proof_id': str(uuid4())}
     assert decode_response(foreign, plan_schema(req))[1]
-    with pytest.raises(D3ProposalRejected): validate(req, parse_d3_plan_proposal(foreign))
+    with pytest.raises(ExecutionProposalRejected): validate(req, parse_d3_plan_proposal(foreign))
 
 
 @pytest.mark.parametrize('output_case', [16], indirect=True)
@@ -236,7 +236,7 @@ def test_fact_projection_cannot_be_forged_or_downgraded(case16, change):
     else:
         forged = replace(req, observation=replace(req.observation, rule_binding_sha256='0' * 64))
     before = len(calls(c, 'fact_review'))
-    with pytest.raises(D3RecoveryRequired, match='s6_fact_source_projection_changed'):
+    with pytest.raises(ExecutionRecoveryRequired, match='s6_fact_source_projection_changed'):
         c.app.conclusions._known(forged, repair=False)
     assert len(calls(c, 'fact_review')) == before
 
@@ -253,7 +253,7 @@ def test_reason_measurement_tamper_pauses(case16):
     envelope['payload']['reason_lengths']['rationale'] += 1
     envelope['sha256'] = digest(envelope['payload'])
     file.write_text(json.dumps(envelope), encoding='utf-8')
-    with pytest.raises(D3RecoveryRequired, match='d9_review_binding_changed'):
+    with pytest.raises(ExecutionRecoveryRequired, match='d9_review_binding_changed'):
         c.app.review_diagnostics.known(request)
 
 

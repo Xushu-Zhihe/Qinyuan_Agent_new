@@ -5,7 +5,7 @@ import json
 
 from agent_core.review_policy import ACTION_KINDS, MAX_ACTION_TIMEOUT, unavailable_decisions
 from agent_core.turn_modeling import digest
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 
 
 CLASSIFICATIONS = ("meaningful", "repetitive", "inconclusive")
@@ -31,7 +31,7 @@ def freeze_policy(app, context, turn_id, intent_id, scope, actions, timeout):
     latest = recent[-1]["ref"] if recent else None
     if (not recent or recent[-1]["ordinal"] != progress["decision_count"]
             or latest not in context["source_versions"]):
-        raise D3RecoveryRequired("s3_latest_decision_unavailable")
+        raise ExecutionRecoveryRequired("s3_latest_decision_unavailable")
     unavailable = unavailable_decisions(app.state, turn_id, intent_id, app.config.max_turns, rolling=bool(app.config.intent_execution_policy))
     sibling, replan = "switch_sibling_intent" not in unavailable, "replan_current_intent" not in unavailable
     mode = progress["mode"]
@@ -78,7 +78,7 @@ def policy_for(request):
                 or not 1 <= p["max_action_timeout_seconds"] <= MAX_ACTION_TIMEOUT):
             raise ValueError("policy")
     except (KeyError, TypeError, ValueError) as exc:
-        raise D3RecoveryRequired("s3_progress_policy_invalid") from exc
+        raise ExecutionRecoveryRequired("s3_progress_policy_invalid") from exc
     return p
 
 

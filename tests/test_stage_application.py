@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -15,8 +15,8 @@ from agent_core.actions import MCPCall
 from agent_core.domain import IntentStatus
 from agent_core.control_store import TargetNetworkBinding
 from agent_core.handoff_contracts import D8HandoffConfig, D8CapacityPolicy
-from agent_core.dual_llm_contracts import D3RunConfig, D3Authorization
-from agent_core.operation_accounting import D8HandoffBudgetPolicy, D4RecoveryRequired
+from agent_core.dual_llm_contracts import D3RunConfig, D3Authorization, ExecutionRecoveryRequired
+from agent_core.operation_accounting import D8HandoffBudgetPolicy, OperationRecoveryRequired
 from agent_core.output_contracts import D8ModelResponse
 from agent_core.stage_contracts import PlanningSession, StageStateChange
 from agent_core.stage_contracts import TurnCompletion
@@ -251,7 +251,7 @@ def test_unknown_tool_is_not_replayed_after_restart(case):
     asyncio.run(case.app.close())
     case.app = StageApplication(case.path, **case.args)
     case.app.bind(task_id)
-    with pytest.raises(D4RecoveryRequired):
+    with pytest.raises(OperationRecoveryRequired):
         asyncio.run(case.app.run(case.token))
     assert len(case.tools.calls) == 1
 
@@ -466,7 +466,7 @@ def test_correction_receives_frozen_exact_length_feedback(case, native):
         role = role_config("inner_action", version=17)
         outgoing = replace(envelope, request=replace(envelope.request, role_config_ref=role.role_config_ref))
         payload = build_payload(outgoing, role)
-        assert '"actual": "unicode_codepoints_806"' in payload["messages"][2]["content"]
+        assert '"actual": "unicode_codepoints_806"' in payload["messages"][-2]["content"]
 
 
 def test_native_output_preserves_raw_identity_and_canonical_history(case):
@@ -597,6 +597,71 @@ def test_premature_completion_is_corrected_before_outer_and_then_creates_fact(ca
     assert any(i.record_type == "verified_fact" for i in case.app.evidence.history(case.app.task_id))
 
 
+@pytest.mark.parametrize("source_kind", ["import", "other_road", "feedback", "inference", "formal_only", "own_tool"])
+def test_fact_sources_are_checked_before_review(source_kind):
+    from agent_core.handoff_contracts import D8HistoryItem
+    from agent_core.stage_planning import stage_output_issues
+    task, turn_id, road_id = (str(uuid4()) for _ in range(3))
+    own = D8HistoryItem(str(uuid4()), task, "progress", turn_id, road_id, None,
+        "observed", (), "a" * 64, 1, "tool_observation_not_fact", "current", "available")
+    extra = {
+        "import": replace(own, record_id="import/" + str(uuid4()), turn_id=None, intent_id=None, identity="imported_attachment_not_fact"),
+        "other_road": replace(own, record_id=str(uuid4()), intent_id=str(uuid4())),
+        "feedback": replace(own, record_id="feedback/" + str(uuid4()), identity="reviewed_feedback_not_fact"),
+        "inference": replace(own, record_type="reviewed_inference", identity="reviewed_inference_not_verified"),
+        "formal_only": replace(own, record_type="verified_fact", identity="reviewed_formal_fact"),
+        "own_tool": own,
+    }[source_kind]
+    turn = StageTurnSnapshot(turn_id, TurnIntent("inspect", "observed"), TurnPlanningState.ACTIVE)
+    request = StageModelRequest(str(uuid4()), task, "stage_action", "test-role", 1,
+        TurnPlanningContext(task, "inspect", PlanningSession("road_execution", road_id), turn, (own, extra)))
+    refs = [extra.ref] if source_kind in {"formal_only", "own_tool"} else [own.ref, extra.ref]
+    raw = native_response(dict(kind="fact_candidate", content="observed", reason="direct observation", support_refs=refs, inferred=False))
+    if source_kind == "own_tool":
+        assert isinstance(parse(request, raw), StageFactProposal)
+        assert not stage_output_issues(request, raw)
+    else:
+        with pytest.raises(ValueError):
+            parse(request, raw)
+        issue = stage_output_issues(request, raw)[0]
+        assert issue.code == ("stage.formal_fact_requires_own_observation" if source_kind == "formal_only" else "stage.fact_source_ineligible")
+
+
+def test_fact_source_failure_preserves_safe_scope_diagnostics():
+    from agent_core.handoff_contracts import D8HistoryItem
+    from agent_core.stage_storage import fact_scope_failure
+    from agent_adapters.output_evidence import safe_failure_details
+    task, turn, road, proposal, review, fact = (str(uuid4()) for _ in range(6))
+    source = D8HistoryItem("import/" + str(uuid4()), task, "progress", None, None, None,
+        "private content must not appear in diagnostics", (), "a" * 64, 1,
+        "imported_attachment_not_fact", "current", "available")
+    with pytest.raises(StageStateError) as caught:
+        fact_scope_failure(source, PlanningSession("road_execution", road), expected_turn_id=turn,
+            fact_id=fact, proposal_id=proposal, review_id=review, reason="source_not_tool_dispatch")
+    details = safe_failure_details(caught.value)["fact_source"]
+    assert details["source_ref"] == source.ref and details["fact_id"] == fact
+    assert details["expected_owner_id"] == road and details["expected_turn_id"] == turn
+    assert details["actual_road_id"] is None and details["actual_turn_id"] is None
+    assert "private content" not in json.dumps(details)
+
+
+def test_fact_source_changed_at_commit_still_stops_with_original_ids(case, monkeypatch, caplog):
+    from agent_core import stage_storage
+    read_history = stage_storage.read_history
+    def changed_scope(store, task_id, refs):
+        return tuple(replace(i, intent_id=None) if i.record_type == "progress" else i
+            for i in read_history(store, task_id, refs))
+    monkeypatch.setattr(stage_storage, "read_history", changed_scope)
+    with pytest.raises(StageStateError, match="stage.fact_source_scope_changed") as caught:
+        asyncio.run(case.app.run(case.token))
+    details = caught.value.context["fact_source"]
+    assert details["fact_id"] and details["proposal_operation_id"] and details["review_operation_id"]
+    assert details["expected_turn_id"] and details["expected_owner_id"] and details["actual_road_id"] is None
+    assert case.app.store._connection.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+    assert len(case.tools.calls) == 1
+    assert any(getattr(r, "qy", {}).get("fact_source") == details for r in caplog.records)
+
+
 @pytest.mark.parametrize("first", ["format", "business"])
 def test_completion_business_and_format_errors_share_one_correction(case, first):
     attempted = []
@@ -725,7 +790,7 @@ def test_stop_after_known_inner_result_prevents_next_review_and_registration(cas
         else: case.now.value += 3601
         return raw
     case.models.inner.transform = transform
-    with pytest.raises(D4RecoveryRequired, match="dispatch_stopped") as error:
+    with pytest.raises(OperationRecoveryRequired, match="dispatch_stopped") as error:
         asyncio.run(case.app.run(case.token))
     from qinyuan_core import Category, classify
     assert classify(error.value) == (Category.POLICY, "stage.dispatch_stopped", False)
@@ -752,7 +817,7 @@ def test_real_provider_payload_keeps_role_and_reasoning_parameters(case):
     request = replace(request, role_config_ref=inner.role_config_ref)
     envelope = D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": schema(request)}, model_contract(request)["instruction"], None)
     payload = build_payload(envelope, inner)
-    assert "Do not copy the contract envelope" in payload["messages"][2]["content"]
+    assert "Do not copy the contract envelope" in payload["messages"][-2]["content"]
     assert payload["tool_choice"] == "auto" and payload["tools"][0]["function"]["name"] == OUTPUT_TOOL
     assert "response_format" not in payload
     history = replace(request, messages=({"role": "assistant", "content": '{"kind":"roads"}'},))
@@ -766,6 +831,25 @@ def test_real_provider_payload_keeps_role_and_reasoning_parameters(case):
     request = replace(request, stage="stage_summary", role_config_ref=outer.role_config_ref)
     envelope = replace(envelope, request=request, output_contract={"version": 1, "stage": request.stage, "schema": schema(request)})
     assert build_payload(envelope, outer)["reasoning_effort"] == "max"
+
+
+def test_execution_channels_are_frozen_for_inner_outer_and_catalog(case):
+    from agent_adapters.deepseek_roles import build_payload, role_config
+    from agent_core.output_contracts import D8OutputRequest
+    from agent_core.stage_planning import model_contract
+    asyncio.run(case.app.mcp.open())
+    assert 'sandbox-only' in case.app.mcp.tools[0]['tags']
+    for stage, name in [('stage_intent', 'inner_action'), ('stage_supervision', 'outer_planning')]:
+        role = role_config(name, version=17)
+        req = replace(case.app._request(stage, PlanningSession('turn_planning', case.app._id('stage/root'))),
+            role_config_ref=role.role_config_ref)
+        contract = model_contract(req)
+        payload = build_payload(D8OutputRequest(req, {'version': 1, 'stage': stage, 'schema': contract['schema']},
+            contract['instruction'], None), role)
+        runtime = next(m['content'] for m in payload['messages'] if m['role'] == 'system' and 'Trusted execution' in m['content'])
+        assert 'network_mode=none' in runtime and 'localhost' in runtime
+        assert 'No http.run_experiment target channel' in runtime
+        assert not req.tools and 'does not prove target behavior' in runtime
 
 
 @pytest.mark.parametrize("stage", ["stage_roads", "stage_action", "stage_review",
@@ -790,7 +874,7 @@ def test_generic_exploration_guidance_reaches_provider_without_granting_tools(st
     contract = model_contract(request)
     payload = build_payload(D8OutputRequest(request, {"version": 1, "stage": stage, "schema": contract["schema"]},
         contract["instruction"], None), role)
-    system = payload["messages"][2]["content"]
+    system = payload["messages"][-2]["content"]
     assert "answer could change the next decision" in system
     assert "use adequate local sources directly and reuse existing retrievals" in system
     assert "Do not search merely because a version, error or attempt count exists" in system
@@ -853,14 +937,15 @@ def test_cache_projection_keeps_exact_evidence_status_and_local_reference_gate()
         return [expand(child) for child in value] if isinstance(value, list) else value
     restored = expand(document)
     assert restored["history"][0]["content"] == json.loads(json.dumps(historical))
-    assert restored["current"] == json.loads(json.dumps({key: value for key, value in asdict(current).items() if key != "messages"}))
+    assert restored["current"] == json.loads(json.dumps({key: value for key, value in asdict(current).items()
+        if key not in {"messages", "execution_context"}}))
     assert restored["history"][0]["content"]["context"]["history"][0]["source_status"] == "available"
     assert restored["current"]["context"]["history"][0]["source_status"] == "unavailable"
     assert json.dumps(document, ensure_ascii=False).count(json.dumps(item.content, ensure_ascii=False)) == 1
     contract = model_contract(current)
     payload = build_payload(D8OutputRequest(current, {"version": 1, "stage": current.stage, "schema": schema(current)},
         contract["instruction"], None), role)
-    encoded_contract = payload["messages"][2]["content"].split("Output contract=", 1)[1]
+    encoded_contract = payload["messages"][-2]["content"].split("Output contract=", 1)[1]
     runtime, _ = json.JSONDecoder().raw_decode(encoded_contract)
     assert runtime["schema"] == schema(current)  # Full current constraints stay system-priority.
     proposal = {"kind": "fact_candidate", "content": "source statement", "reason": "direct",
@@ -878,9 +963,80 @@ def test_cache_projection_keeps_exact_evidence_status_and_local_reference_gate()
         following_contract["instruction"], None), role)
     assert next_payload["tools"] == payload["tools"]
     assert next_payload["messages"][0] == payload["messages"][0]
-    assert next_payload["messages"][2] != payload["messages"][2]
-    assert next_payload["messages"][1]["content"].startswith(payload["messages"][1]["content"][:-2])
+    assert next_payload["messages"][-2] != payload["messages"][-2]
+    assert next_payload["messages"][1] == payload["messages"][1]
     assert request.context.history == (item,) and item.content.startswith('literal source: \\n')
+
+
+def test_provider_history_segments_stay_identical_while_live_snapshots_change(case):
+    from agent_adapters.deepseek_roles import build_payload, role_config, _stage_input
+    from agent_core.output_contracts import D8OutputRequest
+    from agent_core.stage_planning import model_contract
+    role = role_config('inner_action', version=17)
+    req = replace(case.app._request('stage_intent', PlanningSession('turn_planning', case.app._id('stage/root'))),
+        role_config_ref=role.role_config_ref)
+    archive = ({'role': 'user', 'content': json.dumps({'source': 'literal \\n \\u003c ' * 30})},
+        {'role': 'assistant', 'content': '{"kind":"unverified historical decision"}'})
+    def payload(messages):
+        current = replace(req, messages=messages)
+        contract = model_contract(current)
+        return build_payload(D8OutputRequest(current, {'version': 1, 'stage': current.stage, 'schema': contract['schema']},
+            contract['instruction'], None), role)
+    first = payload((*archive, {'role': 'user', 'content': '{"pending_tools":[{"operation_id":"A"}]}'}))
+    second = payload((*archive, {'role': 'user', 'content': '{"review_feedback":"late advice"}'},
+        {'role': 'user', 'content': '{"tool_feedback":[{"operation_id":"A","status":"failed"}]}'}))
+    assert second['messages'][:3] == first['messages'][:3]
+    assert [json.loads(m['content'])['history_start'] for m in second['messages'][1:-2]] == [0, 1, 2]
+    assert 'pending_tools' not in json.dumps(first['messages'][1:-2])
+    assert 'pending_tools' in json.loads(first['messages'][-1]['content'])['current']
+    assert 'tool_feedback' in json.loads(second['messages'][-1]['content'])['current']
+    doc = _stage_input(replace(req, messages=archive))
+    assert doc['history'][0]['content']['source'] == json.loads(archive[0]['content'])['source']
+    assert second['tools'] == first['tools'] and second['reasoning_effort'] == 'max'
+
+
+@pytest.mark.parametrize("invalid_attempts", [0, 1, 2])
+def test_supervision_and_correction_finish_before_next_inner(case, invalid_attempts):
+    events, actions, supervision = [], [], []
+    invoke = case.models.outer.invoke
+    def outer(envelope, *args):
+        request = envelope.request
+        if request.stage == "stage_supervision":
+            events.append("supervision_start")
+            assert len(case.app.models.live_operations) == 1
+        result = invoke(envelope, *args)
+        if request.stage == "stage_supervision": events.append("supervision_end")
+        return result
+    case.models.outer.invoke = outer
+    def review(request, raw):
+        if request.stage == "stage_supervision":
+            supervision.append(request)
+            if len(supervision) <= invalid_attempts:
+                return {"invalid": "format"}
+        return raw
+    case.models.outer.transform = review
+    def decision(request, raw):
+        if request.stage == "stage_action":
+            actions.append(request)
+            events.append("inner")
+            if len(actions) <= 5:
+                return dict(kind="mcp_call", tool_name="shell.run_bash", arguments={"script": "controlled read"})
+        return raw
+    case.models.inner.transform = decision
+    if invalid_attempts == 2:
+        with pytest.raises(StageStateError, match="stage.model_output_unusable"):
+            asyncio.run(case.app.run(case.token))
+        assert len(actions) == 4
+    else:
+        assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
+        assert "review_feedback" in str(actions[4].messages)
+        accepted_id = supervision[-1].model_request_id
+        assert case.app.store.load_d4_operation(accepted_id).application_ref == "stage-advice/" + accepted_id
+    assert len(supervision) == (1 if invalid_attempts == 0 else 2)
+    assert events[:4] == ["inner"] * 4
+    assert events[4:6] == ["supervision_start", "supervision_end"]
+    assert not case.app.models.live_operations
+    assert not case.app.store.list_d4_unresolved_operations(case.app.task_id)
 
 
 def test_single_review_cannot_create_duplicate_formal_facts(case, monkeypatch):
@@ -1005,11 +1161,11 @@ def test_unknown_model_result_is_not_reissued(case):
     def lost(request, raw):
         raise RuntimeError("controlled provider result lost")
     case.models.inner.transform = lost
-    with pytest.raises(D4RecoveryRequired, match="model_outcome_unknown") as error:
+    with pytest.raises(OperationRecoveryRequired, match="model_outcome_unknown") as error:
         asyncio.run(case.app.run(case.token))
     from qinyuan_core import Category, classify
     assert classify(error.value) == (Category.UNKNOWN, "stage.model_outcome_unknown", False)
-    with pytest.raises(D4RecoveryRequired, match="operation_outcome_unknown"):
+    with pytest.raises(OperationRecoveryRequired, match="operation_outcome_unknown"):
         asyncio.run(case.app.run(case.token))
     assert len(case.models.inner.calls) == 1 and not case.tools.calls
 
@@ -1115,58 +1271,34 @@ def overlap_case(case):
     return case
 
 
-@pytest.mark.parametrize("first_tool,second_tool", [
-    ("web.search", "web.fetch"), ("web.search", "web.search"), ("shell.run_bash", "web.search")])
-def test_two_slots_first_result_wakes_and_wait_does_not_spin(overlap_case, first_tool, second_tool):
+@pytest.mark.parametrize("tool", ["web.search", "web.fetch", "shell.run_bash"])
+def test_single_tool_waits_for_result_without_speculative_inner(overlap_case, tool):
     case, control = overlap_case, overlap_case.overlap
     actions = []
     def decision(req):
         actions.append(req)
-        n = len(actions)
-        if n <= 2:
-            tool = first_tool if n == 1 else second_tool
-            label = "A" if n == 1 else "B"
+        if len(actions) == 1:
             key = "query" if tool == "web.search" else "url" if tool == "web.fetch" else "script"
-            return dict(kind="mcp_call", tool_name=tool, arguments={key: "https://docs.example/" + label if tool == "web.fetch" else label})
-        if n == 3:
-            assert req.context.pending_operation_ids and len([i for i in req.context.history if i.record_type == "progress"]) == 1
-            return dict(kind="wait_for_tools", reason="the next action depends on the remaining result")
+            return dict(kind="mcp_call", tool_name=tool,
+                arguments={key: "https://docs.example/A" if tool == "web.fetch" else "A"})
+        assert not req.context.pending_operation_ids
+        assert len([i for i in req.context.history if i.record_type == "progress"]) == 1
         return dict(kind="road_resolution", outcome="failed", reason="controlled end", support_refs=[])
     control.decide = decision
     async def exercise():
         pending = asyncio.create_task(case.app.run(case.token))
         try:
-            await asyncio.wait_for(control.started["B"].wait(), 5)
-            assert control.active == {"A", "B"} and len(actions) == 2
-            assert len(case.app.store.list_d4_unresolved_operations(case.app.task_id)) == 2
-            assert not case.app.store.blocking_d4_operations(case.app.task_id)
-            with pytest.raises(StageStateError, match="tools_still_running"):
-                case.app._commit(StageStateChange(turns=case.app.store.list_stage_turns(case.app.task_id)))
-            if first_tool == "shell.run_bash":
-                assert {t["qualified_name"] for t in actions[1].tools} == {"web.search", "web.fetch"}
-            assert '"pending_tools"' in str(actions[1].messages)
-            control.release["B"].set()
-            while len(actions) < 3:
-                await asyncio.sleep(0.01)
-            assert not control.release["A"].is_set()
-            while not any(op.application_ref and case.app.evidence.read("request", op.start.operation_id)
-                          and case.app.evidence.request(op.start.operation_id).stage == "stage_action"
-                          and isinstance(case.app.evidence.read_model_result(op).result, StagePlanningDecision)
-                          for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == "action"):
-                await asyncio.sleep(0.01)
-            await asyncio.sleep(0.04)
-            assert len(actions) == 3 and control.active == {"A"}
+            await asyncio.wait_for(control.started["A"].wait(), 5)
+            await asyncio.sleep(.08)
+            assert len(actions) == 1 and control.active == {"A"}
             control.release["A"].set()
             await asyncio.wait_for(pending, 5)
         finally:
-            for gate in control.release.values(): gate.set()
+            control.release["A"].set()
             if not pending.done(): pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
     asyncio.run(asyncio.wait_for(exercise(), 10))
-    assert control.maximum == 2 and len(control.calls) == 2
-    assert len(actions) == 4 and not case.app._tools_in_flight
-    assert len([i for i in actions[-1].context.history if i.record_type == "progress"]) == 2
-    assert not any(req.correction_of_model_request_id for req in actions)
+    assert len(actions) == 2 and len(control.calls) == 1
 
 
 def test_results_arriving_during_generation_merge_without_interrupting_inner(overlap_case):
@@ -1177,9 +1309,9 @@ def test_results_arriving_during_generation_merge_without_interrupting_inner(ove
     actions = []
     def decision(req):
         actions.append(req)
-        if len(actions) <= 2:
-            return dict(kind="mcp_call", tool_name="web.search", arguments={"query": "A" if len(actions) == 1 else "B"})
-        if len(actions) == 3:
+        if len(actions) == 1:
+            return dict(kind="mcp_calls", calls=[dict(tool_name="web.search", arguments={"query": label}) for label in "AB"])
+        if len(actions) == 2:
             entered.set()
             assert release_model.wait(5)
             return dict(kind="wait_for_tools", reason="await the remaining response")
@@ -1191,11 +1323,11 @@ def test_results_arriving_during_generation_merge_without_interrupting_inner(ove
             await asyncio.wait_for(control.started["B"].wait(), 5)
             control.release["A"].set()
             while not entered.is_set(): await asyncio.sleep(0.01)
-            assert len([i for i in actions[2].context.history if i.record_type == "progress"]) == 1
+            assert len([i for i in actions[1].context.history if i.record_type == "progress"]) == 1
             control.release["B"].set()
             while control.active: await asyncio.sleep(0.01)
             await asyncio.sleep(0.04)
-            assert len(actions) == 3 and not pending.done()
+            assert len(actions) == 2 and not pending.done()
             release_model.set()
             await asyncio.wait_for(pending, 5)
         finally:
@@ -1204,7 +1336,7 @@ def test_results_arriving_during_generation_merge_without_interrupting_inner(ove
             if not pending.done(): pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
     asyncio.run(asyncio.wait_for(exercise(), 10))
-    assert len(actions) == 4 and not actions[-1].context.pending_operation_ids
+    assert len(actions) == 3 and not actions[-1].context.pending_operation_ids
     assert len([i for i in actions[-1].context.history if i.record_type == "progress"]) == 2
 
 
@@ -1213,7 +1345,7 @@ def test_concurrent_unknown_keeps_other_known_result_and_blocks_restart(overlap_
     actions = []
     def decision(req):
         actions.append(req)
-        return dict(kind="mcp_call", tool_name="web.search", arguments={"query": "A" if len(actions) == 1 else "B"})
+        return dict(kind='mcp_calls', calls=[dict(tool_name='web.search', arguments={'query': label}) for label in 'AB'])
     control.decide, control.failure = decision, "A"
     async def exercise():
         pending = asyncio.create_task(case.app.run(case.token))
@@ -1230,7 +1362,7 @@ def test_concurrent_unknown_keeps_other_known_result_and_blocks_restart(overlap_
     asyncio.run(case.app.close())
     case.app = StageApplication(case.path, **case.args)
     case.app.bind(task_id)
-    with pytest.raises(D4RecoveryRequired): asyncio.run(case.app.run(case.token))
+    with pytest.raises(OperationRecoveryRequired): asyncio.run(case.app.run(case.token))
     assert len(case.models.inner.calls) == count and len(control.calls) == 2
 
 
@@ -1241,10 +1373,10 @@ def test_free_slot_is_reused_but_road_review_waits_for_all_tools(overlap_case, k
     actions = []
     def decision(req):
         actions.append(req)
-        if len(actions) <= 3:
-            tool = "shell.run_bash" if len(actions) == 3 else "web.search"
-            return dict(kind="mcp_call", tool_name=tool,
-                arguments={"script" if tool == "shell.run_bash" else "query": "ABC"[len(actions)-1]})
+        if len(actions) == 1:
+            return dict(kind="mcp_calls", calls=[dict(tool_name="web.search", arguments={"query": label}) for label in "AB"])
+        if len(actions) == 2:
+            return dict(kind="mcp_call", tool_name="shell.run_bash", arguments={"script": "C"})
         return dict(kind="road_resolution", outcome="failed", reason="controlled end", support_refs=[])
     control.decide = decision
     async def exercise():
@@ -1255,7 +1387,7 @@ def test_free_slot_is_reused_but_road_review_waits_for_all_tools(overlap_case, k
             await asyncio.wait_for(control.started["C"].wait(), 5)
             assert control.active == {"A", "C"} and control.maximum == 2
             control.release["C"].set()
-            while len(actions) < 4: await asyncio.sleep(0.01)
+            while len(actions) < 3: await asyncio.sleep(0.01)
             await asyncio.sleep(0.04)
             assert not any(isinstance(req.proposal, RoadResolution) for req in case.models.outer.calls)
             assert case.app.store.list_stage_turns(case.app.task_id)[0].roads[0].status is IntentStatus.RUNNING
@@ -1285,7 +1417,7 @@ def test_cancelled_concurrent_retrievals_keep_confirmed_stop_results(overlap_cas
     actions = []
     def decision(req):
         actions.append(req)
-        return dict(kind="mcp_call", tool_name="web.search", arguments={"query": "A" if len(actions) == 1 else "B"})
+        return dict(kind='mcp_calls', calls=[dict(tool_name='web.search', arguments={'query': label}) for label in 'AB'])
     control.decide = decision
     async def exercise():
         pending = asyncio.create_task(case.app.run(case.token))
@@ -1297,4 +1429,291 @@ def test_cancelled_concurrent_retrievals_keep_confirmed_stop_results(overlap_cas
     records = [op for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == "tool_dispatch"]
     assert len(records) == 2 and all(op.completion is not None and op.completion.result_kind == "failed" for op in records)
     assert not case.app._tools_in_flight and not case.app.store.blocking_d4_operations(case.app.task_id)
-    assert not control.active and len(actions) == 2
+    assert not control.active and len(actions) == 1
+
+
+@pytest.mark.parametrize('first_tool,second_tool,known_failure', [
+    ('web.search', 'web.search', None), ('web.search', 'web.fetch', 'B'),
+    ('shell.run_bash', 'web.search', None)])
+def test_one_decision_starts_two_tools_and_first_result_resumes(overlap_case, first_tool, second_tool, known_failure):
+    case, control = overlap_case, overlap_case.overlap
+    control.known_failure = known_failure
+    case.models.inner.native = True
+    actions = []
+    def decision(req):
+        actions.append(req)
+        if len(actions) == 1:
+            return dict(kind='mcp_calls', calls=[dict(tool_name=tool, arguments={
+                'query' if tool == 'web.search' else 'url' if tool == 'web.fetch' else 'script':
+                'https://docs.example/B' if tool == 'web.fetch' else label})
+                for tool, label in [(first_tool, 'A'), (second_tool, 'B')]])
+        if len(actions) == 2:
+            assert len(req.context.pending_operation_ids) == 1
+            assert len([i for i in req.context.history if i.record_type == 'progress']) == 1
+            return dict(kind='wait_for_tools', reason='the remaining result is needed')
+        return dict(kind='road_resolution', outcome='failed', reason='controlled end', support_refs=[])
+    control.decide = decision
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        try:
+            await asyncio.wait_for(control.started['B'].wait(), 5)
+            assert control.active == {'A', 'B'} and len(actions) == 1
+            with pytest.raises(StageStateError, match='tools_still_running'):
+                case.app._commit(StageStateChange(turns=case.app.store.list_stage_turns(case.app.task_id)))
+            control.release['B'].set()
+            while len(actions) < 2: await asyncio.sleep(.01)
+            assert not control.release['A'].is_set()
+            control.release['A'].set()
+            await asyncio.wait_for(pending, 5)
+        finally:
+            for gate in control.release.values(): gate.set()
+            if not pending.done(): pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    records = [op for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == 'tool_dispatch']
+    assert len(records) == len({op.start.operation_id for op in records}) == 2
+    parents = {case.app.evidence.read('mcp-call', op.start.operation_id)['model_request_id'] for op in records}
+    assert parents == {actions[0].model_request_id}
+    assert all(op.completion is not None for op in records) and len(actions) == 3
+    assert not any(req.correction_of_model_request_id for req in actions)
+    assert not any(type(req.proposal).__name__ == 'StageToolBatch' for req in case.models.outer.calls)
+    before = len(control.calls)
+    case.app.mcp.reconcile()
+    assert len(control.calls) == before
+
+
+@pytest.mark.parametrize('native', [False, True])
+def test_batch_fact_uses_the_original_private_tool_receipt(overlap_case, native):
+    case, control = overlap_case, overlap_case.overlap
+    case.models.inner.native = native
+    for label in 'AB': control.release[label].set()
+    actions = []
+    def decision(req):
+        actions.append(req)
+        if len(actions) == 1:
+            return dict(kind='mcp_calls', calls=[dict(tool_name='shell.run_bash', arguments={'script': 'A'}),
+                dict(tool_name='web.search', arguments={'query': 'B'})])
+        observations = [i.ref for i in req.context.history if i.identity == 'tool_observation_not_fact']
+        facts = [i.ref for i in req.context.history if i.record_type == 'verified_fact']
+        if not facts:
+            return dict(kind='fact_candidate', content='The local tool returned A.', reason='original private-tool observation',
+                support_refs=observations, inferred=False)
+        return dict(kind='road_resolution', outcome='succeeded', reason='controlled result obtained', support_refs=facts)
+    control.decide = decision
+    asyncio.run(case.app.run(case.token))
+    source = case.app.store._connection.execute('SELECT source_ref FROM facts').fetchone()[0]
+    claim = case.app.evidence.read('mcp-call', source)
+    assert source != actions[0].model_request_id and claim['model_request_id'] == actions[0].model_request_id
+    assert claim['call']['tool_name'] == 'shell.run_bash' and len(control.calls) == 2
+    from scripts.qymonitor import tool_usage
+    counts, _ = tool_usage(case.app.directory)
+    assert dict(counts) == {'shell.run_bash': 1, 'web.search': 1}
+
+
+@pytest.mark.parametrize('invalid', ['duplicate', 'two_private', 'three', 'one_pending', 'unknown_tool'])
+def test_invalid_tool_batch_is_corrected_before_any_dispatch(overlap_case, invalid):
+    case, control = overlap_case, overlap_case.overlap
+    calls = [dict(tool_name='web.search', arguments={'query': label}) for label in 'AB']
+    if invalid == 'duplicate': calls[1] = calls[0]
+    if invalid == 'two_private': calls = [dict(tool_name='shell.run_bash', arguments={'script': label}) for label in 'AB']
+    if invalid == 'three': calls.append(dict(tool_name='web.search', arguments={'query': 'C'}))
+    if invalid == 'unknown_tool': calls[1]['tool_name'] = 'unknown.tool'
+    actions = []
+    def decision(req):
+        actions.append(req)
+        if invalid == 'one_pending' and len(actions) == 1:
+            return dict(kind='mcp_calls', calls=[dict(tool_name='web.search', arguments={'query': label}) for label in 'AC'])
+        if req.correction_of_model_request_id:
+            return dict(kind='road_resolution', outcome='failed', reason='controlled correction', support_refs=[])
+        return dict(kind='mcp_calls', calls=calls)
+    control.decide = decision
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        try:
+            if invalid == 'one_pending':
+                await asyncio.wait_for(control.started['C'].wait(), 5)
+                control.release['C'].set()
+            while not any(req.correction_of_model_request_id for req in actions): await asyncio.sleep(.01)
+            assert control.calls == ([('A', 'web.search'), ('C', 'web.search')] if invalid == 'one_pending' else [])
+            if invalid == 'two_private':
+                feedback = case.app.evidence.contract(actions[-1])["correction"]["issues"]
+                assert feedback[0]["code"] == "stage.tool_batch_resource_conflict"
+                assert feedback[0]["actual"] == "two_private_actions"
+            control.release['A'].set()
+            await asyncio.wait_for(pending, 5)
+        finally:
+            for gate in control.release.values(): gate.set()
+            if not pending.done(): pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    assert len([req for req in actions if req.correction_of_model_request_id]) == 1
+    assert len(control.calls) == (2 if invalid == 'one_pending' else 0)
+
+
+@pytest.mark.parametrize("size", [1100000, 2200000])
+def test_storage_capacity_stops_before_dispatch_with_safe_metadata(case, size):
+    from agent_adapters.output_evidence import safe_failure_details
+    from qinyuan_core import Category
+    request = case.app._request("stage_intent", PlanningSession("turn_planning", str(uuid4())))
+    request = replace(request, messages=({"role": "user", "content": "x" * size},))
+    with pytest.raises(StageStateError, match="stage.evidence_capacity_exceeded") as caught:
+        asyncio.run(case.app.models.call(request, case.token))
+    assert caught.value.category is Category.CAPACITY
+    detail = safe_failure_details(caught.value, include_chain=True)["evidence_capacity"]
+    assert detail["record_kind"] == "stage-request" and detail["record_id"] == request.model_request_id
+    assert detail["actual_bytes"] > detail["limit_bytes"] and detail["dispatched"] is False
+    assert not case.models.inner.calls and not case.app.store.list_d4_operations(case.app.task_id)
+    saved = case.app.evidence.read("request", request.model_request_id)
+    assert bool(saved) == (size < 2 * 1024 * 1024)
+
+
+def test_storage_capacity_triggers_bounded_summary_before_model_admission(case):
+    prepare_capacity_episode(case)
+    case.app.models.capacity_port = SimpleNamespace(fits=lambda envelope, policy: True)
+    original = case.tools.call_tool
+    async def large_observation(name, arguments):
+        return replace(await original(name, arguments), stdout="observed " + "x" * 50000)
+    case.tools.call_tool = large_observation
+    result = asyncio.run(case.app.run(case.token))
+    summaries = [r for r in case.models.outer.calls if r.stage == "stage_summary"]
+    assert result.turn.achievement is not None and summaries
+    for summary in summaries:
+        source = case.app.evidence.request(summary.capacity_recovery_of)
+        data = {"request": asdict(source), "proposal_kind": type(source.proposal).__name__}
+        from agent_core.command_contracts import T6EvidenceCapacityError
+        with pytest.raises(T6EvidenceCapacityError):
+            case.app.evidence.records.encode("stage-request", source.model_request_id, data, limit=1024 * 1024)
+        assert case.app.store.load_d4_operation(source.model_request_id) is None
+        assert source.model_request_id not in {r.model_request_id for r in case.models.inner.calls}
+    for summary in summaries:
+        covered = {identity for identity, _ in summary.summary_coverage}
+        source = case.app.evidence.request(summary.capacity_recovery_of)
+        decisions = [r for r in case.models.inner.calls if r.context.session == source.context.session
+            and r.base_checkpoint_sequence < source.base_checkpoint_sequence and r.stage == "stage_action"]
+        assert not covered.intersection(r.model_request_id for r in decisions[-4:])
+
+
+@pytest.mark.parametrize("mcp_failure", [False, True])
+def test_failed_tools_cannot_skip_owned_mcp_and_store_close(mcp_failure):
+    closed = []
+    async def exercise():
+        owner = asyncio.current_task()
+        original = RuntimeError("controlled tool cleanup failure")
+        async def stop():
+            closed.append("tools")
+            raise original
+        async def close_mcp():
+            assert asyncio.current_task() is owner
+            closed.append("mcp")
+            if mcp_failure: raise ValueError("secondary cleanup failure")
+        app = SimpleNamespace(_stop_tools=stop, mcp=SimpleNamespace(close=close_mcp),
+            store=SimpleNamespace(close=lambda: closed.append("store")))
+        with pytest.raises(RuntimeError) as caught:
+            await StageApplication.close(app)
+        assert caught.value is original
+        if mcp_failure: assert "stage.cleanup_failed:mcp" in caught.value.__notes__
+    asyncio.run(exercise())
+    assert closed == ["tools", "mcp", "store"]
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "io"])
+def test_stage_evidence_distinguishes_corruption_from_io(case, monkeypatch, failure):
+    from qinyuan_core import Category
+    identity = str(uuid4())
+    path = case.app.evidence.records._path("stage-result", identity)
+    if failure == "corrupt":
+        path.write_bytes(b"invalid json")
+    else:
+        from agent_core.command_contracts import T6EvidenceError
+        def fail_read(*args):
+            try: raise PermissionError("private path must not appear in diagnostics")
+            except PermissionError as error: raise T6EvidenceError("evidence_read_failed") from error
+        monkeypatch.setattr(case.app.evidence.records, "_read", fail_read)
+    with pytest.raises(StageStateError) as caught:
+        case.app.evidence.read("result", identity)
+    assert caught.value.code == ("stage.evidence_corrupt" if failure == "corrupt" else "stage.evidence_io_failed")
+    assert caught.value.category is (Category.UNKNOWN if failure == "corrupt" else Category.DEPENDENCY)
+
+
+def test_result_storage_capacity_keeps_original_unsettled_identity(case):
+    from agent_adapters.output_evidence import safe_failure_details
+    case.models.inner.transform = lambda request, raw: {**raw, "description": "x" * 1100000}
+    with pytest.raises(StageStateError, match="stage.evidence_capacity_exceeded") as caught:
+        asyncio.run(case.app.run(case.token))
+    detail = safe_failure_details(caught.value)["evidence_capacity"]
+    assert detail["dispatched"] is True and detail["record_kind"] == "stage-result"
+    records = case.app.store.blocking_d4_operations(case.app.task_id)
+    assert len(records) == 1 and records[0].start.operation_id == detail["record_id"]
+    assert records[0].completion is None and len(case.models.inner.calls) == 1
+    with pytest.raises(OperationRecoveryRequired):
+        asyncio.run(case.app.run(case.token))
+    assert len(case.models.inner.calls) == 1
+
+
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+def test_live_model_ownership_is_revoked_on_interruption_without_replay(case, stop):
+    import threading
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    def slow(request, raw):
+        entered.set()
+        try:
+            assert release.wait(5)
+            return raw
+        finally:
+            finished.set()
+    case.models.inner.transform = slow
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            assert len(case.app.models.live_operations) == 1
+            if stop == "cancel": case.token.is_cancelled = True
+            else: case.now.value = case.app.state.task_run.deadline_at
+            with pytest.raises(OperationRecoveryRequired, match="stage.model_outcome_unknown"):
+                await asyncio.wait_for(pending, 5)
+            assert not case.app.models.live_operations
+            assert len(case.app.store.blocking_d4_operations(case.app.task_id)) == 1
+        finally:
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 5)
+            if not pending.done(): pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    asyncio.run(exercise())
+    case.token.is_cancelled = False
+    case.now.value = 1800000000.0
+    with pytest.raises(OperationRecoveryRequired): asyncio.run(case.app.run(case.token))
+    assert len(case.models.inner.calls) == 1 and not case.app.models.live_operations
+
+
+@pytest.mark.parametrize("known_rejection", [True, False])
+def test_planner_rejection_settles_but_generic_mcp_error_remains_unknown(case, known_rejection):
+    from MCPs.Mcp_client.client import MCPCommandPlanError, MCPClientError
+    from agent_adapters.output_evidence import safe_failure_details
+    case.tools.error = MCPCommandPlanError("mcp.planner_rejected") if known_rejection else MCPClientError("PRIVATE transport failure")
+    actions = []
+    def decision(req, raw):
+        if req.stage == "stage_action":
+            actions.append(req)
+            if len(actions) > 1:
+                assert req.context.history[0].identity == "tool_observation_not_fact"
+                result = json.loads(req.context.history[0].content)
+                assert result["status"] == "rejected" and result["code"] == "mcp.planner_rejected"
+                return dict(kind="road_resolution", outcome="failed", reason="known planner rejection", support_refs=[])
+        if req.stage == "stage_completion": return dict(kind="incomplete", reason="no success", support_refs=[])
+        return raw
+    case.models.inner.transform = decision
+    if known_rejection:
+        asyncio.run(case.app.run(case.token))
+        assert len(actions) == 2 and not case.app.store.blocking_d4_operations(case.app.task_id)
+    else:
+        with pytest.raises(ExecutionRecoveryRequired) as caught: asyncio.run(case.app.run(case.token))
+        detail = safe_failure_details(caught.value, include_chain=True)
+        assert "mcp.outcome_unknown" in detail["error_codes"] and "MCPClientError" in detail["exception_types"]
+        context = detail["operation_context"]
+        pending = case.app.store.blocking_d4_operations(case.app.task_id)
+        assert len(pending) == 1 and pending[0].start.operation_id == context["operation_id"]
+        saved = case.app.evidence.read("mcp-failure", context["operation_id"])
+        assert saved["operation_context"] == context and "PRIVATE" not in json.dumps(saved)
+        with pytest.raises(OperationRecoveryRequired): asyncio.run(case.app.run(case.token))
+    assert len(case.tools.calls) == 1
+    assert not any(i.record_type == "verified_fact" for i in case.app.evidence.history(case.app.task_id))

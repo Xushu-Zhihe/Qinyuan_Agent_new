@@ -123,3 +123,35 @@ def test_stage_policy_rejection_keeps_fixed_cli_code_without_raw_message(monkeyp
     result = cli.main(["status", "--state-dir", "unused", "--task-run-id", str(uuid4())])
     output = json.loads(capsys.readouterr().out)
     assert result == 2 and output["errors"] == [dict(code="stage.human_confirmation_closed", category="policy", phase="stage_control")]
+
+
+@pytest.mark.parametrize("close_failure", [False, True])
+def test_public_primary_failure_still_runs_export_app_and_resource_cleanup(tmp_path, monkeypatch, close_failure):
+    from types import SimpleNamespace
+    from agent_adapters import stage_public
+    directory = tmp_path / "state" / "task"
+    directory.mkdir(parents=True)
+    closed, owners = [], []
+    original = RuntimeError("primary controlled failure")
+    async def close():
+        closed.append("application")
+        owners.append(asyncio.current_task())
+        if close_failure: raise ValueError("secondary application failure")
+    def export():
+        closed.append("export")
+        owners.append(asyncio.current_task())
+        raise ValueError("secondary export failure")
+    def request(declaration):
+        owners.append(asyncio.current_task())
+        raise original
+    app = SimpleNamespace(close=close)
+    resource = SimpleNamespace(close=lambda: closed.append("resources"))
+    monkeypatch.setattr(stage_public, "build_application", lambda *args: (app, resource))
+    monkeypatch.setattr(stage_public, "_d3_request", request)
+    monkeypatch.setattr(stage_public, "_Token", lambda directory: SimpleNamespace(is_cancelled=False))
+    with pytest.raises(RuntimeError) as caught:
+        stage_public.run_stage_task(directory, {"task_run_id": str(uuid4())}, finalize_export=export)
+    assert caught.value is original and closed == ["export", "application", "resources"]
+    assert owners[0] is owners[1] is owners[2]
+    assert "stage.public_cleanup_failed:export" in original.__notes__
+    if close_failure: assert "stage.public_cleanup_failed:application" in original.__notes__

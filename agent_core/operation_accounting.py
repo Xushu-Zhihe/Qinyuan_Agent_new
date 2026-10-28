@@ -8,6 +8,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 from uuid import UUID
+from qinyuan_core import QinyuanError, Category, Layer
 
 D4ChargedCategory = Literal[
     "planning",
@@ -328,13 +329,22 @@ class D4AuditEvent:
             _text(self.related_ref, "related_ref")
 
 
-class D4RecoveryRequired(RuntimeError):
+class OperationRecoveryRequired(QinyuanError, RuntimeError):
     """An admitted operation has no reliable completed result."""
+    category = Category.UNKNOWN
+    layer = Layer.STORE
+    code = "operation.result_unconfirmed"
 
 
-class D4BudgetExhausted(RuntimeError):
+class OperationBudgetExhausted(QinyuanError, RuntimeError):
     """The persistent TaskRun start budget admits no further operation."""
+    category = Category.CAPACITY
+    layer = Layer.STORE
+    code = "operation.budget_exhausted"
 
 
-class D4OperationConflict(RuntimeError):
+class OperationIdentityConflict(QinyuanError, RuntimeError):
     """A fixed operation identity or frozen run contract does not match."""
+    category = Category.CONFLICT
+    layer = Layer.STORE
+    code = "operation.identity_conflict"

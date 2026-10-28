@@ -8,8 +8,8 @@ import pytest
 from test_stage_application import case
 from agent_adapters.stage_application import StageApplication
 from agent_core.domain import IntentStatus
-from agent_core.dual_llm_contracts import D3RecoveryRequired
-from agent_core.operation_accounting import D4RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+from agent_core.operation_accounting import OperationRecoveryRequired
 from agent_core.stage_contracts import PlanningSession, StagePlanningDecision, StageStateChange, TurnIntent, TurnPlanningState
 from agent_core.stage_storage import StageStateError, active_turn
 
@@ -166,14 +166,14 @@ def test_unknown_child_tool_never_returns_to_parent_or_replays_on_restart(case):
             case.tools.error = RuntimeError("controlled unknown child execution")
         return value
     case.models.inner.transform = lose
-    with pytest.raises(D3RecoveryRequired, match="mcp.outcome_unknown"):
+    with pytest.raises(ExecutionRecoveryRequired, match="mcp.outcome_unknown"):
         asyncio.run(case.app.run(case.token))
     root, child = case.app.store.list_stage_turns(case.app.task_id)
     assert root.planning_state is TurnPlanningState.WAITING_CHILD and child.roads[0].status is IntentStatus.RUNNING
     calls = len(case.tools.calls), len(case.models.inner.calls), len(case.models.outer.calls)
     reopen(case)
     case.tools.error = None
-    with pytest.raises(D4RecoveryRequired, match="operation_outcome_unknown"):
+    with pytest.raises(OperationRecoveryRequired, match="operation_outcome_unknown"):
         asyncio.run(case.app.run(case.token))
     assert (len(case.tools.calls), len(case.models.inner.calls), len(case.models.outer.calls)) == calls
     assert not any(r.context.feedback_refs for r in case.models.inner.calls)
@@ -193,7 +193,7 @@ def test_child_approval_after_stop_never_registers_or_dispatches_child(case, mon
                 case.now.value = deadline
         return result
     monkeypatch.setattr(case.app.models, "call", stopped)
-    with pytest.raises(D4RecoveryRequired, match="dispatch_stopped"):
+    with pytest.raises(OperationRecoveryRequired, match="dispatch_stopped"):
         asyncio.run(case.app.run(case.token))
     root, = case.app.store.list_stage_turns(case.app.task_id)
     assert root.achievement and root.planning_state is TurnPlanningState.ACTIVE
@@ -291,3 +291,37 @@ def test_continuation_provider_payload_and_capacity_use_inner_role(case):
     capacity = EstimatedCapacity(outer, inner)
     assert capacity.fits(envelope, model_capacity_policy(inner.model, TRANSPORT["base_url"]))
     assert capacity.last_measurement["stage"] == "stage_continuation"
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_proactive_stage_completion_closes_road_before_child_planning(case, native):
+    from agent_core.stage_planning import model_contract
+    case.models.inner.native = case.models.outer.native = native
+    install_chain(case)
+    original = case.models.inner.transform
+    def boundary(request, raw):
+        value = original(request, raw)
+        turn = request.context.turn
+        if request.stage == "stage_action" and value["kind"] == "road_resolution" and value["outcome"] == "succeeded":
+            rules = model_contract(request)["rules"]
+            if turn.achievement is None:
+                assert "compare current formal Facts" in rules
+                return dict(kind="turn_completion", reason="current criterion already has formal support", support_refs=value["support_refs"])
+            assert "truthful closure" in rules and "resumed parent" in rules
+        return value
+    case.models.inner.transform = boundary
+    result = asyncio.run(case.app.run(case.token))
+    turns = case.app.store.list_stage_turns(case.app.task_id)
+    assert len(turns) == 3 and result.reason == "stage.final_validation_requested"
+    assert len(case.tools.calls) == 3
+    for turn in turns[:2]:
+        assert turn.achievement and all(r.status is IntentStatus.SUCCEEDED for r in turn.roads)
+        calls = [q for q in case.models.inner.calls if q.context.session == PlanningSession("road_execution", turn.roads[0].road_id)]
+        values = [case.app.evidence.read_model_result(case.app.store.load_d4_operation(q.model_request_id)).result for q in calls]
+        from agent_core.stage_contracts import TurnCompletion, RoadResolution
+        completed = next(i for i,v in enumerate(values) if isinstance(v,TurnCompletion))
+        assert isinstance(values[completed+1],RoadResolution)
+        child = next(t for t in turns if t.parent_turn_id == turn.turn_id)
+        child_plans = [q for q in case.models.inner.calls if q.stage == "stage_roads" and q.context.turn.turn_id == child.turn_id]
+        assert child_plans[0].context.session == PlanningSession("turn_planning", child.turn_id)
+    assert case.app.state.task_run.status.value == "running"

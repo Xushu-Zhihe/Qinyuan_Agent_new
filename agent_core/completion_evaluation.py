@@ -5,7 +5,7 @@ from dataclasses import asdict
 import hashlib
 import json
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.turn_modeling import digest
 from agent_core.operation_accounting import D4OperationStart, D4OperationCompletion
 
@@ -14,7 +14,7 @@ def completion_schema(request, *, maximum=2):
     from agent_core.output_contracts import obj, tagged, array, B, SUGGESTION, CHANGE
     allowed = list(request.context.supporting_fact_ids)
     if len(allowed) != 1 or len(set(allowed)) != 1:
-        raise D3RecoveryRequired("s4_completion_support_unavailable")
+        raise ExecutionRecoveryRequired("s4_completion_support_unavailable")
     return {"anyOf": [obj({"action": tagged("complete_intent", {
         "fact_ids": {**array({"type": "string", "enum": allowed}, 1, 1), "uniqueItems": True}}),
         "review_requested": B, "next_intent_candidates": array(SUGGESTION, 0, maximum)}), CHANGE]}
@@ -37,7 +37,7 @@ def execution_projection(app, execution, binding):
     artifact = app.workspace.read_artifact(binding.artifact_version_id)
     command = app.commands.read_command(execution.command_ref)
     if observed is None or completed is None or command is None or turn is None:
-        raise D3RecoveryRequired("s4_size_source_unavailable")
+        raise ExecutionRecoveryRequired("s4_size_source_unavailable")
     record = completed.record
     status, size = parse_size_output(record.stdout)
     if (binding.task_run_id != app.state.task_run.task_run_id
@@ -70,7 +70,7 @@ def execution_projection(app, execution, binding):
             or record.authorization_id != command.authorization_id
             or command.stdin_size != 0 or command.stdin_sha256 != hashlib.sha256(b'').hexdigest()
             or command.working_directory != artifact.claim.path.rsplit("/", 1)[0]):
-        raise D3RecoveryRequired("s4_size_source_binding_changed")
+        raise ExecutionRecoveryRequired("s4_size_source_binding_changed")
     content["observation"] = {"kind": "file_size", "byte_size": size,
         "expected_byte_size": observed.expected_byte_size, "comparison": observed.status,
         "identity": "saved_execution_observation_not_verified_fact",
@@ -95,14 +95,14 @@ def freeze_evaluation_policy(app, intent_id, support_fact_id, history):
     if (plan is None or binding is None or result is None or plan.status.value != "completed"
             or not historical and (result.outcome != "satisfied" or result.supporting_fact_id != support_fact_id)
             or binding.intent_id != intent_id or binding.turn_id != intent.turn_id):
-        raise D3RecoveryRequired("s4_evaluation_plan_unavailable")
+        raise ExecutionRecoveryRequired("s4_evaluation_plan_unavailable")
     app.validator.completion_support(app.state, binding, result, support_fact_id)
     observed = app.conclusions.observation(result.proof_id, historical=True)
     support = next((i for i in history if i.record_id == support_fact_id), None)
     goal = next((i for i in history if i.record_id == intent_id), None)
     execution = next((i for i in history if i.record_id == observed.execution_id), None)
     if support is None or goal is None or execution is None:
-        raise D3RecoveryRequired("s4_evaluation_required_sources_missing")
+        raise ExecutionRecoveryRequired("s4_evaluation_required_sources_missing")
     size_items = [i for i in history if i.intent_id == intent_id and i.record_type == "progress"
                   and i.source_status == "available" and i.artifact_version_id == observed.artifact_version_id
                   and isinstance(json.loads(i.content), dict)
@@ -145,7 +145,7 @@ def evaluation_policy(request):
                 or any(by_ref[ref].source_status != "available" or by_ref[ref].conflict for ref in required)):
             raise ValueError("binding")
     except (TypeError, ValueError, KeyError) as exc:
-        raise D3RecoveryRequired("s4_evaluation_policy_invalid") from exc
+        raise ExecutionRecoveryRequired("s4_evaluation_policy_invalid") from exc
     return policy
 
 
@@ -177,15 +177,15 @@ def materialize_candidate(request, wire, *, allow_none=False):
     from agent_core.output_contracts import decode_response
     value, issues, terminal, _ = decode_response(wire, candidate_schema(request, allow_none=allow_none))
     if issues or terminal:
-        from agent_core.dual_llm_modeling import D3ProposalRejected
-        raise D3ProposalRejected("s4_candidate_choice_invalid", structural=True)
+        from agent_core.dual_llm_modeling import ExecutionProposalRejected
+        raise ExecutionProposalRejected("s4_candidate_choice_invalid", structural=True)
     if allow_none and value["action"]["kind"] == "no_candidate":
         return value
     if allow_none:
         body = value['action']['value']
         if not body or '\x00' in body or len(body.encode('utf-8')) > 16 * 1024:
-            from agent_core.dual_llm_modeling import D3ProposalRejected
-            raise D3ProposalRejected('d9_candidate_value_invalid', structural=True)
+            from agent_core.dual_llm_modeling import ExecutionProposalRejected
+            raise ExecutionProposalRejected('d9_candidate_value_invalid', structural=True)
     from agent_core.competition_candidates import provenance
     source=provenance(request.context)
     return {"action": {**value["action"], "execution_id": source["execution_id"], "evidence_version": source["evidence_version"],
@@ -208,7 +208,7 @@ def candidate_binding(output, request, candidate, body_sha256, byte_size):
             or contract.get("task_run_id") != request.task_run_id
             or contract.get("role_config_ref") != request.role_config_ref
             or not matches_output_contract(contract.get("output_contract"), "inner_candidate", output_schema(request, contract_version=contract['contract_version'])[1], contract['contract_version'])):
-        raise D3RecoveryRequired("s4_candidate_contract_changed")
+        raise ExecutionRecoveryRequired("s4_candidate_contract_changed")
     return {"binding_version": 1, "contract_version": contract['contract_version'],
             "task_run_id": request.task_run_id, "model_request_id": request.model_request_id,
             "source_request_sha256": digest(asdict(request)), "contract_sha256": digest(contract),
@@ -221,7 +221,7 @@ def verify_candidate_binding(output, request, candidate, metadata):
     expected = candidate_binding(output, request, candidate, metadata.get("body_sha256"), metadata.get("byte_size"))
     record = output.read("candidate-binding", request.model_request_id)
     if record != expected:
-        raise D3RecoveryRequired("s4_candidate_binding_missing_or_changed")
+        raise ExecutionRecoveryRequired("s4_candidate_binding_missing_or_changed")
     return digest(record)
 
 
@@ -237,25 +237,25 @@ def check_candidate_task(config, output, sessions, models, store, task):
         if not isinstance(contract, dict) or contract.get("stage") != "inner_candidate":
             continue
         if contract.get('contract_version') != config.contract_version:
-            raise D3RecoveryRequired('s4_candidate_contract_changed')
+            raise ExecutionRecoveryRequired('s4_candidate_contract_changed')
         record = output.read("candidate-binding", identity)
         native = models.read(identity)
         if (config.contract_version in {19, 20, 21, 22} and native is not None and native.outcome == 'accepted'
                 and native.raw == {'action': {'kind': 'no_candidate'}}):
             if record is not None:
-                raise D3RecoveryRequired('d9_candidate_result_conflict')
+                raise ExecutionRecoveryRequired('d9_candidate_result_conflict')
             from agent_core.answer_candidates import check_no_candidate
             needs_repair |= check_no_candidate(config, output, sessions, native, op)
             continue
         if record is None:
             if native is not None and native.outcome == "accepted":
-                raise D3RecoveryRequired("s4_candidate_binding_missing_or_changed")
+                raise ExecutionRecoveryRequired("s4_candidate_binding_missing_or_changed")
             continue
         if not isinstance(record, dict):
-            raise D3RecoveryRequired('s4_candidate_binding_missing_or_changed')
+            raise ExecutionRecoveryRequired('s4_candidate_binding_missing_or_changed')
         frozen = sessions.read("request", identity)
         if not isinstance(frozen, dict):
-            raise D3RecoveryRequired("s4_candidate_frozen_request_missing")
+            raise ExecutionRecoveryRequired("s4_candidate_frozen_request_missing")
         try:
             value = dict(frozen["request"])
             context = dict(value["context"])
@@ -265,11 +265,11 @@ def check_candidate_task(config, output, sessions, models, store, task):
             request = D8SessionExecutionRequest(**value)
             candidate = D7AnswerCandidate.from_dict(record["canonical_provenance"])
         except (KeyError, ValueError, TypeError) as exc:
-            raise D3RecoveryRequired("s4_candidate_frozen_request_invalid") from exc
+            raise ExecutionRecoveryRequired("s4_candidate_frozen_request_invalid") from exc
         from agent_core.competition_candidates import provenance,validate_mcp_source
         if candidate.source_kind == "mcp":
             try:validate_mcp_source(store,candidate,output)
-            except ValueError as exc:raise D3RecoveryRequired("mcp_candidate_source_changed") from exc
+            except ValueError as exc:raise ExecutionRecoveryRequired("mcp_candidate_source_changed") from exc
         if (request.task_run_id != task or request.model_request_id != identity
                 or candidate.task_run_id != task
                 or any(getattr(candidate,key) != val for key,val in provenance(request.context).items())
@@ -279,7 +279,7 @@ def check_candidate_task(config, output, sessions, models, store, task):
                 or op.start.context_sha256 != request.context_sha256
                 or op.start.base_checkpoint_sequence != request.base_checkpoint_sequence
                 or op.start.resource_ref != request.resource_ref):
-            raise D3RecoveryRequired("s4_candidate_source_changed")
+            raise ExecutionRecoveryRequired("s4_candidate_source_changed")
         checksum = verify_candidate_binding(output, request, candidate, record)
         if config.contract_version in {19, 20, 21, 22}:
             decision = output.read('answer-decision', identity)
@@ -288,10 +288,10 @@ def check_candidate_task(config, output, sessions, models, store, task):
                         'result_sha256': digest(asdict(native)) if native is not None else None,
                         'candidate': asdict(candidate)}
             if decision is not None and decision != expected:
-                raise D3RecoveryRequired('d9_candidate_decision_changed')
+                raise ExecutionRecoveryRequired('d9_candidate_decision_changed')
             needs_repair |= decision is None or op.application_ref is None
             if op.application_ref is not None and op.application_ref != candidate.candidate_id:
-                raise D3RecoveryRequired('d9_candidate_application_changed')
+                raise ExecutionRecoveryRequired('d9_candidate_application_changed')
         if native is not None and (native.outcome != "accepted" or not isinstance(native.raw, dict)
                 or native.model_request_id != identity or native.task_run_id != task
                 or native.stage != 'inner_candidate' or native.role_config_ref != request.role_config_ref
@@ -301,7 +301,7 @@ def check_candidate_task(config, output, sessions, models, store, task):
                 or native.raw.get("body_sha256") != record["body_sha256"]
                 or native.raw.get("byte_size") != record["byte_size"]
                 or op.completion is not None and op.completion.evidence_sha256 != digest(asdict(native))):
-            raise D3RecoveryRequired("s4_candidate_result_changed")
+            raise ExecutionRecoveryRequired("s4_candidate_result_changed")
         needs_repair |= native is None or op.completion is None
     return needs_repair
 
@@ -316,13 +316,13 @@ class EvaluationBindings:
         from agent_core.handoff_contracts import D8HandoffRequest
         raw = self.handoff.read("request", identity)
         if raw is None:
-            raise D3RecoveryRequired("s4_evaluation_request_missing")
+            raise ExecutionRecoveryRequired("s4_evaluation_request_missing")
         try:
             request = D8HandoffRequest.from_dict(raw)
         except (TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired('s4_evaluation_request_changed') from exc
+            raise ExecutionRecoveryRequired('s4_evaluation_request_changed') from exc
         if request.model_request_id != identity or request.stage != "intent_evaluation":
-            raise D3RecoveryRequired("s4_evaluation_request_changed")
+            raise ExecutionRecoveryRequired("s4_evaluation_request_changed")
         evaluation_policy(request)
         return request
 
@@ -342,20 +342,20 @@ class EvaluationBindings:
                 or contract.get("source_request_sha256") != digest(asdict(request))
                 or not matches_output_contract(contract.get("output_contract"), request.stage, output_schema(request, contract_version=14)[1], contract["contract_version"])
                 or type(finished) not in {int, float} or not math.isfinite(finished)):
-            raise D3RecoveryRequired("s4_evaluation_contract_changed")
+            raise ExecutionRecoveryRequired("s4_evaluation_contract_changed")
         if root != request.model_request_id:
             original = self._request(root)
             excluded = {"model_request_id", "correction_of_model_request_id", "rejection_code"}
             if (original.correction_of_model_request_id is not None
                     or {k: v for k, v in asdict(original).items() if k not in excluded}
                     != {k: v for k, v in asdict(request).items() if k not in excluded}):
-                raise D3RecoveryRequired("s4_evaluation_root_changed")
+                raise ExecutionRecoveryRequired("s4_evaluation_root_changed")
             root_contract = self.output.read('contract', root)
             if (not isinstance(root_contract, dict) or root_contract.get('contract_version') != self.config.contract_version
                     or root_contract.get('source_request_sha256') != digest(asdict(original))
                     or root_contract.get('role_config_ref') != original.role_config_ref
                     or root_contract.get('root_request_id') != root):
-                raise D3RecoveryRequired('s4_evaluation_root_changed')
+                raise ExecutionRecoveryRequired('s4_evaluation_root_changed')
         return {"binding_version": 1, "contract_version": self.config.contract_version, "stage": request.stage,
                 "task_run_id": request.task_run_id, "model_request_id": request.model_request_id,
                 "root_request_id": root, "source_request_sha256": digest(asdict(request)),
@@ -368,7 +368,7 @@ class EvaluationBindings:
                 "review", op.start.started_at, request.base_checkpoint_sequence, request.context_sha256,
                 request.turn_id or request.task_run_id, self.config.d4_budget.budget_policy_ref,
                 "outer_planning", request.role_config_ref) or finished < op.start.started_at):
-            raise D3RecoveryRequired("s4_evaluation_operation_changed")
+            raise ExecutionRecoveryRequired("s4_evaluation_operation_changed")
         return op
 
     def save(self, request, result):
@@ -387,7 +387,7 @@ class EvaluationBindings:
                 or result["rejected_candidate_indices"] != []
                 or result["outcome"] not in {"valid", "invalid"}
                 or result["reason"] != (None if result["outcome"] == "valid" else "d8_output_contract_rejected")):
-            raise D3RecoveryRequired("s4_evaluation_result_binding_changed")
+            raise ExecutionRecoveryRequired("s4_evaluation_result_binding_changed")
 
     def save_diagnostic(self, request, result, issue_code=None):
         issues = [{"code": "evaluation_business_rejected", "path": "$",
@@ -410,7 +410,7 @@ class EvaluationBindings:
         if record is None:
             return None
         if not isinstance(record, dict):
-            raise D3RecoveryRequired('s4_evaluation_diagnostic_changed')
+            raise ExecutionRecoveryRequired('s4_evaluation_diagnostic_changed')
         request = self._request(identity)
         result = record.get("result")
         self._check_result(request, result)
@@ -422,17 +422,17 @@ class EvaluationBindings:
             saved_issues = record.get("issues", [])
             code = saved_issues[0].get("code") if len(saved_issues) == 1 else None
             if code not in EVALUATION_ISSUES:
-                raise D3RecoveryRequired("s4_evaluation_diagnostic_changed")
+                raise ExecutionRecoveryRequired("s4_evaluation_diagnostic_changed")
             path, expected = EVALUATION_ISSUES[code]
             issues = [{"code": code, "path": path, "expected": expected, "actual": "rejected"}]
         elif version != 1:
-            raise D3RecoveryRequired("s4_evaluation_diagnostic_changed")
+            raise ExecutionRecoveryRequired("s4_evaluation_diagnostic_changed")
         if (not isinstance(result, dict) or result.get("outcome") != "invalid" or result.get("raw") is not None
                 or self.output.read("evaluation-binding", identity) is not None
                 or self.output.read("diagnostic", identity) is not None
                 or record != {**self._base(request, result.get("finished_at")), "diagnostic_version": version,
                               "issues": issues, "result": result}):
-            raise D3RecoveryRequired("s4_evaluation_diagnostic_changed")
+            raise ExecutionRecoveryRequired("s4_evaluation_diagnostic_changed")
         if check_operation:
             self._operation(request, result["finished_at"])
         return record
@@ -442,7 +442,7 @@ class EvaluationBindings:
         identity = request.model_request_id
         record = self.output.read("evaluation-binding", identity)
         if record is not None and not isinstance(record, dict):
-            raise D3RecoveryRequired('s4_evaluation_binding_changed')
+            raise ExecutionRecoveryRequired('s4_evaluation_binding_changed')
         diagnostic = self.read(identity, check_operation=True)
         if record is None:
             if diagnostic is None:
@@ -455,10 +455,10 @@ class EvaluationBindings:
         if (not isinstance(result, dict) or result.get("outcome") != "valid"
                 or record != {**self._base(request, result.get("finished_at")), "result": result}
                 or diagnostic is not None or self.output.read("diagnostic", identity) is not None):
-            raise D3RecoveryRequired("s4_evaluation_binding_changed")
+            raise ExecutionRecoveryRequired("s4_evaluation_binding_changed")
         _, issues, terminal, _ = decode_response(result.get("raw"), evaluation_schema(request))
         if issues or terminal or not result["raw"]["reason"].strip():
-            raise D3RecoveryRequired("s4_evaluation_saved_decision_invalid")
+            raise ExecutionRecoveryRequired("s4_evaluation_saved_decision_invalid")
         self._operation(request, result["finished_at"])
         expected = {**result, "evaluation_binding_sha256": digest(record)}
         self._check_completion(request, expected)
@@ -472,24 +472,24 @@ class EvaluationBindings:
             if (not isinstance(root_result, dict) or root_result.get('outcome') != 'invalid'
                     or root_result.get('raw') is not None
                     or root_result.get('request_sha256') != root.context_sha256):
-                raise D3RecoveryRequired('s4_evaluation_root_result_changed')
+                raise ExecutionRecoveryRequired('s4_evaluation_root_result_changed')
             root_op = self._operation(root, root_result['finished_at'])
             if root_op.completion != D4OperationCompletion(root.model_request_id, root_result['finished_at'],
                     'rejected', root.model_request_id, digest(root_result)):
-                raise D3RecoveryRequired('s4_evaluation_root_completion_changed')
+                raise ExecutionRecoveryRequired('s4_evaluation_root_completion_changed')
         if op.completion is not None and op.completion != D4OperationCompletion(
                 request.model_request_id, result["finished_at"],
                 "completed" if result["outcome"] == "valid" else "rejected",
                 request.model_request_id, digest(result)):
-            raise D3RecoveryRequired("s4_evaluation_completion_changed")
+            raise ExecutionRecoveryRequired("s4_evaluation_completion_changed")
 
     def verify_result(self, request, result):
         known = self.known_result(request)
         if known is not None and known != result:
-            raise D3RecoveryRequired("s4_evaluation_result_changed")
+            raise ExecutionRecoveryRequired("s4_evaluation_result_changed")
         if known is None and (result["outcome"] == "valid" or "evaluation_binding_sha256" in result
                               or "evaluation_diagnostic_sha256" in result):
-            raise D3RecoveryRequired("s4_evaluation_binding_missing")
+            raise ExecutionRecoveryRequired("s4_evaluation_binding_missing")
         return known
 
     def check_task(self, task):
@@ -500,7 +500,7 @@ class EvaluationBindings:
             if not isinstance(raw_request, dict) or raw_request.get('stage') != 'intent_evaluation':
                 continue
             if not isinstance(contract, dict) or contract.get('stage') != 'intent_evaluation':
-                raise D3RecoveryRequired('s4_evaluation_contract_changed')
+                raise ExecutionRecoveryRequired('s4_evaluation_contract_changed')
             request = self._request(op.start.operation_id)
             result = self.handoff.read("result", request.model_request_id)
             known = self.known_result(request)
@@ -510,7 +510,7 @@ class EvaluationBindings:
                         request.model_request_id, result["finished_at"],
                         "completed" if result["outcome"] == "valid" else "rejected",
                         request.model_request_id, digest(result)):
-                    raise D3RecoveryRequired("s4_evaluation_completion_changed")
+                    raise ExecutionRecoveryRequired("s4_evaluation_completion_changed")
             needs_repair |= result is None and known is not None or op.completion is None
         return needs_repair
 

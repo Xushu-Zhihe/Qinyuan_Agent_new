@@ -814,8 +814,9 @@ class MCPManager:
         ]
 
         if bool(getattr(result,"isError",False)):
-            message = "\n".join(text_blocks) or "MCP server returned an error"
-            raise MCPClientError(message)
+            # This trusted server only prepares a command. No sandbox execution
+            # task exists yet; a completed rejection is not an unknown execution.
+            raise MCPCommandPlanError("mcp.planner_rejected")
 
         candidates: list[dict[str, Any]] = []
 

@@ -19,6 +19,22 @@ from agent_core.turn_contracts import D1RoleConfig
 
 MAX_IN_FLIGHT_TOOLS = 2
 
+
+@dataclass(frozen=True, slots=True)
+class StageToolBatch:
+    calls: tuple[MCPCall, ...]
+
+
+def tool_calls(value):
+    return value.calls if isinstance(value, StageToolBatch) else (value,) if isinstance(value, MCPCall) else ()
+
+
+def tool_call_key(parent, value, call):
+    """A batch item is bound to its exact unique arguments, not a fabricated model call."""
+    from dataclasses import asdict
+    from agent_core.turn_modeling import digest
+    return parent + "/" + digest(asdict(call)) if isinstance(value, StageToolBatch) else parent
+
 class TurnPlanningState(StrEnum):
     ACTIVE = "active"
     WAITING_CHILD = "waiting_child"
@@ -234,7 +250,7 @@ class StageModelEvidence:
     session: PlanningSession
     context_sha256: str
     evidence_sha256: str
-    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | MCPCall | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
+    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | MCPCall | StageToolBatch | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
     proposal_operation_id: str | None = None
     proposal_sha256: str | None = None
 

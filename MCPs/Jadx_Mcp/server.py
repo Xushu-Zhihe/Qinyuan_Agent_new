@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from MCPs.analysis_common import validate_sandbox_path, validate_timeout
+from MCPs.analysis_common import SANDBOX_WORK_ROOT, validate_sandbox_path, validate_timeout
 from MCPs.fastmcp_compat import FastMCP
 
 
@@ -11,27 +11,28 @@ mcp = FastMCP(
     instructions=(
         "Prepare JADX decompilation commands for Android files in the current "
         "Agent sandbox. Decompiled sources and resources are written under "
-        "/work. This server never executes JADX itself."
+        "/workspace/work or /tmp. This server never executes JADX itself."
     ),
     json_response=True,
 )
 
 
 def _validate_output_directory(value: str) -> str:
-    output_dir = validate_sandbox_path(value, label="output_dir")
-    if not output_dir.startswith("/work/"):
-        raise ValueError("output_dir must be a subdirectory of /work")
-    return output_dir
+    return validate_sandbox_path(value, label="output_dir", writable=True)
 
 
 @mcp.tool(title="Decompile Android File With JADX")
 def decompile_android(
     input_path: str,
-    output_dir: str = "/work/jadx-output",
+    output_dir: str = SANDBOX_WORK_ROOT + "/jadx-output",
     deobfuscate: bool = True,
     timeout_seconds: int = 300,
 ) -> dict[str, Any]:
-    """Decompile an APK, DEX, AAB, AAR, JAR, ZIP, or class file with JADX."""
+    """Decompile an APK, DEX, AAB, AAR, JAR, ZIP, or class file with JADX.
+
+    Read /workspace/input, /workspace/work or /tmp; write only /workspace/work or /tmp.
+    Relative paths resolve below /workspace/work.
+    """
 
     normalized_input = validate_sandbox_path(input_path, label="input_path")
     normalized_output = _validate_output_directory(output_dir)

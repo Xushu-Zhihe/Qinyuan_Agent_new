@@ -23,6 +23,13 @@ class T6EvidenceError(RuntimeError):
     pass
 
 
+class T6EvidenceCapacityError(T6EvidenceError):
+    def __init__(self, kind, reference, actual_bytes, limit_bytes):
+        self.record_kind, self.record_id = kind, reference
+        self.actual_bytes, self.limit_bytes = actual_bytes, limit_bytes
+        super().__init__("evidence_capacity_exceeded")
+
+
 class T6CommandRecoveryRequired(RuntimeError):
     pass
 

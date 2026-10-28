@@ -4,7 +4,7 @@ from dataclasses import asdict
 import math
 from types import SimpleNamespace
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.handoff_contracts import D8HandoffRequest
 from agent_core.turn_modeling import digest
 
@@ -126,7 +126,7 @@ class BusinessDiagnostics:
                     "contract_sha256", "issues", "rejection_reason", "rejected_candidate_indices", "finished_at"}
         if (not isinstance(record, dict) or not isinstance(contract, dict)
                 or not isinstance(payload, dict) or set(record) != required):
-            raise D3RecoveryRequired("d8_business_diagnostic_evidence_missing")
+            raise ExecutionRecoveryRequired("d8_business_diagnostic_evidence_missing")
         request = D8HandoffRequest.from_dict(payload)
         if (type(record["diagnostic_version"]) is not int or record["diagnostic_version"] != 1
                 or type(record["contract_version"]) is not int or record["contract_version"] != self.config.contract_version
@@ -151,9 +151,9 @@ class BusinessDiagnostics:
                 or contract["model_request_id"] != identity
                 or type(record["finished_at"]) not in {int, float}
                 or not math.isfinite(record["finished_at"])):
-            raise D3RecoveryRequired("d8_business_diagnostic_binding_changed")
+            raise ExecutionRecoveryRequired("d8_business_diagnostic_binding_changed")
         if request.correction_of_model_request_id == identity:
-            raise D3RecoveryRequired("d8_business_diagnostic_root_changed")
+            raise ExecutionRecoveryRequired("d8_business_diagnostic_root_changed")
         if request.correction_of_model_request_id is not None:
             root = request.correction_of_model_request_id
             root_contract = self.evidence.read("contract", root)
@@ -167,7 +167,7 @@ class BusinessDiagnostics:
                     or root_payload.get("stage") != request.stage
                     or root_payload.get("role_config_ref") != request.role_config_ref
                     or root_payload.get("base_checkpoint_sequence") != request.base_checkpoint_sequence):
-                raise D3RecoveryRequired("d8_business_diagnostic_root_changed")
+                raise ExecutionRecoveryRequired("d8_business_diagnostic_root_changed")
             root_business = self.read(root, check_operation=check_operation)
             expected_error = {"correction_of_model_request_id": root}
             if root_business is not None:
@@ -177,22 +177,22 @@ class BusinessDiagnostics:
                 from agent_core.structured_output import StructuredOutput
                 root_format = StructuredOutput(SimpleNamespace(config=self.config), self.evidence).diagnostic(root)
                 if root_format is None:
-                    raise D3RecoveryRequired("d8_business_diagnostic_root_missing")
+                    raise ExecutionRecoveryRequired("d8_business_diagnostic_root_missing")
                 expected_error.update(reason="output_format_invalid", issues=root_format["issues"])
             if contract.get("correction") != expected_error:
-                raise D3RecoveryRequired("d8_business_diagnostic_correction_changed")
+                raise ExecutionRecoveryRequired("d8_business_diagnostic_correction_changed")
         if self.evidence.read("diagnostic", identity) is not None:
-            raise D3RecoveryRequired("d8_business_and_format_diagnostic_conflict")
+            raise ExecutionRecoveryRequired("d8_business_and_format_diagnostic_conflict")
         issues = record["issues"]
         if not isinstance(issues, list) or not 1 <= len(issues) <= 8:
-            raise D3RecoveryRequired("d8_business_diagnostic_issues_invalid")
+            raise ExecutionRecoveryRequired("d8_business_diagnostic_issues_invalid")
         allowed = list(ISSUES) + list(CANDIDATE_ISSUES)
         for value in issues:
             if not isinstance(value, dict) or value.get("code") not in allowed:
-                raise D3RecoveryRequired("d8_business_diagnostic_issues_invalid")
+                raise ExecutionRecoveryRequired("d8_business_diagnostic_issues_invalid")
             code = value["code"]
             if self.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and code in {"planning_target_invalid", "planning_target_mismatch"}:
-                raise D3RecoveryRequired("s2_planning_diagnostic_program_field")
+                raise ExecutionRecoveryRequired("s2_planning_diagnostic_program_field")
             if self.config.contract_version == 22 and code in CANDIDATE_ISSUES:
                 parts = value.get('path', '').split('/')
                 index = int(parts[2]) if len(parts) == 4 and parts[2].isdigit() else -1
@@ -200,13 +200,13 @@ class BusinessDiagnostics:
             else:
                 valid = value in ([issue(code, i) for i in range(2)] if code in CANDIDATE_ISSUES else [issue(code)])
             if not valid:
-                raise D3RecoveryRequired("d8_business_diagnostic_issues_invalid")
+                raise ExecutionRecoveryRequired("d8_business_diagnostic_issues_invalid")
         indices = record["rejected_candidate_indices"]
         if (record["rejection_reason"] not in {"d8_output_contract_rejected", "d8_all_dependency_candidates_rejected"}
                 or not isinstance(indices, list) or any(type(i) is not int or i < 0
                     or self.config.contract_version != 22 and i not in {0, 1} for i in indices)
                 or len(indices) != len(set(indices))):
-            raise D3RecoveryRequired("d8_business_diagnostic_result_invalid")
+            raise ExecutionRecoveryRequired("d8_business_diagnostic_result_invalid")
         if check_operation:
             op = self.store.load_d4_operation(identity)
             if (op is None or op.start.task_run_id != request.task_run_id or op.start.category != "planning"
@@ -217,7 +217,7 @@ class BusinessDiagnostics:
                     or op.start.budget_policy_ref != self.config.d4_budget.budget_policy_ref
                     or record["finished_at"] < op.start.started_at
                     or op.completion is not None and op.completion.result_kind != "rejected"):
-                raise D3RecoveryRequired("d8_business_diagnostic_operation_changed")
+                raise ExecutionRecoveryRequired("d8_business_diagnostic_operation_changed")
         return record
 
     def save(self, request, issues, reason, indices, finished_at):
@@ -244,13 +244,13 @@ class BusinessDiagnostics:
         record = self.read(request.model_request_id, check_operation=True)
         if record is not None:
             if result != self.rejected_result(request, record):
-                raise D3RecoveryRequired("d8_business_diagnostic_result_changed")
+                raise ExecutionRecoveryRequired("d8_business_diagnostic_result_changed")
         elif "business_diagnostic_sha256" in result:
-            raise D3RecoveryRequired("d8_business_diagnostic_required")
+            raise ExecutionRecoveryRequired("d8_business_diagnostic_required")
         elif result["outcome"] == "invalid":
             from agent_core.structured_output import StructuredOutput
             if StructuredOutput(SimpleNamespace(config=self.config), self.evidence).diagnostic(request.model_request_id) is None:
-                raise D3RecoveryRequired("d8_business_diagnostic_required")
+                raise ExecutionRecoveryRequired("d8_business_diagnostic_required")
         return record
 
     def projection(self, operations):
@@ -260,7 +260,7 @@ class BusinessDiagnostics:
                 continue
             payload = self.handoff.read("request", op.start.operation_id)
             if payload is None:
-                raise D3RecoveryRequired("d8_business_planning_request_missing")
+                raise ExecutionRecoveryRequired("d8_business_planning_request_missing")
             request = D8HandoffRequest.from_dict(payload)
             if request.stage != "tree_planning":
                 continue
@@ -271,7 +271,7 @@ class BusinessDiagnostics:
                 if op.completion is not None and (result is None
                         or op.completion.evidence_sha256 != digest(result)
                         or op.completion.finished_at != result["finished_at"]):
-                    raise D3RecoveryRequired("d8_business_diagnostic_completion_changed")
+                    raise ExecutionRecoveryRequired("d8_business_diagnostic_completion_changed")
                 rows.append({k: record[k] for k in ("diagnostic_version", "model_request_id", "root_request_id", "stage", "issues")}
                             | {"diagnostic_sha256": digest(record)})
         return rows

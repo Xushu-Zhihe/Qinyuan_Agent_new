@@ -22,7 +22,7 @@ from agent_core.dual_llm_contracts import (
     D3Outcome,
     D3PlanBinding,
     D3PlanResult,
-    D3RecoveryRequired,
+    ExecutionRecoveryRequired,
     D3TurnBinding,
 )
 from agent_core.turn_manager import TurnManager
@@ -172,13 +172,13 @@ class D3Control:
         hybrid=isinstance(proposal,AttachmentPlanProposal)
         if hybrid:turn=attachment_binding(turn,proposal.attachment_index)
         if turn is None:
-            raise D3RecoveryRequired("d3_plan_turn_binding_missing")
+            raise ExecutionRecoveryRequired("d3_plan_turn_binding_missing")
         previous = [item for item in state.plans if item.intent_id == intent_id]
         ordinal = len(previous) + 1
         if (ordinal == 1 and review_id is not None) or (
             ordinal > 1 and review_id is None and not (self.ledger.load_d3_run_config(state.task_run.task_run_id).intent_execution_policy and previous[-1].status is PlanStatus.COMPLETED)
         ):
-            raise D3RecoveryRequired("d3_plan_requires_its_replanning_review")
+            raise ExecutionRecoveryRequired("d3_plan_requires_its_replanning_review")
         plan_id = self._id(f"plan/{intent_id}/{ordinal}")
         steps = (
             (PlanStep(D3_SIZE_STEP), PlanStep(D3_SHA_STEP))
@@ -204,7 +204,7 @@ class D3Control:
         new_plan = UpsertPlan(plan_id, intent_id, steps, PlanStatus.RUNNING)
         if previous and previous[-1].status is PlanStatus.RUNNING:
             if review_id is None:
-                raise D3RecoveryRequired("d3_replan_review_missing")
+                raise ExecutionRecoveryRequired("d3_replan_review_missing")
             old = previous[-1]
             old_change = UpsertPlan(
                 old.plan_id,
@@ -235,7 +235,7 @@ class D3Control:
                 D3CommitMetadata(plan_binding=binding),
             )
         else:
-            raise D3RecoveryRequired("d3_previous_plan_not_closed")
+            raise ExecutionRecoveryRequired("d3_previous_plan_not_closed")
         return binding
 
     def complete_plan(
@@ -291,12 +291,12 @@ class D3Control:
                 or result.proof_id is None
                 or result.supporting_fact_id is None
             ):
-                raise D3RecoveryRequired("d3_observed_plan_support_missing")
+                raise ExecutionRecoveryRequired("d3_observed_plan_support_missing")
 
             # D22 mode: Accept multiple Facts from Plan
             if any(f.fact_id == result.supporting_fact_id for f in state.facts):
                 if conclusion is None or conclusion.fact_id != result.supporting_fact_id:
-                    raise D3RecoveryRequired("d22_reuse_approval_missing")
+                    raise ExecutionRecoveryRequired("d22_reuse_approval_missing")
             elif facts is not None:
                 changes.extend(facts)
             # Backward compatibility: Single Fact via content parameter
@@ -312,7 +312,7 @@ class D3Control:
                     )
                 )
         elif source_execution_id is not None:
-            raise D3RecoveryRequired("d3_reused_plan_cannot_create_fact")
+            raise ExecutionRecoveryRequired("d3_reused_plan_cannot_create_fact")
         if conclusion is not None:
             changes.append(conclusion)
         return self._commit(
@@ -418,7 +418,7 @@ class D3Control:
         ]
         config = self.ledger.load_d3_run_config(state.task_run.task_run_id)
         if not siblings and config.contract_version not in {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
-            raise D3RecoveryRequired("d3_no_sibling_candidate")
+            raise ExecutionRecoveryRequired("d3_no_sibling_candidate")
         next_intent = min(siblings, key=lambda item: item.priority) if siblings else None
         changes: list[StateChange] = [
             UpsertIntent(

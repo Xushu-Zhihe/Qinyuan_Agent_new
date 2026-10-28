@@ -9,7 +9,7 @@ from agent_core.conclusion_revision_contracts import (
     D8PriorChange, D8RevisionHistoryItem, D8RevisionRecord,
 )
 from agent_core.domain import FactStatus, IntentStatus
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.handoff_contracts import D8HistoryItem, handoff_json
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.operation_accounting import D4OperationCompletion, D4OperationStart, _uuid
@@ -45,11 +45,11 @@ class ConclusionRevisions:
         data = self.evidence.read("handoff", record.evidence_ref)
         if (data is None or conclusion_digest(data) != record.evidence_sha256
                 or data.get("record_id") != record.record_id or data.get("request_id") != record.review_request_id):
-            raise D3RecoveryRequired("d8_revision_evidence_unavailable")
+            raise ExecutionRecoveryRequired("d8_revision_evidence_unavailable")
         action = D8ConclusionChange.from_dict(data["candidate"])
         decision = D8ChangeDecision.from_dict(data["decision"])
         if (action.operation, decision.decision) != (record.operation, record.decision):
-            raise D3RecoveryRequired("d8_revision_metadata_changed")
+            raise ExecutionRecoveryRequired("d8_revision_metadata_changed")
         return data, action, decision
 
     def _projection(self, base):
@@ -75,7 +75,7 @@ class ConclusionRevisions:
                 head = heads.get(target.root_id)
                 if (head is None or head["version"] != target.version
                         or head["last_ref"] != target.ref):
-                    raise D3RecoveryRequired("d8_revision_history_chain_changed")
+                    raise ExecutionRecoveryRequired("d8_revision_history_chain_changed")
             operation, roots = action.operation, tuple(t.root_id for t in action.targets)
             if operation in {"correct", "restore"}:
                 head = heads[roots[0]]
@@ -87,7 +87,7 @@ class ConclusionRevisions:
                             current = self._source_snapshot(source)
                             if current != source:
                                 status = "unavailable"
-                        except D3RecoveryRequired:
+                        except ExecutionRecoveryRequired:
                             status = "unavailable"
                     actor = next(i for i in self.state.intents if i.intent_id == record.actor_intent_id)
                     entry = D8HistoryItem(record.record_id, record.task_run_id, "reviewed_inference",
@@ -108,7 +108,7 @@ class ConclusionRevisions:
             elif operation == "resolve_conflict":
                 pair = tuple(sorted(roots))
                 if pair not in conflicts:
-                    raise D3RecoveryRequired("d8_revision_conflict_history_changed")
+                    raise ExecutionRecoveryRequired("d8_revision_conflict_history_changed")
                 if action.resolution != "unresolved":
                     del conflicts[pair]
                 if action.resolution in {"keep_first", "withdraw_both"}:
@@ -203,20 +203,20 @@ class ConclusionRevisions:
         self.app._check_role()
         if (self.app.conclusions.inner_model.role_config != self.app.config.inner_role
                 or self.app.conclusions.outer_model.role_config != self.app.config.outer_role):
-            raise D3RecoveryRequired("d8_revision_frozen_role_changed")
+            raise ExecutionRecoveryRequired("d8_revision_frozen_role_changed")
         if not self.app._redaction_configured:
-            raise D3RecoveryRequired("d5_redaction_configuration_unavailable")
+            raise ExecutionRecoveryRequired("d5_redaction_configuration_unavailable")
         self.app._check_dispatch(allow_conclusion_repair=True)
         if self.store.load_d3_run_config(self.state.task_run.task_run_id) != self.app.config:
-            raise D3RecoveryRequired("d8_revision_frozen_configuration_changed")
+            raise ExecutionRecoveryRequired("d8_revision_frozen_configuration_changed")
         actor = next((i for i in self.state.intents if i.intent_id == actor_id), None)
         if actor is None or actor.status not in {IntentStatus.RUNNING, IntentStatus.PENDING}:
-            raise D3RecoveryRequired("d8_revision_actor_scope_ended")
+            raise ExecutionRecoveryRequired("d8_revision_actor_scope_ended")
         return actor
 
     def validate_action(self, action, visible):
         if self.app.conclusions._sensitive(asdict(action)):
-            raise D3RecoveryRequired("d8_revision_sensitive_rejected")
+            raise ExecutionRecoveryRequired("d8_revision_sensitive_rejected")
         current_items, heads, conflicts, _ = self._projection(self._base())
         current = {i.ref: i for i in self.project(self._base())}
         visible_refs = {i.ref for i in visible}
@@ -224,52 +224,52 @@ class ConclusionRevisions:
             head = heads.get(target.root_id)
             if (head is None or head["version"] != target.version or head["last_ref"] != target.ref
                     or target.ref not in visible_refs):
-                raise D3RecoveryRequired("d8_revision_head_or_visibility_changed")
+                raise ExecutionRecoveryRequired("d8_revision_head_or_visibility_changed")
             frozen = next((i for i in visible if i.ref == target.ref), None)
             now = current.get(target.ref)
             if frozen is None or now is None or frozen != now:
-                raise D3RecoveryRequired("d8_revision_frozen_target_changed")
+                raise ExecutionRecoveryRequired("d8_revision_frozen_target_changed")
         for ref in action.evidence_refs:
             if ref not in visible_refs or not self.reliable(current.get(ref)):
-                raise D3RecoveryRequired("d8_revision_evidence_unavailable")
+                raise ExecutionRecoveryRequired("d8_revision_evidence_unavailable")
         if action.replacement_ref is not None:
             item = current.get(action.replacement_ref)
             restoring_original = (action.operation == "restore" and action.replacement_ref == action.targets[0].ref
                                   and item is not None and item.source_status == "available" and not item.conflict)
             if action.replacement_ref not in visible_refs or not (self.reliable(item) or restoring_original):
-                raise D3RecoveryRequired("d8_revision_replacement_unavailable")
+                raise ExecutionRecoveryRequired("d8_revision_replacement_unavailable")
             kind = heads[action.targets[0].root_id]["kind"]
             if action.operation == "link_verified":
                 if kind != "reviewed_inference" or item.record_type != "verified_fact":
-                    raise D3RecoveryRequired("d8_validation_link_identity_invalid")
+                    raise ExecutionRecoveryRequired("d8_validation_link_identity_invalid")
             elif action.operation in {"correct", "restore"} and item.record_type != kind:
-                raise D3RecoveryRequired("d8_revision_identity_change_forbidden")
+                raise ExecutionRecoveryRequired("d8_revision_identity_change_forbidden")
             if action.operation == "replace_support" and item.record_type not in {"verified_fact", "reviewed_inference"}:
-                raise D3RecoveryRequired("d8_dependency_requires_conclusion")
+                raise ExecutionRecoveryRequired("d8_dependency_requires_conclusion")
             if action.operation == "replace_support" and action.relation_kind == "parent_support" and kind != "verified_fact":
-                raise D3RecoveryRequired("d8_parent_support_requires_verified_fact")
+                raise ExecutionRecoveryRequired("d8_parent_support_requires_verified_fact")
             if action.replacement_ref == action.targets[0].ref and action.operation not in {"restore", "replace_support"}:
-                raise D3RecoveryRequired("d8_revision_replacement_is_unchanged")
+                raise ExecutionRecoveryRequired("d8_revision_replacement_is_unchanged")
         root = action.targets[0].root_id
         if action.operation == "restore":
             if heads[root]["ref"] is not None:
-                raise D3RecoveryRequired("d8_revision_restore_requires_withdrawal")
+                raise ExecutionRecoveryRequired("d8_revision_restore_requires_withdrawal")
         elif action.operation in {"correct", "withdraw"} and heads[root]["ref"] is None:
-            raise D3RecoveryRequired("d8_revision_requires_adopted_version")
+            raise ExecutionRecoveryRequired("d8_revision_requires_adopted_version")
         if action.content is not None:
             if heads[root]["kind"] != "reviewed_inference":
-                raise D3RecoveryRequired("d8_revision_text_cannot_create_fact")
+                raise ExecutionRecoveryRequired("d8_revision_text_cannot_create_fact")
             if any(current[ref].record_type not in {"verified_fact", "reviewed_inference"}
                    for ref in action.evidence_refs):
-                raise D3RecoveryRequired("d8_revision_inference_source_kind_invalid")
+                raise ExecutionRecoveryRequired("d8_revision_inference_source_kind_invalid")
         if action.operation == "report_conflict":
             if any(heads[t.root_id]["ref"] is None for t in action.targets):
-                raise D3RecoveryRequired("d8_conflict_requires_adopted_versions")
+                raise ExecutionRecoveryRequired("d8_conflict_requires_adopted_versions")
             if len({t.ref for t in action.targets}) != 2:
-                raise D3RecoveryRequired("d8_conflict_requires_distinct_versions")
+                raise ExecutionRecoveryRequired("d8_conflict_requires_distinct_versions")
         if action.operation == "resolve_conflict":
             if tuple(sorted(t.root_id for t in action.targets)) not in conflicts:
-                raise D3RecoveryRequired("d8_conflict_pair_not_open")
+                raise ExecutionRecoveryRequired("d8_conflict_pair_not_open")
         if action.operation == "replace_support":
             self._relation(action, current_items)
         return current, heads
@@ -280,24 +280,24 @@ class ConclusionRevisions:
     def _relation_details(self, action, items):
         owner = next((i for i in self.state.intents if i.intent_id == action.relation_owner_id), None)
         if owner is None:
-            raise D3RecoveryRequired("d8_support_owner_missing")
+            raise ExecutionRecoveryRequired("d8_support_owner_missing")
         by_ref = {i.ref: i for i in self._history()}
         root = action.targets[0].root_id
         if action.relation_kind == "parent_support":
             success = [r for r in self.store.list_d8_tree_records(self.state.task_run.task_run_id)
                        if r.kind == "succeeded" and r.intent_id == owner.intent_id]
             if len(success) != 1:
-                raise D3RecoveryRequired("d8_parent_success_relation_missing")
+                raise ExecutionRecoveryRequired("d8_parent_success_relation_missing")
             original = next((i.ref for i in items if i.record_id == success[0].support_fact_id), None)
             existing = self.relation_ref("parent_support", owner.intent_id, original)
             if existing not in by_ref or getattr(by_ref[existing], "logical_root_id", None) != root:
-                raise D3RecoveryRequired("d8_support_relation_version_changed")
+                raise ExecutionRecoveryRequired("d8_support_relation_version_changed")
         else:
             original = self.app.handoff._dependencies(owner.intent_id, apply_revisions=False)
             effective = tuple(self.relation_ref("intent_dependency", owner.intent_id, ref) for ref in original)
             candidates = [ref for ref in effective if ref in by_ref and getattr(by_ref[ref], "logical_root_id", None) == root]
             if len(candidates) != 1:
-                raise D3RecoveryRequired("d8_dependency_relation_version_changed")
+                raise ExecutionRecoveryRequired("d8_dependency_relation_version_changed")
             existing = candidates[0]
         return self.app.redactor.redact(owner.description), existing
 
@@ -308,7 +308,7 @@ class ConclusionRevisions:
         ref, seen = original, set()
         while (kind, owner_id, ref) in relations:
             if ref in seen:
-                raise D3RecoveryRequired("d8_support_relation_cycle")
+                raise ExecutionRecoveryRequired("d8_support_relation_cycle")
             seen.add(ref)
             replacement = relations[(kind, owner_id, ref)]
             if replacement == ref:
@@ -332,35 +332,35 @@ class ConclusionRevisions:
                         or (kind == "intent_dependency" and any(owner == owner_id for owner, _ in row.dependencies))):
                     raw = self.app.handoff.evidence.read("request", row.model_request_id)
                     if raw is None:
-                        raise D3RecoveryRequired("d8_support_original_request_missing")
+                        raise ExecutionRecoveryRequired("d8_support_original_request_missing")
                     frozen = next((D8HistoryItem.from_dict(i) for i in raw["history"] if
                                    f"{i['record_type']}:{i['record_id']}:{i['source_version']}" == original), None)
                     if frozen is not None:
                         break
         current = next((i for i in self._history() if i.ref == current_ref), None)
         if frozen is None or current is None or not self.reliable(current):
-            raise D3RecoveryRequired("d8_support_binding_not_effective")
+            raise ExecutionRecoveryRequired("d8_support_binding_not_effective")
         binding = lambda item: (item.record_id, item.source_version,
                                 getattr(item, "logical_root_id", None), getattr(item, "revision", None),
                                 getattr(item, "effective_version_id", None), getattr(item, "committed_version_id", None))
         if binding(frozen) != binding(current):
-            raise D3RecoveryRequired("d8_support_requires_explicit_reapproval")
+            raise ExecutionRecoveryRequired("d8_support_requires_explicit_reapproval")
 
     def parent_fact(self, intent_id, original_fact_id):
         items = {i.record_id: i for i in self._history()}
         old = items.get(original_fact_id)
         if old is None:
-            raise D3RecoveryRequired("d8_parent_support_missing")
+            raise ExecutionRecoveryRequired("d8_parent_support_missing")
         ref = self.relation_ref("parent_support", intent_id, old.ref)
         self.check_relation_binding("parent_support", intent_id, old.ref, ref)
         item = next((i for i in items.values() if i.ref == ref), None)
         if not self.reliable(item) or item.record_type != "verified_fact":
-            raise D3RecoveryRequired("d8_parent_support_not_effective")
+            raise ExecutionRecoveryRequired("d8_parent_support_not_effective")
         return item.record_id
 
     def check_required(self):
         if self._dirty_turns():
-            raise D3RecoveryRequired("d8_revision_summaries_pending")
+            raise ExecutionRecoveryRequired("d8_revision_summaries_pending")
         history = {i.ref: i for i in self._history()}
         by_id = {i.record_id: i for i in history.values()}
         turns = {t.turn_id: t for t in self.state.turns}
@@ -393,23 +393,23 @@ class ConclusionRevisions:
                 successes = [r for r in self.store.list_d8_tree_records(self.state.task_run.task_run_id)
                              if r.kind == "succeeded" and r.intent_id == trigger]
                 if len(successes) != 1:
-                    raise D3RecoveryRequired("d8_parent_support_relation_missing")
+                    raise ExecutionRecoveryRequired("d8_parent_support_relation_missing")
                 self.parent_fact(trigger, successes[0].support_fact_id)
                 turn = turns[turn.parent_turn_id]
             if any(not self.reliable(history.get(ref)) for ref in required):
-                raise D3RecoveryRequired("d8_required_conclusion_not_effective")
+                raise ExecutionRecoveryRequired("d8_required_conclusion_not_effective")
 
     def validate_frozen_execution(self, request_id):
         import json
         saved = self.app.handoff.evidence.read("execution-context", request_id)
         if saved is None:
-            raise D3RecoveryRequired("d8_frozen_execution_context_missing")
+            raise ExecutionRecoveryRequired("d8_frozen_execution_context_missing")
         packet = json.loads(saved["history_context"])
         frozen = {i["ref"]: i for i in packet["items"]}
         current = {i.ref: i.visible() for i in self._history()}
         for ref in packet["required_refs"]:
             if ref not in current or conclusion_digest(frozen.get(ref)) != conclusion_digest(current[ref]):
-                raise D3RecoveryRequired("d8_frozen_execution_premise_changed")
+                raise ExecutionRecoveryRequired("d8_frozen_execution_premise_changed")
 
     @staticmethod
     def _parse(request, raw):
@@ -431,19 +431,19 @@ class ConclusionRevisions:
         data = self.evidence.read("result", request.model_request_id)
         if call is None:
             if data is not None:
-                raise D3RecoveryRequired("d8_revision_result_without_start")
+                raise ExecutionRecoveryRequired("d8_revision_result_without_start")
             return None
         inner = request.stage == "fact_proposal"
         role = self.app.config.inner_role if inner else self.app.config.outer_role
         if request.role_config_ref != role.role_config_ref or request.task_run_id != self.state.task_run.task_run_id:
-            raise D3RecoveryRequired("d8_revision_frozen_role_changed")
+            raise ExecutionRecoveryRequired("d8_revision_frozen_role_changed")
         expected = D4OperationStart(request.model_request_id, request.task_run_id,
                                    "action" if inner else "fact_review", call.start.started_at,
                                    request.base_checkpoint_sequence, request.context_sha256,
                                    request.actor_intent_id, self.app.config.d4_budget.budget_policy_ref,
                                    "inner_action" if inner else "outer_planning", request.role_config_ref)
         if call.start != expected:
-            raise D3RecoveryRequired("d8_revision_start_binding_changed")
+            raise ExecutionRecoveryRequired("d8_revision_start_binding_changed")
         if data is None:
             boundary = self.app.output_boundary
             failure = boundary.failure(request) if boundary is not None else None
@@ -453,29 +453,29 @@ class ConclusionRevisions:
                         "finished_at": failure["finished_at"]}
                 self.evidence.save("result", request.model_request_id, data)
         if data is None:
-            raise D3RecoveryRequired("d8_revision_model_outcome_unknown")
+            raise ExecutionRecoveryRequired("d8_revision_model_outcome_unknown")
         if (set(data) != {"model_request_id", "request_sha256", "outcome", "raw", "finished_at"}
                 or data["model_request_id"] != request.model_request_id
                 or data["request_sha256"] != request.context_sha256
                 or data["outcome"] not in {"valid", "invalid", "sensitive_rejected", "model_error", "stale"}):
-            raise D3RecoveryRequired("d8_revision_result_binding_changed")
+            raise ExecutionRecoveryRequired("d8_revision_result_binding_changed")
         if data["outcome"] == "valid":
             if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                 self.app.selection_bindings.verify(request, data['raw'])
             self._parse(request, data["raw"])
             if self.app.conclusions._sensitive(data["raw"]):
-                raise D3RecoveryRequired("d8_revision_saved_sensitive_text")
+                raise ExecutionRecoveryRequired("d8_revision_saved_sensitive_text")
         elif data["raw"] is not None:
-            raise D3RecoveryRequired("d8_revision_failed_result_contains_text")
+            raise ExecutionRecoveryRequired("d8_revision_failed_result_contains_text")
         completion = D4OperationCompletion(request.model_request_id, data["finished_at"],
                                            "completed" if data["outcome"] == "valid" else "rejected",
                                            request.model_request_id, conclusion_digest(data))
         if call.completion is None:
             if not repair:
-                raise D3RecoveryRequired("d8_revision_completion_missing")
+                raise ExecutionRecoveryRequired("d8_revision_completion_missing")
             self.store.complete_d4_operation(completion)
         elif call.completion != completion:
-            raise D3RecoveryRequired("d8_revision_completion_changed")
+            raise ExecutionRecoveryRequired("d8_revision_completion_changed")
         return data
 
     async def _call(self, request, token):
@@ -487,14 +487,14 @@ class ConclusionRevisions:
         if saved is None:
             self.evidence.save("request", request.model_request_id, asdict(request))
         elif D8ChangeRequest.from_dict(saved) != request:
-            raise D3RecoveryRequired("d8_revision_request_changed")
+            raise ExecutionRecoveryRequired("d8_revision_request_changed")
         result = self._known(request)
         if result is None:
             self._actor(request.actor_intent_id)
             if self.state.latest_checkpoint.sequence != request.base_checkpoint_sequence:
-                raise D3RecoveryRequired("d8_revision_request_stale")
+                raise ExecutionRecoveryRequired("d8_revision_request_stale")
             if token.is_cancelled:
-                raise D3RecoveryRequired("d8_revision_cancelled")
+                raise ExecutionRecoveryRequired("d8_revision_cancelled")
             self.app.handoff.check_role_request_capacity(request)
             inner = request.stage == "fact_proposal"
             self.store.begin_d4_operation(D4OperationStart(
@@ -506,7 +506,7 @@ class ConclusionRevisions:
             outcome = "valid"
             if isinstance(raw, ModelError):
                 if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22} and raw.kind in {ModelErrorKind.TIMED_OUT, ModelErrorKind.CANCELLED}:
-                    raise D3RecoveryRequired('d8_revision_model_outcome_unknown')
+                    raise ExecutionRecoveryRequired('d8_revision_model_outcome_unknown')
                 outcome, raw = "model_error", None
             elif self.app.conclusions._sensitive(raw):
                 outcome, raw = "sensitive_rejected", None
@@ -532,9 +532,9 @@ class ConclusionRevisions:
                 rejection_code="d8_revision_response_contract_invalid")
             return await self._call(correction, token)
         if result["outcome"] != "valid":
-            raise D3RecoveryRequired("d8_revision_model_" + result["outcome"])
+            raise ExecutionRecoveryRequired("d8_revision_model_" + result["outcome"])
         if token.is_cancelled:
-            raise D3RecoveryRequired("d8_revision_cancelled")
+            raise ExecutionRecoveryRequired("d8_revision_cancelled")
         self._actor(request.actor_intent_id)
         return request, self._parse(request, result["raw"])
 
@@ -576,10 +576,10 @@ class ConclusionRevisions:
                 if revision is not None:
                     for source in self._payload(revision)[0]["sources"]:
                         if self._source_snapshot(source)!=source:
-                            raise D3RecoveryRequired("d8_revision_inference_source_changed")
+                            raise ExecutionRecoveryRequired("d8_revision_inference_source_changed")
                         result[conclusion_digest(source)]=source
         if action.content is not None and not result:
-            raise D3RecoveryRequired("d8_revision_inference_has_no_safe_observation")
+            raise ExecutionRecoveryRequired("d8_revision_inference_has_no_safe_observation")
         return list(result.values())
 
     async def review(self, action, actor_id, proposal_id, visible, token):
@@ -588,7 +588,7 @@ class ConclusionRevisions:
         if existing is not None:
             _, recorded_action, _ = self._payload(existing)
             if recorded_action != action or existing.actor_intent_id != actor_id:
-                raise D3RecoveryRequired("d8_revision_replay_changed")
+                raise ExecutionRecoveryRequired("d8_revision_replay_changed")
             await self.refresh_summaries(token)
             return existing
         if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
@@ -604,13 +604,13 @@ class ConclusionRevisions:
             tuple(visible), action, original_goal,
             prior_changes=self.prior_changes(t.root_id for t in action.targets), relation_old_ref=relation_old_ref)
         if request.candidate != action:
-            raise D3RecoveryRequired("d8_revision_candidate_changed")
+            raise ExecutionRecoveryRequired("d8_revision_candidate_changed")
         final, decision = await self._call(request, token)
         if self.app.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.app.selection_bindings.check_relation(proposal_id, action)
         self.validate_action(action, final.history)
         if final.base_checkpoint_sequence != self.state.latest_checkpoint.sequence:
-            raise D3RecoveryRequired("d8_revision_approval_stale")
+            raise ExecutionRecoveryRequired("d8_revision_approval_stale")
         if decision.decision == "accept":
             self._check_decision(action, decision)
         record_id = self._id("record/" + proposal_id)
@@ -628,12 +628,12 @@ class ConclusionRevisions:
 
     def _check_decision(self, action, decision):
         if action.operation == "replace_support" and action.relation_kind == "parent_support" and decision.goal_supported is not True:
-            raise D3RecoveryRequired("d8_replacement_does_not_support_original_goal")
+            raise ExecutionRecoveryRequired("d8_replacement_does_not_support_original_goal")
         if action.operation == "resolve_conflict" and action.resolution == "different_scope" and not decision.scope_explanation:
-            raise D3RecoveryRequired("d8_scope_resolution_requires_explanation")
+            raise ExecutionRecoveryRequired("d8_scope_resolution_requires_explanation")
         if (action.operation == "resolve_conflict" and action.resolution == "different_scope"
                 and any(set(pair) == {t.ref for t in action.targets} for pair in self._registered_conflicts(self._base()))):
-            raise D3RecoveryRequired("d8_registered_attribute_conflict_cannot_be_dismissed")
+            raise ExecutionRecoveryRequired("d8_registered_attribute_conflict_cannot_be_dismissed")
 
     def validate_record(self, record, state):
         data, action, decision = self._payload(record)
@@ -646,7 +646,7 @@ class ConclusionRevisions:
                 or request.base_checkpoint_sequence != state.latest_checkpoint.sequence
                 or data["commit_sequence"] != state.latest_checkpoint.sequence + 1
                 or data["sources"] != self._sources(action, request.history)):
-            raise D3RecoveryRequired("d8_revision_approval_binding_changed")
+            raise ExecutionRecoveryRequired("d8_revision_approval_binding_changed")
         self._actor(record.actor_intent_id)
         self.validate_action(action, request.history)
         if decision.decision == "accept":
@@ -654,13 +654,13 @@ class ConclusionRevisions:
         if action.operation == "replace_support":
             goal, old = self._relation_details(action, self._base())
             if (request.original_goal, request.relation_old_ref, data["relation_old_ref"]) != (goal, old, old):
-                raise D3RecoveryRequired("d8_support_approval_relation_changed")
+                raise ExecutionRecoveryRequired("d8_support_approval_relation_changed")
         if self.store.load_d3_operation(record.proposal_request_id) is not None:
             evidence = self.app.model_evidence.read(record.proposal_request_id)
             candidate = D8ConclusionChange.parse_action(evidence.raw) if evidence is not None else None
             if (candidate != action or evidence.outcome != "accepted"
                     or evidence.task_run_id != record.task_run_id):
-                raise D3RecoveryRequired("d8_revision_inner_proposal_changed")
+                raise ExecutionRecoveryRequired("d8_revision_inner_proposal_changed")
             if evidence.stage == "inner_plan":
                 parts = evidence.resource_ref.split(":")
                 actor_id = parts[1] if len(parts) == 3 and parts[0] == "plan" else None
@@ -668,14 +668,14 @@ class ConclusionRevisions:
                 binding = self.store.load_d3_plan_binding(evidence.resource_ref.rsplit(":", 1)[0])
                 actor_id = binding.intent_id if binding is not None else None
             if actor_id != record.actor_intent_id:
-                raise D3RecoveryRequired("d8_revision_inner_actor_changed")
+                raise ExecutionRecoveryRequired("d8_revision_inner_actor_changed")
         else:
             proposal = D8ChangeRequest.from_dict(self.evidence.read("request", record.proposal_request_id))
             known = self._known(proposal)
             if (known is None or known["outcome"] != "valid" or proposal.stage != "fact_proposal"
                     or proposal.actor_intent_id != record.actor_intent_id
                     or self._parse(proposal, known["raw"]) != action):
-                raise D3RecoveryRequired("d8_revision_inner_proposal_changed")
+                raise ExecutionRecoveryRequired("d8_revision_inner_proposal_changed")
 
     def _dirty_turns(self):
         records = [r for r in self.records() if r.decision == "accept"]
@@ -685,7 +685,7 @@ class ConclusionRevisions:
         for summary in self.store.list_d8_handoffs(self.state.task_run.task_run_id):
             data = self.app.handoff.evidence.read("handoff", summary.evidence_ref)
             if data is None or conclusion_digest(data) != summary.evidence_sha256:
-                raise D3RecoveryRequired("d8_revision_summary_evidence_unavailable")
+                raise ExecutionRecoveryRequired("d8_revision_summary_evidence_unavailable")
             watermarks[summary.turn_id] = data.get("revision_sequence", 0)
         turns = set()
         all_items = {i.ref: i for i in self._history()}
@@ -735,7 +735,7 @@ class ConclusionRevisions:
             prior = next((r for r in self.records() if r.proposal_request_id == correction), None)
         if prior is not None:
             if prior.actor_intent_id != actor_id:
-                raise D3RecoveryRequired("d8_repair_request_owner_changed")
+                raise ExecutionRecoveryRequired("d8_repair_request_owner_changed")
             await self.refresh_summaries(token)
             return prior
         raw = self.evidence.read("request", request_id)
@@ -755,7 +755,7 @@ class ConclusionRevisions:
                                       self.app.config.inner_role.role_config_ref, self.state.latest_checkpoint.sequence,
                                       tuple(selected), history_context=handoff_json(packet), prior_changes=self.prior_changes())
         if (request.actor_intent_id, request.task_run_id) != (actor_id, self.state.task_run.task_run_id):
-            raise D3RecoveryRequired("d8_repair_request_owner_changed")
+            raise ExecutionRecoveryRequired("d8_repair_request_owner_changed")
         if self.app.sessions is not None:
             request = self.app.sessions.wrap(request)
         final, action = await self._call(request, token)
@@ -782,7 +782,7 @@ class ConclusionRevisions:
     def visible_for_execution(self, request_id):
         saved = self.app.handoff.evidence.read("execution-context", request_id)
         if saved is None:
-            raise D3RecoveryRequired("d8_change_execution_context_missing")
+            raise ExecutionRecoveryRequired("d8_change_execution_context_missing")
         return self.visible_from_context(saved["history_context"])
 
     @staticmethod

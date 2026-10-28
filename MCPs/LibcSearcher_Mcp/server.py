@@ -13,7 +13,7 @@ LIBCSEARCHER_INSTRUCTIONS = (
     "offset matching. It matches leaked addresses by symbol offsets and may "
     "return multiple possible libc versions; candidates are not guaranteed "
     "to be exact and can be tried or narrowed with additional leaks. If the "
-    "challenge supplies a libc file under /challenge, inspect and use that "
+    "challenge supplies a libc file under /workspace/input, inspect and use that "
     "file as authoritative before relying on this database. If there is no "
     "local match, use the existing libc_database MCP for the online libc.rip "
     "fallback. This server never performs network requests or downloads."

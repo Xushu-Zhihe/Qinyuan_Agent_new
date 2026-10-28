@@ -12,8 +12,8 @@ from agent_adapters import task_cli
 from agent_adapters.simulation import SimulationModel
 from agent_adapters.output_evidence import FileD8OutputEvidence
 from agent_core.completion_evaluation import evaluation_policy
-from agent_core.dual_llm_modeling import D3CandidateContext, D3ProposalRejected
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_modeling import D3CandidateContext, ExecutionProposalRejected
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.sqlite_control_store import SqliteControlStore
 from test_public_simulation import request
 from test_output import output_case, run as run_output
@@ -154,7 +154,7 @@ def test_bad_local_binding_never_recovers_or_calls_model(output_case, monkeypatc
         return record
     monkeypatch.setattr(output, 'read', read)
     before = len(case.models['handoff'].calls)
-    with pytest.raises(D3RecoveryRequired):
+    with pytest.raises(ExecutionRecoveryRequired):
         case.app.handoff._known_call(req)
     assert len(case.models['handoff'].calls) == before
 
@@ -265,7 +265,7 @@ def test_protected_candidate_keeps_explicit_source_without_plaintext_binding(out
     original = case.app.output_boundary.evidence.read
     monkeypatch.setattr(case.app.output_boundary.evidence, 'read', lambda kind, identity:
         None if kind == 'candidate-binding' and identity == req.model_request_id else original(kind, identity))
-    with pytest.raises(D3RecoveryRequired, match='s4_candidate_binding'):
+    with pytest.raises(ExecutionRecoveryRequired, match='s4_candidate_binding'):
         asyncio.run(case.app.inner.propose_candidate(req, case.token, protected))
 
 
@@ -292,12 +292,12 @@ def test_candidate_bad_choice_never_creates_protected_body(output_case, monkeypa
         else: action['evidence_version'] = '0'*64
         return {'action':action}
     monkeypatch.setattr(case.models['inner'], 'invoke', propose)
-    with pytest.raises(D3ProposalRejected):
+    with pytest.raises(ExecutionProposalRejected):
         asyncio.run(case.app.inner.propose_candidate(request, case.token, protected))
     assert protected.load_pending_for_request(request.model_request_id) is None
     assert case.app.output_boundary.evidence.read('candidate-binding', request.model_request_id) is None
     monkeypatch.setattr(case.models['inner'], 'invoke', lambda *a: pytest.fail('rejected candidate was retried'))
-    with pytest.raises(D3ProposalRejected):
+    with pytest.raises(ExecutionProposalRejected):
         asyncio.run(case.app.inner.propose_candidate(request, case.token, protected))
 
 
@@ -337,5 +337,5 @@ def test_candidate_process_loss_never_reasks_unknown_and_recovers_known(output_c
         assert candidate.execution_id == context.execution_id
         assert case.app.store.load_d3_operation(identity).completion is not None
     else:
-        with pytest.raises(D3RecoveryRequired, match='outcome_unknown'):
+        with pytest.raises(ExecutionRecoveryRequired, match='outcome_unknown'):
             asyncio.run(case.app.inner.propose_candidate(request, case.token, protected))

@@ -15,7 +15,7 @@ from agent_core.control_store import (
 from agent_core.domain import IntentStatus
 from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.operation_accounting import (
-    D4OperationCompletion, D4OperationConflict, D4OperationStart, D4RecoveryRequired,
+    D4OperationCompletion, OperationIdentityConflict, D4OperationStart, OperationRecoveryRequired,
     D8HandoffBudgetPolicy,
 )
 from agent_core.runtime import RuntimeEvent, TaskRunStatus
@@ -231,14 +231,23 @@ def test_role_admission_is_scoped_and_unknown_is_not_replayed(case):
     session = PlanningSession("turn_planning", case.root_id)
     wrong = D4OperationStart(uid(), case.task_id, "planning", case.now, case.sequence, "a" * 64,
         "root", case.config.budget.budget_policy_ref, "outer_planning", case.config.outer_role.role_config_ref)
-    with pytest.raises(D4OperationConflict, match="registered framework"):
+    with pytest.raises(OperationIdentityConflict, match="registered framework"):
         case.store.begin_d4_operation(wrong)
-    with pytest.raises(D4OperationConflict, match="frozen configuration"):
+    with pytest.raises(OperationIdentityConflict, match="frozen configuration"):
         case.store.begin_d4_operation(replace(wrong, role="inner_action"))
     inner = replace(wrong, role="inner_action", role_config_ref=case.config.inner_role.role_config_ref)
     assert case.store.begin_d4_operation(inner) is None
-    with pytest.raises(D4RecoveryRequired):
+    with pytest.raises(OperationRecoveryRequired):
         case.store.begin_d4_operation(inner)
+    from qinyuan_core import classify, Category
+    from agent_adapters.output_evidence import safe_failure_details
+    with pytest.raises(OperationRecoveryRequired) as caught:
+        case.store.begin_d4_operation(replace(inner, operation_id=uid()))
+    assert classify(caught.value) == (Category.UNKNOWN, "operation.result_unconfirmed", False)
+    diagnostic = safe_failure_details(caught.value)["operation_admission"]
+    assert diagnostic["blocking_count"] == 1
+    assert diagnostic["blocking_operations"][0]["operation_id"] == inner.operation_id
+    assert diagnostic["blocking_operations"][0]["category"] == "planning"
     before = case.sequence
     with pytest.raises(StageStateError, match="pending_operations"):
         case.apply(StageStateChange(sessions=(session,)))
@@ -251,7 +260,7 @@ def test_ordinary_task_cannot_admit_stage_planning_or_stage_writes(tmp_path):
         case.start(stage=False)
         operation = D4OperationStart(uid(), case.task_id, "planning", case.now, case.sequence,
             "a" * 64, "root", case.config.budget.budget_policy_ref, "inner_action", case.config.inner_role.role_config_ref)
-        with pytest.raises(D4OperationConflict):
+        with pytest.raises(OperationIdentityConflict):
             case.store.begin_d4_operation(operation)
         with pytest.raises(StageStateError, match="run_unsupported"):
             case.apply(StageStateChange(sessions=(PlanningSession("turn_planning", case.root_id),)))
@@ -269,7 +278,7 @@ def test_stale_and_conflicting_mutations(case):
         case.store.commit(b)
     altered = case.mutation(StageStateChange(sessions=(PlanningSession("turn_planning", uid()),)),
         mutation_id=a.mutation_id, sequence=a.base_checkpoint_sequence)
-    with pytest.raises(D4OperationConflict, match="control commit start differs"):
+    with pytest.raises(OperationIdentityConflict, match="control commit start differs"):
         case.store.commit(altered)
     assert case.sequence == a.checkpoint.sequence
 
@@ -414,7 +423,7 @@ def test_existing_configured_d4_task_keeps_outer_planning_boundary(tmp_path):
         operation = D4OperationStart(uid(), case.task_id, "planning", case.now,
             case.sequence, "a" * 64, "root", config.d4_budget.budget_policy_ref,
             "inner_action", config.inner_role.role_config_ref)
-        with pytest.raises(D4OperationConflict, match="registered framework"):
+        with pytest.raises(OperationIdentityConflict, match="registered framework"):
             case.store.begin_d4_operation(operation)
     finally:
         case.store.close()

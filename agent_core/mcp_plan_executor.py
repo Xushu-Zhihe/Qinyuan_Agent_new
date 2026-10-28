@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.operation_accounting import (
-    D4BudgetExhausted,
+    OperationBudgetExhausted,
     D4OperationStart,
     D4OperationCompletion,
 )
@@ -208,12 +208,12 @@ class MCPPlanExecutor:
             - tool_results: List of {tool, params, content, is_error, stderr} dicts
 
         Raises:
-            D3RecoveryRequired: If Intent not bound or sandbox unavailable
-            D4BudgetExhausted: If D4/D8 operation budget exhausted
+            ExecutionRecoveryRequired: If Intent not bound or sandbox unavailable
+            OperationBudgetExhausted: If D4/D8 operation budget exhausted
         """
         state = self._intent_states.get(intent_id)
         if state is None:
-            raise D3RecoveryRequired(f"mcp_intent_not_bound_{intent_id}")
+            raise ExecutionRecoveryRequired(f"mcp_intent_not_bound_{intent_id}")
 
         # Check MCP execution budget BEFORE execution
         budget = self.default_budget  # TODO: per-Intent budget override
@@ -237,9 +237,9 @@ class MCPPlanExecutor:
         )
 
         try:
-            # Record operation start (may raise D4BudgetExhausted)
+            # Record operation start (may raise OperationBudgetExhausted)
             self.control_store.record_operation_start(operation_start)
-        except D4BudgetExhausted:
+        except OperationBudgetExhausted:
             # D4/D8 budget exhausted - return budget unavailable
             return False, []
 
@@ -345,7 +345,7 @@ class MCPPlanExecutor:
         # NOTE: AgentMCPClient must be stored during bind_intent()
         agent_client = self._bound_agents.get(agent_id)
         if agent_client is None:
-            raise D3RecoveryRequired(f"mcp_agent_not_bound_{agent_id}")
+            raise ExecutionRecoveryRequired(f"mcp_agent_not_bound_{agent_id}")
 
         # Execute tool through MCP layer
         result: MCPExecutionResult = await agent_client.call_tool(tool_name, params)

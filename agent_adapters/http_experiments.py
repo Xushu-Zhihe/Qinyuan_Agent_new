@@ -6,12 +6,13 @@ import json
 import time
 from dataclasses import asdict
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.dual_llm_modeling import parse_d3_plan_proposal
 from agent_core.actions import MCPCall
 from agent_core.operation_accounting import D4OperationStart
+from agent_core.stage_storage import StageStateError
 from agent_core.turn_modeling import digest
-from agent_adapters.web.http_adapter import D7HttpRequest, D7HttpError, D7HttpPolicy
+from agent_adapters.web.http_adapter import D7HttpRequest, HttpCapabilityError, D7HttpPolicy
 from Sandbox.http_experiment import HttpExperimentProcess, MAX_SCRIPT_BYTES
 from Sandbox.task_run_sandbox import TaskRunSandboxError
 from qinyuan_core import get_logger
@@ -20,8 +21,8 @@ TOOL = 'http.run_experiment'
 SCRIPT_ERRORS = frozenset({'SyntaxError','NameError','TypeError','ValueError','KeyError','IndexError',
     'AttributeError','ZeroDivisionError','AssertionError','ImportError','ModuleNotFoundError','PermissionError',
     'RuntimeError','TimeoutError','MemoryError','RecursionError','OSError'})
-SPEC = dict(qualified_name=TOOL, tags=['http','conditional-experiment'],
-    description='Run Python branches/loops in this container. request(method,path_query,headers={},body="") returns status, body bytes, text and evidence_ref. HTTP uses the authorized origin, persistent cookies and per-request evidence; direct networking/process creation is disabled. Print a concise unreviewed summary.',
+SPEC = dict(qualified_name=TOOL, tags=['http','conditional-experiment','authorized-target-channel'],
+    description='[authorized-target-channel] Run Python branches/loops in a networkless container. Use request(method,path_query,headers={},body="") for target HTTP through the trusted forwarder; never use sockets, subprocesses or localhost as a substitute for the remote target. request returns status, body bytes, text and evidence_ref. HTTP uses only the authorized origin, persistent cookies and per-request evidence. Print a concise unreviewed summary.',
     input_schema={'type':'object','properties':{'script':{'type':'string','minLength':1,'maxLength':MAX_SCRIPT_BYTES},
         'timeout_seconds':{'type':'integer','minimum':5,'maximum':300}},
         'required':['script','timeout_seconds'],'additionalProperties':False})
@@ -44,7 +45,7 @@ def failure_diagnostics(evidence, store, task_id):
                 or failure['phase'] not in {'http_execute','receipt_save','receipt_apply'}
                 or failure['code'] not in SAFE_MODEL_ERROR_CODES
                 or failure['result_sha256'] is not None and (result is None or failure['result_sha256'] != digest(result))):
-            raise D3RecoveryRequired('d22_experiment_failure_diagnostic_invalid')
+            raise ExecutionRecoveryRequired('d22_experiment_failure_diagnostic_invalid')
         parent=store.load_d3_operation(claim['model_request_id'])
         rows.append(dict(execution_id=identity,model_request_id=claim['model_request_id'],
             phase=failure['phase'],code=failure['code'],result_saved=failure['result_sha256'] is not None,
@@ -77,11 +78,11 @@ class HttpExperiments:
     def stage(self):
         return self.app.store.load_stage_run_config(self.app.state.task_run.task_run_id) is not None
 
-    def _limits(self, owner):
+    def _limits(self, owner, *, tool_resource=None):
         app = self.app
         if self.stage:
             turn = next(t for t in app.store.list_stage_turns(app.task_id) if any(r.road_id == owner for r in t.roads))
-            return app.validator.action_limits(app.task_id, turn.turn_id, owner)[1]
+            return app.validator.action_limits(app.task_id, turn.turn_id, owner, tool_resource=tool_resource)[1]
         turn_id = next(i.turn_id for i in app.state.intents if i.intent_id == owner)
         _, maximum = app.validator.action_limits(app.state.task_run.task_run_id, turn_id, owner)
         app.validator._allowed(app.state.task_run.task_run_id, turn_id, owner, 'probe', maximum)
@@ -121,7 +122,7 @@ class HttpExperiments:
                 or session['task_run_id'] != self.app.state.task_run.task_run_id
                 or value['requests'] != [r.start.operation_id for r in rows]
                 or any(r.completion is None for r in rows)):
-            raise D3RecoveryRequired('d22_experiment_session_changed')
+            raise ExecutionRecoveryRequired('d22_experiment_session_changed')
         for ref in value['requests']:
             self.mcp.feedback(ref)
         return {**value, 'identity':'unreviewed_experiment_summary_with_independent_request_evidence'}
@@ -135,14 +136,14 @@ class HttpExperiments:
         if (session is None or session['task_run_id'] != claim['task_run_id']
                 or session['intent_id'] != claim['intent_id'] or session['call'] != claim['call']
                 or session['authorization_sha256'] != web.policy()['authorization_sha256']):
-            raise D3RecoveryRequired('d22_experiment_source_changed')
+            raise ExecutionRecoveryRequired('d22_experiment_source_changed')
         if self.stage:
             from agent_core.stage_contracts import PlanningSession
             parent = self.app.store.load_d4_operation(claim['model_request_id'])
             native = self.evidence.read_model_result(parent)
             if (parent.start.category != 'action' or parent.start.role != 'inner_action'
                     or native.session != PlanningSession('road_execution',claim['intent_id'])):
-                raise D3RecoveryRequired('d22_experiment_source_changed')
+                raise ExecutionRecoveryRequired('d22_experiment_source_changed')
             proposal = native.result
         else:
             native = self.app.model_evidence.read(claim['model_request_id'])
@@ -156,33 +157,34 @@ class HttpExperiments:
                 or parent.completion is None or parent.completion.result_kind != 'completed'
                 or parent.completion.evidence_ref != claim['model_request_id']
                 or parent.completion.evidence_sha256 != digest(asdict(native))):
-                raise D3RecoveryRequired('d22_experiment_source_changed')
+                raise ExecutionRecoveryRequired('d22_experiment_source_changed')
             try:
                 proposal = parse_d3_plan_proposal(native.raw)
             except (TypeError, ValueError) as error:
-                raise D3RecoveryRequired('d22_experiment_source_changed') from error
-        if not isinstance(proposal, MCPCall) or asdict(proposal) != session['call']:
-            raise D3RecoveryRequired('d22_experiment_source_changed')
+                raise ExecutionRecoveryRequired('d22_experiment_source_changed') from error
+        from agent_core.stage_contracts import tool_calls
+        if not any(asdict(call) == session['call'] for call in tool_calls(proposal)):
+            raise ExecutionRecoveryRequired('d22_experiment_source_changed')
         raw = web.protected.read(source['evidence_id'])
         if hashlib.sha256(raw).hexdigest() != source['sha256']:
-            raise D3RecoveryRequired('d22_experiment_source_changed')
+            raise ExecutionRecoveryRequired('d22_experiment_source_changed')
         fields = json.loads(raw)
         fields['headers'] = tuple(tuple(h) for h in fields['headers'])
         request = D7HttpRequest(operation.start.operation_id, **fields)
         method, _, _, _ = D7HttpPolicy.for_origin(web.policy()['endpoint']).validate(request)
         if method not in web.policy()['allowed_methods']:
-            raise D3RecoveryRequired('d22_experiment_source_changed')
+            raise ExecutionRecoveryRequired('d22_experiment_source_changed')
         response = result['payload']['http_response']
         body = web.protected.read(response['body_evidence_id'])
         if (hashlib.sha256(body).hexdigest() != response['body_sha256'] or len(body) != response['body_bytes']
                 or result['payload']['status'] != 'completed'
                 or operation.start.resource_ref != 'mcp/'+claim['intent_id']+'/experiment/'+claim['model_request_id']+'/'+str(source['ordinal'])):
-            raise D3RecoveryRequired('d22_experiment_source_changed')
+            raise ExecutionRecoveryRequired('d22_experiment_source_changed')
         web.cookie_snapshot(response)
 
     def record_failure(self, operation_id, claim, result, phase, error):
         from agent_adapters.output_evidence import safe_failure_details, SAFE_MODEL_ERROR_CODES
-        code = str(error) if isinstance(error,D3RecoveryRequired) and str(error) in SAFE_MODEL_ERROR_CODES else "d22_experiment_receipt_settlement_failed"
+        code = str(error) if isinstance(error,ExecutionRecoveryRequired) and str(error) in SAFE_MODEL_ERROR_CODES else "d22_experiment_receipt_settlement_failed"
         if phase == "http_execute":code = "d22_experiment_request_outcome_unknown"
         if self.evidence.read("experiment-failure",operation_id) is None:
             self.evidence.save("experiment-failure",operation_id,dict(
@@ -209,24 +211,24 @@ class HttpExperiments:
                 continue
             rows = self.records(identity)
             if any(r.completion is None for r in rows):
-                raise D3RecoveryRequired('d22_experiment_request_outcome_unknown')
+                raise ExecutionRecoveryRequired('d22_experiment_request_outcome_unknown')
             result = self.result(identity)
             if result is None:
                 process = self.evidence.read('experiment-process',identity)
                 if process is None or process['sandbox_id'] != self.app.state.task_run.sandbox_id:
-                    raise D3RecoveryRequired('d22_experiment_process_reconciliation_required')
+                    raise ExecutionRecoveryRequired('d22_experiment_process_reconciliation_required')
                 # Read-only reconciliation: never restart/kill/replay a lost program.
                 try:
                     status = self.app.http_sandbox._runtime.client.api.exec_inspect(process['exec_id'])
                 except Exception as error:
-                    raise D3RecoveryRequired('d22_experiment_process_reconciliation_required') from error
+                    raise ExecutionRecoveryRequired('d22_experiment_process_reconciliation_required') from error
                 if status.get('ContainerID') != process['sandbox_id'] or status.get('Running') is not False:
-                    raise D3RecoveryRequired('d22_experiment_process_reconciliation_required')
+                    raise ExecutionRecoveryRequired('d22_experiment_process_reconciliation_required')
                 stopped = self.evidence.read('experiment-stop',identity)
                 if stopped is not None:
                     if (stopped['session_sha256'] != digest(session)
                             or stopped['requests'] != [r.start.operation_id for r in rows]):
-                        raise D3RecoveryRequired('d22_experiment_session_changed')
+                        raise ExecutionRecoveryRequired('d22_experiment_session_changed')
                     # Reuse the retained intent to stop and observations. The
                     # fresh inspection above, not the failed close, proves exit.
                     restored = {**stopped, 'stop_diagnostic':{**stopped.get('stop_diagnostic',{}),
@@ -256,10 +258,14 @@ class HttpExperiments:
 
     async def request(self, parent, intent_id, call, ordinal, raw, token, expires):
         app, web = self.app, self.app.web
-        app._check_dispatch()
+        resource = 'mcp/'+intent_id+'/experiment/'+parent+'/'+str(ordinal)
+        if self.stage:
+            app._check_dispatch(tool_resource=resource)
+        else:
+            app._check_dispatch()
         if set(raw) != {'kind','method','path_query','headers','body'} or not isinstance(raw['headers'],dict):
             raise ValueError('d22_experiment_request_invalid')
-        maximum = self._limits(intent_id)
+        maximum = self._limits(intent_id, tool_resource=resource)
         from agent_adapters.http_capability import wire_id
         identity = wire_id(app.state.task_run.task_run_id,'experiment/request/'+parent+'/'+str(ordinal))
         proposed = D7HttpRequest(identity,raw['method'],raw['path_query'],tuple(raw['headers'].items()),raw['body'])
@@ -274,14 +280,14 @@ class HttpExperiments:
                 sha256=hashlib.sha256(encoded).hexdigest()))
         prior = app.store.load_d4_operation(identity)
         if prior is not None:
-            raise D3RecoveryRequired('d22_experiment_request_replay_forbidden')
+            raise ExecutionRecoveryRequired('d22_experiment_request_replay_forbidden')
         previous = web.restore_cookies()
         self.evidence.save('mcp-call',identity,claim)
         timeout = min(maximum,app.config.http_timeout_seconds,app.state.task_run.deadline_at-app.clock(),expires-time.monotonic())
         if timeout <= 0:
             raise TimeoutError('d22_experiment_timeout')
         app.store.begin_d4_operation(D4OperationStart(identity,claim['task_run_id'],'tool_dispatch',app.clock(),
-            app.state.latest_checkpoint.sequence,digest(claim),'mcp/'+intent_id+'/experiment/'+parent+'/'+str(ordinal),
+            app.state.latest_checkpoint.sequence,digest(claim),resource,
             app.config.d4_budget.budget_policy_ref))
         self.log.info('experiment.request_started',run=claim['task_run_id'],intent=intent_id,request=parent,exec=identity)
         web.http.timeout_seconds = timeout
@@ -292,7 +298,7 @@ class HttpExperiments:
                 await asyncio.wait({pending},timeout=0.025)
                 await self._strategy(intent_id)
                 if token.is_cancelled or app.clock() >= app.state.task_run.deadline_at or time.monotonic() >= expires:
-                    raise D3RecoveryRequired('d22_experiment_request_outcome_unknown')
+                    raise ExecutionRecoveryRequired('d22_experiment_request_outcome_unknown')
             response = pending.result()
             phase = 'receipt_save'
             data = dict(execution_id=identity,method=method,status=response.status,
@@ -310,8 +316,10 @@ class HttpExperiments:
                 run=claim['task_run_id'],request=parent,exec=identity,phase=phase,
                 category='unknown' if phase=='http_execute' else 'integrity' if phase=='receipt_apply' else 'persistence',
                 code=code,error_type=type(error).__name__)
-            if phase != 'http_execute' and isinstance(error,D3RecoveryRequired):raise
-            raise D3RecoveryRequired(code) from error
+            if phase != 'http_execute' and isinstance(error,ExecutionRecoveryRequired):raise
+            failure = ExecutionRecoveryRequired(code)
+            failure.operation_context = dict(operation_id=identity, resource_ref=resource, road_id=intent_id)
+            raise failure from error
         self.log.info('experiment.request_finished',run=claim['task_run_id'],request=parent,exec=identity,
             status=response.status,body_bytes=response.body_bytes)
         body = web.protected.read(response.body_evidence_id)
@@ -326,7 +334,7 @@ class HttpExperiments:
             self._apply_parent(parent)
             return
         if self.evidence.read('experiment-session',parent) is not None:
-            raise D3RecoveryRequired('d22_experiment_replay_forbidden')
+            raise ExecutionRecoveryRequired('d22_experiment_replay_forbidden')
         app._check_dispatch()
         app.web.attach()
         maximum = self._limits(intent_id)
@@ -341,9 +349,11 @@ class HttpExperiments:
         finished = dict(status='failed',code='d22_experiment_environment_error',output='')
         primary_error = None
         expires = time.monotonic()+timeout
+        phase = 'process_start'
         try:
             runner = await asyncio.to_thread(self.runner_factory,app.http_sandbox,session['task_run_id'],
                 app.state.task_run.sandbox_id,call.arguments['script'],timeout)
+            phase = 'bridge_ready'
             ready = await self._event(runner,token,expires)
             if ready.get('kind') == 'unavailable':
                 finished['code'] = 'd22_experiment_isolation_unavailable'
@@ -353,6 +363,7 @@ class HttpExperiments:
                 self.evidence.save('experiment-process',parent,dict(sandbox_id=app.state.task_run.sandbox_id,
                     exec_id=runner.exec_id))
                 while True:
+                    phase = 'bridge_event'
                     event = await self._event(runner,token,expires,intent_id)
                     await self._strategy(intent_id)
                     if event.get('kind') == 'finished':
@@ -366,6 +377,8 @@ class HttpExperiments:
                             line=event.get('error_line')
                             if type(line) is int and 1<=line<=call.arguments['script'].count('\n')+1:
                                 finished['error_line']=line
+                            finished['failure'] = dict(category='script', phase='script_execution',
+                                code=finished['code'], error_type=finished['error_type'])
                         break
                     if await self._strategy(intent_id, start=True):
                         finished = dict(status='stopped',code='d22_experiment_strategy_stop',output='')
@@ -373,34 +386,48 @@ class HttpExperiments:
                     if event.get('kind') != 'request':
                         raise ValueError('d22_experiment_bridge_invalid')
                     try:
+                        phase = 'target_request'
                         result = await self.request(parent,intent_id,call,len(self.records(parent))+1,event,token,expires)
-                    except (ValueError,D7HttpError) as error:
+                    except (ValueError,HttpCapabilityError) as error:
                         from agent_adapters.output_evidence import SAFE_HTTP_ERROR_CODES
                         code=getattr(error,'code',error.args[0] if len(error.args)==1 else None)
                         if code not in SAFE_HTTP_ERROR_CODES | {'d22_experiment_method_not_authorized','d22_experiment_request_invalid'}:
                             code='d22_experiment_request_rejected'
                         self.log.warning('experiment.request_rejected',run=session['task_run_id'],request=parent,
                             category='policy',code=code)
-                        finished = dict(status='rejected',code=code,output='')
+                        finished = dict(status='rejected',code=code,output='',
+                            failure=dict(category='policy',phase='target_request',code=code))
                         break
                     await self._strategy(intent_id, start=True)
+                    phase = 'bridge_reply'
                     await asyncio.to_thread(runner.send,result)
-        except D3RecoveryRequired as error:
+        except ExecutionRecoveryRequired as error:
             primary_error = error
+            raise
+        except StageStateError as error:
+            primary_error = error
+            self.log.warning('experiment.local_failure',run=session['task_run_id'],request=parent,
+                category=error.category.value, phase=phase, code=error.code, error_type=type(error).__name__)
             raise
         except _StrategyStop:
             finished = dict(status='stopped',code='d22_experiment_strategy_stop',output='')
         except TaskRunSandboxError as error:
             if error.outcome == 'outcome_unknown':
-                primary_error = D3RecoveryRequired('d22_experiment_process_outcome_unknown')
+                primary_error = ExecutionRecoveryRequired('d22_experiment_process_outcome_unknown')
                 raise primary_error from error
             finished['code'] = 'd22_experiment_environment_error'
+            finished['failure'] = dict(category='environment',phase=phase,code=finished['code'],
+                error_type=type(error).__name__)
         except (TimeoutError,InterruptedError) as error:
             finished = dict(status='stopped',code='d22_experiment_timeout' if isinstance(error,TimeoutError) else 'd22_experiment_cancelled',output='')
         except Exception as error:
+            code = 'd22_experiment_environment_error' if runner is None else 'd22_experiment_local_error'
+            category = 'environment' if runner is None else 'bridge' if phase.startswith('bridge_') else 'technical_failure'
+            finished['failure'] = dict(category=category,phase=phase,code=code,
+                error_type=type(error).__name__ if type(error).__name__ in SCRIPT_ERRORS else 'OtherError')
             self.log.warning('experiment.local_failure',run=session['task_run_id'],request=parent,
-                category='environment' if runner is None else 'technical_failure',error_type=type(error).__name__)
-            finished['code'] = 'd22_experiment_environment_error' if runner is None else 'd22_experiment_local_error'
+                **finished['failure'])
+            finished['code'] = code
         finally:
             try:
                 if runner is not None:
@@ -420,7 +447,7 @@ class HttpExperiments:
                             request=parent,category='unknown',code='d22_experiment_process_outcome_unknown',
                             stop_diagnostic=diagnostic,**failure)
                         if primary_error is None:
-                            raise D3RecoveryRequired('d22_experiment_process_outcome_unknown') from error
+                            raise ExecutionRecoveryRequired('d22_experiment_process_outcome_unknown') from error
                     else:
                         diagnostic = getattr(runner,'stop_diagnostic',None)
                         if diagnostic is not None:

@@ -682,12 +682,12 @@ def _snapshot_once(directory: Path, declaration: dict) -> dict:
                                     known_model_failure = "d8_review_call_failed"
                     if is_http(config):
                         from agent_adapters.http_capability import check_http_task
-                        from agent_core.dual_llm_contracts import D3RecoveryRequired
+                        from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
                         try:
                             phase = "http_evidence"
                             d8_unresolved |= check_http_task(Path(directory), store, config,
                                                             diagnostics=http_diagnostics)
-                        except D3RecoveryRequired as exc:
+                        except ExecutionRecoveryRequired as exc:
                             # A single broken HTTP operation must not erase the
                             # whole projection; keep what was read and report
                             # recovery with the precise reason instead.

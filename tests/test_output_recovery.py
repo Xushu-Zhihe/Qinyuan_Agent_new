@@ -260,7 +260,7 @@ def test_malformed_execution_proposal_still_stops_without_dispatch(http_case):
 @pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
 @pytest.mark.parametrize("mode", ["once", "twice", "unknown"])
 def test_http_predispatch_constraint_feedback_uses_only_the_original_correction(http_case, monkeypatch, mode):
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     from agent_core.execution_feasibility import KEY
     c=http_case
     install(c,steps=1)
@@ -273,8 +273,8 @@ def test_http_predispatch_constraint_feedback_uses_only_the_original_correction(
     c.models[1].invoke=capture
     def guard(*args):
         checks.append(args)
-        if mode=="unknown":raise D3RecoveryRequired("d4_operation_outcome_unknown")
-        if len(checks)==1 or mode=="twice":raise D3RecoveryRequired("d3_action_rejected_by_review_constraint")
+        if mode=="unknown":raise ExecutionRecoveryRequired("d4_operation_outcome_unknown")
+        if len(checks)==1 or mode=="twice":raise ExecutionRecoveryRequired("d3_action_rejected_by_review_constraint")
         return original(*args)
     monkeypatch.setattr(c.app.validator,"_allowed",guard)
     result=asyncio.run(c.app.run(c.token))
@@ -395,12 +395,12 @@ def test_attachment_optional_format_failure_preserves_fixed_observation(output_c
 def test_nonrolling_plan_rejection_does_not_require_optional_conclusion_services():
     from types import SimpleNamespace
     from agent_adapters.multi_turn_application import D3Application
-    from agent_core.dual_llm_modeling import D3ProposalRejected
-    error=D3ProposalRejected("known_pre_d8_rejection",model_request_id="known")
+    from agent_core.dual_llm_modeling import ExecutionProposalRejected
+    error=ExecutionProposalRejected("known_pre_d8_rejection",model_request_id="known")
     async def rejected(*args,**kwargs):raise error
     app=SimpleNamespace(config=SimpleNamespace(intent_execution_policy=None),
         conclusions=None,inner=SimpleNamespace(propose=rejected))
-    with pytest.raises(D3ProposalRejected) as caught:
+    with pytest.raises(ExecutionProposalRejected) as caught:
         asyncio.run(D3Application._propose_inner_plan(app,None,None,refresh=None,validate=None))
     assert caught.value is error
 

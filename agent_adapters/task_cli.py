@@ -221,12 +221,11 @@ def _dispatch_v3_run_task(args, raw):
         from agent_adapters.web.task_result import snapshot_v3_task_result
 
         phase = _failure_phase()
-        prefix = ("d8_real" if d8_real else "simulation" if "execution_profile" in raw
-                  else "d7_simulation")
-        error_code = f"{prefix}_{phase}_failed"
+        prefix = "task.real" if d8_real else "task.simulated"
+        error_code = f"{prefix}.{phase}_failed"
         failure = {"code": error_code, "phase": phase, **safe_failure_details(exc)}
-        from agent_core.stage_storage import StageStateError, StageRecoveryRequired
-        if isinstance(exc, (StageStateError, StageRecoveryRequired)):
+        from qinyuan_core import QinyuanError
+        if isinstance(exc, QinyuanError):
             from qinyuan_core import classify
             category, cause_code, _ = classify(exc)
             failure.update(category=str(category), cause_code=cause_code)

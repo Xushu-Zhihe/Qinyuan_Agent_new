@@ -14,17 +14,17 @@ from agent_adapters.multi_turn_application import D3Application
 from agent_core.contracts import TaskRequest
 from agent_core.dual_llm_contracts import (
     D3Authorization,
-    D3RecoveryRequired,
+    ExecutionRecoveryRequired,
     D3RunConfig,
     D3TurnBinding,
 )
 from agent_core.dual_llm_modeling import (
     D3ActionContext,
     D3OuterContext,
-    D3ProposalRejected,
+    ExecutionProposalRejected,
 )
 from agent_core.modeling import ModelError, ModelErrorKind
-from agent_core.operation_accounting import D4BudgetPolicy, D4RecoveryRequired
+from agent_core.operation_accounting import D4BudgetPolicy, OperationRecoveryRequired
 from agent_core.review_contracts import D2ReviewRequest
 from agent_core.turn_contracts import D1RoleConfig
 
@@ -223,7 +223,7 @@ def outer_proposal_call(case, monkeypatch, responses):
 
     def validate(_current, proposal):
         if proposal.attachment_index not in app.config.authorization.attachment_indices:
-            raise D3ProposalRejected("d3_attachment_not_authorized")
+            raise ExecutionProposalRejected("d3_attachment_not_authorized")
 
     return request, calls, token, refresh, validate
 
@@ -330,7 +330,7 @@ def test_d4_structural_then_semantic_rejection_shares_one_correction_and_reports
         monkeypatch,
         [{"unexpected": "shape"}, outer_proposal(1)],
     )
-    with pytest.raises(D3ProposalRejected) as raised:
+    with pytest.raises(ExecutionProposalRejected) as raised:
         asyncio.run(
             app.outer.propose(request, token, refresh=refresh, validate=validate)
         )
@@ -544,7 +544,7 @@ def test_d4_unknown_correction_is_not_redispatched_after_recovery(
         monkeypatch,
         [outer_proposal(1), TimeoutError("correction result lost")],
     )
-    with pytest.raises(D3RecoveryRequired, match="d3_model_call_outcome_unknown"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_model_call_outcome_unknown"):
         asyncio.run(
             app.outer.propose(request, token, refresh=refresh, validate=validate)
         )
@@ -553,7 +553,7 @@ def test_d4_unknown_correction_is_not_redispatched_after_recovery(
     correction_record = app.store.load_d3_operation(correction_id)
     assert correction_record is not None and correction_record.completion is None
 
-    with pytest.raises(D3RecoveryRequired):
+    with pytest.raises(ExecutionRecoveryRequired):
         asyncio.run(
             app.outer.propose(request, token, refresh=refresh, validate=validate)
         )
@@ -1066,5 +1066,5 @@ def test_unknown_model_operation_stays_charged_and_is_never_reinvoked(
         len(d4_scenario[0].store.list_d4_operations(first.task_run_id))
         == operation_count
     )
-    with pytest.raises(D4RecoveryRequired):
+    with pytest.raises(OperationRecoveryRequired):
         d4_scenario[0].store.begin_d4_operation(unknown[0].start)

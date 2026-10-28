@@ -181,8 +181,8 @@ def _base_output_schema(request, *, contract_version=None):
         if contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and progress:
             from agent_core.progress_policy import progress_schema, policy_for
             if policy_for(request)['version'] != (2 if contract_version in {16, 17, 18, 19, 20, 21, 22} else 1):
-                from agent_core.dual_llm_contracts import D3RecoveryRequired
-                raise D3RecoveryRequired('s6_review_text_policy_version_changed')
+                from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+                raise ExecutionRecoveryRequired('s6_review_text_policy_version_changed')
             return "progress_review", progress_schema(request)
         if contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and not progress:
             from agent_core.review_policy import review_schema
@@ -225,8 +225,8 @@ def _base_output_schema(request, *, contract_version=None):
         if contract_version in {17, 18, 19, 20, 21, 22}:
             from agent_core.execution_feasibility import KEY
             if KEY not in json.loads(request.history_context):
-                from agent_core.dual_llm_contracts import D3RecoveryRequired
-                raise D3RecoveryRequired('d17_plan_execution_context_missing')
+                from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+                raise ExecutionRecoveryRequired('d17_plan_execution_context_missing')
         if contract_version in {16, 17, 18, 19, 20, 21, 22}:
             from agent_core.plan_policy import plan_schema
             return stage, {"anyOf": [plan_schema(request), CHANGE, *READS]}

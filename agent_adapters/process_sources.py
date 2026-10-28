@@ -16,7 +16,7 @@ from agent_adapters.workspace_evidence import FileD3WorkspaceEvidence
 from agent_core.command_contracts import T6EvidenceError, T6ExecutionRecord
 from agent_core.control_candidate import validate_control_ownership
 from agent_core.control_store import ControlStateRows, StorageError
-from agent_core.dual_llm_contracts import D3PlanBinding, D3RecoveryRequired
+from agent_core.dual_llm_contracts import D3PlanBinding, ExecutionRecoveryRequired
 from agent_core.process_facts import D5Source, D5SourceKind, d5_digest
 
 
@@ -574,7 +574,7 @@ class D5SourceReader:
         except D5SourceCorrupt:
             return {**base, "status": "corrupt"}
         except (
-            D3RecoveryRequired,
+            ExecutionRecoveryRequired,
             T6EvidenceError,
             StorageError,
             sqlite3.Error,

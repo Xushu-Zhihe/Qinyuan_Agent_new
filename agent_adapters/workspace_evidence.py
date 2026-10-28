@@ -28,7 +28,7 @@ from agent_core.attachment_workspace import (
     D1ProofClaim,
 )
 from agent_core.command_contracts import T6EvidenceError
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.intent_postconditions import FileDigestObservation
 
 
@@ -145,11 +145,11 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 artifact claim owner mismatch")
             return claim
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_artifact_claim_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_artifact_claim_unavailable") from exc
 
     def save_artifact(self, receipt: D3ArtifactReceipt) -> None:
         if self.read_artifact_claim(receipt.claim.artifact_version_id) != receipt.claim:
-            raise D3RecoveryRequired("d3_artifact_receipt_without_claim")
+            raise ExecutionRecoveryRequired("d3_artifact_receipt_without_claim")
         self.records._write(
             "d3-artifact", receipt.claim.artifact_version_id, asdict(receipt)
         )
@@ -172,7 +172,7 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 artifact receipt owner mismatch")
             return receipt
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_artifact_receipt_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_artifact_receipt_unavailable") from exc
 
     def list_artifacts(self, task_run_id: str) -> tuple[D3ArtifactReceipt, ...]:
         receipts = []
@@ -182,7 +182,7 @@ class FileD3WorkspaceEvidence:
             )
             claim = self.read_artifact_claim(version_id)
             if claim is None:
-                raise D3RecoveryRequired("d3_artifact_claim_disappeared")
+                raise ExecutionRecoveryRequired("d3_artifact_claim_disappeared")
             if claim.task_run_id != task_run_id:
                 continue
             receipt = self.read_artifact(version_id)
@@ -203,7 +203,7 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 size observation owner mismatch")
             return observation
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_size_observation_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_size_observation_unavailable") from exc
 
     def begin_digest(self, claim: D3DigestClaim) -> None:
         self.records._write("d3-digest-claim", claim.observation_id, asdict(claim))
@@ -218,11 +218,11 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 digest claim owner mismatch")
             return claim
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_digest_claim_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_digest_claim_unavailable") from exc
 
     def save_digest(self, receipt: D3DigestReceipt) -> None:
         if self.read_digest_claim(receipt.claim.observation_id) != receipt.claim:
-            raise D3RecoveryRequired("d3_digest_receipt_without_claim")
+            raise ExecutionRecoveryRequired("d3_digest_receipt_without_claim")
         self.records._write("d3-digest", receipt.claim.observation_id, asdict(receipt))
 
     def read_digest(self, observation_id: str) -> D3DigestReceipt | None:
@@ -243,14 +243,14 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 digest receipt owner mismatch")
             return receipt
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_digest_receipt_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_digest_receipt_unavailable") from exc
 
     def begin_share(self, claim: D3ShareClaim) -> None:
         for path in self.records.directory.glob("d3-share-claim-*.json"):
             other_id = path.name.removeprefix("d3-share-claim-").removesuffix(".json")
             other = self.read_share_claim(other_id)
             if other is None:
-                raise D3RecoveryRequired("d3_share_claim_disappeared")
+                raise ExecutionRecoveryRequired("d3_share_claim_disappeared")
             if (
                 other.task_run_id,
                 other.artifact_version_id,
@@ -260,7 +260,7 @@ class FileD3WorkspaceEvidence:
                 claim.artifact_version_id,
                 claim.target_intent_id,
             ) and other.share_id != claim.share_id:
-                raise D3RecoveryRequired("d3_share_pair_already_claimed")
+                raise ExecutionRecoveryRequired("d3_share_pair_already_claimed")
         self.records._write("d3-share-claim", claim.share_id, asdict(claim))
 
     def read_share_claim(self, share_id: str) -> D3ShareClaim | None:
@@ -273,11 +273,11 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 share claim owner mismatch")
             return claim
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_share_claim_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_share_claim_unavailable") from exc
 
     def save_share(self, receipt: D3ShareReceipt) -> None:
         if self.read_share_claim(receipt.claim.share_id) != receipt.claim:
-            raise D3RecoveryRequired("d3_share_receipt_without_claim")
+            raise ExecutionRecoveryRequired("d3_share_receipt_without_claim")
         self.records._write("d3-share", receipt.claim.share_id, asdict(receipt))
 
     def read_share(self, share_id: str) -> D3ShareReceipt | None:
@@ -299,7 +299,7 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 share receipt owner mismatch")
             return receipt
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_share_receipt_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_share_receipt_unavailable") from exc
 
     def list_shares(self, task_run_id: str) -> tuple[D3ShareReceipt, ...]:
         receipts = []
@@ -307,7 +307,7 @@ class FileD3WorkspaceEvidence:
             share_id = path.name.removeprefix("d3-share-claim-").removesuffix(".json")
             claim = self.read_share_claim(share_id)
             if claim is None:
-                raise D3RecoveryRequired("d3_share_claim_disappeared")
+                raise ExecutionRecoveryRequired("d3_share_claim_disappeared")
             if claim.task_run_id != task_run_id:
                 continue
             receipt = self.read_share(share_id)
@@ -329,11 +329,11 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 stop claim owner mismatch")
             return claim
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_stop_claim_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_stop_claim_unavailable") from exc
 
     def save_stop(self, receipt: D3StopReceipt) -> None:
         if self.read_stop_claim(receipt.claim.stop_id) != receipt.claim:
-            raise D3RecoveryRequired("d3_stop_receipt_without_claim")
+            raise ExecutionRecoveryRequired("d3_stop_receipt_without_claim")
         self.records._write("d3-stop", receipt.claim.stop_id, asdict(receipt))
 
     def read_stop(self, stop_id: str) -> D3StopReceipt | None:
@@ -359,7 +359,7 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 stop receipt owner mismatch")
             return receipt
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_stop_receipt_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_stop_receipt_unavailable") from exc
 
     def save_readback_audit(self, audit: D3ReadbackAudit) -> None:
         self.records._write("d3-readback-audit", audit.audit_id, asdict(audit))
@@ -383,4 +383,4 @@ class FileD3WorkspaceEvidence:
                 raise ValueError("D3 readback audit owner mismatch")
             return audit
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_readback_audit_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_readback_audit_unavailable") from exc

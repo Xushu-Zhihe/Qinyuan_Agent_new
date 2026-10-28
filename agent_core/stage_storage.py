@@ -10,16 +10,17 @@ from uuid import NAMESPACE_URL, uuid5
 from qinyuan_core import Category, Layer, QinyuanError
 from agent_core.control_store import StorageError, UpsertTaskRun, canonical_json
 from agent_core.domain import FactStatus, IntentStatus
-from agent_core.actions import MCPCall, PUBLIC_REFERENCE_TOOLS
+from agent_core.actions import PUBLIC_REFERENCE_TOOLS
 from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8RevisionRecord
 from agent_core.handoff_contracts import D8HistoryItem
-from agent_core.operation_accounting import D4OperationConflict, D4RecoveryRequired, D8HandoffBudgetPolicy, _text, _uuid, _sha
+from agent_core.operation_accounting import OperationIdentityConflict, OperationRecoveryRequired, D8HandoffBudgetPolicy, _text, _uuid, _sha
 from agent_core.runtime import TaskRunStatus
 from agent_core.stage_contracts import (
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot,
     StageConclusionChange, StageFactApplication, StageFactProposal, StageFactSelection, StageHistoryRead,
     StageModelEvidence, StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnIntent, TurnPlanningReview, TurnPlanningState, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
+    StageToolBatch, tool_calls, tool_call_key,
 )
 from agent_core.turn_contracts import D1RoleConfig
 
@@ -103,20 +104,31 @@ class StageStateError(QinyuanError, StorageError):
     code = "stage.state_conflict"
 
 
-class StageAdmissionError(StageStateError, D4OperationConflict):
+class StageAdmissionError(StageStateError, OperationIdentityConflict):
     category = Category.POLICY
 
 
-class StageRecoveryRequired(StageStateError, D4RecoveryRequired):
+class StageRecoveryRequired(StageStateError, OperationRecoveryRequired):
     def __init__(self, code, *, category=Category.UNKNOWN, layer=Layer.MODEL):
         self.category = category
         super().__init__(code, code=code, layer=layer, retryable=False)
 
 
-def _fail(code, category=Category.CONFLICT):
-    error = StageStateError(code, code=code, retryable=False)
+def _fail(code, category=Category.CONFLICT, **context):
+    error = StageStateError(code, code=code, retryable=False, **context)
     error.category = category
     raise error
+
+
+def fact_scope_failure(item, scope, *, expected_turn_id=None, fact_id=None,
+                       proposal_id=None, review_id=None, reason="observation_owner_mismatch"):
+    _fail("stage.fact_source_scope_changed", Category.POLICY, fact_source={
+        "reason": reason, "fact_id": fact_id, "proposal_operation_id": proposal_id,
+        "review_operation_id": review_id, "source_ref": item.ref if item else None,
+        "source_identity": item.identity if item else None,
+        "expected_scope": scope.scope, "expected_owner_id": scope.owner_id,
+        "expected_turn_id": expected_turn_id, "actual_turn_id": item.turn_id if item else None,
+        "actual_road_id": item.intent_id if item else None})
 
 
 def execution_policy(config):
@@ -126,7 +138,8 @@ def execution_policy(config):
         "tcp_authorization": asdict(config.tcp_authorization) if config.tcp_authorization else None,
         "capacity": asdict(config.handoff_config),
         "tool_execution": {"max_in_flight": MAX_IN_FLIGHT_TOOLS, "sandbox_target_in_flight": 1,
-                           "wake": "first_result_merge_during_generation"}}))
+                           "max_calls_per_decision": MAX_IN_FLIGHT_TOOLS,
+                           "wake": "first_result_before_next_decision_merge_during_generation"}}))
 
 
 def proposal_digest(value):
@@ -182,22 +195,30 @@ def validate_tool_start(store, start):
             or row["planning_state"] != TurnPlanningState.ACTIVE.value):
         _fail("stage.tool_road_not_running", Category.POLICY)
     operation = store.load_d4_operation(proposal_id)
+    if store.stage_evidence is None:
+        _fail("stage.evidence_unconfigured", Category.DEPENDENCY)
     live_experiment = experiment and getattr(store, "live_tool_request", lambda identity: False)(proposal_id)
+    applied_batch = (operation is not None and operation.application_ref == proposal_id
+        and getattr(store, "live_tool_request", lambda identity: False)(proposal_id)
+        and isinstance(store.stage_evidence.read_model_result(operation).result, StageToolBatch))
     if (operation is None or operation.start.task_run_id != start.task_run_id or operation.start.category != "action"
             or operation.start.role != "inner_action" or operation.start.role_config_ref != config.inner_role.role_config_ref
             or (operation.start.base_checkpoint_sequence != start.base_checkpoint_sequence and not live_experiment)
             or operation.completion is None or operation.completion.result_kind != "completed"
-            or (operation.application_ref is not None and not (live_experiment and operation.application_ref == proposal_id))):
+            or (operation.application_ref is not None and not applied_batch
+                and not (live_experiment and operation.application_ref == proposal_id))):
         _fail("stage.tool_proposal_not_ready", Category.POLICY)
-    if store.stage_evidence is None:
-        _fail("stage.evidence_unconfigured", Category.DEPENDENCY)
     evidence = store.stage_evidence.read_model_result(operation)
-    if evidence.session != PlanningSession("road_execution", road_id) or not isinstance(evidence.result, MCPCall):
+    saved = store.stage_evidence.read("mcp-call", start.operation_id)
+    proposed = next((call for call in tool_calls(evidence.result) if saved and asdict(call) == saved.get("call")), None)
+    if evidence.session != PlanningSession("road_execution", road_id) or not tool_calls(evidence.result):
         _fail("stage.tool_proposal_scope_changed", Category.POLICY)
-    others = [store.stage_evidence.read_model_result(record).result for record in live_tool_requests(store, start.task_run_id)
-              if record.start.operation_id != proposal_id]
-    if (len(others) >= MAX_IN_FLIGHT_TOOLS or evidence.result.tool_name not in PUBLIC_REFERENCE_TOOLS
-            and any(isinstance(call, MCPCall) and call.tool_name not in PUBLIC_REFERENCE_TOOLS for call in others)):
+    if proposed is None:
+        _fail("stage.tool_proposal_changed", Category.UNKNOWN)
+    others = [call for parent, call in getattr(store, "live_tool_calls", lambda: ())()
+              if parent != proposal_id or call != proposed]
+    if (len(others) >= MAX_IN_FLIGHT_TOOLS or proposed.tool_name not in PUBLIC_REFERENCE_TOOLS
+            and any(call.tool_name not in PUBLIC_REFERENCE_TOOLS for call in others)):
         _fail("stage.tool_slot_unavailable", Category.POLICY)
     from agent_core.stage_knowledge import StageKnowledge
     knowledge = StageKnowledge(store.stage_evidence, start.task_run_id, store=store)
@@ -207,15 +228,18 @@ def validate_tool_start(store, start):
     road = next(r for r in turn.roads if r.road_id == road_id)
     _sources(store, start.task_run_id, knowledge.effective_premises(turn, road))
     claim = {"task_run_id": start.task_run_id, "intent_id": road_id,
-             "model_request_id": proposal_id, "call": asdict(evidence.result)}
+             "model_request_id": proposal_id, "call": asdict(proposed)}
     if experiment:
-        saved = store.stage_evidence.read("mcp-call", start.operation_id)
-        if (saved is None or evidence.result.tool_name != "http.run_experiment"
+        if (saved is None or proposed.tool_name != "http.run_experiment"
                 or not parts[4].isdigit() or int(parts[4]) < 1
                 or any(saved.get(key) != value for key, value in claim.items())
                 or saved["experiment_request"]["ordinal"] != int(parts[4])):
             _fail("stage.experiment_binding_changed", Category.POLICY)
         claim = saved
+    else:
+        from agent_core.turn_modeling import stable_id
+        if start.operation_id != stable_id(start.task_run_id, "mcp/" + tool_call_key(proposal_id, evidence.result, proposed)):
+            _fail("stage.tool_proposal_changed", Category.UNKNOWN)
     if start.context_sha256 != hashlib.sha256(canonical_json(claim).encode("utf-8")).hexdigest():
         _fail("stage.tool_proposal_changed", Category.UNKNOWN)
 
@@ -432,11 +456,18 @@ def _reviewed(store, mutation, change):
             observations = [i for i in sources if i.record_type == "progress"]
             if not value.inferred and (not observations or any(i.record_type == "reviewed_inference" for i in sources)):
                 _fail("stage.formal_fact_requires_own_observation", Category.POLICY)
+            owner_turn_id = next((t.turn_id for t in list_turns(store, mutation.task_run_id)
+                if any(r.road_id == proposal.session.owner_id for r in t.roads)), None)
             for item in observations:
                 operation = (store.load_d4_operation(item.record_id)
                              if not item.record_id.startswith("revision/") else None)
                 if (operation is None or operation.start.category != "tool_dispatch" or item.intent_id != proposal.session.owner_id):
-                    _fail("stage.fact_source_scope_changed", Category.POLICY)
+                    fact_scope_failure(item, proposal.session,
+                        expected_turn_id=owner_turn_id,
+                        fact_id=next((a.fact_id for a in change.facts if a.review_operation_id == binding.review_operation_id), None),
+                        proposal_id=binding.proposal_operation_id, review_id=binding.review_operation_id,
+                        reason="source_not_tool_dispatch" if operation is None or operation.start.category != "tool_dispatch"
+                            else "observation_owner_mismatch")
         feedback = isinstance(value, PlanningExhausted) or isinstance(value, StagePlanningDecision) and value.kind == "return_to_parent"
         if feedback:
             read_history(store, mutation.task_run_id, refs)
@@ -446,8 +477,6 @@ def _reviewed(store, mutation, change):
             accepted.append((binding, proposal.session, value, decision))
     pending = {r.start.operation_id for r in store.list_d4_operations(mutation.task_run_id)
                if (r.completion is None or r.completion.result_kind == "completed" and r.application_ref is None)
-               and not (r.start.category == "review" and callable(getattr(store, "live_strategy_operation", None))
-                             and store.live_strategy_operation(r.start.operation_id))
                and not (r.start.category == "tool_dispatch"
                         and getattr(store, "live_tool_operation", lambda identity: False)(r.start.operation_id))} - used - set(change.applications)
     if pending:
@@ -639,7 +668,11 @@ def _validate(store, mutation):
         if (turn is None or not observations or any(i.intent_id != scope.owner_id or i.turn_id != turn.turn_id for i in observations)
                 or any(i.record_type not in {"progress", "verified_fact"} for i in sources)
                 or store._connection.execute("SELECT 1 FROM facts WHERE fact_id=?", (application.fact_id,)).fetchone()):
-            _fail("stage.fact_source_scope_changed", Category.POLICY)
+            invalid = next((i for i in sources if i.record_type not in {"progress", "verified_fact"}
+                or i.record_type == "progress" and (i.intent_id != scope.owner_id or turn is None or i.turn_id != turn.turn_id)), None)
+            fact_scope_failure(invalid, scope, expected_turn_id=turn.turn_id if turn else None,
+                fact_id=application.fact_id, review_id=application.review_operation_id,
+                reason="formal_fact_application_invalid")
         consumed.add(application.review_operation_id)
     consumed.update(b.review_operation_id for b, _, value, _ in accepted
                     if isinstance(value, StageFactProposal) and value.inferred)

@@ -9,7 +9,7 @@ import pytest
 
 from agent_adapters.deepseek_roles import build_payload, role_config
 from agent_adapters.output_evidence import FileD8OutputEvidence
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.execution_feasibility import KEY, freeze
 from agent_core.output_contracts import decode_response, output_schema
 from agent_core.plan_policy import policy_for
@@ -102,7 +102,7 @@ def test_review_snapshot_tamper_does_not_change_recovered_authority(case17):
     snapshot['context_summary'] = json.dumps(summary)
     path = next((c.directory/'d8-output').glob('*review-request-' + e.request.review_id + '.json'))
     path.write_text(json.dumps({'payload': snapshot, 'sha256': digest(snapshot)}), encoding='utf-8')
-    with pytest.raises(D3RecoveryRequired):
+    with pytest.raises(ExecutionRecoveryRequired):
         c.app.review_diagnostics.known(e.request)
     assert len(calls(c, 'progress_review')) == 1
 
@@ -170,7 +170,7 @@ def test_known_start_diagnostic_recovery_never_reasks_root(case17, monkeypatch, 
         next((c.directory/'d8-output').glob('*diagnostic-' + crashed[0] + '.json')).write_text('{}', encoding='utf-8')
     reopen(c)
     if damage:
-        with pytest.raises(D3RecoveryRequired):
+        with pytest.raises(ExecutionRecoveryRequired):
             asyncio.run(c.app.resume(c.task, c.token))
         assert not c.app.state.plans
         assert sum(e.request.review_id == crashed[0] for e in calls(c, 'review')) == 1

@@ -4,7 +4,7 @@ from dataclasses import asdict
 from itertools import permutations
 import json
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.turn_modeling import digest
 
 
@@ -34,7 +34,7 @@ def freeze(app, turn_id, intent_id, *, state=None):
     task = state.task_run.task_run_id
     intent = next((i for i in state.intents if i.intent_id == intent_id), None)
     if intent is None or intent.turn_id != turn_id:
-        raise D3RecoveryRequired('d17_execution_scope_changed')
+        raise ExecutionRecoveryRequired('d17_execution_scope_changed')
     allowed, _ = app.validator.action_limits(task, turn_id, intent_id)
     plans = [p for p in state.plans if p.intent_id == intent_id]
     proofs, versions = [], []
@@ -43,7 +43,7 @@ def freeze(app, turn_id, intent_id, *, state=None):
         binding = app.store.load_d3_plan_binding(plan.plan_id)
         result = app.store.load_d3_plan_result(plan.plan_id)
         if binding is None:
-            raise D3RecoveryRequired('d17_plan_binding_missing')
+            raise ExecutionRecoveryRequired('d17_plan_binding_missing')
         if result is not None and result.outcome == 'satisfied':
             if app.config.intent_execution_policy:
                 app.conclusions.check_support(state, binding, result.proof_id, result.supporting_fact_id)
@@ -59,7 +59,7 @@ def freeze(app, turn_id, intent_id, *, state=None):
                 # The saved first observation can proceed through Fact review without a new probe.
                 source = app.conclusions.observation(proof.proof_id)
                 if source.plan_id != plan.plan_id or source.intent_id != intent_id:
-                    raise D3RecoveryRequired('d17_observation_scope_changed')
+                    raise ExecutionRecoveryRequired('d17_observation_scope_changed')
                 ready = True
         elif not ready and binding.observation_mode == 'reuse_saved_proof':
             app.validator._support(state, binding, binding.source_proof_id, binding.source_fact_id)
@@ -95,7 +95,7 @@ def policy(request, *, required=False):
                        for paths in (p['continue_paths'], p['replan_paths']))):
             raise ValueError('policy')
     except (TypeError, KeyError, ValueError) as exc:
-        raise D3RecoveryRequired('d17_execution_policy_invalid') from exc
+        raise ExecutionRecoveryRequired('d17_execution_policy_invalid') from exc
     return p
 
 
@@ -143,7 +143,7 @@ def constrain_schema(schema, request):
                 action['enum'] = legal
             branches.append(branch)
     if not branches:
-        raise D3RecoveryRequired('d17_no_executable_review_path')
+        raise ExecutionRecoveryRequired('d17_no_executable_review_path')
     return {'anyOf': branches}
 
 
@@ -154,7 +154,7 @@ def plan_choices(request, original):
     allowed = set(p['allowed_action_kinds'])
     selected = [c for c in original if c in p['next_plan_choices'] and set(requirements(c)) <= allowed]
     if not selected:
-        raise D3RecoveryRequired('d17_no_executable_plan')
+        raise ExecutionRecoveryRequired('d17_no_executable_plan')
     return selected
 
 
@@ -164,20 +164,20 @@ def verify_review(app, request, raw, state):
         return
     saved = policy(request, required=True)
     if saved != freeze(app, request.turn_id, request.intent_id, state=state):
-        raise D3RecoveryRequired('d17_review_execution_state_changed')
+        raise ExecutionRecoveryRequired('d17_review_execution_state_changed')
     validate(raw, request)
 
 
 def verify_plan(app, request, proposal, state):
     from agent_core.dual_llm_modeling import D3PlanProposal
     if not isinstance(proposal, D3PlanProposal):
-        raise D3RecoveryRequired('d17_plan_proposal_type_changed')
+        raise ExecutionRecoveryRequired('d17_plan_proposal_type_changed')
     saved = json.loads(request.history_context).get(KEY)
     if not isinstance(saved, dict) or not all(k in saved for k in ('turn_id', 'intent_id')):
-        raise D3RecoveryRequired('d17_plan_execution_state_changed')
+        raise ExecutionRecoveryRequired('d17_plan_execution_state_changed')
     current = freeze(app, saved['turn_id'], saved['intent_id'], state=state)
     if current != saved:
-        raise D3RecoveryRequired('d17_plan_execution_state_changed')
+        raise ExecutionRecoveryRequired('d17_plan_execution_state_changed')
     choice = {k: getattr(proposal, k) for k in ('template', 'observation_mode', 'source_proof_id')}
     if choice not in plan_choices(request, current['next_plan_choices']):
-        raise D3RecoveryRequired('d17_plan_action_constraint_conflict')
+        raise ExecutionRecoveryRequired('d17_plan_action_constraint_conflict')

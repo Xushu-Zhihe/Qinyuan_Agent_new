@@ -557,7 +557,7 @@ def test_outer_watchdog_waits_for_adapter_or_keeps_result_unknown(cooperative):
     import asyncio
     import threading
     from agent_core.dual_llm_modeling import D3AuditedModel
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     release = threading.Event()
     seen = []
     def invoke(request, timeout, token):
@@ -575,7 +575,7 @@ def test_outer_watchdog_waits_for_adapter_or_keeps_result_unknown(cooperative):
         if cooperative:
             assert asyncio.run(call).kind is ModelErrorKind.TIMED_OUT
         else:
-            with pytest.raises(D3RecoveryRequired, match="d3_model_call_outcome_unknown"):
+            with pytest.raises(ExecutionRecoveryRequired, match="d3_model_call_outcome_unknown"):
                 asyncio.run(call)
         assert seen == [True]
     finally:

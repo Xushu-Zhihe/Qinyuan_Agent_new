@@ -12,7 +12,7 @@ from agent_core.conclusion_contracts import conclusion_digest, _fields
 from agent_core.control_store import StorageError, UpsertIntent, UpsertTurn
 from agent_core.domain import IntentStatus, TurnStatus
 from agent_core.dual_llm_contracts import (
-    D3CommitMetadata, D3IntentBinding, D3RecoveryRequired, D3TurnBinding,
+    D3CommitMetadata, D3IntentBinding, ExecutionRecoveryRequired, D3TurnBinding,
 )
 from agent_core.dual_llm_modeling import D3TurnProposal, parse_d3_turn_proposal
 from agent_core.handoff_contracts import (
@@ -21,7 +21,7 @@ from agent_core.handoff_contracts import (
 )
 from agent_core.intent_context import build_intent_frontier, format_frontier_for_context
 from agent_core.modeling import model_call_timeout, ModelError, ModelErrorKind
-from agent_core.operation_accounting import D4BudgetExhausted, D4OperationCompletion, D4OperationRecord, D4OperationStart, _uuid
+from agent_core.operation_accounting import OperationBudgetExhausted, D4OperationCompletion, D4OperationRecord, D4OperationStart, _uuid
 from agent_core.turn_modeling import stable_id, digest
 
 
@@ -36,7 +36,7 @@ class D8PlanningResult:
     exhaustion_reason: str | None = None
 
 
-class D8DependencyCandidatesRejected(ValueError):
+class DependencyCandidatesRejected(ValueError):
     def __init__(self, indices):
         self.indices = tuple(indices)
         super().__init__("d8_all_dependency_candidates_rejected")
@@ -96,12 +96,12 @@ class HandoffContext:
     def increase_capacity(self, updates):
         self.app._check_dispatch()
         if self.store.list_d4_unresolved_operations(self.state.task_run.task_run_id):
-            raise D3RecoveryRequired("d8_restore_original_request_before_capacity_change")
+            raise ExecutionRecoveryRequired("d8_restore_original_request_before_capacity_change")
         if any(call.start.category in {"planning", "action", "review", "fact_review", "handoff_summary"}
                and call.completion is not None and call.completion.result_kind == "completed"
                and call.application_ref is None
                for call in self.store.list_d4_operations(self.state.task_run.task_run_id)):
-            raise D3RecoveryRequired("d8_apply_known_model_result_before_capacity_change")
+            raise ExecutionRecoveryRequired("d8_apply_known_model_result_before_capacity_change")
         old = self.capacity()
         new = D8CapacityVersion(self._id(f"capacity/{old.version + 1}"), old.task_run_id,
                                 old.version + 1, old.capacity.increased(updates))
@@ -123,7 +123,7 @@ class HandoffContext:
                 self.pause_report["unit"] = measured.get("estimate_unit", self.pause_report["unit"])
         identity = self._id("pause/" + conclusion_digest(self.pause_report))
         self.evidence.save("pause", identity, self.pause_report)
-        raise D3RecoveryRequired(reason or "d8_context_paused:" + kind)
+        raise ExecutionRecoveryRequired(reason or "d8_context_paused:" + kind)
 
     def history(self, *, apply_revisions=True):
         state, items = self.state, []
@@ -174,10 +174,10 @@ class HandoffContext:
         for fact in state.facts:
             if (fact.verification_ref or "").startswith("d8e:"):
                 record=next((r for r in self.store.list_d8_conclusions(task_id) if r.review_request_id==fact.verification_ref[4:]),None)
-                if record is None:raise D3RecoveryRequired("d22_fact_approval_missing")
+                if record is None:raise ExecutionRecoveryRequired("d22_fact_approval_missing")
                 status="available"
                 try:self.app.evidence_conclusions.validate_fact(fact,state)
-                except D3RecoveryRequired:status="unavailable"
+                except ExecutionRecoveryRequired:status="unavailable"
                 add(fact.fact_id,"verified_fact",fact.turn_id,record.intent_id,None,fact.content,
                     (fact.source_ref,fact.verification_ref),{"fact":asdict(fact),"source":record.source_version_sha256},"outer_reviewed_evidence_fact",status)
                 items[-1]=replace(items[-1],scope="historical")
@@ -187,7 +187,7 @@ class HandoffContext:
             artifact, status, version = None, "available", asdict(fact)
             try:
                 if not fact.verification_ref or not fact.verification_ref.startswith("d3:"):
-                    raise D3RecoveryRequired("d8_history_rule_not_registered")
+                    raise ExecutionRecoveryRequired("d8_history_rule_not_registered")
                 observed = self.app.conclusions.observation(fact.verification_ref[3:], historical=True)
                 if (observed.fact_content() != fact.content
                         and self.app.config.contract_version not in {21, 22}):
@@ -196,10 +196,10 @@ class HandoffContext:
                     # no longer the expected content there. Treating that as an
                     # unavailable source made every refined Fact unreliable and
                     # blocked the next dispatch.
-                    raise D3RecoveryRequired("d8_history_fact_binding_changed")
+                    raise ExecutionRecoveryRequired("d8_history_fact_binding_changed")
                 artifact = observed.artifact_version_id
                 version = {"fact": asdict(fact), "source": observed.source_version_sha256}
-            except D3RecoveryRequired:
+            except ExecutionRecoveryRequired:
                 status = "unavailable"
             add(fact.fact_id, "verified_fact", fact.turn_id, intent.intent_id, artifact,
                 fact.content, (fact.source_ref, fact.verification_ref or ""), version,
@@ -218,7 +218,7 @@ class HandoffContext:
                 request=self.app.conclusions.evidence.read_request(record.review_request_id)
                 status="available"
                 try:self.app.evidence_conclusions.validate_record(record,state)
-                except D3RecoveryRequired:status="unavailable"
+                except ExecutionRecoveryRequired:status="unavailable"
                 add(record.record_id,"reviewed_inference",record.turn_id,record.intent_id,None,
                     self.app.conclusions.accepted_content(record),(record.proposal_request_id,record.review_request_id),
                     asdict(record),"reviewed_inference_not_verified",status)
@@ -271,7 +271,7 @@ class HandoffContext:
                     from agent_core.intent_planning import selection_context
                     turn = turns[record.turn_id]
                     if selection != selection_context(self.app, turn, intents[record.intent_id]):
-                        raise D3RecoveryRequired("d22_intent_selection_context_changed")
+                        raise ExecutionRecoveryRequired("d22_intent_selection_context_changed")
                     content["selection"] = selection
             if self.app.config.intent_execution_policy and record.inner_request_id:
                 from agent_core.intent_execution import result_summary
@@ -358,7 +358,7 @@ class HandoffContext:
                 - fits=False, error=message if frontier doesn't fit
 
         Raises:
-            D3RecoveryRequired: if capacity check fails
+            ExecutionRecoveryRequired: if capacity check fails
         """
         frontier = self.active_intent_frontier()
         result = check_capacity(frontier, available_capacity)
@@ -377,7 +377,7 @@ class HandoffContext:
         record = rows[-1]
         data = self.evidence.read("handoff", record.evidence_ref)
         if data is None or conclusion_digest(data) != record.evidence_sha256:
-            raise D3RecoveryRequired("d8_summary_evidence_unavailable")
+            raise ExecutionRecoveryRequired("d8_summary_evidence_unavailable")
         return record, data
 
     def _dependencies(self, intent_id, *, apply_revisions=True):
@@ -470,7 +470,7 @@ class HandoffContext:
                 supports = [r.support_fact_id for r in self.store.list_d8_tree_records(self.state.task_run.task_run_id)
                             if r.intent_id == trigger and r.kind == "succeeded"]
                 if len(supports) != 1 or supports[0] not in by_id:
-                    raise D3RecoveryRequired("d8_parent_support_relation_missing")
+                    raise ExecutionRecoveryRequired("d8_parent_support_relation_missing")
                 support_id = supports[0]
                 if self.app.revisions is not None and phase not in {"handoff_summary", "conclusion_repair"}:
                     support_id = self.app.revisions.parent_fact(trigger, support_id)
@@ -497,11 +497,11 @@ class HandoffContext:
                 if result is not None and result.supporting_fact_id:
                     support = by_id.get(result.supporting_fact_id)
                     if support is None:
-                        raise D3RecoveryRequired("d8_current_plan_support_missing")
+                        raise ExecutionRecoveryRequired("d8_current_plan_support_missing")
                     required.add(support.ref)
         if support_fact_id:
             if support_fact_id not in by_id:
-                raise D3RecoveryRequired("d8_support_fact_missing")
+                raise ExecutionRecoveryRequired("d8_support_fact_missing")
             required.add(by_id[support_fact_id].ref)
         if self.app.config.contract_version in {14, 15, 16, 17, 18, 19, 20, 21, 22} and phase == "intent_evaluation":
             # These observations are evidence, never a program-generated semantic decision.
@@ -526,7 +526,7 @@ class HandoffContext:
             item = by_ref.get(ref)
             if (not maintenance_summary and (item is None or item.source_status != "available" or item.conflict
                     or self.app.revisions is not None and not self.app.revisions.reliable(item))):
-                raise D3RecoveryRequired("d8_required_source_unavailable_or_changed")
+                raise ExecutionRecoveryRequired("d8_required_source_unavailable_or_changed")
         _, previous = self._latest_summary()
         ranks = {r: n for n, r in enumerate(previous["ordered_refs"])} if previous else {}
         recent_turns = {t.turn_id for t in sorted(self.state.turns, key=lambda t: t.sequence)[-2:]}
@@ -694,7 +694,7 @@ class HandoffContext:
             kept.append({"description": item["description"], "intent_type": item["intent_type"]})
             dependencies.append(deps)
         if not kept:
-            raise D8DependencyCandidatesRejected(rejected)
+            raise DependencyCandidatesRejected(rejected)
         parsed = parse_d3_turn_proposal({"turn_target": value["turn_target"],
                                         "completion_rule": value["completion_rule"], "intents": kept},
                                        maximum=None if self.app.config.contract_version == 22 else 2)
@@ -709,13 +709,13 @@ class HandoffContext:
         result = self.evidence.read("result", request.model_request_id)
         if call is None:
             if result is not None:
-                raise D3RecoveryRequired("d8_result_without_admission")
+                raise ExecutionRecoveryRequired("d8_result_without_admission")
             return None
         if (call.start.task_run_id != request.task_run_id
                 or call.start.context_sha256 != request.context_sha256
                 or call.start.base_checkpoint_sequence != request.base_checkpoint_sequence
                 or call.start.role_config_ref != request.role_config_ref):
-            raise D3RecoveryRequired("d8_call_binding_changed")
+            raise ExecutionRecoveryRequired("d8_call_binding_changed")
         if result is None:
             bindings = getattr(self.app, "planning_assertion_bindings", None)
             if bindings is not None and request.stage == "tree_planning":
@@ -723,9 +723,9 @@ class HandoffContext:
                 if known is not None:
                     planned = self._parse(request, known["raw"])
                     if known["rejected_candidate_indices"] != list(planned.rejected_indices):
-                        raise D3RecoveryRequired("s2_planning_rejection_indices_changed")
+                        raise ExecutionRecoveryRequired("s2_planning_rejection_indices_changed")
                     if self.app.conclusions._sensitive(known["raw"]):
-                        raise D3RecoveryRequired("s2_saved_planning_not_safe")
+                        raise ExecutionRecoveryRequired("s2_saved_planning_not_safe")
                     self.evidence.save("result", request.model_request_id, known)
                     result = known
         if result is None:
@@ -754,20 +754,20 @@ class HandoffContext:
                     result = self.app.business_diagnostics.rejected_result(request, diagnostic)
                     self.evidence.save("result", request.model_request_id, result)
         if result is None:
-            raise D3RecoveryRequired("d8_summary_or_planning_outcome_unknown")
+            raise ExecutionRecoveryRequired("d8_summary_or_planning_outcome_unknown")
         if (result.get("model_request_id") != request.model_request_id
                 or result.get("request_sha256") != request.context_sha256
                 or result.get("outcome") not in {"valid", "invalid", "model_error", "sensitive_rejected", "stale"}):
-            raise D3RecoveryRequired("d8_saved_result_binding_changed")
+            raise ExecutionRecoveryRequired("d8_saved_result_binding_changed")
         if result["outcome"] == "valid":
             parsed = self._parse(request, result["raw"])
             if self.app.config.contract_version in {12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and request.stage == "tree_planning" and (
                     result.get("rejected_candidate_indices") != list(parsed.rejected_indices)):
-                raise D3RecoveryRequired("s2_planning_rejection_indices_changed")
+                raise ExecutionRecoveryRequired("s2_planning_rejection_indices_changed")
             if self.app.conclusions._sensitive(result["raw"]):
-                raise D3RecoveryRequired("d8_saved_summary_not_safe")
+                raise ExecutionRecoveryRequired("d8_saved_summary_not_safe")
         elif result["raw"] is not None:
-            raise D3RecoveryRequired("d8_invalid_result_contains_text")
+            raise ExecutionRecoveryRequired("d8_invalid_result_contains_text")
         evaluations = getattr(self.app, "evaluation_bindings", None)
         if evaluations is not None and request.stage == "intent_evaluation":
             evaluations.verify_result(request, result)
@@ -784,7 +784,7 @@ class HandoffContext:
             _trace("call.completed", stage=request.stage, outcome=result["outcome"],
                    request=request.model_request_id)
         elif call.completion != completion:
-            raise D3RecoveryRequired("d8_saved_completion_changed")
+            raise ExecutionRecoveryRequired("d8_saved_completion_changed")
         return result
 
     def reconcile(self):
@@ -826,7 +826,7 @@ class HandoffContext:
                 or start.role != "outer_planning"
                 or start.resource_ref != (request.turn_id or request.task_run_id)
                 or start.budget_policy_ref != self.app.config.d4_budget.budget_policy_ref):
-            raise D3RecoveryRequired("d8_review_operation_binding_changed")
+            raise ExecutionRecoveryRequired("d8_review_operation_binding_changed")
         # Validates request digest/checkpoint, saved result and completion;
         # an unknown result pauses rather than dispatching another model call.
         self._known_call(request)
@@ -897,13 +897,13 @@ class HandoffContext:
             _trace("call.enter", stage=current.stage, attempt=attempt,
                    request=current.model_request_id)
             if self.model.adapter.role_config != self.app.config.outer_role:
-                raise D3RecoveryRequired("d8_handoff_role_changed")
+                raise ExecutionRecoveryRequired("d8_handoff_role_changed")
             self.evidence.save("request", current.model_request_id, asdict(current))
             result = self._known_call(current)
             if result is None:
                 self.app._check_dispatch(allow_conclusion_repair=current.stage == "handoff_summary")
                 if self.state.latest_checkpoint.sequence != current.base_checkpoint_sequence:
-                    raise D3RecoveryRequired("d8_handoff_request_stale")
+                    raise ExecutionRecoveryRequired("d8_handoff_request_stale")
                 policy = self.app.config.handoff_config.outer_capacity
                 if not self._fits_complete_request(current, policy):
                     self._pause("complete_model_request", [i.ref for i in current.history],
@@ -930,7 +930,7 @@ class HandoffContext:
                     from agent_core.structured_output import ended_transport_failure
                     if (raw.kind in {ModelErrorKind.TIMED_OUT, ModelErrorKind.CANCELLED}
                             and not ended_transport_failure((self.app.output_boundary.evidence.read("provider-result", current.model_request_id) or {}).get("transport", {}))):
-                        raise D3RecoveryRequired("d8_model_outcome_unknown")
+                        raise ExecutionRecoveryRequired("d8_model_outcome_unknown")
                     reason = _provider_billing_code(raw)
                     outcome, raw = "model_error", None
                 elif self.app.conclusions._sensitive(raw):
@@ -944,7 +944,7 @@ class HandoffContext:
                         from agent_core.intent_execution import EVALUATION_ISSUES
                         evaluation_issue = str(exc) if str(exc) in EVALUATION_ISSUES else None
                         outcome, reason = "invalid", "d8_output_contract_rejected"
-                        if isinstance(exc, D8DependencyCandidatesRejected):
+                        if isinstance(exc, DependencyCandidatesRejected):
                             reason = "d8_all_dependency_candidates_rejected"
                             rejected_indices = list(exc.indices)
                         if (self.app.business_diagnostics is not None and current.stage == "tree_planning"
@@ -986,7 +986,7 @@ class HandoffContext:
             if result["outcome"] == "model_error" and result.get("reason") in {
                     "d8_provider_payment_required", "d8_provider_auth_failed"}:
                 # The known response and completion are durable before stopping.
-                raise D3RecoveryRequired(result["reason"])
+                raise ExecutionRecoveryRequired(result["reason"])
             technical_retry = (result["outcome"] == "model_error" and self.app.output_boundary is not None
                                and self.app.output_boundary.retryable_technical_failure(current))
             if (result["outcome"] != "invalid" and not technical_retry) or attempt == 1:
@@ -1048,19 +1048,19 @@ class HandoffContext:
                 and versions[-1].turn_id == turn_id):
             data = self.evidence.read("handoff", prior.evidence_ref)
             if data is None or conclusion_digest(data) != prior.evidence_sha256:
-                raise D3RecoveryRequired("d8_reused_summary_evidence_unavailable")
+                raise ExecutionRecoveryRequired("d8_reused_summary_evidence_unavailable")
             if data.get("capacity_recovery", False) == capacity_recovery:
                 return prior
         origin = "model_organized"
         try:
             final, candidate = await self.call(request, token)
             request_id = final.model_request_id
-        except D4BudgetExhausted:
+        except OperationBudgetExhausted:
             final, candidate, request_id = request, None, None
         if candidate is None:
             # Only known failures and pre-admission budget exhaustion can reach this branch.
             if request_id and self._known_call(final)["outcome"] == "stale":
-                raise D3RecoveryRequired("d8_stale_summary_cannot_fallback")
+                raise ExecutionRecoveryRequired("d8_stale_summary_cannot_fallback")
             origin = "trusted_code_fallback"
             candidate = D8SummaryCandidate(
                 f"Stage snapshot for Turn {turn_id}; no model interpretation. See labelled source entries.",
@@ -1068,11 +1068,11 @@ class HandoffContext:
                 (), ())
         self.app._check_dispatch(allow_conclusion_repair=True)
         if self.state.latest_checkpoint.sequence != request.base_checkpoint_sequence:
-            raise D3RecoveryRequired("d8_summary_commit_stale")
+            raise ExecutionRecoveryRequired("d8_summary_commit_stale")
         all_items = self.history()
         current = {i.ref: i for i in all_items}
         if any(current.get(i.ref) != i for i in request.history):
-            raise D3RecoveryRequired("d8_summary_source_changed")
+            raise ExecutionRecoveryRequired("d8_summary_source_changed")
         identity = self._id("handoff/" + request.model_request_id)
         data = {"task_run_id": request.task_run_id, "turn_id": turn_id,
                 "base_checkpoint_sequence": request.base_checkpoint_sequence,
@@ -1110,7 +1110,7 @@ class HandoffContext:
             successes = [r for r in self.store.list_d8_tree_records(self.state.task_run.task_run_id)
                          if r.kind == "succeeded" and r.intent_id == trigger_id]
             if len(successes) != 1:
-                raise D3RecoveryRequired("d8_child_requires_committed_success_support")
+                raise ExecutionRecoveryRequired("d8_child_requires_committed_success_support")
             support = successes[0].support_fact_id
             if self.app.revisions is not None:
                 support = self.app.revisions.parent_fact(trigger_id, support)
@@ -1118,7 +1118,7 @@ class HandoffContext:
         if request is None:request, _ = self._request("tree_planning", parent_turn_id, trigger_id, support)
         final, planned = await self.call(request, token)
         if not isinstance(planned, D8PlanningResult):
-            raise D3RecoveryRequired("d8_planning_failed_not_exhausted")
+            raise ExecutionRecoveryRequired("d8_planning_failed_not_exhausted")
         identity = self._id("tree/" + final.model_request_id)
         if planned.proposal is None:
             record = D8TreeRecord(identity, request.task_run_id, parent_turn_id, trigger_id,
@@ -1190,7 +1190,7 @@ class HandoffContext:
             # An unreadable verdict leaves this Intent unjudged; that is a local
             # unknown, not an unknown run state, so degrade to inconclusive.
             if not self.note_evaluation_fallback("d8_local_goal_evaluation_invalid"):
-                raise D3RecoveryRequired("d8_local_goal_evaluation_failed")
+                raise ExecutionRecoveryRequired("d8_local_goal_evaluation_failed")
             record = D8TreeRecord(self._id("evaluation/" + final.model_request_id), request.task_run_id,
                                   intent.turn_id, intent_id, "inconclusive", final.model_request_id,
                                   fact_id, inner_request_id)
@@ -1218,18 +1218,18 @@ class HandoffContext:
         from agent_core.handoff_storage import D8_CHANGES
         records = [c for c in mutation.state_changes if isinstance(c, D8_CHANGES)]
         if len(records) != 1 or self.app.config.contract_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}:
-            raise D3RecoveryRequired("d8_handoff_mutation_not_enabled")
+            raise ExecutionRecoveryRequired("d8_handoff_mutation_not_enabled")
         record = records[0]
         from agent_core.session_contracts import D8DecisionRecord
         if isinstance(record, D8DecisionRecord):
             if self.app.sessions is None:
-                raise D3RecoveryRequired("d8_session_not_enabled")
+                raise ExecutionRecoveryRequired("d8_session_not_enabled")
             self.app.sessions.validate_record(record, state)
             return
         from agent_core.conclusion_revision_contracts import D8RevisionRecord
         if isinstance(record, D8RevisionRecord):
             if self.app.revisions is None:
-                raise D3RecoveryRequired("d8_revision_not_enabled")
+                raise ExecutionRecoveryRequired("d8_revision_not_enabled")
             self.app.revisions.validate_record(record, state)
             return
         if isinstance(record, D8CapacityVersion):
@@ -1239,12 +1239,12 @@ class HandoffContext:
             if (data is None or conclusion_digest(data) != record.evidence_sha256
                     or (data["task_run_id"], data["turn_id"], data["base_checkpoint_sequence"], data["capacity_version"], data["origin"])
                     != (record.task_run_id, record.turn_id, record.base_checkpoint_sequence, record.capacity_version, record.origin)):
-                raise D3RecoveryRequired("d8_joint_summary_binding_changed")
+                raise ExecutionRecoveryRequired("d8_joint_summary_binding_changed")
             frozen = tuple(D8HistoryItem.from_dict(i) for i in data["all_items"])
             expected_index = tuple((i.ref, i.record_id, i.record_type, i.turn_id, i.intent_id,
                                     i.artifact_version_id) for i in frozen)
             if record.index_entries != expected_index:
-                raise D3RecoveryRequired("d8_local_index_binding_changed")
+                raise ExecutionRecoveryRequired("d8_local_index_binding_changed")
             refs = {i.ref for i in frozen}
             read_refs = checked_refs(data["actual_read_refs"], refs)
             if (data["identity"] != "handoff_information_not_verified"
@@ -1254,7 +1254,7 @@ class HandoffContext:
                     or data["unordered_refs"] != [i.ref for i in frozen if i.ref not in data["ordered_refs"]]
                     or record.source_snapshot_sha256 != conclusion_digest(
                         [asdict(next(i for i in frozen if i.ref == ref)) for ref in read_refs])):
-                raise D3RecoveryRequired("d8_summary_coverage_binding_changed")
+                raise ExecutionRecoveryRequired("d8_summary_coverage_binding_changed")
             capacities = self.store.list_d8_capacities(record.task_run_id)
             capacity = next(v.capacity for v in capacities if v.version == record.capacity_version)
             D8SummaryCandidate.parse({k: data[k] for k in (
@@ -1266,7 +1266,7 @@ class HandoffContext:
                         or request.stage != "handoff_summary" or request.turn_id != record.turn_id
                         or request.capacity_version != record.capacity_version
                         or list(read_refs) != [i.ref for i in request.history]):
-                    raise D3RecoveryRequired("d8_summary_scope_stale")
+                    raise ExecutionRecoveryRequired("d8_summary_scope_stale")
                 previous_context = json.loads(request.prior_summary).get("previous_summary")
                 if previous_context and record.origin == "model_organized":
                     parent = next((v for v in self.store.list_d8_handoffs(record.task_run_id)
@@ -1279,28 +1279,28 @@ class HandoffContext:
                             or json.loads(request.prior_summary)["global_body"] != parent_data["global_body"]
                             or previous_context["carried_refs"] != sorted(set(parent_data.get("covered_refs", parent_data["actual_read_refs"])) & refs)
                             or data.get("covered_refs") != sorted(set(read_refs) | set(previous_context["carried_refs"]))):
-                        raise D3RecoveryRequired("d8_summary_coverage_binding_changed")
+                        raise ExecutionRecoveryRequired("d8_summary_coverage_binding_changed")
                 elif "covered_refs" in data:
-                    raise D3RecoveryRequired("d8_summary_coverage_binding_changed")
+                    raise ExecutionRecoveryRequired("d8_summary_coverage_binding_changed")
                 if data.get("capacity_recovery", False) != json.loads(request.prior_summary).get("capacity_recovery", False):
-                    raise D3RecoveryRequired("d8_summary_coverage_binding_changed")
+                    raise ExecutionRecoveryRequired("d8_summary_coverage_binding_changed")
                 if record.origin == "model_organized":
                     candidate = self._parse(request, result["raw"])
                     if (candidate.turn_body, candidate.global_body, list(candidate.ordered_refs),
                         [{"text": text, "refs": list(refs)} for text, refs in candidate.open_questions]) != (
                             data["turn_body"], data["global_body"], data["ordered_refs"], data["open_questions"]):
-                        raise D3RecoveryRequired("d8_summary_candidate_changed")
+                        raise ExecutionRecoveryRequired("d8_summary_candidate_changed")
                 elif result["outcome"] not in {"invalid", "model_error", "sensitive_rejected"}:
-                    raise D3RecoveryRequired("d8_fallback_is_not_known_failure")
+                    raise ExecutionRecoveryRequired("d8_fallback_is_not_known_failure")
             elif record.origin != "trusted_code_fallback":
-                raise D3RecoveryRequired("d8_model_summary_has_no_call")
+                raise ExecutionRecoveryRequired("d8_model_summary_has_no_call")
             else:
                 usage = self.store.d4_budget_usage(record.task_run_id)
                 if (dict(usage.category_counts).get("handoff_summary", 0) < self.app.config.d4_budget.handoff_summary
                         and usage.total_used < self.app.config.d4_budget.total):
-                    raise D3RecoveryRequired("d8_fallback_has_no_failure_or_exhausted_budget")
+                    raise ExecutionRecoveryRequired("d8_fallback_has_no_failure_or_exhausted_budget")
             if frozen != self.history():
-                raise D3RecoveryRequired("d8_summary_source_snapshot_changed")
+                raise ExecutionRecoveryRequired("d8_summary_source_snapshot_changed")
             return
         if record.kind in {"strategy_yielded", "strategy_resumed"}:
             from agent_core.strategy_supervision import validate_transition, validate_yield_note
@@ -1316,56 +1316,56 @@ class HandoffContext:
                 if (note is None or note.get("intent_id") != record.intent_id
                         or note.get("failed_request_id") != record.model_request_id
                         or note.get("identity") != "technical_suspension_not_business_verdict"):
-                    raise D3RecoveryRequired("d22_suspension_evidence_changed")
+                    raise ExecutionRecoveryRequired("d22_suspension_evidence_changed")
             return
         if record.model_request_id:
             raw_request = self.evidence.read("request", record.model_request_id)
             if raw_request is None:
-                raise D3RecoveryRequired("d8_tree_request_missing")
+                raise ExecutionRecoveryRequired("d8_tree_request_missing")
             request = D8HandoffRequest.from_dict(raw_request)
             result = self._known_call(request)
             if result is None or result["outcome"] != "valid" or request.base_checkpoint_sequence != state.latest_checkpoint.sequence:
-                raise D3RecoveryRequired("d8_tree_call_stale_or_unavailable")
+                raise ExecutionRecoveryRequired("d8_tree_call_stale_or_unavailable")
             parsed = self._parse(request, result["raw"])
             current = {i.ref: i for i in self.history()}
             if any(current.get(i.ref) != i for i in request.history):
-                raise D3RecoveryRequired("d8_tree_source_changed")
+                raise ExecutionRecoveryRequired("d8_tree_source_changed")
             if record.kind == "registration":
                 if state.turns and request.turn_id is None:
                     marker = self.evidence.read("pause", self.app._id("continuous/root-replan"))
                     contract = self.app.output_boundary.evidence.read("contract", record.model_request_id)
                     if (self.app.config.intent_execution_policy != "continuous_v1" or marker is None
                             or contract is None or contract["root_request_id"] != marker["model_request_id"]):
-                        raise D3RecoveryRequired("d22_root_replan_binding_changed")
+                        raise ExecutionRecoveryRequired("d22_root_replan_binding_changed")
                 if not isinstance(parsed, D8PlanningResult) or parsed.proposal is None:
-                    raise D3RecoveryRequired("d8_registration_has_no_candidates")
+                    raise ExecutionRecoveryRequired("d8_registration_has_no_candidates")
                 change = next(c for c in mutation.state_changes if isinstance(c, UpsertTurn))
                 children = [c for c in mutation.state_changes if isinstance(c, UpsertIntent)]
                 if (change.parent_turn_id, change.triggering_intent_id) != (request.turn_id, request.intent_id):
-                    raise D3RecoveryRequired("d8_child_parent_binding_changed")
+                    raise ExecutionRecoveryRequired("d8_child_parent_binding_changed")
                 if (tuple((c.description, c.intent_type) for c in children)
                         != tuple((c.description, c.intent_type) for c in parsed.proposal.intents)
                         or tuple(c.priority for c in children) != tuple(range(1, len(children) + 1))
                         or tuple(refs for _, refs in record.dependencies) != parsed.dependencies
                         or change.turn_target != state.task_run.request.goal):
-                    raise D3RecoveryRequired("d8_candidate_or_dependencies_changed")
+                    raise ExecutionRecoveryRequired("d8_candidate_or_dependencies_changed")
                 if self.app.config.tcp_authorization is not None:
                     from agent_core.target_contracts import turn_binding
                     if mutation.d3.turn_binding != turn_binding(self.app, change.turn_id, record.model_request_id):
-                        raise D3RecoveryRequired("tcp.turn_source_changed")
+                        raise ExecutionRecoveryRequired("tcp.turn_source_changed")
                 elif self.app.web is not None:
                     if mutation.d3.turn_binding != self.app.web.turn_binding(change.turn_id, record.model_request_id):
-                        raise D3RecoveryRequired('d20_http_turn_source_changed')
+                        raise ExecutionRecoveryRequired('d20_http_turn_source_changed')
                 else:
                     receipt = self.app.imports.read_receipt(mutation.d3.turn_binding.import_id)
                     if receipt is None or (receipt.byte_size, receipt.sha256) != (
                             mutation.d3.turn_binding.expected_byte_size, mutation.d3.turn_binding.expected_sha256):
-                        raise D3RecoveryRequired("d8_turn_import_binding_changed")
+                        raise ExecutionRecoveryRequired("d8_turn_import_binding_changed")
             elif record.kind == "expansion_exhausted":
                 if not isinstance(parsed, D8PlanningResult) or parsed.proposal is not None:
-                    raise D3RecoveryRequired("d8_exhaustion_is_not_explicit")
+                    raise ExecutionRecoveryRequired("d8_exhaustion_is_not_explicit")
                 if (request.turn_id, request.intent_id) != (record.turn_id, record.intent_id):
-                    raise D3RecoveryRequired("d8_exhaustion_scope_changed")
+                    raise ExecutionRecoveryRequired("d8_exhaustion_scope_changed")
             else:
                 from agent_core.intent_execution import support_anchor
                 policy = json.loads(request.prior_summary).get("s4_evaluation_policy", {})
@@ -1373,14 +1373,14 @@ class HandoffContext:
                 if (("evaluation_continued" if parsed["decision"] == "continue" else parsed["decision"]) != record.kind
                         or (request.turn_id, request.intent_id, anchor)
                         != (record.turn_id, record.intent_id, record.support_fact_id)):
-                    raise D3RecoveryRequired("d8_local_goal_decision_changed")
+                    raise ExecutionRecoveryRequired("d8_local_goal_decision_changed")
                 if json.loads(request.prior_summary).get("s4_evaluation_policy", {}).get("version") in {2, 3}:
                     from agent_core.intent_execution import validate_record
                     validate_record(self.app, request, record)
                     return
                 inner = self.app.validator._known_model(record.task_run_id, record.inner_request_id, "inner_complete")
                 if inner.action.fact_ids != (record.support_fact_id,):
-                    raise D3RecoveryRequired("d8_inner_completion_support_changed")
+                    raise ExecutionRecoveryRequired("d8_inner_completion_support_changed")
                 plans = [p for p in state.plans if p.intent_id == record.intent_id]
                 binding = self.store.load_d3_plan_binding(plans[-1].plan_id)
                 result = self.store.load_d3_plan_result(binding.plan_id)
@@ -1397,17 +1397,17 @@ class HandoffContext:
         for item in facts:
             source = current.get(item.record_id)
             if source is None:
-                raise D3RecoveryRequired("d8_read_source_version_missing")
+                raise ExecutionRecoveryRequired("d8_read_source_version_missing")
             if (source.source_status != "available" or source.ref != item.ref
                     or source.content != item.content or source.source_refs != item.source_refs):
-                raise D3RecoveryRequired("d8_read_source_version_changed")
+                raise ExecutionRecoveryRequired("d8_read_source_version_changed")
 
     def _page(self, snapshot, request_id):
         items = tuple(D8HistoryItem.from_dict(i) for i in snapshot["items"])
         if snapshot["mode"] == "details" and any(i.identity == "public_reference_not_target_observation" for i in items):
             originals = {i.ref: i for i in self.history() if i.identity == "public_reference_not_target_observation"}
             if any(i.ref not in originals for i in items if i.identity == "public_reference_not_target_observation"):
-                raise D3RecoveryRequired("retrieval.source_version_unavailable")
+                raise ExecutionRecoveryRequired("retrieval.source_version_unavailable")
             from agent_adapters.public_web import document_text
             items = tuple(replace(i, content=document_text(json.loads(originals[i.ref].content)["observation"])
                           if snapshot.get("content_projection") == "public_documents_text" else originals[i.ref].content)
@@ -1479,16 +1479,16 @@ class HandoffContext:
             frozen = self.evidence.read("read-snapshot", start["snapshot_id"])
             if (frozen is None or frozen["read_input"] != {"query": query, "refs": refs, "cursor": cursor}
                     or actor_intent_id is not None and frozen["actor_intent_id"] != actor_intent_id):
-                raise D3RecoveryRequired("d8_read_parameters_changed")
+                raise ExecutionRecoveryRequired("d8_read_parameters_changed")
             if self.evidence.read("read-result", request_id) is None:
-                raise D3RecoveryRequired("d8_read_requires_explicit_original_id_recovery")
+                raise ExecutionRecoveryRequired("d8_read_requires_explicit_original_id_recovery")
             return self.resume_read(request_id)
         version = self.capacity()
         if cursor is not None:
             _uuid(cursor, "cursor")
             snapshot = self.evidence.read("read-snapshot", cursor)
             if snapshot is None or snapshot["task_run_id"] != self.state.task_run.task_run_id:
-                raise D3RecoveryRequired("d8_cursor_missing_or_foreign")
+                raise ExecutionRecoveryRequired("d8_cursor_missing_or_foreign")
             snapshot = {**snapshot, "capacity_version": version.version, "capacity": asdict(version.capacity)}
         else:
             all_items = self.history()
@@ -1531,23 +1531,23 @@ class HandoffContext:
     def resume_read(self, request_id):
         known = self.store.load_d8_read(request_id)
         if known is None or known[0]["task_run_id"] != self.state.task_run.task_run_id:
-            raise D3RecoveryRequired("d8_read_request_missing_or_foreign")
+            raise ExecutionRecoveryRequired("d8_read_request_missing_or_foreign")
         start, completion = known
         snapshot = self.evidence.read("read-snapshot", start["snapshot_id"])
         if snapshot is None or conclusion_digest(snapshot) != start["snapshot_sha256"]:
-            raise D3RecoveryRequired("d8_read_snapshot_unavailable")
+            raise ExecutionRecoveryRequired("d8_read_snapshot_unavailable")
         if snapshot["task_run_id"] != start["task_run_id"] or snapshot["capacity_version"] != start["capacity_version"]:
-            raise D3RecoveryRequired("d8_read_snapshot_owner_or_capacity_changed")
+            raise ExecutionRecoveryRequired("d8_read_snapshot_owner_or_capacity_changed")
         saved = self.evidence.read("read-result", request_id)
         if saved is not None:
             if completion is not None and completion != {"sha256": conclusion_digest(saved)}:
-                raise D3RecoveryRequired("d8_read_result_changed")
+                raise ExecutionRecoveryRequired("d8_read_result_changed")
             self.store.complete_d8_read(request_id, {"sha256": conclusion_digest(saved)})
             return saved
         try:
             self._validate_frozen_read_sources(tuple(D8HistoryItem.from_dict(i) for i in snapshot["items"]))
             response, positions = self._page(snapshot, request_id)
-        except D3RecoveryRequired as exc:
+        except ExecutionRecoveryRequired as exc:
             capacity_failure = str(exc).startswith("d8_context_paused:") and self.pause_report is not None
             source_failure = str(exc) in {"d8_read_source_version_missing", "d8_read_source_version_changed"}
             if not capacity_failure and not source_failure:
@@ -1583,12 +1583,12 @@ class HandoffContext:
                 continue
             snapshot = self.evidence.read("read-snapshot", start["snapshot_id"])
             if snapshot is None or conclusion_digest(snapshot) != start["snapshot_sha256"]:
-                raise D3RecoveryRequired("d8_retained_read_snapshot_unavailable")
+                raise ExecutionRecoveryRequired("d8_retained_read_snapshot_unavailable")
             if snapshot["actor_intent_id"] != intent_id:
                 continue
             response = self.evidence.read("read-result", request_id)
             if response is None or completion != {"sha256": conclusion_digest(response)}:
-                raise D3RecoveryRequired("d8_retained_read_result_unavailable")
+                raise ExecutionRecoveryRequired("d8_retained_read_result_unavailable")
             views = []
             for item in response["items"]:
                 now = current.get(item["ref"])
@@ -1608,7 +1608,7 @@ class HandoffContext:
         pending = [(identity, start) for identity, start, completion in
                    self.store.list_d8_reads(self.state.task_run.task_run_id) if completion is None]
         if len(pending) > 1:
-            raise D3RecoveryRequired("d8_multiple_unfinished_local_reads")
+            raise ExecutionRecoveryRequired("d8_multiple_unfinished_local_reads")
         if pending:
             self.resume_read(pending[0][0])
             self._apply_read_parent(pending[0][0])
@@ -1622,7 +1622,7 @@ class HandoffContext:
         for identity, _, completion in self.store.list_d8_reads(self.state.task_run.task_run_id):
             if completion is None:
                 if self.evidence.read("read-result", identity) is None:
-                    raise D3RecoveryRequired("d8_read_requires_explicit_original_id_recovery")
+                    raise ExecutionRecoveryRequired("d8_read_requires_explicit_original_id_recovery")
                 self.resume_read(identity)
                 self._apply_read_parent(identity)
 
@@ -1688,7 +1688,7 @@ class HandoffContext:
                     needed = old_result["pause_report"]["known_needed"]
                     if (version.capacity.read_return <= old_snapshot["capacity"]["read_return"]
                             or needed is not None and version.capacity.read_return < needed):
-                        raise D3RecoveryRequired("d8_read_capacity_paused_requires_operator_update")
+                        raise ExecutionRecoveryRequired("d8_read_capacity_paused_requires_operator_update")
             while len(handoff_json({k: v for k, v in packet.items() if k != "retrieved"})) > version.capacity.initial_history and packet["process_facts"]:
                 packet["process_facts"].pop()
             initial_length = len(handoff_json({k: v for k, v in packet.items() if k != "retrieved"}))
@@ -1702,7 +1702,7 @@ class HandoffContext:
             saved = {"task_run_id": request.task_run_id, "model_request_id": request.model_request_id,
                      "capacity_version": version.version, "history_context": handoff_json(packet)}
         elif (saved["task_run_id"], saved["model_request_id"]) != (request.task_run_id, request.model_request_id):
-            raise D3RecoveryRequired("d8_execution_context_owner_changed")
+            raise ExecutionRecoveryRequired("d8_execution_context_owner_changed")
         values = {f.name: getattr(request, f.name) for f in fields(request)}
         values["process_facts"] = ()
         result = D8ExecutionModelRequest(**values,
@@ -1744,8 +1744,8 @@ class HandoffContext:
         import json
         packet = json.loads(request.history_context)
         if (packet.get("intent_execution", {}).get("stop_requested") or {}).get("history_reads_allowed") is False:
-            from agent_core.dual_llm_modeling import D3ProposalRejected
-            raise D3ProposalRejected("d22_closure_history_not_allowed")
+            from agent_core.dual_llm_modeling import ExecutionProposalRejected
+            raise ExecutionProposalRejected("d22_closure_history_not_allowed")
         visible = {i["ref"] for i in packet["items"]}
         from agent_core.handoff_contracts import session_read_refs
         visible.update(session_read_refs(getattr(request, "session_context", "{}")))
@@ -1771,5 +1771,5 @@ class HandoffContext:
         response = self.read_history(**{mode: action.value}, request_id=request_id)
         self.store.mark_d3_operation_applied(model_request_id, request_id)
         if response.get("error") == "capacity_paused":
-            raise D3RecoveryRequired("d8_read_capacity_paused_requires_operator_update")
+            raise ExecutionRecoveryRequired("d8_read_capacity_paused_requires_operator_update")
         return response

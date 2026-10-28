@@ -101,10 +101,10 @@ def test_valid_stop_discards_inflight_decision_without_dispatch_or_technical_ret
     assert history.identity == "strategy_interruption_not_execution_or_fact"
     assert history.record_type == "progress"
     from dataclasses import replace
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     read = c.app.model_evidence.read
     monkeypatch.setattr(c.app.model_evidence, "read", lambda key: replace(read(key), reason="changed") if key == identity else read(key))
-    with pytest.raises(D3RecoveryRequired, match="d22_strategy_interruption_source_changed"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d22_strategy_interruption_source_changed"):
         list(c.app.supervision.interruptions())
 
 
@@ -330,7 +330,7 @@ def test_voluntary_yield_restores_same_session_without_technical_revisit(http_ca
     assert parked["status"] == "suspended" and parked["suspension_kind"] == "strategy"
     from agent_core.strategy_supervision import validate_yield_note
     from agent_core.control_store import UpsertIntent
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     from types import SimpleNamespace
     row = next(r for r in rows if r.kind == "strategy_yielded")
     note = c.app.handoff.evidence.read("strategy-yield", row.record_id)
@@ -341,7 +341,7 @@ def test_voluntary_yield_restores_same_session_without_technical_revisit(http_ca
     with monkeypatch.context() as patch:
         patch.setattr(c.app.handoff.evidence, "read", lambda kind, key:
             None if kind == "strategy-yield" and key == row.record_id else read(kind, key))
-        with pytest.raises(D3RecoveryRequired, match="d22_strategy_yield_evidence_changed"):
+        with pytest.raises(ExecutionRecoveryRequired, match="d22_strategy_yield_evidence_changed"):
             validate_yield_note(c.app, row, mutation)
 
 
@@ -533,7 +533,7 @@ def test_lost_readonly_worker_is_classified_without_replaying_it(http_case):
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
 def test_unknown_tool_is_never_exempt_from_admission(http_case):
     from uuid import uuid4
-    from agent_core.operation_accounting import D4OperationStart, D4RecoveryRequired
+    from agent_core.operation_accounting import D4OperationStart, OperationRecoveryRequired
     c = http_case
     identity = str(uuid4())
     c.app.store.begin_d4_operation(D4OperationStart(identity, c.task, "tool_dispatch", c.app.clock(),
@@ -541,7 +541,7 @@ def test_unknown_tool_is_never_exempt_from_admission(http_case):
     # Even a broad owner callback must not exempt an actual tool operation.
     c.app.store.live_strategy_operation = lambda key: True
     assert c.app.store.blocking_d4_operations(c.task)
-    with pytest.raises(D4RecoveryRequired):
+    with pytest.raises(OperationRecoveryRequired):
         c.app._check_dispatch()
     assert not c.sends and not any(m.calls for m in c.models)
 
@@ -799,7 +799,7 @@ def test_nullable_object_diagnostics_keep_acceptance_and_report_actual_fields():
 @pytest.mark.parametrize("boundary",["normal","commit_gap","unconfirmed","unexpected","known_response"])
 def test_supervision_poll_failure_settles_cancelled_inner_before_technical_wait(http_case,monkeypatch,boundary):
     import time
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     from agent_core.modeling import ModelError,ModelErrorKind
     c=http_case
     install(c,steps=6)
@@ -813,7 +813,7 @@ def test_supervision_poll_failure_settles_cancelled_inner_before_technical_wait(
     def persist(evidence):
         if boundary=='commit_gap' and evidence.reason=='model_cancelled' and not injected:
             injected.append(True)
-            raise D3RecoveryRequired('d8_handoff_evidence_write_recovery_required')
+            raise ExecutionRecoveryRequired('d8_handoff_evidence_write_recovery_required')
         return save(evidence)
     monkeypatch.setattr(c.app.model_evidence,'save',persist)
     def review(envelope,*args):
@@ -848,7 +848,7 @@ def test_supervision_poll_failure_settles_cancelled_inner_before_technical_wait(
                 and entered.is_set() and not failed.is_set()):
             failed.set()
             if boundary=='unexpected':raise RuntimeError('private first failure must not be saved')
-            raise D3RecoveryRequired('d8_handoff_evidence_write_recovery_required')
+            raise ExecutionRecoveryRequired('d8_handoff_evidence_write_recovery_required')
         return poll()
     c.models[0].invoke,c.models[1].invoke=review,choose
     if boundary=='known_response':
@@ -871,7 +871,7 @@ def test_supervision_poll_failure_settles_cancelled_inner_before_technical_wait(
     identity=cancelled[0]
     diagnostic=c.app.output_boundary.evidence.read('call-interruption',identity)
     assert diagnostic['phase']=='supervision_poll'
-    assert diagnostic['failure']['exception_types'][0]==('RuntimeError' if boundary=='unexpected' else 'D3RecoveryRequired')
+    assert diagnostic['failure']['exception_types'][0]==('RuntimeError' if boundary=='unexpected' else 'ExecutionRecoveryRequired')
     assert 'private' not in json.dumps(diagnostic)
     if boundary=='unexpected':assert result.stop_reason=='d22_strategy_result_processing_failed'
     if boundary=='unconfirmed':
@@ -910,7 +910,7 @@ def test_supervision_poll_failure_settles_cancelled_inner_before_technical_wait(
 def test_repair_only_bound_cancelled_provider_result_never_replays(http_case,monkeypatch,state):
     from copy import deepcopy
     from types import SimpleNamespace as NS
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     from agent_core.turn_modeling import digest
     c=http_case
     install(c,steps=1)
@@ -954,7 +954,7 @@ def test_repair_only_bound_cancelled_provider_result_never_replays(http_case,mon
     monkeypatch.setattr(c.app.model_evidence,'save',lambda evidence:captured.append(evidence))
     before=len(c.sends),len(c.models[1].calls)
     if state=='wrong_binding':
-        with pytest.raises(D3RecoveryRequired,match='cancelled_call_binding_changed'):boundary.reconcile_formats()
+        with pytest.raises(ExecutionRecoveryRequired,match='cancelled_call_binding_changed'):boundary.reconcile_formats()
     else:boundary.reconcile_formats()
     if state=='cancelled':
         assert len(captured)==1 and captured[0].reason=='model_cancelled'
