@@ -178,12 +178,13 @@ async def _run_stage_task(directory, declaration, *, operation, finalize_export,
                             raise ValueError("competition_question_not_active")
                         request = replace(request, deadline_seconds=min(request.deadline_seconds, remaining))
                 app.start(request, source_root=declaration["source_root"], task_run_id=task_id)
-                if binding_file.is_file() and "schedule" in binding:
+                if binding_file.is_file():
+                    schedule = binding.get("schedule", {})
                     app.controller.submit_operator_control(app.store, task_id, declaration["request_id"], "configure", {
-                        "question_seconds": binding["schedule"]["question_seconds"],
-                        "overall_deadline_at": binding["schedule"]["overall_deadline_at"],
+                        "question_seconds": schedule.get("question_seconds", request.deadline_seconds),
+                        "overall_deadline_at": schedule.get("overall_deadline_at"),
                         "platform_deadline_at": binding["platform_deadline_at"],
-                        "overall_ceiling_at": binding["schedule"].get("overall_ceiling_at")})
+                        "overall_ceiling_at": schedule.get("overall_ceiling_at")})
                     operator_controls.enable(app.controller)
                     queued = sorted((immutable_read(path) for path in controls_dir.glob("*.json")),
                         key=lambda item: (item["requested_at"], item["request"]["operation_id"]))
@@ -200,8 +201,7 @@ async def _run_stage_task(directory, declaration, *, operation, finalize_export,
                         app.controller.submit_operator_control(app.store, task_id, command["operation_id"], "pause", {})
         else:
             app.bind(task_id)
-        if operator_controls.current(app.store, task_id) is not None:
-            operator_controls.enable(app.controller)
+        operator_controls.enable(app.controller)
         app.store.operator_pause_probe = lambda: (directory.parent.parent / "operator-pause-request.json").exists()
         if declaration["mode"] == "real" and operation in {"start", "resume"}:
             app.models.outer.bind_runtime(token, lambda: app.state.task_run.deadline_at)

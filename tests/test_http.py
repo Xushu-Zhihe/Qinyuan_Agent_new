@@ -24,6 +24,29 @@ from test_candidate_evidence import _TestOnlyProtection
 ORIGIN='http://example.test:18080'
 
 
+def test_response_evidence_failure_has_public_phase_without_resending(http_case, monkeypatch):
+    from agent_adapters.web.http_adapter import HttpCapabilityError
+    from agent_adapters.web.task_result import snapshot_v3_task_result
+    c = http_case
+    c.app.web.attach()
+    save = c.app.web.protected.store.save
+    def fail_response(operation, body):
+        if c.sends:
+            raise HttpCapabilityError('d7_http_evidence_write_failed')
+        return save(operation, body)
+    monkeypatch.setattr(c.app.web.protected.store, 'save', fail_response)
+    result = asyncio.run(c.app._run_once(c.token))
+    assert result.recovery_required and result.stop_reason == 'http.response_evidence_save_failed'
+    assert len(c.sends) == 1 and not c.app.state.facts
+    snapshot = snapshot_v3_task_result(c.directory, c.declaration)
+    assert not snapshot['errors'], snapshot
+    row = next(r for r in snapshot['http_diagnostics'] if r.get('phase') == 'response_evidence_save')
+    assert 'd7_http_evidence_write_failed' in row['error_codes']
+    assert snapshot['recovery']['required']
+    c.app.web.reconcile()
+    assert len(c.sends) == 1
+
+
 class Network:
     def create(self,task,url):
         return TargetNetworkBinding('1'*64,'2'*64,'3'*64,'a'*64,url)

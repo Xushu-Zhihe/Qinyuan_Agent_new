@@ -6,14 +6,14 @@ Qinyuan Agent 是一个面向 CTF 与授权安全实验的双 LLM Agent。它通
 
 ## 工作方式
 
-- **OuterLLM**：规划和调整 Intent，复盘探索进展，审核结论与 Intent 结束申请。
-- **InnerLLM**：围绕当前 Intent 选择下一步，调用工具，整理中间结果并提出结论候选。
-- **MCP 与 Sandbox**：提供工具目录和受控执行能力，工具结果回传当前 Intent，供后续决策使用。
+- **OuterLLM**：审核阶段目标、Road 方案、结论和收尾，复盘探索进展并提出路线优先级建议。
+- **InnerLLM**：在 Turn 规划会话提出目标和 Road，各 Road 通过独立执行会话调用工具、整理证据及提出结论；路线选择由原规划 Inner 决定。
+- **MCP 与 Sandbox**：提供工具目录和受控执行能力，工具结果回传原 Road，供后续决策使用。
 - **状态与证据**：使用 SQLite 和文件记录保存运行、操作、观测及审核关系，支持查询、回放和恢复。
 
-一个 TaskRun 可以包含多个 Turn，每个 Turn 可以包含多个 Intent。工具调用成功代表获得了一次执行结果，不会自动生成 verified Fact；正式结论需要提供证据并经过审核。工作记录和摘要可以辅助推理，但不能替代正式证据。
+一个 TaskRun 可以包含多个 Turn，每个 Turn 有固定的阶段目标 Turn.Intent 和单层备选 Road。正式 Fact 单一存储，Turn.Fact 引用其中的阶段成果。工具调用成功代表获得了一次执行结果，不会自动生成 verified Fact；正式结论需要提供证据并经过审核。工作记录和摘要可以辅助推理，但不能替代正式证据。
 
-Intent 可以完成、合法收束或技术挂起，任务随后继续其他方向。技术挂起会保留进展，并按相邻兄弟失败后的规则获得一次回访机会；业务上的失败或无法判定不会按技术错误自动回访。根方向用尽后最多重新规划一次，仍无方向则等待原 deadline。
+待审 Intent/Road 可在原授权内探索，待审 Fact 仅为假设。当前 Turn 正式收尾通过并结算执行后，原 Inner 才提出后继 Intent；提交后直接规划其 Road，不等待后继规划审核。子阶段无法继续时反馈直接父规划，保留可靠成果；恢复会话不回滚环境。
 
 正常自动调度以任务通过独立验证或总时限到达为结束边界，也支持人工取消。操作结果不明或共享状态需要核验时会等待恢复，不自动重放工具。
 
@@ -36,6 +36,22 @@ uv sync --frozen
 
 `pyproject.toml` 声明项目依赖，`uv.lock` 锁定具体版本，两者都应保留。
 
+### Windows 安全配置
+
+启动后打开侧栏 **Windows 安全配置**，集中检查、配置或撤销当前数据目录的 Microsoft Defender 排除规则。按钮由本地服务发起标准 UAC 管理员确认；页面自动跟踪操作完成并显示核验时间，外部改动后请重新点击检查。未核验、取消或配置失败均只提示，允许继续运行，不会自动重试配置或重新执行任务。固定助手子进程使用 `-ExecutionPolicy Bypass` 加载内置脚本，只放宽该子进程的脚本检查；不修改用户/系统全局执行策略，组策略、UAC 和 Defender 权限仍有效。更新后端代码后需要重启工作台，仅刷新网页不会重新加载后端。
+
+规则固定为 `<实际 data-dir>\runs\*\agent-state\*\stage-evidence`，覆盖后续运行；不排除整个项目、Python 或 Docker 进程。配置只追加这一条，撤销只移除这一条，均不关闭实时保护或防篡改。匹配目录中的真实恶意样本也会跳过常规内容扫描；其他目录和 EDR/行为告警不在本规则保证范围内。目录排除是否生效由 `MpCmdRun -CheckExclusion` 核验，规则存在和实际生效分别显示；普通权限不可见时保持未知。参见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-exclusions-configure)。
+
+命令行也可在**管理员 Windows PowerShell 5.1**中运行（项目根目录，`DataDir` 要和工作台启动参数一致）：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent_adapters\windows_defender_setup.ps1 -Action Check -DataDir .\workbench_data
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent_adapters\windows_defender_setup.ps1 -Action Apply -DataDir .\workbench_data
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent_adapters\windows_defender_setup.ps1 -Action Remove -DataDir .\workbench_data
+```
+
+脚本默认 Check，不修改 Defender 配置；会创建并清理空目录以验证路径，不读取或执行恶意样本。JSON 的 `status` 区分 `excluded`、`not_excluded`、`unknown`；`exact_rule_present` 单独表示本项目规则是否存在，撤销后其他排除项仍可能覆盖目录。退出码 0/1/2 分别表示已排除/未排除/无法核验，撤销成功后通常为 1。上面命令的 Bypass 只影响新开的固定助手进程。如组织策略或 Defender 服务限制仍使其无法完成，请由管理员处理或在 Windows 安全中心管理同一范围；工作台不会绕过组织策略。
+
 启动工作台：
 
 ```powershell
@@ -53,6 +69,8 @@ uv run qinyuan-workbench --port 4174 --data-dir workbench_data
 浏览器打开 <http://127.0.0.1:4174/>。服务绑定本机回环地址，运行期间保持终端开启。
 
 当前启动器默认使用公共协议 v3、执行配置 `d8_v22`。创建运行时需要明确选择模拟或真实模式；已有运行继续使用其保存的配置。
+
+当前新运行使用 `async_planning_v1`：待审 Intent/Road 可在原授权内探索，Road 从规划前缀派生独立执行会话；Fact 可逐项合批，待审不是正式成果。当前 Turn 收尾确认后，原 Inner 才提下一 Turn.Intent；提交后直接规划 Road 并在授权内探索，不等待后继规划审核。排序不同回原 Road 规划 Inner 决定保留或切换，未知不重放。需重启工作台后端并新建运行采用当前策略；旧运行只读保留。边界和验证见 [架构验收](Plan/architecture_upgrade_v3_acceptance.md)。
 
 ## 配置真实运行
 
@@ -152,7 +170,7 @@ MCP 服务提供工具能力，可执行命令由所属 TaskRun 的 Sandbox 承�
 
 排查时先确定对应的 TaskRun 和请求 ID，再查看错误类别、操作记录与证据。模型输出不符合要求、上游调用失败、状态读取失败和执行结果未知是不同的问题，不应统一当作 Intent 失败。
 
-已知且允许纠正的模型请求保留一次共享纠正机会；未知操作不自动重放。暂停或等待不会清空已有 Fact、执行与证据。
+已知且允许纠正的 Stage 模型请求共享最多两次纠正机会；未知操作不自动重放。暂停或等待不会清空已有 Fact、执行与证据。
 
 已有运行可以直接只读查看，不需要工作台：
 
@@ -160,7 +178,13 @@ MCP 服务提供工具能力，可执行命令由所属 TaskRun 的 Sandbox 承�
 python scripts/qymonitor.py runs -n 10      # 最近几轮
 python scripts/qymonitor.py show latest     # 单轮总览
 python scripts/qymonitor.py watch latest    # 实时盯
+python scripts/qymonitor.py planning latest # 规划、审核重叠与来源引用
+python scripts/qymonitor.py planning latest --json # 含原操作身份及覆盖率
 ```
+
+工作台“审核与分支”页签按 Task/Turn/Road 范围显示待审、结果保存待应用、部分接受、受阻和失效提案，以及作者、审核对象和逻辑分支关系。规划审核状态与运行状态分别展示；分支前缀不表示进程存活，待审结论不计入正式 Fact。
+
+planning 报告统计已结算区间的实际重叠、审核期间产生的观察及其正式引用、阶段成果引用的 Fact、未采用生成、未派发围栏和有覆盖率的 Token。尚无引用不判为无效，重叠不等于节省时间；Token 缺失及未确认单价的金额保持未知，不自动打质量分。监控只读且容错，不替代执行侧严格证据校验。
 
 各命令的读法、指标口径与排查顺序见[运行监测手册](Plan/monitoring_guide.md)。
 

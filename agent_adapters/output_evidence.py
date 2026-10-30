@@ -15,7 +15,7 @@ SAFE_EXCEPTION_TYPES = frozenset({
     "ReadTimeout", "ConnectTimeout", "SSLError", "gaierror", "OtherError",
     "AttributeError", "KeyError", "IndexError", "CancelledError", "UnboundLocalError", "ProgrammingError",
     "OperationalError", "IntegrityError", "D5EvidenceError", "D5SensitiveDataError", "T6TargetNetworkError",
-    "StorageError", "T6EvidenceError", "T6EvidenceCapacityError", "StageStateError", "StageRecoveryRequired",
+    "StorageError", "T6EvidenceError", "T6EvidenceCapacityError", "StageStateError", "StageRecoveryRequired", "StageModelTransportFailure",
     "JSONDecodeError", "IncompleteRead", "MCPClientError", "MCPCommandPlanError", "MCPCommandExecutionTimeout",
 })
 SAFE_HTTP_ERROR_CODES = frozenset({
@@ -31,6 +31,7 @@ SAFE_HTTP_ERROR_CODES = frozenset({
     "d7_http_transport_response_invalid", "d7_http_response_invalid",
     "d7_http_response_too_large", "d7_http_evidence_protection_failed",
     "d7_http_evidence_store_invalid", "d7_http_evidence_conflict",
+    "d7_http_evidence_write_failed", "http.response_evidence_save_failed",
     "d7_http_evidence_operation_conflict", "d8_handoff_evidence_write_recovery_required",
     "d7_http_authorization_or_ownership_mismatch", "d7_http_request_rejected",
     "d7_http_sandbox_profile_mismatch", "d7_http_target_network_adapter_required",
@@ -101,7 +102,7 @@ def safe_failure_details(error, *, include_chain=False):
         traceback.print_exception(type(error), error, error.__traceback__)
     kinds, codes, seen, chain = [], [], set(), []
     capacity, http_diagnostic, operation_context = None, None, None
-    fact_source, operation_admission = None, None
+    fact_source, operation_admission, model_call = None, None, None
     current = error
     while current is not None and id(current) not in seen and len(kinds) < 6:
         seen.add(id(current))
@@ -117,9 +118,17 @@ def safe_failure_details(error, *, include_chain=False):
             if code is not None and code not in codes:
                 codes.append(code)
         resource_code = getattr(current, "code", None)
+        if (name == "StageRecoveryRequired" and resource_code == "stage.model_outcome_unknown"
+                or name == "StageModelTransportFailure" and resource_code == "stage.model_transport_failed"):
+            model_call = current.context.get("model_call")
+            code = model_call.get("model_error_code") if model_call else None
+            if code in SAFE_MODEL_ERROR_CODES and code not in codes:
+                codes.append(code)
         if name == "OperationRecoveryRequired":
             operation_admission = {k: v for k, v in current.context.items()
                 if k in {"operation_id", "blocking_count", "blocking_operations"}}
+        if name == "StageRecoveryRequired" and resource_code == "stage.operation_outcome_unknown":
+            operation_admission = current.context.get("operation_admission")
         if name == "StageStateError" and resource_code == "stage.fact_source_scope_changed":
             fact_source = current.context.get("fact_source")
         if resource_code == "stage.evidence_capacity_exceeded":
@@ -171,6 +180,8 @@ def safe_failure_details(error, *, include_chain=False):
         result["fact_source"] = fact_source
     if operation_admission:
         result["operation_admission"] = operation_admission
+    if model_call is not None:
+        result["model_call"] = model_call
     if include_chain:
         result["exception_chain"] = chain
     return result

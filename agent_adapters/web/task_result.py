@@ -140,6 +140,98 @@ def _empty_result(task_run_id: str, mode: str, *, error: str, recovery: bool) ->
     }
 
 
+def _stage_activity(evidence, store, task_id, operations, requests, turns):
+    """Bound public subjects and logical prefixes; ledger state is not worker liveness."""
+    from agent_core.stage_contracts import (
+        PlanningSession, StageSessionBranch, TurnIntent, StageFactBatch, StageConclusionChange,
+        TurnCompletion, RoadResolution, StagePlanningDecision, PlanningExhausted,
+        fact_candidates, reviewed_fact, fact_verification_ref,
+    )
+    from agent_core.stage_planning import stage_runtime, review_members
+    from agent_core.stage_storage import branch_id
+    from agent_core.stage_plans import bindings
+    by_id = {op.start.operation_id: op for op in operations}
+    owners = {turn.turn_id: turn.turn_id for turn in turns}
+    owners.update({road.road_id: turn.turn_id for turn in turns for road in turn.roads})
+    targets = {}
+    for session, source in bindings(store, task_id):
+        targets.setdefault(source, []).append(dict(turn_id=owners[session.owner_id],
+            road_id=session.owner_id if session.scope == "road_execution" else None))
+    activity = []
+    attempts = {}
+    for identity, request in requests.items():
+        op = by_id[identity]
+        application = op.application_ref or ""
+        disposition = ("discarded" if application.startswith("stage-discarded/") else
+            "reused" if application.startswith("stage-reused/") else "applied" if application else "unapplied")
+        item = dict(operation_id=identity, phase=op.start.category, stage=request.stage,
+            status=op.completion.result_kind if op.completion else "unsettled", applied=bool(application),
+            turn_id=owners.get(request.context.session.owner_id, request.context.turn.turn_id if request.context.turn else None),
+            road_id=request.context.session.owner_id if request.context.session.scope == "road_execution" else None,
+            started_at=op.start.started_at, finished_at=op.completion.finished_at if op.completion else None,
+            branch_id=stage_runtime(request).get("branch_id"), disposition=disposition,
+            disposition_ref=application.split("/", 1)[1] if disposition in {"discarded", "reused"} else None)
+        activity.append((op.start.role, item))
+        if request.stage == "stage_review":
+            evidence.review_sources(request)
+            for member in review_members(request):
+                attempts.setdefault(member, []).append(identity)
+    formal = {row["verification_ref"]: row["fact_id"] for row in store._connection.execute(
+        "SELECT f.fact_id,f.verification_ref FROM facts f JOIN stage_turns t ON t.turn_id=f.turn_id WHERE t.task_run_id=?", (task_id,))}
+    queue = []
+    for entry in store.list_stage_reviews(task_id):
+        source = evidence.read_model_result(by_id[entry.proposal_operation_id])
+        value = source.result
+        kind = ("fact_candidates" if fact_candidates(value) else "turn_intent" if isinstance(value, TurnIntent)
+            else "roads" if isinstance(value, tuple) else "conclusion_change" if isinstance(value, StageConclusionChange)
+            else "turn_completion" if isinstance(value, TurnCompletion) else "road_resolution" if isinstance(value, RoadResolution)
+            else value.kind if isinstance(value, StagePlanningDecision) else "exhausted" if isinstance(value, PlanningExhausted) else type(value).__name__)
+        subject = targets.get(entry.proposal_operation_id) or [dict(turn_id=owners.get(source.session.owner_id),
+            road_id=source.session.owner_id if source.session.scope == "road_execution" else None)]
+        item = dict(**asdict(entry), kind=kind, author=asdict(source.session), targets=subject,
+            attempt_ids=attempts.get(entry.proposal_operation_id, []), decision=None, reason=None, candidates=[])
+        reviewed = review_request = None
+        if entry.state == "settled":
+            review_request = requests[entry.review_operation_id]
+            reviewed = evidence.read_model_result(by_id[entry.review_operation_id]).result
+            item.update(decision=reviewed.decision, reason=reviewed.reason)
+            if isinstance(value, tuple):
+                item["suggested_indices"] = list(reviewed.accepted_road_indices)
+        slots = ({(identity, index): slot for slot, (identity, index, _) in enumerate(evidence.review_claims(review_request))}
+            if reviewed is not None and fact_candidates(value) else {})
+        for index, claim in fact_candidates(value):
+            candidate = dict(index=index, content=claim.content, inferred=claim.inferred,
+                support_refs=list(claim.support_refs), decision=None, reason=None, fact_id=None)
+            if reviewed is not None:
+                slot = slots[(entry.proposal_operation_id, index)] if isinstance(review_request.proposal, StageFactBatch) else None
+                _, decision = reviewed_fact(review_request.proposal, reviewed, slot)
+                candidate.update(decision=decision.decision, reason=decision.reason,
+                    fact_id=formal.get(fact_verification_ref(entry.review_operation_id, slot)))
+            item["candidates"].append(candidate)
+        queue.append(item)
+    branches = []
+    if store._schema_version >= 37:
+        rows = store._connection.execute("SELECT b.*,s.scope,s.owner_id FROM stage_branches b "
+            "JOIN stage_sessions s ON s.session_id=b.session_id WHERE s.task_run_id=? ORDER BY b.rowid", (task_id,)).fetchall()
+        heads = {row["session_id"]: row["branch_id"] for row in rows}
+        for row in rows:
+            source = requests[row["proposal_operation_id"]]
+            session = PlanningSession(row["scope"], row["owner_id"])
+            inherited = source.context.session != session
+            value = StageSessionBranch(row["branch_id"], row["proposal_operation_id"], row["review_operation_id"])
+            if source.task_run_id != task_id or branch_id(task_id, value, session if inherited else None) != value.branch_id:
+                raise ValueError("stage.branch_binding_changed")
+            if value.review_operation_id and value.proposal_operation_id not in evidence.review_rejections(value.review_operation_id):
+                raise ValueError("stage.branch_correction_unbound")
+            branches.append(dict(**asdict(value), session=asdict(session), author=asdict(source.context.session),
+                parent_branch_id=stage_runtime(source).get("branch_id"), current=heads[row["session_id"]] == value.branch_id,
+                kind="correction" if value.review_operation_id else "inheritance" if inherited else "continuation",
+                turn_id=owners.get(session.owner_id), road_id=session.owner_id if session.scope == "road_execution" else None))
+    return dict(review_queue=queue, branches=branches,
+        inner_activity=[item for role, item in activity if role == "inner_action"],
+        retrospective=[item for role, item in activity if role == "outer_planning"])
+
+
 def _stage_task_result(directory, declaration, store, expected):
     """Project actual stage/Road identities without constructing a writer or legacy tree."""
     from agent_adapters.stage_evidence import StageEvidence
@@ -149,10 +241,17 @@ def _stage_task_result(directory, declaration, store, expected):
     config = store.load_stage_run_config(task_id)
     policy = execution_policy(expected)
     evidence = StageEvidence(Path(directory) / "stage-evidence", store, create=False)
+    frozen_policy = evidence.read("policy", task_id)
+    queue_policy = frozen_policy.get("review_queue") if isinstance(frozen_policy, dict) else None
+    supported_queue = queue_policy is None or queue_policy in (
+        {"binding": "immutable_proposal_v1", "dispatch": "synchronous_v1"},
+        {"binding": "immutable_proposal_v1", "dispatch": "async_fact_v1"},
+        {"binding": "immutable_proposal_v1", "dispatch": "async_planning_v1"})
     if (config.outer_role != expected.outer_role or config.inner_role != expected.inner_role
             or config.goal_validation != declaration.get("goal_validation")
-            or config.budget != expected.d4_budget or config.execution_policy_ref != "sha256:" + digest(policy)
-            or evidence.read("policy", task_id) != policy):
+            or config.budget != expected.d4_budget or not isinstance(frozen_policy, dict) or not supported_queue
+            or config.execution_policy_ref != "sha256:" + digest(frozen_policy)
+            or {k: v for k, v in frozen_policy.items() if k != "review_queue"} != {k: v for k, v in policy.items() if k != "review_queue"}):
         raise ValueError("stage.execution_configuration_changed")
     rows = store.load_control_state_rows(task_id)
     if rows is None:
@@ -163,23 +262,29 @@ def _stage_task_result(directory, declaration, store, expected):
     result = _empty_result(task_id, declaration["mode"], error="", recovery=False)
     result.update(execution_profile=declaration.get("execution_profile", "d8_v22"),
         contract_version=declaration.get("contract_version", 22))
-    result["task_run"] = dict(status=task.status.value, reason=task.failure_reason,
+    result["task_run"] = dict(goal=task.request.goal, status=task.status.value, reason=task.failure_reason,
         sandbox_id=task.sandbox_id, deadline_at=task.deadline_at, finished_at=task.finished_at,
         confirmation_deadline=task.confirmation_deadline)
     result["checkpoint"] = dict(sequence=checkpoint.sequence, watermark_event_sequence=checkpoint.watermark_event_sequence)
     result["dispatch"] = dict(status=_dispatch_status(task.status.value), checkpoint_sequence=checkpoint.sequence,
         turn_id=current.turn_id if current else None)
+    from agent_core.stage_plans import status as planning_review_status
+    from agent_core.stage_contracts import PlanningSession
     result["turns"] = [dict(turn_id=t.turn_id, parent_turn_id=t.parent_turn_id,
         intent=asdict(t.intent), planning_state=t.planning_state.value,
+        review_state=planning_review_status(store, task_id, PlanningSession("turn_planning", t.turn_id), evidence=evidence),
         achievement=asdict(t.achievement) if t.achievement else None, fact_refs=list(t.fact_refs),
         roads=[dict(road_id=r.road_id, description=r.candidate.description,
-            support_refs=list(r.candidate.support_refs), status=r.status.value) for r in t.roads]) for t in turns]
+            support_refs=list(r.candidate.support_refs), status=r.status.value,
+            review_state=planning_review_status(store, task_id, PlanningSession("road_execution", r.road_id), evidence=evidence))
+            for r in t.roads]) for t in turns]
     history = evidence.history(task_id)
     result["verified_facts"] = [dict(fact_id=i.record_id, turn_id=i.turn_id, road_id=i.intent_id,
         content=i.content, ref=i.ref, source_refs=list(i.source_refs), source_status=i.source_status,
         current_status=i.current_status, effective_ref=i.effective_ref, conflict=i.conflict)
         for i in history if i.record_type == "verified_fact"]
     operations = store.list_d4_operations(task_id)
+    queue = {entry.proposal_operation_id: entry for entry in store.list_stage_reviews(task_id)}
     requests = {op.start.operation_id: evidence.request(op.start.operation_id)
         for op in operations if op.start.category != "tool_dispatch"}
     corrected = {r.correction_of_model_request_id for r in requests.values() if r.correction_of_model_request_id}
@@ -191,29 +296,56 @@ def _stage_task_result(directory, declaration, store, expected):
         if saved is None or digest(saved) != op.completion.evidence_sha256:
             raise ValueError("stage.model_result_changed")
         if saved["outcome"] != "valid" and op.start.operation_id not in corrected:
+            request = requests[op.start.operation_id]
             failure = dict(operation_id=op.start.operation_id,
-                phase=requests[op.start.operation_id].stage, code="stage.model_output_unusable",
+                phase=request.stage, code="stage.model_output_unusable",
                 category="input" if saved["outcome"] == "invalid" else "dependency")
+            if saved["outcome"] == "superseded":
+                stop = evidence.branch_stop(request)
+                if stop is None or digest(stop) != saved.get("branch_stop_sha256"):
+                    raise ValueError("stage.branch_stop_binding_changed")
+                failure.update(code="stage.generation_superseded", category="branch_correction")
             if saved["outcome"] == "invalid":
                 from agent_core.output_contracts import D8ModelResponse
                 from agent_core.stage_planning import stage_output_issues
                 failure["issue_codes"] = [i.code for i in stage_output_issues(requests[op.start.operation_id],
                     D8ModelResponse(saved["content"], saved["finish_reason"], saved.get("tool_calls")))]
             provider = evidence.read("provider-result", op.start.operation_id) or {}
+            if saved["outcome"] == "model_error" and evidence.transport_failure(request, saved) is not None:
+                from agent_core.stage_planning import MAX_STAGE_CORRECTIONS
+                failure.update(code="stage.model_transport_failed", model_error_code=provider["error"]["code"])
+                if request.stage == "stage_supervision" and evidence.correction_depth(request) == MAX_STAGE_CORRECTIONS:
+                    failure["code"] = "stage.supervision_unavailable"
+                from agent_core.stage_contracts import StageFactProposal, StageFactBatch, TurnIntent
+                from agent_core.stage_plans import admitted
+                async_planning = (store._schema_version >= 38 and supported_queue
+                    and queue_policy == {"binding": "immutable_proposal_v1", "dispatch": "async_planning_v1"}
+                    and isinstance(request.proposal, (TurnIntent, tuple))
+                    and admitted(store, request.proposal_operation_id))
+                if (request.stage == "stage_review" and (async_planning or request.context.session.scope == "road_execution"
+                        and isinstance(request.proposal, (StageFactProposal, StageFactBatch)))
+                        and evidence.correction_depth(request) == MAX_STAGE_CORRECTIONS):
+                    from agent_core.stage_planning import review_members, conversation_operation_ids
+                    members = review_members(request)
+                    if all(member in queue and (
+                            queue[member].state == "blocked" and queue[member].review_operation_id == op.start.operation_id
+                            or queue[member].state == "superseded" and set(evidence.review_interruptions(
+                                queue[member].review_operation_id)).intersection(conversation_operation_ids(evidence.request(member))))
+                            for member in members):
+                        failure["code"] = "stage.review_unavailable"
             transport = provider.get("transport", {})
             if transport.get("stream_error"):
                 failure.update(stream_error=transport["stream_error"], finish_seen=transport["finish_seen"],
                     done_seen=transport["done_seen"])
             failures.append(failure)
     result["model_failures"] = failures
-    result["errors"] = failures
+    result["errors"] = [f for f in failures if f["code"] not in {
+        "stage.supervision_unavailable", "stage.review_unavailable", "stage.generation_superseded"}]
     result["tool_operations"] = [dict(operation_id=op.start.operation_id,
         road_id=op.start.resource_ref.split("/")[1], phase="tool_dispatch",
         status=op.completion.result_kind if op.completion else "in_flight")
         for op in operations if op.start.category == "tool_dispatch"]
-    result["retrospective"] = [dict(operation_id=op.start.operation_id, phase=op.start.category,
-        status=op.completion.result_kind if op.completion else "in_flight", applied=op.application_ref is not None)
-        for op in operations if op.start.role == "outer_planning"]
+    result.update(_stage_activity(evidence, store, task_id, operations, requests, turns))
     usage = store.d4_budget_usage(task_id)
     result["budget"] = dict(status="available", policy_ref=usage.budget_policy_ref, total_used=usage.total_used,
         total_limit=None if expected.intent_execution_policy == "continuous_v1" else expected.d4_budget.total,
@@ -239,14 +371,17 @@ def _stage_task_result(directory, declaration, store, expected):
     result["imports"] = [dict(ref=i.ref, metadata=json.loads(i.content))
         for i in history if i.identity == "imported_attachment_not_fact"]
     unresolved = store.blocking_d4_operations(task_id)
-    recovery = bool(unresolved) or feedback_unknown or any(r.result is None for r in checks) or bool(failures)
-    result["recovery"] = dict(required=recovery, reason="stage.model_output_unusable" if failures else "operation_or_evidence_unknown" if recovery else None)
+    recovery = bool(unresolved) or feedback_unknown or any(r.result is None for r in checks) or bool(result["errors"])
+    result["recovery"] = dict(required=recovery, reason=result["errors"][0]["code"] if result["errors"] else "operation_or_evidence_unknown" if recovery else None)
     result["recovery_status"] = "required" if recovery else "not_required"
     result["cleanup"], result["cleanup_status"] = _cleanup(Path(directory), task)
     from agent_core.operator_controls import current as operator_control
     control = operator_control(store, task_id)
     if control is not None:
         result["operator_control"] = control
+    from agent_core.operator_controls import user_hints
+    result["user_hints"] = [dict(**hint, ref=next(i.ref for i in history
+        if i.record_id == "user/" + hint["operation_id"])) for hint in user_hints(store, task_id)]
     if task.status in TERMINAL_STATUSES:
         terminal = store.load_terminal_commit(task_id)
         if terminal is None:

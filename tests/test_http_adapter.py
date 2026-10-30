@@ -197,3 +197,80 @@ def test_duplicate_evidence_operation_records_are_a_conflict(tmp_path):
 
     with pytest.raises(HttpCapabilityError, match="operation_conflict"):
         store.find_by_operation(operation_id)
+
+
+@pytest.mark.parametrize("suffix", [".cipher", ".meta.json"])
+def test_response_evidence_sharing_retry_publishes_same_bytes_without_http_replay(tmp_path, monkeypatch, caplog, suffix):
+    from agent_adapters.web import http_adapter
+    caplog.set_level("INFO", logger="qinyuan")
+    task, operation = str(uuid4()), str(uuid4())
+    store = D7HttpResponseEvidenceStore(tmp_path, task, protection=FakeProtection())
+    transport = FakeTransport(D7HttpWireResponse(200, (), b"observed"))
+    adapter = D7HttpAdapter(task, "https://example.test:443", store, transport=transport)
+    link, attempts, delays = http_adapter.os.link, [], []
+    def sharing(source, destination):
+        if str(destination).endswith(suffix):
+            attempts.append((str(source), str(destination), Path(source).read_bytes()))
+            if len(attempts) <= 3:
+                error = PermissionError(13, "private sharing detail")
+                error.winerror = 32
+                raise error
+        return link(source, destination)
+    monkeypatch.setattr(http_adapter.os, "link", sharing)
+    monkeypatch.setattr(http_adapter.time, "sleep", delays.append)
+    response = adapter.execute(_request(operation_id=operation))
+    assert len(transport.calls) == 1 and len(attempts) == 4 and len(set(attempts)) == 1
+    assert delays == [0.05, 0.1, 0.2]
+    assert store.read(response.body_evidence_id) == b"observed"
+    assert store.find_by_operation(operation).evidence_id == response.body_evidence_id
+    assert not list(store.directory.glob(".d7-http-pending-*"))
+    events = [r.qy for r in caplog.records if getattr(r, "qy", {}).get("event") == "http.evidence_publish_recovered"]
+    assert len(events) == 1 and events[0]["attempts"] == 4 and events[0]["run"] == task
+
+
+@pytest.mark.parametrize("winerror,attempt_count", [(32, 4), (5, 1), (33, 1), (None, 1)])
+def test_response_evidence_publication_failure_is_bounded_and_not_replayed(tmp_path, monkeypatch, winerror, attempt_count):
+    from agent_adapters.web import http_adapter
+    from agent_adapters.output_evidence import safe_failure_details
+    task = str(uuid4())
+    store = D7HttpResponseEvidenceStore(tmp_path, task, protection=FakeProtection())
+    transport = FakeTransport(D7HttpWireResponse(200, (), b"private body"))
+    adapter = D7HttpAdapter(task, "https://example.test:443", store, transport=transport)
+    attempts, delays = [], []
+    def blocked(source, destination):
+        attempts.append((str(source), Path(source).read_bytes()))
+        error = PermissionError(13, "private file path")
+        if winerror is not None: error.winerror = winerror
+        raise error
+    monkeypatch.setattr(http_adapter.os, "link", blocked)
+    monkeypatch.setattr(http_adapter.time, "sleep", delays.append)
+    with pytest.raises(HttpCapabilityError, match="d7_http_evidence_write_failed") as caught:
+        adapter.execute(_request())
+    assert caught.value.context["phase"] == "response_evidence_save"
+    assert len(transport.calls) == 1 and len(attempts) == attempt_count and len(set(attempts)) == 1
+    assert delays == ([0.05, 0.1, 0.2] if winerror == 32 else [])
+    assert not list(store.directory.glob("*.cipher")) and not list(store.directory.glob("*.meta.json"))
+    assert not list(store.directory.glob(".d7-http-pending-*"))
+    details = safe_failure_details(caught.value, include_chain=True)
+    assert "d7_http_evidence_write_failed" in details["error_codes"] and "private" not in json.dumps(details)
+
+
+def test_response_evidence_retry_never_overwrites_racing_destination(tmp_path, monkeypatch):
+    from agent_adapters.web import http_adapter
+    store = D7HttpResponseEvidenceStore(tmp_path, str(uuid4()), protection=FakeProtection())
+    attempts, delays = [], []
+    def race(source, destination):
+        attempts.append(destination)
+        if len(attempts) == 1:
+            error = PermissionError(13, "sharing")
+            error.winerror = 32
+            raise error
+        Path(destination).write_bytes(b"other writer")
+        raise FileExistsError("already published")
+    monkeypatch.setattr(http_adapter.os, "link", race)
+    monkeypatch.setattr(http_adapter.time, "sleep", delays.append)
+    with pytest.raises(HttpCapabilityError, match="d7_http_evidence_conflict"):
+        store.save(str(uuid4()), b"observed")
+    assert len(attempts) == 2 and delays == [0.05]
+    assert Path(attempts[-1]).read_bytes() == b"other writer"
+    assert not list(store.directory.glob(".d7-http-pending-*"))

@@ -464,6 +464,8 @@ class HttpCapability:
             except Exception as exc:
                 if self.dispatch_stop(binding) is not None:
                     raise  # A known admission stop is not a failed HTTP exchange.
+                if phase == 'http_dispatch' and isinstance(exc,ExecutionRecoveryRequired) and str(exc) == 'http.response_evidence_save_failed':
+                    phase = 'response_evidence_save'
                 # A diagnostic is not a completion receipt. Preserve the unknown operation.
                 try:
                     self.evidence.save('http-failure',binding.execution_id,dict(
@@ -554,7 +556,10 @@ class HttpCapability:
             await asyncio.sleep(delay)
             delay=min(0.025, delay*2)
         ok,value=result[0]
-        if not ok:raise ExecutionRecoveryRequired('d20_http_outcome_unknown') from value
+        if not ok:
+            code = ('http.response_evidence_save_failed' if isinstance(value,HttpCapabilityError)
+                    and value.context.get('phase') == 'response_evidence_save' else 'd20_http_outcome_unknown')
+            raise ExecutionRecoveryRequired(code) from value
         return value
 
     def source(self,reference):
@@ -864,7 +869,7 @@ def check_http_task(directory,store,config,*,diagnostics=None):
                     or failure['task_run_id']!=binding.task_run_id or failure['plan_id']!=binding.plan_id
                     or failure['execution_id']!=binding.execution_id
                     or failure['request_sha256']!=binding.request_sha256
-                    or failure['phase'] not in ('http_dispatch','response_metadata','cookie_snapshot','response_save')
+                    or failure['phase'] not in ('http_dispatch','response_evidence_save','response_metadata','cookie_snapshot','response_save')
                     or not isinstance(failure['exception_types'],list)
                     or not 1<=len(failure['exception_types'])<=6
                     or any(not isinstance(v,str) or v not in SAFE_EXCEPTION_TYPES for v in failure['exception_types'])

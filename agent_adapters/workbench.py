@@ -102,6 +102,9 @@ class Workbench:
     ):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        from agent_adapters.windows_security import WindowsSecuritySetup
+
+        self.windows_security = WindowsSecuritySetup(self.root)
         self.uploads = self.root / "attachments"
         self.uploads.mkdir(exist_ok=True)
         self.database = self.root / "workbench.sqlite3"
@@ -595,6 +598,18 @@ class Handler(BaseHTTPRequestHandler):
             mime = "text/html" if name.endswith(".html") else "text/javascript" if name.endswith(".js") else "text/css"
             self._send(HTTPStatus.OK, (FRONTEND / name).read_bytes(), mime + "; charset=utf-8")
             return
+        if parts == ["api", "windows-security"]:
+            setup = self.server.workbench.windows_security
+            if self.command == "GET":
+                self._send(HTTPStatus.OK, setup.snapshot())
+            elif self.command == "POST":
+                value = self._json()
+                if not isinstance(value, dict) or set(value) != {"action"} or not isinstance(value["action"], str):
+                    raise WorkbenchError("windows_security_invalid_action")
+                self._send(HTTPStatus.ACCEPTED, setup.start(value["action"]))
+            else:
+                raise WorkbenchError("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
+            return
         if parts == ["api", "health"] and self.command == "GET":
             self._send(HTTPStatus.OK, {"status": "ready", "agent_execution": "connected", "capabilities": {
                 "current_cli": (
@@ -750,6 +765,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[3] == "human-decision" and self.command == "POST":
                 self._send(HTTPStatus.OK, workbench.runner.human_decision(challenge_id, self._json()))
+                return
+            if len(parts) == 4 and parts[3] == "operator-control" and self.command == "POST":
+                self._send(HTTPStatus.OK, workbench.runner.live_control(challenge_id, self._json()))
                 return
             if len(parts) == 4 and parts[3] == "cleanup" and self.command == "POST":
                 self._send(HTTPStatus.ACCEPTED, workbench.runner.cleanup(challenge_id))

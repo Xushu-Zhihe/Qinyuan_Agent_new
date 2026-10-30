@@ -57,7 +57,10 @@ def test_zero_request_failure_is_visible_to_next_inner_without_becoming_a_fact(c
     assert not any(op.start.category == 'tool_dispatch' for op in app.store.list_d4_operations(app.task_id))
 
 
-def test_stage_http_script_preserves_per_request_evidence_and_read_only_projection(case):
+@pytest.mark.parametrize("publish_failures", [0, 3, 4])
+def test_stage_http_script_preserves_per_request_evidence_and_read_only_projection(case, monkeypatch, publish_failures):
+    from pathlib import Path
+    from agent_adapters.web import http_adapter
     request = case.app.state.task_run.request
     app = StageApplication(case.path / "http-task", **case.args, http_sandbox=SimpleNamespace(), goal_validation="human")
     app.start(request)
@@ -71,6 +74,17 @@ def test_stage_http_script_preserves_per_request_evidence_and_read_only_projecti
             return D7HttpWireResponse(200, (("Content-Type", "text/plain"),), b"observed")
     app.web.transport_factory = lambda _: Transport()
     app.mcp.experiments.runner_factory = ScriptProcess
+    link, attempts, delays = http_adapter.os.link, [], []
+    def publish(source, destination):
+        if sends and str(destination).endswith('.cipher') and (not attempts or str(destination) == attempts[0][0]):
+            attempts.append((str(destination), str(source), Path(source).read_bytes()))
+            if len(attempts) <= publish_failures:
+                error = PermissionError(13, 'PRIVATE sharing detail')
+                error.winerror = 32
+                raise error
+        return link(source, destination)
+    monkeypatch.setattr(http_adapter.os, 'link', publish)
+    monkeypatch.setattr(http_adapter.time, 'sleep', delays.append)
     execute = app.mcp.execute
     async def execute_once(identity, owner, call, token):
         await execute(identity, owner, call, token)
@@ -88,8 +102,32 @@ def test_stage_http_script_preserves_per_request_evidence_and_read_only_projecti
                 "script": "response=request('GET','/first')\nassert response['body']==b'observed'\nrequest('GET','/second')\nprint('observed')", "timeout_seconds": 60}}
         return previous(request, raw)
     case.models.inner.transform = experiment
+    if publish_failures == 4:
+        from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+        from agent_adapters.http_experiments import failure_diagnostics
+        from agent_adapters.output_evidence import safe_failure_details
+        with pytest.raises(ExecutionRecoveryRequired, match='http.response_evidence_save_failed') as caught:
+            asyncio.run(app.run(case.token))
+        assert len(sends) == 1 and len(attempts) == 4 and delays == [0.05, 0.1, 0.2]
+        assert len(set(attempts)) == 1
+        detail = safe_failure_details(caught.value, include_chain=True)
+        assert 'd7_http_evidence_write_failed' in detail['error_codes'] and 'PRIVATE' not in json.dumps(detail)
+        operation = app.store.load_d4_operation(detail['operation_context']['operation_id'])
+        assert operation.completion is None
+        assert app.evidence.read('mcp-result', operation.start.operation_id) is None
+        failure = app.evidence.read('experiment-failure', operation.start.operation_id)
+        assert failure['phase'] == 'response_evidence_save' and failure['result_sha256'] is None
+        row = next(r for r in failure_diagnostics(app.evidence, app.store, app.task_id)
+            if r['execution_id'] == operation.start.operation_id)
+        assert row['category'] == 'persistence' and row['active'] and not row['result_saved']
+        assert not app.evidence.history(app.task_id)
+        with pytest.raises(ExecutionRecoveryRequired): app.mcp.reconcile()
+        assert len(sends) == 1
+        return
     result = asyncio.run(app.run(case.token))
     assert result.turn.achievement and len(sends) == 2
+    assert len(attempts) == publish_failures + 1 and len(set(attempts)) == 1
+    assert delays == ([0.05, 0.1, 0.2] if publish_failures else [])
     assert not case.tools.calls
     history = app.evidence.history(app.task_id)
     assert len([i for i in history if i.identity == "tool_observation_not_fact"]) == 2
@@ -322,3 +360,105 @@ def test_http_unknown_keeps_worker_diagnostic_and_original_road_operation(case):
     saved = app.evidence.read("experiment-failure", context["operation_id"])
     assert saved["http_diagnostic"] == diagnostic
     assert not app.evidence.history(app.task_id)
+
+
+@pytest.mark.parametrize('mode', ['normal', 'corrected', 'cancel', 'deadline'])
+def test_due_supervision_is_owned_by_main_loop_after_both_tools_settle(case, mode):
+    import threading
+    from agent_core.stage_storage import StageRecoveryRequired
+    corrected = mode == 'corrected'
+    public_started, public_release = asyncio.Event(), asyncio.Event()
+    strategy_seen, experiment_done = asyncio.Event(), asyncio.Event()
+    release_http, supervision_started, release_supervision = (threading.Event() for _ in range(3))
+    app = StageApplication(case.path / 'supervision-owner', **case.args, http_sandbox=SimpleNamespace())
+    async def public(call, timeout, token, target):
+        public_started.set()
+        await public_release.wait()
+        return dict(status='completed', ok=True, identity='public_reference_not_target_observation', content='reference')
+    app.mcp.public_web = SimpleNamespace(binding={'backend': 'controlled'}, validate=lambda call: None, call=public)
+    app.start(case.app.state.task_run.request)
+    asyncio.run(case.app.close())
+    case.app, case.tools.task_id = app, app.task_id
+    sends, actions = [], []
+    class Transport:
+        def send(self, **kwargs):
+            sends.append(kwargs)
+            assert release_http.wait(5)
+            return D7HttpWireResponse(200, (), b'observed')
+    app.web.transport_factory = lambda _: Transport()
+    app.mcp.experiments.runner_factory = ScriptProcess
+    strategy, execute = app.mcp.experiments._strategy, app.mcp.execute
+    async def observe_strategy(owner=None, *, start=False):
+        if owner is not None: strategy_seen.set()
+        return await strategy(owner, start=start)
+    async def observe_execute(*args):
+        await execute(*args)
+        if args[2].tool_name == 'http.run_experiment': experiment_done.set()
+    app.mcp.experiments._strategy, app.mcp.execute = observe_strategy, observe_execute
+    outer_invoke = case.models.outer.invoke
+    def outer(envelope, timeout, token):
+        response = outer_invoke(envelope, timeout, token)
+        request = envelope.request
+        if request.stage == 'stage_supervision':
+            if corrected and request.correction_of_model_request_id is None:
+                return type(response)('{}')
+            supervision_started.set()
+            assert release_supervision.wait(5)
+        return response
+    case.models.outer.invoke = outer
+    def decide(request, raw):
+        if request.stage == 'stage_action':
+            actions.append(request)
+            if len(actions) <= 3:
+                return dict(kind='mcp_call', tool_name='shell.run_bash', arguments=dict(script='printf observed'))
+            if len(actions) == 4:
+                return dict(kind='mcp_calls', calls=[
+                    dict(tool_name='http.run_experiment', arguments=dict(
+                        script="request('GET','/first')\nrequest('GET','/second')", timeout_seconds=60)),
+                    dict(tool_name='web.fetch', arguments=dict(url='https://docs.example/source'))])
+            return dict(kind='road_resolution', outcome='inconclusive', reason='controlled end', support_refs=[])
+        if request.stage == 'stage_completion':
+            return dict(kind='incomplete', reason='no stage success claimed', support_refs=[])
+        return raw
+    case.models.inner.transform = decide
+    async def exercise():
+        pending = asyncio.create_task(app.run(case.token))
+        try:
+            await asyncio.wait_for(public_started.wait(), 5)
+            await asyncio.wait_for(strategy_seen.wait(), 5)
+            assert not supervision_started.is_set() and not app.models.live_operations
+            release_http.set()
+            await asyncio.wait_for(experiment_done.wait(), 5)
+            assert not supervision_started.is_set()  # Public retrieval still owns its original worker.
+            if mode in {'cancel', 'deadline'}:
+                if mode == 'cancel': case.token.is_cancelled = True
+                else: case.now.value = app.state.task_run.deadline_at
+                public_release.set()
+                with pytest.raises(StageRecoveryRequired, match='stage.dispatch_stopped'):
+                    await asyncio.wait_for(pending, 10)
+                assert not supervision_started.is_set() and len(sends) == 2
+                assert not any(r.stage == 'stage_supervision' for r in case.models.outer.calls)
+                return
+            public_release.set()
+            assert await asyncio.to_thread(supervision_started.wait, 5)
+            requests = [r for r in case.models.outer.calls if r.stage == 'stage_supervision']
+            assert len(requests) == (2 if corrected else 1)
+            assert not requests[-1].context.pending_operation_ids and not app._tools_in_flight
+            blockers = app.store.blocking_d4_operations(app.task_id)
+            assert [r.start.operation_id for r in blockers] == [requests[-1].model_request_id]
+            with pytest.raises(StageRecoveryRequired, match='stage.operation_outcome_unknown') as blocked:
+                app._check_dispatch()  # Ordinary state gates still reject a live model.
+            from agent_adapters.output_evidence import safe_failure_details
+            admission = safe_failure_details(blocked.value)['operation_admission']
+            assert admission['blocking_count'] == 1
+            assert admission['blocking_operations'] == [dict(operation_id=requests[-1].model_request_id,
+                category='review', role='outer_planning', resource_ref='stage/road_execution/' + requests[-1].context.session.owner_id)]
+            release_supervision.set()
+            result = await asyncio.wait_for(pending, 10)
+            assert result.reason == 'stage.exhausted'
+            assert len(sends) == 2 and len(case.tools.calls) == 3
+            assert not app.store.blocking_d4_operations(app.task_id)
+        finally:
+            release_http.set(); public_release.set(); release_supervision.set()
+            await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 10)
+    asyncio.run(exercise())

@@ -46,6 +46,8 @@ from agent_core.stage_contracts import (
     StageConclusionChange,
     StageFactSelection,
     StageFactProposal,
+    StageFactBatch,
+    StageFactBatchReview,
     StageHistoryRead,
     StagePlanningDecision,
     StageTurnSnapshot,
@@ -230,17 +232,17 @@ class TurnPlanningPort(Protocol):
     async def propose_roads(
         self, context: TurnPlanningContext, operation_id: str,
         cancellation_token: CancellationToken,
-    ) -> tuple[RoadCandidate, ...] | PlanningExhausted | StageFactSelection | StageHistoryRead | StageConclusionChange | StageFactProposal | StagePlanningDecision | ModelError: ...
+    ) -> tuple[RoadCandidate, ...] | PlanningExhausted | StageFactSelection | StageHistoryRead | StageConclusionChange | StageFactProposal | StageFactBatch | StagePlanningDecision | ModelError: ...
 
 
 class TurnPlanningReviewPort(Protocol):
     """Outer reviews a frozen proposal; the trusted controller owns commit."""
 
     async def review(
-        self, context: TurnPlanningContext, proposal: TurnPlanningProposal | StageFactProposal,
+        self, context: TurnPlanningContext, proposal: TurnPlanningProposal | StageFactProposal | StageFactBatch,
         proposal_operation_id: str, operation_id: str,
         cancellation_token: CancellationToken,
-    ) -> TurnPlanningReview | D8ChangeDecision | ModelError: ...
+    ) -> TurnPlanningReview | StageFactBatchReview | D8ChangeDecision | ModelError: ...
 
 
 class TurnProjectionPort(Protocol):

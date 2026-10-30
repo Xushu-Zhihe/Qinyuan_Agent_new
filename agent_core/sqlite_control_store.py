@@ -152,7 +152,7 @@ from agent_core.handoff_storage import (
 )
 from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.stage_contracts import (
-    PlanningSession, StageEvidencePort, StageRunConfig, StageStateChange, StageTurnSnapshot,
+    PlanningSession, StageEvidencePort, StageRunConfig, StageStateChange, StageTurnSnapshot, StageQueuedReview,
 )
 from agent_core import stage_storage
 from agent_core.review_contracts import (
@@ -177,7 +177,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 34
+CURRENT_SCHEMA_VERSION = 38
 
 MIGRATION_28 = """
 CREATE TABLE d8_conclusions_new (
@@ -1363,6 +1363,22 @@ class SqliteControlStore:
                 for statement in _sql_statements(stage_storage.CANDIDATE_SCHEMA):
                     self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (34,self._now()))
+            if version < 35:
+                for statement in _sql_statements(stage_storage.FACT_BATCH_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (35,self._now()))
+            if version < 36:
+                for statement in _sql_statements(stage_storage.REVIEW_QUEUE_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (36,self._now()))
+            if version < 37:
+                for statement in _sql_statements(stage_storage.ASYNC_REVIEW_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (37,self._now()))
+            if version < 38:
+                for statement in _sql_statements(stage_storage.PLAN_BINDING_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (38,self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -2889,15 +2905,19 @@ class SqliteControlStore:
             raise StorageError("D4 operation disappeared while checking disposition")
         return row["unknown_disposition_json"] is not None
 
-    def blocking_d4_operations(self, task_run_id, *, tool_resource=None):
+    def blocking_d4_operations(self, task_run_id, *, tool_resource=None, admitting_stage_review=False):
         """Process-owned Stage workers are live; all other unfinished work blocks."""
         live = getattr(self, "live_strategy_operation", lambda identity: False)
         tool = getattr(self, "live_tool_operation", lambda identity: False)
         model = getattr(self, "live_http_model", lambda identity, resource: False)
+        review = getattr(self, "live_stage_review_operation", lambda identity: False)
+        foreground = getattr(self, "live_stage_foreground_operation", lambda identity: False)
         return tuple(r for r in self.list_d4_unresolved_operations(task_run_id)
                      if not (r.start.category == "review" and r.start.role == "outer_planning"
                              and live(r.start.operation_id))
                      and not (r.start.category == "tool_dispatch" and tool(r.start.operation_id))
+                     and not review(r.start.operation_id)
+                     and not (admitting_stage_review and foreground(r.start.operation_id))
                      and not (tool_resource is not None and model(r.start.operation_id, tool_resource)))
 
     def list_d4_unresolved_operations(
@@ -3351,7 +3371,8 @@ class SqliteControlStore:
             "SELECT MAX(sequence) FROM checkpoints WHERE task_run_id = ?",
             (start.task_run_id,),
         ).fetchone()[0]
-        if checkpoint != start.base_checkpoint_sequence:
+        owned_stage_review = stage_config is not None and getattr(self, "admit_stage_review", lambda value: False)(start)
+        if checkpoint != start.base_checkpoint_sequence and not (owned_stage_review and start.base_checkpoint_sequence < checkpoint):
             raise StaleControlStateError("D4 operation was prepared from a stale checkpoint")
         if (
             task.status is not TaskRunStatus.RUNNING
@@ -3360,7 +3381,8 @@ class SqliteControlStore:
         ):
             raise OperationIdentityConflict("operation requires a running TaskRun before Deadline")
         blockers = self.blocking_d4_operations(start.task_run_id,
-                tool_resource=start.resource_ref if start.category == "tool_dispatch" else None)
+                tool_resource=start.resource_ref if start.category == "tool_dispatch" else None,
+                admitting_stage_review=owned_stage_review)
         if blockers:
             raise OperationRecoveryRequired("an earlier operation result remains unconfirmed",
                 operation_id=start.operation_id, blocking_count=len(blockers),
@@ -5643,6 +5665,9 @@ class SqliteControlStore:
 
     def load_stage_session(self, task_run_id: str, session: PlanningSession) -> str | None:
         return stage_storage.load_session(self, task_run_id, session)
+
+    def list_stage_reviews(self, task_run_id: str) -> tuple[StageQueuedReview, ...]:
+        return stage_storage.list_reviews(self, task_run_id)
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None:
         try:

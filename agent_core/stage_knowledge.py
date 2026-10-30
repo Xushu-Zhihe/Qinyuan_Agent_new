@@ -135,7 +135,7 @@ class StageKnowledge(ConclusionRevisions):
         road = next((r for r in turn.roads if r.road_id == session.owner_id), None)
         premises = self.effective_premises(turn, road)
         refs = {i.ref for i in self.turn_facts(turn.turn_id, include_ancestors=True)} | set(premises) | set(turn.intent.support_refs) | set(retrieved)
-        refs.update(i.ref for i in items if i.identity == "imported_attachment_not_fact")
+        refs.update(i.ref for i in items if i.identity in {"imported_attachment_not_fact", "user_hint_not_verified"})
         if turn.achievement:
             refs.update(turn.achievement.completion.support_refs)
         for candidate in turn.roads:

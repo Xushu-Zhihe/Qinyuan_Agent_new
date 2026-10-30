@@ -180,13 +180,15 @@ def test_unknown_child_tool_never_returns_to_parent_or_replays_on_restart(case):
 
 
 @pytest.mark.parametrize("stop", ["cancel", "deadline"])
-def test_child_approval_after_stop_never_registers_or_dispatches_child(case, monkeypatch, stop):
+def test_child_approval_after_stop_never_becomes_formal_or_dispatches_more_tools(case, monkeypatch, stop):
     install_chain(case)
     call = case.app.models.call
     deadline = case.app.state.task_run.deadline_at
+    stopped_calls = []
     async def stopped(request, token):
         result = await call(request, token)
         if isinstance(request.proposal, TurnIntent) and request.proposal.description == "child1":
+            stopped_calls.append(len(case.tools.calls))
             if stop == "cancel":
                 case.token.is_cancelled = True
             else:
@@ -195,9 +197,11 @@ def test_child_approval_after_stop_never_registers_or_dispatches_child(case, mon
     monkeypatch.setattr(case.app.models, "call", stopped)
     with pytest.raises(OperationRecoveryRequired, match="dispatch_stopped"):
         asyncio.run(case.app.run(case.token))
-    root, = case.app.store.list_stage_turns(case.app.task_id)
-    assert root.achievement and root.planning_state is TurnPlanningState.ACTIVE
-    assert len(case.tools.calls) == 1
+    root, child = case.app.store.list_stage_turns(case.app.task_id)
+    from agent_core.stage_plans import status
+    assert root.achievement and child.achievement is None
+    assert status(case.app.store, case.app.task_id, PlanningSession("turn_planning", child.turn_id)) == "pending"
+    assert stopped_calls == [len(case.tools.calls)]
 
 
 def test_continuation_exhaustion_keeps_pending_candidates_and_historical_achievement(case):

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sqlite3
 import sys
@@ -45,6 +46,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_STATE_DIR = REPO / ".test" / "live" / "nssctf"
 FALLBACK_STATE_DIR = REPO / ".runs"
+WORKBENCH_DB = REPO / "workbench_data" / "workbench.sqlite3"
 
 # Result/event files written by PowerShell redirection are UTF-16 with a BOM.
 BOMS = {b"\xff\xfe": "utf-16", b"\xfe\xff": "utf-16", b"\xef\xbb\xbf": "utf-8-sig"}
@@ -139,13 +141,29 @@ def run_number(path: Path) -> int:
 # run resolution
 # --------------------------------------------------------------------------
 def locate_db(directory: Path) -> Path | None:
-    """Return control.sqlite inside *directory* or one level below it."""
+    """Return control.sqlite inside *directory* or a couple of levels below it.
+
+    CLI state dirs are <state>/runsNN/<task_run_id>/control.sqlite (one level).
+    Workbench runs are <state>/<run_id>/agent-state/<task_run_id>/control.sqlite
+    (two levels), so both layouts resolve.
+    """
     direct = directory / "control.sqlite"
     if direct.is_file():
         return direct
-    for candidate in sorted(directory.glob("*/control.sqlite")):
-        return candidate
+    for pattern in ("*/control.sqlite", "*/*/control.sqlite"):
+        for candidate in sorted(directory.glob(pattern)):
+            return candidate
     return None
+
+
+def run_label(run_dir: Path) -> str:
+    """Display name: runsNN for CLI dirs, the workbench run id under agent-state."""
+    parent = run_dir.parent
+    if re.match(r"^runs\d+$", parent.name):
+        return parent.name
+    if parent.name == "agent-state" and parent.parent.is_dir():
+        return parent.parent.name[:8]
+    return parent.name
 
 
 def state_dir(explicit: str | None) -> Path:
@@ -159,12 +177,18 @@ def state_dir(explicit: str | None) -> Path:
 
 def latest_run(base: Path) -> Path:
     numbered = [p for p in base.glob("runs*") if p.is_dir() and run_number(p) >= 0]
-    if not numbered:
-        raise SystemExit("no runs* directories under %s" % base)
-    for candidate in sorted(numbered, key=run_number, reverse=True):
-        db = locate_db(candidate)
-        if db:
-            return db.parent
+    if numbered:
+        for candidate in sorted(numbered, key=run_number, reverse=True):
+            db = locate_db(candidate)
+            if db:
+                return db.parent
+    elif base.is_dir():
+        # workbench layout: newest run id wins
+        for candidate in sorted(base.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if candidate.is_dir():
+                db = locate_db(candidate)
+                if db:
+                    return db.parent
     raise SystemExit("no control.sqlite found under %s" % base)
 
 
@@ -187,11 +211,13 @@ def resolve_run(ref: str | None, base: Path) -> Path:
         if db:
             return db.parent
 
-    matches = [p for p in base.glob("*/*") if p.is_dir() and p.name.startswith(ref)]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        raise SystemExit("ambiguous task_run_id prefix %r: %s" % (ref, ", ".join(m.name for m in matches)))
+    matches = [p for p in list(base.glob("*")) + list(base.glob("*/*")) + list(base.glob("*/*/*"))
+               if p.is_dir() and p.name.startswith(ref)]
+    resolved = [db.parent for db in (locate_db(p) for p in matches) if db is not None]
+    if len(resolved) == 1:
+        return resolved[0]
+    if len(resolved) > 1:
+        raise SystemExit("ambiguous id prefix %r: %s" % (ref, ", ".join(m.name for m in resolved)))
     raise SystemExit("cannot resolve run %r under %s" % (ref, base))
 
 
@@ -226,6 +252,31 @@ def table_counts(con: sqlite3.Connection, names) -> dict:
 def load_task(con: sqlite3.Connection) -> dict:
     rows = query(con, "select * from task_runs limit 1")
     return dict(rows[0]) if rows else {}
+
+
+def workbench_run_state(run_dir: Path) -> dict | None:
+    """Workbench runs keep their terminal status outside control.sqlite.
+
+    task_runs stays 'running' when the CLI exits with 5, so a finished workbench
+    run can look alive forever. Read the wrapper's own row when the layout
+    matches <workbench>/runs/<run_id>/agent-state/<task_run_id>.
+    """
+    if run_dir.parent.name != "agent-state" or not WORKBENCH_DB.is_file():
+        return None
+    try:
+        con = connect(WORKBENCH_DB)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = query(con, """select run_id, status, exit_code, started_at, finished_at
+                             from runs where agent_task_run_id = ?""", (run_dir.name,))
+        if not rows:
+            rows = query(con, """select run_id, status, exit_code, started_at, finished_at
+                                 from runs where directory like ?""",
+                         ("%" + run_dir.parent.parent.name + "%",))
+    finally:
+        con.close()
+    return dict(rows[0]) if rows else None
 
 
 def intent_status_counts(con: sqlite3.Connection) -> dict:
@@ -275,6 +326,24 @@ def provider_results(run_dir: Path) -> list[tuple[str, Path]]:
             identity = identity[:-5]
         found.setdefault(identity, path)
     return list(found.items())
+
+
+def inflight_calls(run_dir: Path) -> list[tuple[str, float]]:
+    """Model requests written but not answered yet: (id, request mtime), oldest first.
+
+    The request file is persisted before the call starts, so a request without a
+    matching result means the model is still generating — that is not idleness.
+    """
+    done = {identity for identity, _ in provider_results(run_dir)}
+    pending: dict[str, float] = {}
+    for path in run_dir.rglob("*provider-request-*.json"):
+        identity = path.name.split("provider-request-", 1)[1]
+        if identity.endswith(".json"):
+            identity = identity[:-5]
+        if identity in done:
+            continue
+        pending.setdefault(identity, path.stat().st_mtime)
+    return sorted(pending.items(), key=lambda item: item[1])
 
 
 def stage_result_payloads(run_dir: Path):
@@ -408,10 +477,128 @@ def interval_seconds(intervals) -> float:
     return total
 
 
+def overlap_seconds(first, second):
+    return interval_seconds((max(a, c), min(b, d)) for a, b in first for c, d in second if max(a, c) < min(b, d))
+
+
+def add_usage(tokens, usage):
+    for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens"):
+        value = ((usage.get("completion_tokens_details") or {}).get(key) if key == "reasoning_tokens" else usage.get(key))
+        metric = tokens.setdefault(key, dict(known_calls=0, total=None))
+        if type(value) is int and value >= 0:
+            metric["known_calls"] += 1
+            metric["total"] = (metric["total"] or 0) + value
+
+
+def review_report(run_dir, con, calls, operations, requests):
+    """Observed ledger overlap and explicit source adoption, without semantic scoring."""
+    results = {identity: read_payload(run_dir / "stage-evidence" / f"stage-result-{identity}.json") for identity in requests}
+    spans = dict(review=[], inner=[], tool=[])
+    tools, attempts, tool_intervals = {}, {}, {}
+    coverage = Counter()
+    for identity, operation in operations.items():
+        start, end = operation["start"], operation["end"]
+        begin, finish = start.get("started_at"), end.get("finished_at")
+        request = requests.get(identity, {})
+        kind = "tool" if start.get("category") == "tool_dispatch" else "review" if request.get("stage") == "stage_review" else "inner" if start.get("role") == "inner_action" else None
+        if kind:
+            coverage[kind + "_calls"] += 1
+        known = all(type(value) in {int, float} and math.isfinite(value) for value in (begin, finish)) and finish >= begin
+        if kind and known:
+            spans[kind].append((begin, finish))
+            coverage["timed_" + kind + "_calls"] += 1
+            if kind == "tool":
+                tool_intervals[identity] = (begin, finish)
+        if kind == "tool":
+            tools[identity] = operation
+        if request.get("stage") == "stage_review":
+            runtime = (request.get("execution_context") or {}).get("stage_runtime") or {}
+            for source in runtime.get("review_members") or [request.get("proposal_operation_id")]:
+                if source:
+                    attempts.setdefault(source, []).append(identity)
+    commits = {row["mutation_id"]: row["committed_at"] for row in query(con, "select mutation_id,committed_at from control_mutations")}
+    queue = []
+    for row in query(con, "select proposal_operation_id,state,review_operation_id from stage_review_queue order by rowid"):
+        identity = row["proposal_operation_id"]
+        source = operations.get(identity, {})
+        ready = source.get("end", {}).get("finished_at")
+        starts = [operations[attempt]["start"].get("started_at") for attempt in attempts.get(identity, [])]
+        starts = [value for value in starts if isinstance(value, (float, int))]
+        first = min(starts) if starts else None
+        review = operations.get(row["review_operation_id"], {})
+        queue.append(dict(row, attempt_ids=attempts.get(identity, []), proposal_finished_at=ready,
+            first_review_started_at=first,
+            proposal_ready_to_first_review_seconds=first-ready if first is not None and ready is not None and first >= ready else None,
+            settled_at=commits.get(review.get("application")) if row["state"] == "settled" else None))
+    observed = {identity for identity, (_, end) in tool_intervals.items()
+        if tools[identity]["end"].get("result_kind") == "completed" and any(begin <= end < finish for begin, finish in spans["review"])}
+    overlapping = {identity for identity, span in tool_intervals.items() if overlap_seconds([span], spans["review"]) > 0}
+    facts = query(con, "select fact_id,source_ref,verification_ref from facts where status='verified'")
+    referenced, missing_claims = set(), 0
+    for fact in facts:
+        if fact["source_ref"] in tools:
+            referenced.add(fact["source_ref"])
+        parts = (fact["verification_ref"] or "").split(":")
+        request = requests.get(parts[1], {}) if len(parts) > 1 and parts[0] == "stage" else {}
+        claim = request.get("proposal") or {}
+        claim = claim if isinstance(claim, dict) else {}
+        if len(parts) == 3 and parts[2].isdigit():
+            candidates = claim.get("candidates") or []
+            claim = candidates[int(parts[2])] if isinstance(candidates, list) and int(parts[2]) < len(candidates) else {}
+            claim = claim if isinstance(claim, dict) else {}
+        if not claim.get("support_refs"):
+            missing_claims += 1
+        for ref in claim.get("support_refs", []):
+            parts = ref.split(":", 2)
+            if len(parts) == 3 and parts[0] == "progress" and parts[1] in tools:
+                referenced.add(parts[1])
+    adopted, missing_achievements = set(), 0
+    for row in query(con, "select achievement_json from stage_turns where achievement_json is not null"):
+        try:
+            achievement = json.loads(row["achievement_json"])
+            refs = achievement.get("completion", {}).get("support_refs")
+        except (TypeError, ValueError, AttributeError):
+            refs = None
+        if refs is None:
+            missing_achievements += 1
+        for ref in refs or []:
+            parts = ref.split(":", 2)
+            if len(parts) == 3 and parts[0] == "verified_fact":
+                adopted.add(parts[1])
+    unused = {identity for identity, operation in operations.items() if
+        (operation["application"] or "").startswith("stage-discarded/") or results.get(identity, {}).get("outcome") == "superseded"}
+    reused = {identity for identity, operation in operations.items() if (operation["application"] or "").startswith("stage-reused/")}
+    costs = {}
+    for name, identities in (("all_models", set(calls)), ("unadopted_generations", unused),
+            ("reused_proposals", reused), ("corrections", {identity for identity, call in calls.items() if call["correction"]})):
+        tokens = {}
+        for identity in identities:
+            add_usage(tokens, calls.get(identity, {}).get("usage") or {})
+        costs[name] = dict(calls=len(identities), tokens=tokens)
+    fences = [path.stem.removeprefix("stage-tool-dispatch-stop-") for path in (run_dir / "stage-evidence").glob("stage-tool-dispatch-stop-*.json")
+        if read_payload(path).get("outcome") == "not_dispatched"]
+    return dict(queue_available=bool(query(con, "select name from sqlite_master where name='stage_review_queue'")),
+        timing_coverage=dict(coverage), queue=queue, queue_states=dict(Counter(item["state"] for item in queue)),
+        branch_count=scalar(con, "select count(*) from stage_branches", default=None),
+        overlap=dict(review_interval_union_seconds=interval_seconds(spans["review"]) if spans["review"] else None,
+            review_with_inner_seconds=overlap_seconds(spans["review"], spans["inner"]) if spans["review"] and spans["inner"] else None,
+            review_with_tools_seconds=overlap_seconds(spans["review"], spans["tool"]) if spans["review"] and spans["tool"] else None),
+        exploration=dict(tools_overlapping_review=sorted(overlapping), observations_completed_during_review=sorted(observed),
+            observations_referenced_by_stored_facts=sorted(observed & referenced),
+            observations_without_recorded_fact_reference=sorted(observed - referenced),
+            fact_ids_referenced_by_achievements=sorted(adopted),
+            unresolved_fact_source_records=missing_claims, unresolved_achievement_support=missing_achievements,
+            fact_sources_available=bool(query(con, "select name from pragma_table_info('facts') where name='source_ref'"))),
+        cost=costs, monetary_cost=None, pricing_status="no_confirmed_pricing",
+        unadopted_generation_ids=sorted(unused), fenced_dispatch_ids=sorted(fences),
+        inconsistent_fence_ids=sorted(set(fences) & tools.keys()))
+
+
 def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
     """Read-only observations for comparison, not a causal ROI/quality score."""
     calls = {c["id"]: c for c in load_calls(run_dir, con)}
     unreadable_rows = 0
+    operations, requests = {}, {}
     for row in query(con, "select operation_id, start_json, completion_json, application_ref from d4_operations"):
         try:
             start = json.loads(row["start_json"])
@@ -421,11 +608,13 @@ def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
         except (TypeError, ValueError):
             unreadable_rows += 1
             continue
+        operations[row["operation_id"]] = dict(start=start, end=completion, application=row["application_ref"])
         if start.get("category") == "tool_dispatch" or start.get("role") not in {"inner_action", "outer_planning"}:
             continue
         identity = row["operation_id"]
         saved = read_payload(run_dir / "stage-evidence" / ("stage-request-" + identity + ".json"))
         request = saved.get("request") or {}
+        requests[identity] = request
         call = calls.setdefault(identity, dict(id=identity, stage=request.get("stage") or start["category"],
             started=start.get("started_at"), duration=None, usage={}, correction=bool(request.get("correction_of_model_request_id")),
             error=None, finish="-"))
@@ -454,12 +643,7 @@ def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
                 if call["stage"] in planning:
                     plan_intervals.append(span)
         usage = call.get("usage") or {}
-        for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens"):
-            value = ((usage.get("completion_tokens_details") or {}).get(key) if key == "reasoning_tokens" else usage.get(key))
-            metric = group["tokens"].setdefault(key, dict(known_calls=0, total=None))
-            if type(value) is int and value >= 0:
-                metric["known_calls"] += 1
-                metric["total"] = (metric["total"] or 0) + value
+        add_usage(group["tokens"], usage)
     turns = query(con, "select turn_id, achievement_json from stage_turns")
     outcomes = dict(stage_data_available=bool(query(con, "select name from sqlite_master where name='stage_turns'")),
         turns=len(turns), achieved_turns=sum(bool(r["achievement_json"]) for r in turns),
@@ -478,6 +662,7 @@ def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
     model_union = interval_seconds(intervals) if intervals else None
     plan_union = interval_seconds(plan_intervals) if intervals else None
     return dict(stages=grouped, planning_stages=sorted(planning), outcomes=outcomes,
+        reviews=review_report(run_dir, con, calls, operations, requests),
         unreadable_ledger_rows=unreadable_rows,
         model_interval_union_seconds=model_union, planning_interval_union_seconds=plan_union,
         planning_share_of_observed_model_time=plan_union / model_union if model_union else None,
@@ -488,6 +673,10 @@ def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
             "Outcomes are observations, not proof that planning caused improvement; compare matched tasks/configurations.",
             "Reasoning tokens are part of completion tokens; never add them again.",
             "Semantic duplicate work and exploration beyond the criterion are not inferred from counts.",
+            "Review overlap uses completed ledger intervals; it is not wall-clock time saved. Unsettled intervals are excluded.",
+            "Proposal-ready to first review includes admission/restoration delay, not a measured queue insertion timestamp.",
+            "Unreferenced observations are not classified as useless. Stored Fact/achievement references do not establish current validity or causation.",
+            "Cost subsets overlap; do not add them. Missing usage and unconfirmed monetary pricing remain unknown.",
             "Tolerant monitor: evidence is not binding-validated; use analyze_run_timing.py for strict reports."])
 
 
@@ -514,6 +703,19 @@ def cmd_planning(args) -> int:
         "%.1f" % report["planning_interval_union_seconds"] if report["planning_interval_union_seconds"] is not None else "unknown",
         "%.1f%%" % (share * 100) if share is not None else "unknown"))
     print("outcomes " + json.dumps(report["outcomes"], ensure_ascii=False))
+    reviews = report["reviews"]
+    print("review queue %s | branches %s" % (reviews["queue_states"] if reviews["queue_available"] else "unavailable", reviews["branch_count"]))
+    print("observed review overlap " + json.dumps(reviews["overlap"]))
+    exploration = reviews["exploration"]
+    print("observations completed during review %d | with recorded Fact reference %d | without recorded reference %d" % (
+        len(exploration["observations_completed_during_review"]), len(exploration["observations_referenced_by_stored_facts"]),
+        len(exploration["observations_without_recorded_fact_reference"])))
+    print("achievement-referenced Facts %d | unadopted generations %d | fenced dispatches %d" % (
+        len(exploration["fact_ids_referenced_by_achievements"]), len(reviews["unadopted_generation_ids"]), len(reviews["fenced_dispatch_ids"])))
+    for name, cost in reviews["cost"].items():
+        print("cost %s: %d calls | %s" % (name, cost["calls"], " | ".join(
+            "%s=%s (%d/%d calls)" % (key, fmt_int(value["total"]), value["known_calls"], cost["calls"]) for key, value in cost["tokens"].items())))
+    print("monetary cost: unknown (no confirmed pricing); timing coverage " + json.dumps(reviews["timing_coverage"]))
     print("unknown ledger %d calls | unreadable ledger %d rows" % (
         sum(g["ledger_unknown"] for g in report["stages"].values()), report["unreadable_ledger_rows"]))
     for note in report["notes"]:
@@ -649,6 +851,7 @@ def cmd_show(args) -> int:
         con.close()
 
     result = find_result(run_dir, run_dir.name)
+    workbench = workbench_run_state(run_dir)
     now = time.time()
     started = task.get("started_at")
     deadline = task.get("deadline_at")
@@ -661,11 +864,15 @@ def cmd_show(args) -> int:
     completion = sum(c["completion"] for c in calls)
     reasoning = sum(c["reasoning"] for c in calls)
 
-    print("run        %s" % run_dir.parent.name)
+    print("run        %s" % run_label(run_dir))
     print("task_run   %s" % run_dir.name)
     print("status     %s   started %s   elapsed %s   deadline %s   left %s" % (
         status, fmt_time(started), fmt_span(now - started) if started else "-",
         fmt_time(deadline), fmt_left(deadline, now)))
+    if workbench:
+        print("workbench  %s   exit %s   finished %s   (wrapper view; control.sqlite keeps status=running on exit 5)" % (
+            workbench.get("status") or "-", workbench.get("exit_code"),
+            _fmt_iso(workbench.get("finished_at"))))
     print("goal       %s" % clip(task.get("goal"), 96))
     legacy_empty = not any(counts.values()) and not facts_verified and not candidates
     if stage_turns and legacy_empty:
@@ -680,8 +887,13 @@ def cmd_show(args) -> int:
     print("events     %d   last %s (%s)   checkpoint %s" % (events, fmt_clock(last_event), fmt_age(last_event, now), checkpoint))
     # A run can be dead while task_runs still says running (no terminal commit).
     # The persisted CLI result is the authority on that.
+    pending = inflight_calls(run_dir)
     if result and result.get("exit_code") is not None:
         liveness = "finished (exit %s)" % result["exit_code"]
+    elif workbench and workbench.get("finished_at") and workbench.get("status") != "running":
+        liveness = "finished (workbench %s, exit %s)" % (workbench["status"], workbench["exit_code"])
+    elif status == "running" and pending:
+        liveness = "generating %s" % fmt_span(now - pending[0][1])
     elif status == "running" and idle > args.stall:
         liveness = "IDLE %s" % fmt_span(idle)
     else:
@@ -689,6 +901,9 @@ def cmd_show(args) -> int:
     print("calls      %d   last %s (%s, evidence %s)   %s" % (
         len(calls), fmt_clock(last_call), fmt_age(last_call, now),
         fmt_age(last_file, now), liveness))
+    if pending:
+        print("inflight   %d request(s) written, no result yet; oldest %s (%s)" % (
+            len(pending), fmt_clock(pending[0][1]), fmt_span(now - pending[0][1])))
     if calls:
         print("tokens     prompt %s   cache %.1f%%   completion %s   reasoning %.0f%%" % (
             fmt_int(prompt), 100.0 * hit / prompt if prompt else 0.0,
@@ -754,7 +969,7 @@ def cmd_watch(args) -> int:
         if status == "running" and idle > args.stall:
             flag = "  !! IDLE %s" % fmt_span(idle)
         print("[%s] %s %s  left %s  calls %d (last %s)  prompt %s cache %.1f%% comp %s reas %.0f%%%s" % (
-            fmt_clock(now), run_dir.parent.name, status,
+            fmt_clock(now), run_label(run_dir), status,
             fmt_left(deadline, now),
             len(calls), fmt_age(last_call, now), fmt_int(prompt),
             100.0 * hit / prompt if prompt else 0.0,
@@ -826,7 +1041,7 @@ def cmd_calls(args) -> int:
         print("no completed model calls recorded")
         return 0
 
-    print("%-4s %-8s %-18s %-14s %-16s %8s %10s %7s %8s %7s %-7s %s" % (
+    print("%-4s %-8s %-18s %-14s %-16s %8s %10s %7s %8s %7s %-12s %s" % (
         "#", "clock", "stage", "role", "category", "dur", "prompt", "hit%", "compl", "reas", "finish", "flags"))
     print("-" * 128)
     for index, call in enumerate(calls, 1):
@@ -843,7 +1058,7 @@ def cmd_calls(args) -> int:
             clip(call["category"], 16),
             ("%.1fs" % call["duration"]) if call["duration"] is not None else "-",
             fmt_int(call["prompt"]), rate, fmt_int(call["completion"]),
-            fmt_int(call["reasoning"]), clip(call["finish"], 7), " ".join(flags)))
+            fmt_int(call["reasoning"]), clip(call["finish"], 12), " ".join(flags)))
     return 0
 
 
@@ -898,6 +1113,9 @@ def cmd_tree(args) -> int:
                                  "achievement_json, fact_refs_json from stage_turns")
         stage_roads = query(con, "select road_id, turn_id, ordinal, candidate_json, status "
                                  "from stage_roads order by turn_id, ordinal")
+        # facts.turn_id points at the stage turn; fact_refs_json is the curated view only
+        owned_facts = {row["turn_id"]: row["n"] for row in
+                       query(con, "select turn_id, count(*) n from facts group by turn_id")} if stage_turns else {}
         if not stage_turns:
             turns = query(con, "select * from turns order by sequence")
             intents = query(con, "select * from intents order by priority")
@@ -913,8 +1131,8 @@ def cmd_tree(args) -> int:
             intent = json.loads(turn["intent_json"] or "{}")
             refs = json.loads(turn["fact_refs_json"] or "[]")
             parent = ("  parent %s" % turn["parent_turn_id"][:8]) if turn["parent_turn_id"] else ""
-            print("Turn %s  [%s]  facts %d%s" % (
-                turn["turn_id"][:8], turn["planning_state"], len(refs), parent))
+            print("Turn %s  [%s]  facts %d (view %d)%s" % (
+                turn["turn_id"][:8], turn["planning_state"], owned_facts.get(turn["turn_id"], 0), len(refs), parent))
             print("   intent   %s" % clip(intent.get("description"), 78))
             print("   done when %s" % clip(intent.get("completion_criterion"), 78))
             for road in roads_by_turn.get(turn["turn_id"], []):
@@ -1013,6 +1231,93 @@ def cmd_hints(args) -> int:
     return 0
 
 
+def _fmt_iso(value) -> str:
+    """Workbench stores ISO-8601 UTC strings; show them in local clock time."""
+    if not value:
+        return "-"
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return clip(value, 16)
+    return fmt_time(stamp)
+
+
+def cmd_challenge(args) -> int:
+    """Bridge a workbench URL (#task/<challenge_id>) to its runs."""
+    db = Path(getattr(args, "workbench_db", None) or WORKBENCH_DB)
+    if not db.is_absolute():
+        db = Path.cwd() / db
+    if not db.is_file():
+        raise SystemExit("workbench database not found: %s (use --workbench-db)" % db)
+
+    con = connect(db)
+    try:
+        challenges = query(con, """select id, title, category, status, endpoint, deadline_minutes, updated_at
+                                   from challenges order by updated_at desc""")
+        if args.challenge:
+            chosen = [row for row in challenges if row["id"].startswith(args.challenge)]
+            if not chosen:
+                raise SystemExit("no challenge matching %r in %s" % (args.challenge, db))
+            if len(chosen) > 1:
+                raise SystemExit("ambiguous challenge prefix %r: %s" % (
+                    args.challenge, ", ".join(row["id"] for row in chosen)))
+            challenge = chosen[0]
+            runs = query(con, """select run_id, status, exit_code, started_at, finished_at, agent_task_run_id, directory
+                                 from runs where challenge_id = ? order by started_at desc""", (challenge["id"],))
+        else:
+            runs = {}
+            for row in challenges:
+                runs[row["id"]] = query(con, """select run_id, status, exit_code, started_at
+                                                from runs where challenge_id = ? order by started_at desc""",
+                                        (row["id"],))
+    finally:
+        con.close()
+
+    if not args.challenge:
+        header = "%-10s %-18s %-9s %-18s %5s %-10s %s" % (
+            "challenge", "title", "category", "status", "runs", "latest run", "latest status")
+        print(header)
+        print("-" * len(header))
+        for row in challenges:
+            entries = runs.get(row["id"]) or []
+            latest = entries[0] if entries else None
+            print("%-10s %-18s %-9s %-18s %5d %-10s %s" % (
+                row["id"][:8], clip(row["title"], 18), clip(row["category"], 9),
+                clip(row["status"], 18), len(entries),
+                latest["run_id"][:8] if latest else "-", clip(latest["status"], 20) if latest else "-"))
+        return 0
+
+    print("challenge   %s" % challenge["id"])
+    print("title       %s" % (challenge["title"] or "-"))
+    print("category    %-12s status %-18s deadline %s min" % (
+        challenge["category"] or "-", challenge["status"] or "-", challenge["deadline_minutes"]))
+    print("endpoint    %s" % (challenge["endpoint"] or "-"))
+    print("runs        %d" % len(runs))
+    if runs:
+        print("  %-10s %-13s %-18s %-5s %s" % ("run", "started", "status", "exit", "task_run"))
+        for row in runs:
+            task_run = row["agent_task_run_id"] or ""
+            if not task_run and row["directory"]:
+                # the workbench only fills agent_task_run_id once the run ends
+                run_db = locate_db(Path(row["directory"]))
+                if run_db:
+                    try:
+                        side = connect(run_db)
+                        try:
+                            task_run = scalar(side, "select task_run_id from task_runs") or ""
+                        finally:
+                            side.close()
+                    except sqlite3.Error:
+                        pass
+            print("  %-10s %-13s %-18s %-5s %s" % (
+                row["run_id"][:8], _fmt_iso(row["started_at"]), clip(row["status"], 18),
+                row["exit_code"] if row["exit_code"] is not None else "-", (task_run or "-")[:8]))
+        print()
+        print("next        python scripts/qymonitor.py --state-dir %s show %s" % (
+            Path(WORKBENCH_DB).parent.name + "/runs", runs[0]["run_id"][:8]))
+    return 0
+
+
 def cmd_sql(args) -> int:
     run_dir = resolve_run(args.run, state_dir(args.state_dir))
     con = connect(run_dir / "control.sqlite")
@@ -1106,6 +1411,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("hints", help="diagnostics sent back with a rejected output")
     p.add_argument("run", nargs="?", default="latest")
     p.set_defaults(func=cmd_hints)
+
+    p = sub.add_parser("challenge", help="workbench challenge -> its runs (bridges the #task/<id> URL)")
+    p.add_argument("challenge", nargs="?", help="challenge id or unique prefix; omit to list all")
+    p.add_argument("--workbench-db", help="default: workbench_data/workbench.sqlite3")
+    p.set_defaults(func=cmd_challenge)
 
     p = sub.add_parser("sql", help="read-only SQL escape hatch")
     p.add_argument("run", nargs="?", default="latest")

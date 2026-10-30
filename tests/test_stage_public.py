@@ -29,6 +29,16 @@ def test_public_projection_uses_actual_stage_road_and_current_fact_identities(ca
     assert view["verified_facts"][0]["current_status"] == "effective"
     assert view["goal_evaluation"] == "not_evaluated" and view["task_run"]["status"] == "running"
     assert len(view["tool_operations"]) == 1 and not view["plans"] and not view["executions"]
+    assert view["task_run"]["goal"] == case.app.state.task_run.request.goal
+    by_id = {r.model_request_id: r for r in (*case.models.inner.calls, *case.models.outer.calls)}
+    for review in view["retrospective"]:
+        request = by_id[review["operation_id"]]
+        session = request.context.session
+        if session.scope == "road_execution":
+            assert review["road_id"] == session.owner_id
+            assert review["turn_id"] == request.context.turn.turn_id
+        else:
+            assert review["turn_id"] == session.owner_id and review["road_id"] is None
 
 
 def test_public_projection_rejects_changed_frozen_policy(case):

@@ -470,7 +470,10 @@ def _depth(text):
     return maximum
 
 
-def decode_response(response, schema):
+NATIVE_TRAILING_BRACE_POLICY = "native_single_trailing_brace_v1"
+
+
+def decode_response(response, schema, *, normalization_policy=None, json_error_details=False):
     """Return safe issues and explicit terminal status without retaining text."""
     finish = "stop"
     if isinstance(response, D8ModelResponse):
@@ -504,10 +507,31 @@ def decode_response(response, schema):
         except json.JSONDecodeError as error:
             import re
             code = "json_parse_failed"
+            actual = f"invalid_json_at_char_{error.pos}"
             if error.msg == "Extra data":
                 code = ("output_trailing_markup" if re.search(r"</?[|\uff5c]+DSML[|\uff5c]+", encoded[error.pos:])
                     else "json_trailing_data")
-            return None, [D8FormatIssue(code, "$", "single_complete_json", "invalid")], None, units
+                suffix = encoded[error.pos:].strip(" \t\r\n")
+                actual = f"trailing_data_at_char_{error.pos}"
+                if suffix == "}":
+                    actual += ";single_extra_right_brace"
+                elif all(c in "} \t\r\n" for c in suffix):
+                    actual += f";extra_right_braces_{suffix.count('}')}"
+                else:
+                    actual += ";non_brace_trailing_data"
+                if suffix == "}" and normalization_policy == NATIVE_TRAILING_BRACE_POLICY:
+                    # The strict decoder already consumed the complete prefix
+                    # with the same duplicate-key and finite-number checks.
+                    response = json.loads(encoded[:error.pos], object_pairs_hook=_pairs,
+                        parse_constant=_nonfinite, parse_float=_float)
+                    units["normalization"] = {"policy": normalization_policy,
+                        "offset": error.pos, "removed_characters": 1}
+                else:
+                    return None, [D8FormatIssue(code, "$", "single_complete_json",
+                        actual if json_error_details else "invalid")], None, units
+            else:
+                return None, [D8FormatIssue(code, "$", "single_complete_json",
+                    actual if json_error_details else "invalid")], None, units
         except (ValueError, RecursionError):
             return None, [D8FormatIssue("json_parse_failed", "$", "valid_json", "invalid")], None, units
     else:

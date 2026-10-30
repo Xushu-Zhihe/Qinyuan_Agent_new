@@ -34,7 +34,7 @@ from agent_core.web_contracts import (
     D7_WEB_RESPONSE_HEADERS,
 )
 from agent_core.sqlite_control_store import SqliteControlStore
-from qinyuan_core import CodedError
+from qinyuan_core import CodedError, get_logger
 
 MAX_D7_HTTP_REQUEST_BYTES = D7_WEB_MAX_REQUEST_BODY_BYTES
 MAX_D7_HTTP_RESPONSE_BYTES = D7_WEB_MAX_RESPONSE_BODY_BYTES
@@ -280,8 +280,7 @@ class D7HttpResponseEvidenceStore:
             allow_nan=False,
         ).encode("utf-8")
 
-    @staticmethod
-    def _write_exclusive(path: Path, payload: bytes) -> None:
+    def _write_exclusive(self, path: Path, payload: bytes) -> None:
         if path.exists() or path.is_symlink():
             raise HttpCapabilityError("d7_http_evidence_conflict")
         descriptor, temporary = tempfile.mkstemp(
@@ -292,10 +291,26 @@ class D7HttpResponseEvidenceStore:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            try:
-                os.link(temporary, path)
-            except FileExistsError as exc:
-                raise HttpCapabilityError("d7_http_evidence_conflict") from exc
+            for attempt, delay in enumerate((0.05, 0.1, 0.2, None), 1):
+                try:
+                    os.link(temporary, path)
+                except FileExistsError as exc:
+                    raise HttpCapabilityError("d7_http_evidence_conflict") from exc
+                except OSError as exc:
+                    if getattr(exc, "winerror", None) != 32 or delay is None:
+                        get_logger("store").error("http.evidence_publish_failed", run=self.task_run_id,
+                            evidence_ref=path.name, category="dependency", code="d7_http_evidence_write_failed",
+                            attempts=attempt, winerror=getattr(exc, "winerror", None))
+                        raise
+                    get_logger("store").warning("http.evidence_publish_retry", run=self.task_run_id,
+                        evidence_ref=path.name, category="dependency", winerror=32,
+                        attempt=attempt, retry_delay_seconds=delay)
+                    time.sleep(delay)
+                else:
+                    if attempt > 1:
+                        get_logger("store").info("http.evidence_publish_recovered", run=self.task_run_id,
+                            evidence_ref=path.name, attempts=attempt)
+                    break
         finally:
             Path(temporary).unlink(missing_ok=True)
 
@@ -918,7 +933,13 @@ class D7HttpAdapter:
                 raise HttpCapabilityError("d7_http_response_too_large")
             response_headers = _validated_response_headers(response.headers)
             self._cookies.accept(response_headers, path_query)
-            metadata = self.evidence_store.save(operation_id, response.body)
+            try:
+                metadata = self.evidence_store.save(operation_id, response.body)
+            except HttpCapabilityError as exc:
+                # This exchange returned; persistence failure is not a second
+                # network failure, nor a settled operation without its receipt.
+                exc.context["phase"] = "response_evidence_save"
+                raise
             location, blocked = self._redirect_location(response_headers, request_url)
             text_bytes = response.body[:MAX_D7_HTTP_MODEL_TEXT_BYTES]
             body_text = text_bytes.decode("utf-8", errors="ignore")

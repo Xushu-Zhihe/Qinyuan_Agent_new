@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from uuid import NAMESPACE_URL, uuid5
 
 from qinyuan_core import Category, Layer, QinyuanError
@@ -20,7 +20,8 @@ from agent_core.stage_contracts import (
     StageConclusionChange, StageFactApplication, StageFactProposal, StageFactSelection, StageHistoryRead,
     StageModelEvidence, StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnIntent, TurnPlanningReview, TurnPlanningState, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
-    StageToolBatch, tool_calls, tool_call_key,
+    StageToolBatch, tool_calls, tool_call_key, StageFactBatch, StageFactBatchReview,
+    fact_candidates, reviewed_fact, fact_verification_ref, StageQueuedReview, StageBranchFork, StageSessionBranch,
 )
 from agent_core.turn_contracts import D1RoleConfig
 
@@ -41,6 +42,37 @@ CREATE TABLE stage_sessions (
  task_run_id TEXT NOT NULL REFERENCES stage_runs(task_run_id), scope TEXT NOT NULL,
  owner_id TEXT NOT NULL, session_id TEXT NOT NULL UNIQUE,
  PRIMARY KEY(task_run_id,scope,owner_id));
+"""
+
+REVIEW_QUEUE_SCHEMA = """
+CREATE TABLE stage_review_queue (
+ proposal_operation_id TEXT PRIMARY KEY REFERENCES d4_operations(operation_id),
+ state TEXT NOT NULL CHECK(state IN ('pending','blocked','settled')),
+ review_operation_id TEXT UNIQUE REFERENCES d4_operations(operation_id),
+ CHECK((state='pending') = (review_operation_id IS NULL)));
+"""
+
+ASYNC_REVIEW_SCHEMA = """
+CREATE TABLE stage_review_queue_async (
+ proposal_operation_id TEXT PRIMARY KEY REFERENCES d4_operations(operation_id),
+ state TEXT NOT NULL CHECK(state IN ('pending','blocked','settled','superseded')),
+ review_operation_id TEXT REFERENCES d4_operations(operation_id),
+ CHECK((state='pending') = (review_operation_id IS NULL)));
+INSERT INTO stage_review_queue_async SELECT * FROM stage_review_queue ORDER BY rowid;
+DROP TABLE stage_review_queue;
+ALTER TABLE stage_review_queue_async RENAME TO stage_review_queue;
+CREATE TABLE stage_branches (
+ branch_id TEXT PRIMARY KEY,
+ session_id TEXT NOT NULL REFERENCES stage_sessions(session_id),
+ proposal_operation_id TEXT NOT NULL REFERENCES d4_operations(operation_id),
+ review_operation_id TEXT REFERENCES d4_operations(operation_id));
+CREATE INDEX stage_branches_session ON stage_branches(session_id);
+"""
+
+PLAN_BINDING_SCHEMA = """
+CREATE TABLE stage_plan_bindings (
+ session_id TEXT PRIMARY KEY REFERENCES stage_sessions(session_id),
+ proposal_operation_id TEXT NOT NULL REFERENCES d4_operations(operation_id));
 """
 
 # Keep one canonical Fact table. Ownership accepts a stage Turn directly;
@@ -74,6 +106,13 @@ WHEN NOT EXISTS(SELECT 1 FROM executions WHERE execution_id=NEW.source_ref)
    SELECT 1 FROM turns t WHERE t.turn_id=NEW.turn_id AND t.task_run_id=s.task_run_id))))
 BEGIN SELECT RAISE(ABORT,'Fact source unavailable'); END;
 """
+
+# Existing Fact rows and hashes stay unchanged. A batch claim adds only its
+# ordinal to the original review reference; the FK trigger resolves that review.
+FACT_BATCH_SCHEMA = "DROP TRIGGER facts_source_insert;\n" + FACT_SCHEMA[
+    FACT_SCHEMA.index("CREATE TRIGGER facts_source_insert"):].replace(
+        "substr(NEW.verification_ref,CASE WHEN NEW.verification_ref LIKE 'stage:%' THEN 7 ELSE 5 END)",
+        "CASE WHEN NEW.verification_ref LIKE 'stage:%' THEN substr(NEW.verification_ref,7,36) ELSE substr(NEW.verification_ref,5) END")
 
 CANDIDATE_SCHEMA = """
 CREATE TABLE d7_candidate_registry_stage (
@@ -109,9 +148,9 @@ class StageAdmissionError(StageStateError, OperationIdentityConflict):
 
 
 class StageRecoveryRequired(StageStateError, OperationRecoveryRequired):
-    def __init__(self, code, *, category=Category.UNKNOWN, layer=Layer.MODEL):
+    def __init__(self, code, *, category=Category.UNKNOWN, layer=Layer.MODEL, **context):
         self.category = category
-        super().__init__(code, code=code, layer=layer, retryable=False)
+        super().__init__(code, code=code, layer=layer, retryable=False, **context)
 
 
 def _fail(code, category=Category.CONFLICT, **context):
@@ -137,6 +176,7 @@ def execution_policy(config):
         "web_authorization": asdict(config.web_authorization) if config.web_authorization else None,
         "tcp_authorization": asdict(config.tcp_authorization) if config.tcp_authorization else None,
         "capacity": asdict(config.handoff_config),
+        "review_queue": {"binding": "immutable_proposal_v1", "dispatch": "async_planning_v1"},
         "tool_execution": {"max_in_flight": MAX_IN_FLIGHT_TOOLS, "sandbox_target_in_flight": 1,
                            "max_calls_per_decision": MAX_IN_FLIGHT_TOOLS,
                            "wake": "first_result_before_next_decision_merge_during_generation"}}))
@@ -226,6 +266,9 @@ def validate_tool_start(store, start):
     if active_turn(tuple(knowledge.turns.values())).turn_id != turn.turn_id:
         _fail("stage.execution_frontier_changed", Category.POLICY)
     road = next(r for r in turn.roads if r.road_id == road_id)
+    from agent_core.stage_plans import execution_allowed
+    if not execution_allowed(store, start.task_run_id, turn, road):
+        _fail("stage.parent_completion_not_accepted", Category.POLICY)
     _sources(store, start.task_run_id, knowledge.effective_premises(turn, road))
     claim = {"task_run_id": start.task_run_id, "intent_id": road_id,
              "model_request_id": proposal_id, "call": asdict(proposed)}
@@ -311,6 +354,7 @@ def list_turns(store, task_id):
 
 def active_turn(turns):
     """Follow the persisted waiting chain; historical branches retain their state."""
+    turns = tuple(t for t in turns if t.planning_state is not TurnPlanningState.SUPERSEDED)
     roots = [t for t in turns if t.parent_turn_id is None]
     if not roots:
         return None
@@ -340,6 +384,285 @@ def load_session(store, task_id, session):
     if row and row[0] != session_id(task_id, session):
         _fail("stage.session_identity_changed", Category.UNKNOWN)
     return row[0] if row else None
+
+
+def list_reviews(store, task_id):
+    """FIFO metadata only; proposal/result bytes stay in the existing ledger."""
+    require_run(store, task_id)
+    if store._schema_version < 36:
+        return ()
+    return tuple(StageQueuedReview(*row) for row in store._connection.execute(
+        "SELECT q.proposal_operation_id,q.state,q.review_operation_id "
+        "FROM stage_review_queue q JOIN d4_operations p ON p.operation_id=q.proposal_operation_id "
+        "WHERE p.task_run_id=? ORDER BY q.rowid", (task_id,)))
+
+
+def _queue_source(store, task_id, identity, *, allow_applied=False):
+    config = require_run(store, task_id)
+    operation = store.load_d4_operation(identity)
+    if (operation is None or operation.start.task_run_id != task_id
+            or operation.start.role != "inner_action" or operation.start.category not in {"planning", "action"}
+            or operation.start.role_config_ref != config.inner_role.role_config_ref
+            or operation.start.budget_policy_ref != config.budget.budget_policy_ref
+            or operation.completion is None or operation.completion.result_kind != "completed"
+            or operation.application_ref is not None and not allow_applied):
+        _fail("stage.review_proposal_not_ready", Category.POLICY)
+    evidence = store.stage_evidence.read_model_result(operation)
+    if load_session(store, task_id, evidence.session) is None:
+        _fail("stage.review_session_unavailable", Category.POLICY)
+    value = evidence.result
+    if not isinstance(value, (TurnIntent, tuple, PlanningExhausted, StagePlanningDecision,
+            StageFactProposal, StageFactBatch, StageConclusionChange, TurnCompletion, RoadResolution)):
+        _fail("stage.review_proposal_invalid", Category.INPUT)
+    if isinstance(value, StagePlanningDecision) and value.kind in {"wait_for_tools", "wait_for_review"}:
+        _fail("stage.review_proposal_invalid", Category.INPUT)
+    return operation, evidence
+
+
+def _review_target_current(store, task_id, identity):
+    """Checkpoint movement is allowed; changing the actual target is not."""
+    request = store.stage_evidence.request(identity)
+    original = request.context.turn
+    if original is None:
+        return
+    current = load_turn(store, task_id, original.turn_id)
+    if current is None or current.intent != original.intent or current.parent_turn_id != original.parent_turn_id:
+        _fail("stage.review_target_changed", Category.CONFLICT)
+    if request.context.session.scope == "road_execution":
+        road_id = request.context.session.owner_id
+        before = next((r for r in original.roads if r.road_id == road_id), None)
+        after = next((r for r in current.roads if r.road_id == road_id), None)
+        if before is None or after is None or before.candidate != after.candidate:
+            _fail("stage.review_target_changed", Category.CONFLICT)
+
+
+def _queue_review_matches(store, task_id, source, review, proposal_id=None):
+    config = require_run(store, task_id)
+    request = store.stage_evidence.request(review.start.operation_id)
+    category = "fact_review" if isinstance(source.result,
+        (StageFactProposal, StageFactBatch, StageConclusionChange)) else "review"
+    if (review.start.task_run_id != task_id or review.start.role != "outer_planning"
+            or review.start.role_config_ref != config.outer_role.role_config_ref
+            or review.start.budget_policy_ref != config.budget.budget_policy_ref
+            or review.start.category != category or request.stage != "stage_review"
+            or request.context.session != source.session
+            or request.proposal_operation_id is None
+            or request.proposal is None
+            ):
+        _fail("stage.review_binding_changed", Category.UNKNOWN)
+    sources = dict(store.stage_evidence.review_sources(request))
+    original = sources.get(proposal_id or request.proposal_operation_id)
+    if original is None or original != source:
+        _fail("stage.review_binding_changed", Category.UNKNOWN)
+    return request
+
+
+def _queued_known_operations(store, task_id, entries):
+    """Only complete authenticated results qualify, never an in-flight review."""
+    pending = {entry.proposal_operation_id for entry in entries if entry.state in {"pending", "blocked"}}
+    if not pending:
+        return set()
+    sources = {identity: _queue_source(store, task_id, identity)[1] for identity in pending}
+    known = set(pending)
+    for operation in store.list_d4_operations(task_id):
+        if (operation.application_ref is not None or operation.completion is None
+                or operation.completion.result_kind != "completed" or operation.start.role != "outer_planning"):
+            continue
+        saved = store.stage_evidence.read("request", operation.start.operation_id)
+        if saved is None or saved["request"].get("proposal_operation_id") not in pending:
+            continue
+        identity = saved["request"]["proposal_operation_id"]
+        _queue_review_matches(store, task_id, sources[identity], operation, identity)
+        store.stage_evidence.read_model_result(operation)
+        known.add(operation.start.operation_id)
+    return known
+
+
+def _validate_queue(store, mutation, change):
+    from agent_core.stage_planning import MAX_STAGE_CORRECTIONS
+    entries = {entry.proposal_operation_id: entry for entry in list_reviews(store, mutation.task_run_id)}
+    if any(not isinstance(binding, StageReviewBinding) for binding in change.blocked_reviews):
+        _fail("stage.review_binding_invalid", Category.INPUT)
+    if len(set(change.review_submissions)) != len(change.review_submissions):
+        _fail("stage.review_submission_duplicate", Category.INPUT)
+    if len({b.proposal_operation_id for b in change.blocked_reviews}) != len(change.blocked_reviews):
+        _fail("stage.review_failure_duplicate", Category.INPUT)
+    for identity in change.review_submissions:
+        _uuid(identity, "proposal_operation_id")
+        if identity in entries and entries[identity].state != "pending":
+            _fail("stage.review_already_closed", Category.CONFLICT)
+        operation, _ = _queue_source(store, mutation.task_run_id, identity)
+        if identity not in entries and operation.start.base_checkpoint_sequence != mutation.base_checkpoint_sequence:
+            _fail("stage.model_context_stale", Category.CONFLICT)
+        _review_target_current(store, mutation.task_run_id, identity)
+    for binding in change.blocked_reviews:
+        entry = entries.get(binding.proposal_operation_id)
+        if (entry is None or entry.state != "pending"
+                or binding.proposal_operation_id in change.review_submissions
+                or any(other.proposal_operation_id == binding.proposal_operation_id for other in change.reviews)):
+            _fail("stage.review_failure_not_pending", Category.CONFLICT)
+        _, source = _queue_source(store, mutation.task_run_id, binding.proposal_operation_id)
+        review = store.load_d4_operation(binding.review_operation_id)
+        if review is None or review.completion is None or review.completion.result_kind != "failed" or review.application_ref is not None:
+            _fail("stage.review_failure_unconfirmed", Category.UNKNOWN)
+        request = _queue_review_matches(store, mutation.task_run_id, source, review, binding.proposal_operation_id)
+        from agent_core.stage_planning import review_members
+        if (not set(review_members(request)).issubset({b.proposal_operation_id for b in change.blocked_reviews})
+                or store.stage_evidence.correction_depth(request) != MAX_STAGE_CORRECTIONS
+                or store.stage_evidence.transport_failure(request,
+                    store.stage_evidence.read("result", binding.review_operation_id)) is None):
+            _fail("stage.review_failure_unconfirmed", Category.UNKNOWN)
+
+
+def review_groups(store, task_id):
+    """Suggest contiguous Fact batches, without merging identities or verdicts."""
+    groups, last_key = [], None
+    for entry in list_reviews(store, task_id):
+        if entry.state != "pending":
+            continue
+        _, source = _queue_source(store, task_id, entry.proposal_operation_id)
+        _review_target_current(store, task_id, entry.proposal_operation_id)
+        request = store.stage_evidence.request(entry.proposal_operation_id)
+        turn = request.context.turn
+        road = next((r for r in turn.roads if r.road_id == source.session.owner_id), None) if turn else None
+        key = ((source.session, turn.turn_id, proposal_digest(turn.intent), proposal_digest(road.candidate))
+               if fact_candidates(source.result) and turn and road else None)
+        if key is not None and key == last_key:
+            groups[-1].append(entry.proposal_operation_id)
+        else:
+            groups.append([entry.proposal_operation_id])
+        last_key = key
+    return tuple(tuple(group) for group in groups)
+
+
+def duplicate_fact(store, task_id, session, value):
+    for entry in list_reviews(store, task_id):
+        if entry.state not in {"pending", "blocked"}:
+            continue
+        original = store.stage_evidence.read_model_result(store.load_d4_operation(entry.proposal_operation_id))
+        if original.session == session and proposal_digest(original.result) == proposal_digest(value):
+            return entry
+    return None
+
+
+def branch_id(task_id, fork, target_session=None):
+    from agent_core.turn_modeling import stable_id
+    target = target_session or getattr(fork, "target_session", None)
+    suffix = "/" + target.scope + "/" + target.owner_id if target else ""
+    return stable_id(task_id, "stage/branch/" + fork.proposal_operation_id + "/" + (fork.review_operation_id or "continue") + suffix)
+
+
+def load_branch(store, task_id, session):
+    if store._schema_version < 37:
+        return None
+    identity = load_session(store, task_id, session)
+    row = store._connection.execute("SELECT branch_id,proposal_operation_id,review_operation_id "
+        "FROM stage_branches WHERE session_id=? ORDER BY rowid DESC LIMIT 1", (identity,)).fetchone()
+    if row is None:
+        return None
+    value = StageSessionBranch(*row)
+    source = store.stage_evidence.request(value.proposal_operation_id)
+    target = session if session != source.context.session else None
+    if value.branch_id != branch_id(task_id, value, target):
+        _fail("stage.branch_binding_changed", Category.UNKNOWN)
+    return value
+
+
+def branch_prefix(store, branch):
+    from agent_core.stage_planning import conversation_operation_ids
+    request = store.stage_evidence.request(branch.proposal_operation_id)
+    return (*conversation_operation_ids(request), branch.proposal_operation_id,
+            *((branch.review_operation_id,) if branch.review_operation_id else ()))
+
+
+def review_rejections(store, review_id):
+    return store.stage_evidence.review_rejections(review_id)
+
+
+def _validate_branches(store, mutation, change):
+    from agent_core.stage_planning import stage_runtime, review_members, conversation_operation_ids
+    if not change.branches:
+        return {}
+    discarded = {}
+    heads = set()
+    reviewed = {identity for binding in change.reviews
+        for identity in review_members(store.stage_evidence.request(binding.review_operation_id))}
+    for fork in change.branches:
+        if not isinstance(fork, StageBranchFork):
+            _fail("stage.branch_invalid", Category.INPUT)
+        operation, source = _queue_source(store, mutation.task_run_id, fork.proposal_operation_id, allow_applied=True)
+        if fork.target_session is not None:
+            if not isinstance(fork.target_session, PlanningSession) or fork.target_session.scope not in {"turn_planning", "road_execution"}:
+                _fail("stage.branch_target_invalid", Category.INPUT)
+            _uuid(fork.target_session.owner_id, "session_owner_id")
+        session = fork.target_session or source.session
+        if session in heads:
+            _fail("stage.multiple_branch_heads", Category.INPUT)
+        heads.add(session)
+        request = store.stage_evidence.request(fork.proposal_operation_id)
+        current = load_branch(store, mutation.task_run_id, session)
+        identity = branch_id(mutation.task_run_id, fork)
+        if store._connection.execute("SELECT 1 FROM stage_branches WHERE branch_id=?", (identity,)).fetchone():
+            _fail("stage.branch_already_registered", Category.CONFLICT)
+        queued = next((entry for entry in list_reviews(store, mutation.task_run_id)
+            if entry.proposal_operation_id == fork.proposal_operation_id), None)
+        if fork.target_session is not None:
+            # Seed one Road with its author's immutable planning prefix. The
+            # destination has its own future transcript and execution context.
+            road = next((road for turn in change.turns for road in turn.roads
+                if road.road_id == session.owner_id), None)
+            accepted_source = next((binding for binding in change.reviews
+                if binding.proposal_operation_id == fork.proposal_operation_id), None)
+            review = (store.stage_evidence.read_model_result(store.load_d4_operation(accepted_source.review_operation_id)).result
+                if accepted_source else None)
+            pending = fork.proposal_operation_id in change.planning_submissions
+            road_seed = (session.scope == "road_execution" and road is not None
+                and isinstance(source.result, tuple) and road.candidate in source.result
+                and (pending or isinstance(review, TurnPlanningReview) and review.decision == "accept"
+                    and source.result.index(road.candidate) in review.accepted_road_indices)
+                and not store._connection.execute("SELECT 1 FROM stage_roads WHERE road_id=?", (road.road_id,)).fetchone()
+                and any(turn.turn_id == source.session.owner_id and road in turn.roads for turn in change.turns))
+            turn_seed = (session.scope == "turn_planning" and isinstance(source.result, TurnIntent) and pending
+                and any(turn.turn_id == session.owner_id and turn.intent == source.result for turn in change.turns)
+                and load_turn(store, mutation.task_run_id, session.owner_id) is None)
+            if (source.session.scope != "turn_planning" or fork.review_operation_id is not None
+                    or current is not None or not (road_seed or turn_seed)):
+                _fail("stage.branch_inheritance_unbound", Category.POLICY)
+        elif fork.review_operation_id is None:
+            if (operation.application_ref is not None or fork.proposal_operation_id not in change.review_submissions
+                    or stage_runtime(request).get("branch_id") != (current.branch_id if current else None)):
+                _fail("stage.branch_author_changed", Category.CONFLICT)
+        else:
+            if (queued is None or fork.proposal_operation_id not in review_rejections(store, fork.review_operation_id)
+                    or not (queued.review_operation_id == fork.review_operation_id and queued.state == "settled"
+                        or any(binding.review_operation_id == fork.review_operation_id for binding in change.reviews))
+                    or current is None or fork.proposal_operation_id not in branch_prefix(store, current)):
+                _fail("stage.branch_correction_unbound", Category.UNKNOWN)
+            for candidate in store.list_d4_operations(mutation.task_run_id):
+                if (candidate.start.role != "inner_action" or candidate.application_ref is not None
+                        or candidate.completion is None or candidate.completion.result_kind != "completed"
+                        or candidate.start.operation_id in reviewed):
+                    continue
+                original = store.stage_evidence.request(candidate.start.operation_id)
+                if fork.proposal_operation_id not in conversation_operation_ids(original):
+                    continue
+                # Already executed actions must retain their actual outcomes;
+                # only a never-dispatched decision can be discarded here.
+                if any(child.start.category == "tool_dispatch" and candidate.start.operation_id in child.start.resource_ref.split("/")
+                        for child in store.list_d4_operations(mutation.task_run_id)):
+                    continue
+                store.stage_evidence.read_model_result(candidate)
+                discarded[candidate.start.operation_id] = fork.review_operation_id
+        author_branch = load_branch(store, mutation.task_run_id, source.session) if fork.target_session else current
+        inherited = set(branch_prefix(store, author_branch)) if author_branch else set()
+        for prefix_id in branch_prefix(store, fork):
+            prefix = store.load_d4_operation(prefix_id)
+            if prefix is None or prefix.start.task_run_id != mutation.task_run_id:
+                _fail("stage.branch_prefix_changed", Category.UNKNOWN)
+            if (store.stage_evidence.read_model_result(prefix).session != source.session
+                    and prefix_id not in inherited):
+                _fail("stage.branch_prefix_changed", Category.UNKNOWN)
+    return discarded
 
 
 def _shape(turn):
@@ -374,11 +697,15 @@ def _shape(turn):
             _fail("stage.achievement_support_required", Category.INPUT)
 
 
-def _reviewed(store, mutation, change):
+def _reviewed(store, mutation, change, discarded=()):
     config = require_run(store, mutation.task_run_id)
+    queue = {entry.proposal_operation_id: entry for entry in list_reviews(store, mutation.task_run_id)}
     accepted = []
     used = set()
     for binding in change.reviews:
+        queued = queue.get(binding.proposal_operation_id)
+        if queued is not None and queued.state != "pending":
+            _fail("stage.review_already_closed", Category.CONFLICT)
         if binding.proposal_operation_id == binding.review_operation_id:
             _fail("stage.review_binding_invalid", Category.INPUT)
         pair = []
@@ -392,7 +719,8 @@ def _reviewed(store, mutation, change):
                     or record.start.role != role or record.completion is None
                     or record.completion.result_kind != "completed" or record.application_ref is not None):
                 _fail("stage.model_operation_not_ready")
-            if record.start.base_checkpoint_sequence != mutation.base_checkpoint_sequence:
+            if (record.start.base_checkpoint_sequence > mutation.base_checkpoint_sequence
+                    or queued is None and record.start.base_checkpoint_sequence != mutation.base_checkpoint_sequence):
                 _fail("stage.model_context_stale")
             expected = config.inner_role if role == "inner_action" else config.outer_role
             if (record.start.role_config_ref != expected.role_config_ref
@@ -408,9 +736,26 @@ def _reviewed(store, mutation, change):
                 _fail("stage.model_evidence_changed", Category.UNKNOWN)
             pair.append((record, evidence))
         (proposal_record, proposal), (review_record, review) = pair
+        if queued is not None:
+            _review_target_current(store, mutation.task_run_id, binding.proposal_operation_id)
+            request = _queue_review_matches(store, mutation.task_run_id, proposal, review_record, binding.proposal_operation_id)
+            members = store.stage_evidence.review_sources(request)
+            for identity, _ in members[1:]:
+                if identity in used or identity not in queue or queue[identity].state != "pending":
+                    _fail("stage.review_members_changed", Category.UNKNOWN)
+                member, _ = _queue_source(store, mutation.task_run_id, identity)
+                if member.start.base_checkpoint_sequence > mutation.base_checkpoint_sequence:
+                    _fail("stage.model_context_stale")
+                _review_target_current(store, mutation.task_run_id, identity)
+                used.add(identity)
+            proposal = replace(proposal, result=request.proposal)
+            if review_record.start.base_checkpoint_sequence < proposal_record.start.base_checkpoint_sequence:
+                _fail("stage.model_context_stale")
         changing = isinstance(proposal.result, StageConclusionChange)
-        category = "fact_review" if isinstance(proposal.result, (StageFactProposal, StageConclusionChange)) else "review"
-        if (review_record.start.category != category or not isinstance(review.result, D8ChangeDecision if changing else TurnPlanningReview)
+        batching = isinstance(proposal.result, StageFactBatch)
+        category = "fact_review" if isinstance(proposal.result, (StageFactProposal, StageFactBatch, StageConclusionChange)) else "review"
+        if (review_record.start.category != category or not isinstance(review.result,
+                D8ChangeDecision if changing else StageFactBatchReview if batching else TurnPlanningReview)
                 or proposal.session != review.session
                 or review.proposal_operation_id != proposal_record.start.operation_id
                 or review.proposal_sha256 != proposal_digest(proposal.result)):
@@ -434,8 +779,9 @@ def _reviewed(store, mutation, change):
         value = proposal.result
         if isinstance(value, (StageFactSelection, StageHistoryRead)):
             _fail("stage.pure_reference_review_forbidden", Category.POLICY)
-        expected_scope = "road_execution" if isinstance(value, (RoadResolution, StageFactProposal)) else "turn_planning"
-        if isinstance(value, (TurnCompletion, StageConclusionChange)) or isinstance(value, StageFactProposal) and value.inferred:
+        claims = fact_candidates(value)
+        expected_scope = "road_execution" if isinstance(value, RoadResolution) or claims else "turn_planning"
+        if isinstance(value, (TurnCompletion, StageConclusionChange)) or claims and all(c.inferred for _, c in claims):
             expected_scope = proposal.session.scope
         if isinstance(value, StagePlanningDecision) and value.kind == "return_to_parent":
             expected_scope = proposal.session.scope
@@ -448,13 +794,19 @@ def _reviewed(store, mutation, change):
         else:
             refs = value.evidence_refs if changing else value.support_refs
             _text(value.description if isinstance(value, TurnIntent) else value.reason, "proposal_text")
-        if isinstance(value, StageFactProposal):
-            if not refs or len(value.content) > 256 or type(value.inferred) is not bool:
+        if batching and (not claims or len(decision.decisions) != len(claims)):
+            _fail("stage.fact_batch_binding_invalid", Category.INPUT)
+        for index, claim in claims:
+            _, claim_review = reviewed_fact(value, decision, index)
+            if claim_review.decision not in {"accept", "revise", "reject"}:
+                _fail("stage.fact_batch_binding_invalid", Category.INPUT)
+            _text(claim_review.reason, "review_reason")
+            if not claim.support_refs or len(claim.content) > 256 or type(claim.inferred) is not bool:
                 _fail("stage.fact_proposal_invalid", Category.INPUT)
-            _text(value.content, "fact_content")
-            sources = read_history(store, mutation.task_run_id, refs)
+            _text(claim.content, "fact_content")
+            sources = read_history(store, mutation.task_run_id, claim.support_refs)
             observations = [i for i in sources if i.record_type == "progress"]
-            if not value.inferred and (not observations or any(i.record_type == "reviewed_inference" for i in sources)):
+            if not claim.inferred and (not observations or any(i.record_type == "reviewed_inference" for i in sources)):
                 _fail("stage.formal_fact_requires_own_observation", Category.POLICY)
             owner_turn_id = next((t.turn_id for t in list_turns(store, mutation.task_run_id)
                 if any(r.road_id == proposal.session.owner_id for r in t.roads)), None)
@@ -475,10 +827,13 @@ def _reviewed(store, mutation, change):
             _sources(store, mutation.task_run_id, refs)
         if decision.decision == "accept":
             accepted.append((binding, proposal.session, value, decision))
+    known_queue = _queued_known_operations(store, mutation.task_run_id, tuple(queue.values()))
     pending = {r.start.operation_id for r in store.list_d4_operations(mutation.task_run_id)
                if (r.completion is None or r.completion.result_kind == "completed" and r.application_ref is None)
                and not (r.start.category == "tool_dispatch"
-                        and getattr(store, "live_tool_operation", lambda identity: False)(r.start.operation_id))} - used - set(change.applications)
+                        and getattr(store, "live_tool_operation", lambda identity: False)(r.start.operation_id))
+               and not getattr(store, "live_stage_review_operation", lambda identity: False)(r.start.operation_id)
+               } - used - set(change.applications) - known_queue - set(change.review_submissions) - set(discarded)
     if pending:
         _fail("stage.pending_operations", Category.UNKNOWN)
     return accepted
@@ -510,13 +865,15 @@ def _validate(store, mutation):
     if len(changes) != 1:
         _fail("stage.change_invalid", Category.INPUT)
     change = changes[0]
-    if not all(isinstance(value, tuple) for value in (change.turns, change.sessions, change.reviews, change.facts, change.applications, change.revisions)):
+    if not all(isinstance(value, tuple) for value in (change.turns, change.sessions, change.reviews,
+            change.facts, change.applications, change.revisions, change.review_submissions, change.blocked_reviews, change.branches,
+            change.planning_submissions, change.discarded_decisions)):
         _fail("stage.change_invalid", Category.INPUT)
     for session in change.sessions:
         if not isinstance(session, PlanningSession) or session.scope not in {"turn_planning", "road_execution"}:
             _fail("stage.session_scope_invalid", Category.INPUT)
         _uuid(session.owner_id, "session_owner_id")
-    for binding in change.reviews:
+    for binding in (*change.reviews, *change.discarded_decisions):
         if not isinstance(binding, StageReviewBinding):
             _fail("stage.review_binding_invalid", Category.INPUT)
         _uuid(binding.proposal_operation_id, "proposal_operation_id")
@@ -531,7 +888,9 @@ def _validate(store, mutation):
         if (mutation.operation != "start_task_run" or store.load_task_run(mutation.task_run_id) is not None
                 or len(mutation.state_changes) != 2 or not any(isinstance(c, UpsertTaskRun) for c in mutation.state_changes)
                 or mutation.d1_config or mutation.d2_config or mutation.d3 or mutation.d7
-                or change.turns or change.reviews or change.facts or change.applications or change.revisions or not isinstance(config, StageRunConfig)
+                or change.turns or change.reviews or change.facts or change.applications or change.revisions
+                or change.review_submissions or change.blocked_reviews or change.branches or change.planning_submissions
+                or change.discarded_decisions or not isinstance(config, StageRunConfig)
                 or any(c.status is not TaskRunStatus.RUNNING for c in mutation.state_changes if isinstance(c, UpsertTaskRun))
                 or config.outer_role.role != "outer_planning" or config.inner_role.role != "inner_action"
                 or not isinstance(config.budget, D8HandoffBudgetPolicy)):
@@ -552,9 +911,33 @@ def _validate(store, mutation):
     if (task.status is not TaskRunStatus.RUNNING or store._now() >= task.deadline_at
             or task.request != mutation.request or task.effective_model_backend != mutation.effective_model_backend):
         _fail("stage.task_not_active", Category.POLICY)
-    accepted = _reviewed(store, mutation, change)
+    _validate_queue(store, mutation, change)
+    from agent_core import stage_plans
+    stage_plans.submissions(store, mutation.task_run_id, change)
+    discarded = _validate_branches(store, mutation, change)
+    from agent_core.stage_planning import conversation_operation_ids
+    for binding in change.discarded_decisions:
+        operation = store.load_d4_operation(binding.proposal_operation_id)
+        if (operation is None or operation.start.task_run_id != mutation.task_run_id or operation.start.role != "inner_action"
+                or operation.application_ref is not None or operation.completion is None
+                or operation.completion.result_kind != "completed"
+                or not set(store.stage_evidence.review_interruptions(binding.review_operation_id)).intersection(
+                    conversation_operation_ids(store.stage_evidence.request(binding.proposal_operation_id)))
+                or any(child.start.category == "tool_dispatch" and binding.proposal_operation_id in child.start.resource_ref.split("/")
+                    for child in store.list_d4_operations(mutation.task_run_id))):
+            _fail("stage.discarded_decision_unbound", Category.POLICY)
+        store.stage_evidence.read_model_result(operation)
+        discarded[binding.proposal_operation_id] = binding.review_operation_id
+    accepted = _reviewed(store, mutation, change, discarded)
     if (change.turns or change.reviews or change.facts or change.revisions) and live_tool_requests(store, mutation.task_run_id):
-        _fail("stage.tools_still_running", Category.POLICY)
+        if (change.turns or change.revisions or not change.reviews
+                or any(not (fact_candidates(store.stage_evidence.request(binding.review_operation_id).proposal)
+                        or isinstance(store.stage_evidence.request(binding.review_operation_id).proposal, (TurnIntent, tuple)))
+                    or not store._connection.execute("SELECT 1 FROM stage_review_queue WHERE proposal_operation_id=?",
+                        (binding.proposal_operation_id,)).fetchone() for binding in change.reviews)):
+            _fail("stage.tools_still_running", Category.POLICY)
+    if any(fork.review_operation_id for fork in change.branches) and live_tool_requests(store, mutation.task_run_id):
+        _fail("stage.branch_tools_unsettled", Category.POLICY)
     old = {t.turn_id: t for t in list_turns(store, mutation.task_run_id)}
     current = active_turn(tuple(old.values()))
     projected = dict(old)
@@ -570,10 +953,15 @@ def _validate(store, mutation):
             _fail("stage.immutable_turn_changed")
         projected[turn.turn_id] = turn
     consumed = set()
+    plan_members = {row[1] for row in stage_plans.bindings(store, mutation.task_run_id)}
+    plan_members.update(binding.proposal_operation_id for binding, _, value, _ in accepted
+        if isinstance(value, (TurnIntent, tuple)) and stage_plans.admitted(store, binding.proposal_operation_id))
+    consumed.update(binding.review_operation_id for binding, _, value, _ in accepted
+        if binding.proposal_operation_id in plan_members and isinstance(value, (TurnIntent, tuple)))
     if sum(t.turn_id not in old for t in change.turns) > 1:
         _fail("stage.multiple_successors", Category.POLICY)
     for binding, scope, value, _ in accepted:
-        if isinstance(value, (TurnIntent, tuple, PlanningExhausted, StagePlanningDecision)) and current is not None:
+        if isinstance(value, (TurnIntent, tuple, PlanningExhausted, StagePlanningDecision)) and current is not None and binding.proposal_operation_id not in plan_members:
             if scope.owner_id != current.turn_id and not (isinstance(value, StagePlanningDecision)
                     and value.kind == "return_to_parent" and any(r.road_id == scope.owner_id for r in current.roads)):
                 _fail("stage.planning_frontier_changed", Category.POLICY)
@@ -608,11 +996,17 @@ def _validate(store, mutation):
         consumed.add(binding.review_operation_id)
     if any(not isinstance(a, StageFactApplication) for a in change.facts):
         _fail("stage.fact_application_invalid", Category.INPUT)
-    if len({a.review_operation_id for a in change.facts}) != len(change.facts):
+    if len({(a.review_operation_id, a.candidate_index) for a in change.facts}) != len(change.facts):
         _fail("stage.duplicate_fact_review", Category.INPUT)
+    accepted_claims = [(b, scope, claim, index) for b, scope, value, decision in accepted
+        for index, claim in fact_candidates(value) if reviewed_fact(value, decision, index)[1].decision == "accept"]
+    if not {(b.review_operation_id, index) for b, _, claim, index in accepted_claims if not claim.inferred}.issubset({
+            (a.review_operation_id, a.candidate_index) for a in change.facts}):
+        _fail("stage.accepted_fact_not_applied", Category.INPUT)
     consumed.update(b.review_operation_id for b, scope, value, _ in accepted
         if isinstance(value, PlanningExhausted) and scope.owner_id not in projected)
     selections = {}
+    route_changes = set()
     if change.applications or change.revisions:
         from agent_core.stage_knowledge import StageKnowledge
         knowledge = StageKnowledge(store.stage_evidence, mutation.task_run_id, store=store)
@@ -637,6 +1031,37 @@ def _validate(store, mutation):
                 request = store.stage_evidence.request(identity)
                 if source.session.scope != "road_execution" or not request.context.pending_operation_ids:
                     _fail("stage.wait_without_tools", Category.POLICY)
+            elif isinstance(source.result, StagePlanningDecision) and source.result.kind == "wait_for_review":
+                from agent_core.stage_planning import stage_runtime
+                request = store.stage_evidence.request(identity)
+                pending = [entry["proposal_operation_id"] for entry in stage_runtime(request).get("pending_reviews", ())
+                    if entry["state"] == "pending"]
+                owned = {entry.proposal_operation_id for entry in list_reviews(store, mutation.task_run_id)}
+                if not pending or not set(pending).issubset(owned):
+                    _fail("stage.wait_without_review", Category.POLICY)
+            elif isinstance(source.result, tuple) or isinstance(source.result, StagePlanningDecision) and source.result.kind == "select_road":
+                from agent_core.stage_planning import stage_runtime
+                request = store.stage_evidence.request(identity)
+                advice = stage_runtime(request).get("route_advice")
+                if source.session.scope != "turn_planning" or not advice or advice != stage_plans.route_advice(store, mutation.task_run_id):
+                    _fail("stage.route_decision_unbound", Category.POLICY)
+                _sources(store, mutation.task_run_id, tuple(ref for candidate in source.result for ref in candidate.support_refs)
+                    if isinstance(source.result, tuple) else source.result.support_refs)
+                before = [road for road in owner.roads if road.status in {IntentStatus.PENDING, IntentStatus.RUNNING, IntentStatus.SUSPENDED}]
+                after = [road for road in projected[owner.turn_id].roads if road.road_id in {road.road_id for road in before}]
+                if isinstance(source.result, tuple) and (len(source.result) != len(before)
+                        or set(source.result) != {road.candidate for road in before}
+                        or source.result != tuple(road.candidate for road in after)):
+                    _fail("stage.route_order_changed_candidates", Category.POLICY)
+                chosen = after[0] if isinstance(source.result, tuple) else next((road for road in projected[owner.turn_id].roads
+                    if road.road_id == source.result.road_id and road.road_id in {road.road_id for road in before}), None)
+                if chosen is None or chosen.status is not IntentStatus.RUNNING:
+                    _fail("stage.route_decision_not_applied", Category.POLICY)
+                route_changes.add(owner.turn_id)
+            elif fact_candidates(source.result):
+                duplicate = duplicate_fact(store, mutation.task_run_id, source.session, source.result)
+                if duplicate is None or duplicate.proposal_operation_id == identity:
+                    _fail("stage.reference_operation_invalid", Category.INPUT)
             else:
                 _fail("stage.reference_operation_invalid", Category.INPUT)
         if len(change.revisions) > 1:
@@ -657,8 +1082,10 @@ def _validate(store, mutation):
                 consumed.add(revision.review_request_id)
     for application in change.facts:
         _uuid(application.fact_id, "fact_id")
-        matches = [(b, scope, value) for b, scope, value, _ in accepted
-            if b.review_operation_id == application.review_operation_id and isinstance(value, StageFactProposal)]
+        if application.candidate_index is not None and type(application.candidate_index) is not int:
+            _fail("stage.fact_batch_binding_invalid", Category.INPUT)
+        matches = [(b, scope, value) for b, scope, value, index in accepted_claims
+            if b.review_operation_id == application.review_operation_id and index == application.candidate_index]
         if len(matches) != 1 or matches[0][2].inferred:
             _fail("stage.fact_not_reviewed")
         _, scope, value = matches[0]
@@ -674,10 +1101,14 @@ def _validate(store, mutation):
                 fact_id=application.fact_id, review_id=application.review_operation_id,
                 reason="formal_fact_application_invalid")
         consumed.add(application.review_operation_id)
-    consumed.update(b.review_operation_id for b, _, value, _ in accepted
-                    if isinstance(value, StageFactProposal) and value.inferred)
+    consumed.update(b.review_operation_id for b, _, value, _ in accepted_claims if value.inferred)
+    feedback = {turn.turn_id: turn for binding in change.reviews
+        for turn in stage_plans.feedback_turns(store, mutation.task_run_id, binding.review_operation_id)}
     for turn in change.turns:
-        consumed.update(_validate_turn(store, mutation.task_run_id, turn, old.get(turn.turn_id), projected, accepted, selections))
+        if turn == feedback.get(turn.turn_id):
+            continue
+        consumed.update(_validate_turn(store, mutation.task_run_id, turn, old.get(turn.turn_id), projected,
+            accepted, selections, change.planning_submissions, turn.turn_id in route_changes))
     if consumed != {b.review_operation_id for b, _, _, _ in accepted}:
         _fail("stage.accepted_review_not_applied")
     if sum(r.status is IntentStatus.RUNNING for t in projected.values() for r in t.roads) > 1:
@@ -796,8 +1227,11 @@ def validate_goal_mutation(store, mutation):
         goal_candidate_proof(store, candidate)
 
 
-def _validate_turn(store, task_id, turn, prior, projected, accepted, selections):
+def _validate_turn(store, task_id, turn, prior, projected, accepted, selections, planning_submissions=(), route_change=False):
     consumed = set()
+    from agent_core import stage_plans
+    provisional = [(identity, store.stage_evidence.read_model_result(store.load_d4_operation(identity)))
+        for identity in planning_submissions]
 
     def match(kind, owner):
         return [(b, value, decision) for b, scope, value, decision in accepted
@@ -805,7 +1239,8 @@ def _validate_turn(store, task_id, turn, prior, projected, accepted, selections)
                     and scope.scope == "road_execution" and scope.owner_id in {r.road_id for r in turn.roads})]
     if prior is None:
         proposals = match(TurnIntent, turn.parent_turn_id or turn.turn_id)
-        if (not any(value == turn.intent for _, value, _ in proposals) or turn.roads or turn.achievement
+        admitted = any(isinstance(source.result, TurnIntent) and source.result == turn.intent for _, source in provisional)
+        if (not (admitted or any(value == turn.intent for _, value, _ in proposals)) or turn.roads or turn.achievement
                 or turn.planning_state is not TurnPlanningState.ACTIVE):
             _fail("stage.registration_not_reviewed")
         consumed.update(b.review_operation_id for b, value, _ in proposals if value == turn.intent)
@@ -833,10 +1268,13 @@ def _validate_turn(store, task_id, turn, prior, projected, accepted, selections)
     pending_after = tuple(r.road_id for r in turn.roads if r.status is IntentStatus.PENDING)
     candidates = tuple(r.candidate for r in turn.roads if r.status is IntentStatus.PENDING)
     selections = [b for b, value, review in match(tuple, turn.turn_id)
-                  if tuple(value[i] for i in review.accepted_road_indices) == candidates]
+                  if tuple(value[i] for i in (sorted(review.accepted_road_indices)
+                      if stage_plans.admitted(store, b.proposal_operation_id) else review.accepted_road_indices)) == candidates]
+    admitted_roads = any(source.session.owner_id == turn.turn_id and isinstance(source.result, tuple)
+        and source.result == candidates for _, source in provisional)
     consumed.update(b.review_operation_id for b in selections)
     if (set(after) - set(before) or set(pending_before) == set(pending_after)
-            and pending_before != pending_after) and not selections:
+            and pending_before != pending_after) and not selections and not admitted_roads and not route_change:
         _fail("stage.roads_not_reviewed")
     closed = {IntentStatus.SUCCEEDED, IntentStatus.FAILED, IntentStatus.INCONCLUSIVE,
               IntentStatus.ABANDONED, IntentStatus.SKIPPED}
@@ -854,7 +1292,7 @@ def _validate_turn(store, task_id, turn, prior, projected, accepted, selections)
             continue
         if road.candidate != previous.candidate or previous.status in closed and road.status != previous.status:
             _fail("stage.closed_or_changed_road")
-        if previous.status is not IntentStatus.PENDING and prior.roads.index(previous) != index:
+        if previous.status is not IntentStatus.PENDING and prior.roads.index(previous) != index and not (route_change and previous.status not in closed):
             _fail("stage.running_road_reordered")
         if road.status == previous.status:
             continue
@@ -878,12 +1316,16 @@ def _validate_turn(store, task_id, turn, prior, projected, accepted, selections)
             if turn.achievement is not None and previous.status is IntentStatus.PENDING and not (
                     any(value.kind == "select_road" and value.road_id == road.road_id
                         for _, value, _ in match(StagePlanningDecision, turn.turn_id))
+                    or route_change
                     or _just_registered_roads(store, task_id, turn.turn_id)):
                 _fail("stage.achieved_road_requires_selection", Category.POLICY)
             from agent_core.stage_knowledge import StageKnowledge
             knowledge = StageKnowledge(store.stage_evidence, task_id, store=store)
             _sources(store, task_id, knowledge.effective_premises(turn, road))
     if turn.achievement is not None and (prior is None or prior.achievement is None):
+        if not stage_plans.ready(store, task_id, turn) or any(not stage_plans.ready(store, task_id, turn, road)
+                for road in turn.roads if road.status is IntentStatus.RUNNING):
+            _fail("stage.completion_planning_not_accepted", Category.POLICY)
         if not any(b.review_operation_id == turn.achievement.review_operation_id
                    and value == turn.achievement.completion for b, value, _ in match(TurnCompletion, turn.turn_id)):
             _fail("stage.achievement_not_reviewed")
@@ -922,7 +1364,28 @@ def _validate_turn(store, task_id, turn, prior, projected, accepted, selections)
 
 
 def _just_registered_roads(store, task_id, turn_id):
-    # A two-commit register/start boundary is recoverable from the original review.
+    # The latest admitted planning proposal authorizes its first selection;
+    # finishing that selection returns an achieved Turn to its planner.
+    from agent_core.stage_plans import admitted
+    for operation in reversed(store.list_d4_operations(task_id)):
+        if (operation.start.role != "inner_action" or operation.start.category != "planning"
+                or operation.completion is None or operation.completion.result_kind != "completed"
+                or operation.application_ref and operation.application_ref.startswith("stage-discarded/")):
+            continue
+        source = store.stage_evidence.read_model_result(operation)
+        if source.session != PlanningSession("turn_planning", turn_id):
+            continue
+        if isinstance(source.result, tuple) and admitted(store, operation.start.operation_id):
+            queued = next(entry for entry in list_reviews(store, task_id)
+                if entry.proposal_operation_id == operation.start.operation_id)
+            if (queued.state == "superseded" or queued.state == "settled" and store.stage_evidence.read_model_result(
+                    store.load_d4_operation(queued.review_operation_id)).result.decision != "accept"):
+                return False
+            turn = load_turn(store, task_id, turn_id)
+            return all(any(road.candidate == candidate and road.status is IntentStatus.PENDING for road in turn.roads)
+                for candidate in source.result)
+        break
+    # Direct synchronous registration retains its exact commit binding.
     checkpoint = store.load_control_state_rows(task_id).latest_checkpoint.sequence
     rows = store._connection.execute("SELECT r.operation_id FROM d4_operations r JOIN control_mutations c "
         "ON c.task_run_id=r.task_run_id AND c.mutation_id=r.application_ref "
@@ -936,10 +1399,21 @@ def _just_registered_roads(store, task_id, turn_id):
     return False
 
 
+def _review_value(store, review_id, reviewed):
+    if store._connection.execute("SELECT 1 FROM stage_review_queue WHERE proposal_operation_id=?",
+            (reviewed.proposal_operation_id,)).fetchone():
+        return store.stage_evidence.request(review_id).proposal
+    return store.stage_evidence.read_model_result(store.load_d4_operation(reviewed.proposal_operation_id)).result
+
+
 def save(store, mutation, change):
     if change is None:
         return
     task_id = mutation.task_run_id
+    from agent_core import stage_plans
+    plan_rows = stage_plans.submissions(store, task_id, change) if change.config is None else ()
+    discarded = _validate_branches(store, mutation, change)
+    discarded.update((binding.proposal_operation_id, binding.review_operation_id) for binding in change.discarded_decisions)
     if change.config is not None:
         store._connection.execute("INSERT INTO stage_runs VALUES (?,?)",
                                   (task_id, canonical_json(asdict(change.config))))
@@ -968,23 +1442,59 @@ def save(store, mutation, change):
             _fail("stage.session_owner_invalid", Category.POLICY)
         store._connection.execute("INSERT OR IGNORE INTO stage_sessions VALUES (?,?,?,?)",
             (task_id, session.scope, session.owner_id, session_id(task_id, session)))
+    # Resolve old source evidence before publishing this review's application;
+    # mixed batches must not expose an inference before its mutation row exists.
+    fact_sources = {}
+    for application in change.facts:
+        reviewed = store.stage_evidence.read_model_result(store.load_d4_operation(application.review_operation_id))
+        value = _review_value(store, application.review_operation_id, reviewed)
+        value, _ = reviewed_fact(value, reviewed.result, application.candidate_index)
+        fact_sources[application.fact_id] = next(i for i in read_history(store, task_id, value.support_refs)
+            if i.record_type == "progress")
     for binding in change.reviews:
         if binding.review_operation_id in {r.review_request_id for r in change.revisions}:
             continue
-        for op_id in (binding.proposal_operation_id, binding.review_operation_id):
+        request = store.stage_evidence.request(binding.review_operation_id) if store._connection.execute(
+            "SELECT 1 FROM stage_review_queue WHERE proposal_operation_id=?", (binding.proposal_operation_id,)).fetchone() else None
+        from agent_core.stage_planning import review_members
+        members = review_members(request) if request is not None else (binding.proposal_operation_id,)
+        for op_id in (*members, binding.review_operation_id):
             store._mark_d4_operation_applied(op_id, mutation.mutation_id)
+    for identity in change.review_submissions:
+        store._connection.execute("INSERT OR IGNORE INTO stage_review_queue VALUES (?,'pending',NULL)", (identity,))
+    stage_plans.save(store, task_id, plan_rows)
+    for binding in change.blocked_reviews:
+        store._connection.execute("UPDATE stage_review_queue SET state='blocked',review_operation_id=? "
+            "WHERE proposal_operation_id=?", (binding.review_operation_id, binding.proposal_operation_id))
+    for binding in change.reviews:
+        if not store._connection.execute("SELECT 1 FROM stage_review_queue WHERE proposal_operation_id=?",
+                (binding.proposal_operation_id,)).fetchone():
+            continue
+        for identity in review_members(store.stage_evidence.request(binding.review_operation_id)):
+            store._connection.execute("UPDATE stage_review_queue SET state='settled',review_operation_id=? "
+                "WHERE proposal_operation_id=?", (binding.review_operation_id, identity))
+    for identity, review_id in discarded.items():
+        store._mark_d4_operation_applied(identity, "stage-discarded/" + review_id)
+        store._connection.execute("UPDATE stage_review_queue SET state='superseded',review_operation_id=? "
+            "WHERE proposal_operation_id=?", (review_id, identity))
+    for fork in change.branches:
+        source = store.stage_evidence.request(fork.proposal_operation_id)
+        store._connection.execute("INSERT INTO stage_branches VALUES (?,?,?,?)", (
+            branch_id(task_id, fork), session_id(task_id, fork.target_session or source.context.session),
+            fork.proposal_operation_id, fork.review_operation_id))
     for ordinal, application in enumerate(change.facts):
         record = store.load_d4_operation(application.review_operation_id)
         review_request = store.stage_evidence.read_model_result(record)
-        source = store.load_d4_operation(review_request.proposal_operation_id)
-        proposed = store.stage_evidence.read_model_result(source)
-        value = proposed.result
-        item = next(i for i in read_history(store, task_id, value.support_refs) if i.record_type == "progress")
+        proposed = _review_value(store, application.review_operation_id, review_request)
+        value, _ = reviewed_fact(proposed, review_request.result, application.candidate_index)
+        item = fact_sources[application.fact_id]
         store._connection.execute("INSERT INTO facts VALUES (?,?,?,?,?,?,?,?)", (
             application.fact_id, item.turn_id, value.content, item.record_id, FactStatus.VERIFIED.value,
-            store._next_event_sequence(task_id), ordinal, "stage:" + application.review_operation_id))
+            store._next_event_sequence(task_id), ordinal, fact_verification_ref(application.review_operation_id, application.candidate_index)))
     for identity in change.applications:
-        store._mark_d4_operation_applied(identity, mutation.mutation_id)
+        source = store.stage_evidence.read_model_result(store.load_d4_operation(identity))
+        duplicate = duplicate_fact(store, task_id, source.session, source.result) if fact_candidates(source.result) else None
+        store._mark_d4_operation_applied(identity, "stage-reused/" + duplicate.proposal_operation_id if duplicate else mutation.mutation_id)
     if change.revisions:
         from types import SimpleNamespace
         from agent_core.handoff_storage import save_handoff_mutation

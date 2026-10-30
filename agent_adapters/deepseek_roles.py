@@ -303,7 +303,9 @@ def _stage_input(request):
     context = asdict(request)
     # This immutable profile description is supplied once in trusted system
     # text, rather than duplicated in the current user snapshot.
-    context.pop("execution_context")
+    environment = context.pop("execution_context")
+    if environment is not None and "stage_runtime" in environment:
+        context["review_status"] = {"pending_reviews": environment["stage_runtime"].get("pending_reviews", [])}
     history = []
     for message in context.pop("messages"):
         content = message["content"]
@@ -356,7 +358,8 @@ def _build_payload(envelope, role, *, context_loader=None):
             "only original request observations can prove target behavior. "
             "Submit exactly one submit_stage_result; "
             "it proposes a result and never executes a tool. No private reasoning is retained or requested for replay. "
-            "Trusted execution environment=" + json.dumps(request.execution_context, ensure_ascii=False))
+            "Trusted execution environment=" + json.dumps(None if request.execution_context is None else {
+                key: value for key, value in request.execution_context.items() if key != "stage_runtime"}, ensure_ascii=False))
         history = [{"role": "user", "content": json.dumps({"history_start": index, "history": [item]},
             ensure_ascii=False, allow_nan=False)} for index, item in enumerate(projected["history"])]
         return {"model": role.model, "messages": [
@@ -1000,8 +1003,11 @@ class D8DeepSeekModel:
         sent = {"task_run_id": getattr(request, "task_run_id", None), "model_request_id": identity,
                 "stage": envelope.output_contract["stage"], "role_config_ref": self.role_config.role_config_ref,
                 "envelope_sha256": digest(asdict(envelope)), "parameters": parameters,
-                "timeout_seconds": min(float(timeout_seconds), self.settings.timeout_seconds),
-                "timeout_policy": timeout_policy(self.settings),
+                "timeout_seconds": (None if getattr(token, "task_deadline_only", False)
+                    else min(float(timeout_seconds), self.settings.timeout_seconds)),
+                "timeout_policy": ({**timeout_policy(self.settings), "total_seconds": None,
+                    "total_scope": "task_deadline", "initial_deadline_at": token.deadline}
+                    if getattr(token, "task_deadline_only", False) else timeout_policy(self.settings)),
                 "request_utf8_bytes": len(payload_bytes(payload))}
         evidence = self._diagnostic_evidence
         if evidence is not None:

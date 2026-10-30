@@ -203,7 +203,7 @@ def test_road_success_does_not_imply_stage_success(case):
     assert result.turn.roads[0].status is IntentStatus.SUCCEEDED
 
 
-def test_outer_rejection_does_not_register_and_feedback_stays_in_root_session(case):
+def test_outer_rejection_retires_provisional_identity_and_feedback_stays_in_root_session(case):
     seen = []
     def review(request, raw):
         if not seen:
@@ -216,8 +216,10 @@ def test_outer_rejection_does_not_register_and_feedback_stays_in_root_session(ca
     assert len(root_requests) == 2
     assert root_requests[0].context.session == root_requests[1].context.session
     assert "state a clearer criterion" in json.dumps(root_requests[1].messages)
-    assert len(case.app.store.list_stage_turns(case.app.task_id)) == 1
-    assert len(case.tools.calls) == 1
+    previous, current = case.app.store.list_stage_turns(case.app.task_id)
+    assert previous.planning_state is TurnPlanningState.SUPERSEDED
+    assert current.turn_id == result.turn.turn_id != previous.turn_id
+    assert 1 <= len(case.tools.calls) <= 2
 
 
 def test_known_review_after_process_loss_is_applied_without_recalling_models(case, monkeypatch):
@@ -393,7 +395,7 @@ def test_optional_tool_parameters_reach_execution_and_stage_completion(case, inv
             asyncio.run(case.app.run(case.token))
         assert error.value.category == "input" and not case.tools.calls
         actions = [r for r in case.models.inner.calls if r.stage == "stage_action"]
-        assert len(actions) == 2 and actions[1].correction_of_model_request_id == actions[0].model_request_id
+        assert len(actions) == 3 and actions[1].correction_of_model_request_id == actions[0].model_request_id
         assert all(op.completion is not None for op in case.app.store.list_d4_operations(case.app.task_id))
         return
     result = asyncio.run(case.app.run(case.token))
@@ -420,9 +422,9 @@ def test_wrapped_stage_output_remains_invalid_and_correction_is_bounded(case, re
     else:
         assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
     intents = [r for r in case.models.inner.calls if r.stage == "stage_intent"]
-    assert len(intents) == 2 and intents[1].correction_of_model_request_id == intents[0].model_request_id
+    assert len(intents) == (3 if repeat else 2) and intents[1].correction_of_model_request_id == intents[0].model_request_id
     invalid = [entry for event, entry in seen if event == "stage.output_rejected"]
-    assert len(invalid) == (2 if repeat else 1)
+    assert len(invalid) == (3 if repeat else 1)
     assert all(i["code"] == "stage.output_envelope_invalid" and i["category"] == "input"
         and i["phase"] == "stage_intent" for i in invalid)
 
@@ -499,7 +501,7 @@ def test_correction_cannot_rebind_a_different_stage_scope(case):
 
 @pytest.mark.parametrize("stage", ["stage_action", "stage_review"])
 @pytest.mark.parametrize("repeat", [False, True])
-def test_complete_multi_call_stream_shares_one_correction_without_dispatch(case, monkeypatch, stage, repeat):
+def test_complete_multi_call_stream_shares_two_corrections_without_dispatch(case, monkeypatch, stage, repeat):
     import io
     from agent_adapters.model_stream import read_chat_stream
     from agent_adapters.web.task_result import _stage_task_result
@@ -515,7 +517,7 @@ def test_complete_multi_call_stream_shares_one_correction_without_dispatch(case,
             return response
         if not roots:
             roots.append(request.model_request_id)
-        if request.model_request_id != roots[0] and request.correction_of_model_request_id != roots[0]:
+        if request.model_request_id != roots[0] and request.correction_of_model_request_id is None:
             return response
         calls = list(response.tool_calls)
         if repeat or request.correction_of_model_request_id is None:
@@ -533,8 +535,8 @@ def test_complete_multi_call_stream_shares_one_correction_without_dispatch(case,
     else:
         assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
         assert len(case.tools.calls) == 1
-    corrected = [e for e in model.envelopes if e.request.correction_of_model_request_id == roots[0]]
-    assert len(corrected) == 1
+    corrected = [e for e in model.envelopes if e.request.stage == stage and e.request.correction_of_model_request_id]
+    assert len(corrected) == (2 if repeat else 1)
     assert corrected[0].correction["reason"] == "output_format_invalid"
     assert corrected[0].correction["issues"] == [{"code": "multiple_tool_calls", "path": "$/tool_calls",
         "expected": "exactly_one_output_tool", "actual": "multiple"}]
@@ -568,6 +570,144 @@ def test_native_envelope_never_bypasses_local_validation(review_request, change)
     else: calls[0]["function"]["arguments"] = '{"script":"untrusted"}'
     with pytest.raises(ValueError, match="stage.output_invalid"):
         parse(request, response)
+
+
+@pytest.mark.parametrize("suffix", ["}", " \t}\r\n"])
+def test_native_single_trailing_brace_preserves_values_and_requires_policy(review_request, suffix):
+    from agent_core.output_contracts import NATIVE_TRAILING_BRACE_POLICY
+    request = replace(review_request, stage="stage_intent")
+    value = {"kind": "turn_intent", "description": '正文🙂 literal } and "quoted {"',
+        "completion_criterion": "criterion", "support_refs": []}
+    response = native_response(value)
+    arguments = response.tool_calls[0]["function"]["arguments"] + suffix
+    response.tool_calls[0]["function"]["arguments"] = arguments
+    diagnostics = {}
+    assert parse(request, response, diagnostics=diagnostics).description == value["description"]
+    assert response.tool_calls[0]["function"]["arguments"] == arguments
+    assert diagnostics["normalization"] == {"policy": NATIVE_TRAILING_BRACE_POLICY,
+        "offset": arguments.rfind("}"),
+        "removed_characters": 1}
+    with pytest.raises(ValueError):
+        parse(request, response, normalization_policy=None)
+    with pytest.raises(ValueError):
+        parse(request, D8ModelResponse(json.dumps(value) + suffix))
+
+
+@pytest.mark.parametrize("change", ["two_braces", "second_json", "text", "markup", "unicode_whitespace", "missing_brace",
+    "duplicate_key", "nonfinite", "overflow", "length", "stop", "oversized", "deep", "wrong_shape"])
+def test_native_trailing_brace_never_repairs_other_invalid_outputs(review_request, change):
+    request = replace(review_request, stage="stage_intent")
+    value = {"kind": "turn_intent", "description": "stage", "completion_criterion": "criterion", "support_refs": []}
+    response = native_response(value)
+    arguments = response.tool_calls[0]["function"]["arguments"]
+    if change in {"two_braces", "second_json", "text", "markup", "unicode_whitespace"}:
+        arguments += {"two_braces": "}}", "second_json": "{}", "text": "} execute",
+            "markup": "}</||DSML|| parameter>", "unicode_whitespace": "}\u00a0"}[change]
+    elif change == "missing_brace": arguments = arguments[:-1]
+    elif change == "duplicate_key": arguments = '{"result":' + json.dumps(value) + ',"result":{}}}'
+    elif change in {"nonfinite", "overflow"}:
+        arguments = arguments[:-1] + ',"extra":' + ("NaN" if change == "nonfinite" else "1e400") + '}}'
+    elif change in {"length", "stop"}:
+        response = replace(response, finish_reason=change)
+        arguments += "}"
+    elif change == "oversized": arguments = json.dumps({"result": {**value, "description": "x" * 65537}}) + "}"
+    elif change == "deep": arguments = '{"result":' + '[' * 33 + '0' + ']' * 33 + '}}'
+    else: arguments = '{"result":{"kind":"not_allowed"}}}'
+    response.tool_calls[0]["function"]["arguments"] = arguments
+    diagnostics = {}
+    with pytest.raises(ValueError):
+        parse(request, response, diagnostics=diagnostics)
+    assert not diagnostics
+
+
+@pytest.mark.parametrize("stage", ["stage_action", "stage_review"])
+def test_native_trailing_brace_audited_without_correction_and_reloads(case, monkeypatch, stage):
+    from agent_adapters.stage_evidence import StageEvidence
+    from agent_adapters import stage_evidence
+    model = case.models.inner if stage == "stage_action" else case.models.outer
+    model.native = True
+    original, events = model.invoke, []
+    def invoke(envelope, timeout, token):
+        response = original(envelope, timeout, token)
+        if envelope.request.stage == stage:
+            response.tool_calls[0]["function"]["arguments"] += "}"
+        return response
+    logger = SimpleNamespace(info=lambda event, **fields: events.append((event, fields)),
+        warning=lambda *args, **fields: None)
+    monkeypatch.setattr(model, "invoke", invoke)
+    monkeypatch.setattr(stage_evidence, "get_logger", lambda _: logger)
+    assert asyncio.run(case.app.run(case.token)).turn.achievement
+    assert len(case.tools.calls) == 1
+    assert not any(r.correction_of_model_request_id for r in case.models.inner.calls + case.models.outer.calls)
+    reader = StageEvidence(case.path / "stage-evidence", case.app.store, create=False)
+    for request in (r for r in model.calls if r.stage == stage):
+        result = case.app.evidence.read("result", request.model_request_id)
+        assert result["outcome"] == "valid" and result["tool_calls"][0]["function"]["arguments"].endswith("}}")
+        assert result["normalization"]["removed_characters"] == 1
+        assert reader.read_model_result(case.app.store.load_d4_operation(request.model_request_id)).result
+        record = next(fields for event, fields in events
+            if event == "stage.output_normalized" and fields["operation"] == request.model_request_id)
+        assert record["offset"] == result["normalization"]["offset"]
+        assert record["code"] == "json_trailing_data_trimmed"
+
+
+def test_native_trailing_brace_correction_has_position_and_still_blocks_illegal_tool(case, monkeypatch):
+    model = case.models.inner
+    model.native = True
+    original = model.invoke
+    def invoke(envelope, timeout, token):
+        response = original(envelope, timeout, token)
+        if envelope.request.stage == "stage_action":
+            if envelope.request.correction_of_model_request_id:
+                value = {"kind": "mcp_call", "tool_name": "shell.not_registered", "arguments": {"script": "never run"}}
+                response = native_response(value)
+                response.tool_calls[0]["function"]["arguments"] += "}"
+            else:
+                response.tool_calls[0]["function"]["arguments"] += "}}"
+        return response
+    monkeypatch.setattr(model, "invoke", invoke)
+    with pytest.raises(StageStateError, match="stage.model_output_unusable"):
+        asyncio.run(case.app.run(case.token))
+    requests = [r for r in model.calls if r.stage == "stage_action"]
+    assert len(requests) == 3 and requests[1].correction_of_model_request_id == requests[0].model_request_id
+    issue = next(e.correction["issues"][0] for e in model.envelopes if e.request == requests[1])
+    assert issue["code"] == "json_trailing_data" and issue["path"] == "$/tool_calls/0/function/arguments"
+    assert issue["actual"].startswith("trailing_data_at_char_")
+    assert issue["actual"].endswith(";extra_right_braces_2")
+    assert not case.tools.calls
+    assert all(case.app.evidence.read("result", r.model_request_id)["outcome"] == "invalid" for r in requests)
+    assert all("normalization" not in case.app.evidence.read("result", r.model_request_id) for r in requests)
+
+
+def test_native_trailing_brace_absent_frozen_policy_keeps_legacy_strict(case, monkeypatch):
+    from agent_adapters import stage_evidence
+    from agent_adapters.stage_evidence import StageEvidence
+    model, contract = case.models.inner, stage_evidence.model_contract
+    model.native = True
+    original, roots = model.invoke, []
+    def legacy_contract(request):
+        value = contract(request)
+        value.pop("output_normalization")
+        return value
+    def invoke(envelope, timeout, token):
+        response = original(envelope, timeout, token)
+        if envelope.request.stage == "stage_action" and not roots:
+            roots.append(envelope.request.model_request_id)
+            response.tool_calls[0]["function"]["arguments"] += "}"
+        return response
+    with monkeypatch.context() as patch:
+        patch.setattr(stage_evidence, "model_contract", legacy_contract)
+        patch.setattr(model, "invoke", invoke)
+        assert asyncio.run(case.app.run(case.token)).turn.achievement
+    reader = StageEvidence(case.path / "stage-evidence", case.app.store, create=False)
+    old = reader.read("result", roots[0])
+    assert old["outcome"] == "invalid" and "normalization" not in old
+    corrected = next(r for r in model.calls if r.correction_of_model_request_id == roots[0])
+    assert "output_normalization" not in reader.read("contract", corrected.model_request_id)
+    assert reader.read_model_result(case.app.store.load_d4_operation(corrected.model_request_id)).result
+    with pytest.raises(StageStateError, match="stage.original_evidence_changed"):
+        reader.read_model_result(case.app.store.load_d4_operation(roots[0]))
+    assert reader.read("result", roots[0]) == old and len(case.tools.calls) == 1
 
 
 def test_multi_call_diagnostic_does_not_hide_response_limit(review_request):
@@ -663,7 +803,7 @@ def test_fact_source_changed_at_commit_still_stops_with_original_ids(case, monke
 
 
 @pytest.mark.parametrize("first", ["format", "business"])
-def test_completion_business_and_format_errors_share_one_correction(case, first):
+def test_completion_business_and_format_errors_share_two_corrections(case, first):
     attempted = []
     def transform(request, raw):
         observations = [i.ref for i in request.context.history if i.record_type == "progress"]
@@ -675,8 +815,9 @@ def test_completion_business_and_format_errors_share_one_correction(case, first)
     case.models.inner.transform = transform
     with pytest.raises(StageStateError, match="model_output_unusable") as error:
         asyncio.run(case.app.run(case.token))
-    assert error.value.category == "input" and len(attempted) == 2 and len(case.tools.calls) == 1
+    assert error.value.category == "input" and len(attempted) == 3 and len(case.tools.calls) == 1
     assert attempted[1].correction_of_model_request_id == attempted[0].model_request_id
+    assert attempted[2].correction_of_model_request_id == attempted[1].model_request_id
     assert not any(e.request.proposal_operation_id in {r.model_request_id for r in attempted}
         for e in case.models.outer.envelopes)
 
@@ -725,14 +866,26 @@ def test_format_correction_exhaustion_does_not_register_or_execute(case):
     case.models.inner.transform = lambda request, raw: {"unrecognized": "output"}
     with pytest.raises(StageStateError, match="model_output_unusable"):
         asyncio.run(case.app.run(case.token))
-    assert len(case.models.inner.calls) == 2
+    assert len(case.models.inner.calls) == 3
     assert not case.models.outer.calls and not case.tools.calls
     assert not case.app.store.list_stage_turns(case.app.task_id)
 
 
-def test_supervision_keeps_original_four_decision_cadence_without_extra_planning(case):
-    counter = []
+@pytest.mark.parametrize("correct_first_action", [False, True])
+def test_supervision_keeps_original_four_decision_cadence_without_extra_planning(case, correct_first_action):
+    counter, supervised_after = [], []
+    invalid_sent = False
+    invoke = case.models.outer.invoke
+    def outer(envelope, *args):
+        if envelope.request.stage == "stage_supervision":
+            supervised_after.append(len(case.tools.calls))
+        return invoke(envelope, *args)
+    case.models.outer.invoke = outer
     def transform(request, raw):
+        nonlocal invalid_sent
+        if request.stage == "stage_action" and correct_first_action and not invalid_sent:
+            invalid_sent = True
+            return {"invalid": "controlled format failure"}
         if request.stage == "stage_action" and len(counter) < 5:
             counter.append(True)
             return {"kind": "mcp_call", "tool_name": "shell.run_bash", "arguments": {"script": "printf observed"}}
@@ -742,6 +895,7 @@ def test_supervision_keeps_original_four_decision_cadence_without_extra_planning
     assert result.turn.achievement is not None and len(case.tools.calls) == 5
     reviews = [r for r in case.models.outer.calls if r.stage == "stage_supervision"]
     assert len(reviews) == 1
+    assert supervised_after == [4]
     assert len([r for r in case.models.inner.calls if r.stage == "stage_intent"]) == 1
     assert len([r for r in case.models.inner.calls if r.stage == "stage_roads"]) == 1
 
@@ -995,7 +1149,58 @@ def test_provider_history_segments_stay_identical_while_live_snapshots_change(ca
     assert second['tools'] == first['tools'] and second['reasoning_effort'] == 'max'
 
 
-@pytest.mark.parametrize("invalid_attempts", [0, 1, 2])
+def test_continuation_history_omits_only_exact_summary_covered_unneeded_raw():
+    from agent_core.handoff_contracts import D8HistoryItem
+    from agent_core.stage_contracts import StageSessionSummary, StageHistoryRead
+    from agent_core.turn_modeling import digest
+    task, owner = str(uuid4()), str(uuid4())
+    def observation(text):
+        return D8HistoryItem(str(uuid4()), task, "progress", owner, str(uuid4()), None,
+            text, (), "a" * 64, 1, "tool_observation_not_fact", "current", "available")
+    old, necessary, recent, retrieved, negative, support, exact_read = (
+        observation(text) for text in ("covered old raw", "required premise", "recent complete decision",
+            "explicitly retrieved", "uncovered failed probe", "formal Fact support", "history_details original"))
+    fact = replace(observation("formal conclusion"), record_type="verified_fact", identity="verified_fact",
+        source_refs=(support.ref,))
+    revision = replace(observation("withdrawn premise notification"), record_id="revision/" + str(uuid4()),
+        identity="revision_notification")
+    history = (old, necessary, recent, retrieved, negative, support, exact_read, fact, revision)
+    context = TurnPlanningContext(task, "useful next result", PlanningSession("turn_planning", owner), None, history)
+    base = StageModelRequest(str(uuid4()), task, "stage_continuation", "frozen-role", 1, context)
+    values = {}
+    def source(items, value=None):
+        request = replace(base, model_request_id=str(uuid4()), context=replace(context, history=items))
+        operation = SimpleNamespace(start=SimpleNamespace(operation_id=request.model_request_id))
+        values[request.model_request_id] = SimpleNamespace(result=value)
+        return operation, request, {"outcome": "valid", "content": "frozen result"}
+    covered = source((old, necessary, retrieved, support), StageHistoryRead((exact_read.ref,)))
+    latest_four = [source((recent,)) for _ in range(4)]
+    version = digest({"request": asdict(covered[1]), "result": covered[2]})
+    summary = replace(base, model_request_id=str(uuid4()), stage="stage_summary",
+        context=replace(context, history=()), summary_coverage=((covered[0].start.operation_id, version),))
+    values[summary.model_request_id] = SimpleNamespace(result=StageSessionSummary("Unverified index; retrieve originals."))
+    sources = [covered, *latest_four, (SimpleNamespace(start=SimpleNamespace(operation_id=summary.model_request_id)),
+        summary, {"outcome": "valid", "content": "Unverified index; retrieve originals."})]
+    app = object.__new__(StageApplication)
+    app.evidence = SimpleNamespace(read_model_result=lambda operation: values[operation.start.operation_id],
+        read_history_result=lambda operation: (exact_read,))
+    before = asdict(base)
+    projected = app._planning_history(history, sources, required=(necessary.ref,), retrieved=(retrieved.ref,))
+    assert projected == tuple(i for i in history if i not in (old, exact_read))
+    assert negative in projected and fact in projected and revision in projected and recent in projected
+    assert app._planning_history(history, latest_four) == history  # No summary means no omission.
+    assert app._planning_history(history, sources, retrieved=(old.ref, exact_read.ref),
+        required=(necessary.ref, retrieved.ref)) == history
+    for changed_old in (replace(old, source_status="unavailable"), replace(old, conflict=True),
+                        replace(old, source_version="b" * 64)):
+        assert changed_old in app._planning_history((changed_old, *history[1:]), sources)
+    assert asdict(base) == before  # Originals, versions and latest decisions are unchanged.
+    changed = [(*covered[:2], {**covered[2], "content": "changed covered result"}), *sources[1:]]
+    with pytest.raises(StageStateError, match="summary_coverage_changed"):
+        app._planning_history(history, changed)
+
+
+@pytest.mark.parametrize("invalid_attempts", [0, 1, 2, 3])
 def test_supervision_and_correction_finish_before_next_inner(case, invalid_attempts):
     events, actions, supervision = [], [], []
     invoke = case.models.outer.invoke
@@ -1023,7 +1228,7 @@ def test_supervision_and_correction_finish_before_next_inner(case, invalid_attem
                 return dict(kind="mcp_call", tool_name="shell.run_bash", arguments={"script": "controlled read"})
         return raw
     case.models.inner.transform = decision
-    if invalid_attempts == 2:
+    if invalid_attempts == 3:
         with pytest.raises(StageStateError, match="stage.model_output_unusable"):
             asyncio.run(case.app.run(case.token))
         assert len(actions) == 4
@@ -1032,7 +1237,7 @@ def test_supervision_and_correction_finish_before_next_inner(case, invalid_attem
         assert "review_feedback" in str(actions[4].messages)
         accepted_id = supervision[-1].model_request_id
         assert case.app.store.load_d4_operation(accepted_id).application_ref == "stage-advice/" + accepted_id
-    assert len(supervision) == (1 if invalid_attempts == 0 else 2)
+    assert len(supervision) == min(invalid_attempts + 1, 3)
     assert events[:4] == ["inner"] * 4
     assert events[4:6] == ["supervision_start", "supervision_end"]
     assert not case.app.models.live_operations
@@ -1170,6 +1375,393 @@ def test_unknown_model_result_is_not_reissued(case):
     assert len(case.models.inner.calls) == 1 and not case.tools.calls
 
 
+def save_provider_stop(case, envelope, code, *, exit_confirmed=True, changed_binding=False, transport_end=None):
+    from agent_core.turn_modeling import digest
+    request = envelope.request
+    sent = dict(model_request_id=request.model_request_id, task_run_id=request.task_run_id,
+        stage=request.stage, role_config_ref=request.role_config_ref, envelope_sha256=digest(asdict(envelope)))
+    case.app.evidence.save("provider-request", request.model_request_id, sent)
+    result = dict(model_request_id=request.model_request_id,
+        request_sha256="a" * 64 if changed_binding else digest(sent),
+        error={"kind": "timed_out", "code": code}, transport=dict(
+            elapsed_seconds=.03, first_output_seconds=.001, last_output_seconds=.029,
+            reasoning_chars=120, reasoning_utf8_bytes=120, content_chars=0,
+            worker_exit_confirmed=exit_confirmed, finish_seen=False, done_seen=False,
+            reasoning_content="PRIVATE_REASONING_MUST_NOT_LEAK"))
+    if transport_end is not None:
+        result["transport"]["transport_end"] = transport_end
+    case.app.evidence.save("provider-result", request.model_request_id, result)
+    return result
+
+
+@pytest.mark.parametrize("failures", [("timeout", "timeout"), ("timeout", "format"), ("format", "timeout")])
+def test_stage_two_shared_corrections_reuse_bound_chain_without_replay(case, failures, caplog):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    caplog.set_level("INFO", logger="qinyuan.model")
+    invoke = case.models.inner.invoke
+    def controlled(envelope, timeout, token):
+        valid = invoke(envelope, timeout, token)
+        index = len(case.models.inner.calls) - 1
+        if index < len(failures):
+            if failures[index] == "format":
+                return D8ModelResponse('{"bad":"shape"}')
+            save_provider_stop(case, envelope, "model_idle_timeout", transport_end="timeout")
+            return ModelError(ModelErrorKind.TIMED_OUT, "model_idle_timeout")
+        return valid
+    case.models.inner.invoke = controlled
+    request = case.app._request("stage_intent", PlanningSession("turn_planning", case.app._id("stage/root")))
+    identity, value = asyncio.run(case.app.models.call(request, case.token))
+    calls = case.models.inner.calls
+    assert len(calls) == 3 and isinstance(value, TurnIntent)
+    assert [case.app.evidence.correction_depth(r) for r in calls] == [0, 1, 2]
+    assert calls[2].correction_of_model_request_id == calls[1].model_request_id
+    assert case.app.models.resolved_operation_id(calls[0].model_request_id) == identity
+    case.app.models.reconcile(case.app.task_id)
+    assert asyncio.run(case.app.models.call(request, case.token))[0] == identity
+    assert len(calls) == 3 and not case.tools.calls
+    assert sum(record.msg == "stage.call_retried" for record in caplog.records) == 2
+    assert not case.app.store.list_d4_unresolved_operations(case.app.task_id)
+    for r in calls:
+        contract = case.app.evidence.read("contract", r.model_request_id)
+        assert contract["call_policy"]["max_corrections"] == 2
+        if r.correction_of_model_request_id:
+            reason = contract["correction"]["reason"]
+            previous = case.app.evidence.read("result", r.correction_of_model_request_id)
+            assert reason == ("output_format_invalid" if previous["outcome"] == "invalid"
+                              else "previous_model_transport_failed_no_usable_decision")
+
+
+@pytest.mark.parametrize("stage", ["stage_intent", "stage_review"])
+def test_known_transport_exhaustion_is_failed_not_unknown_and_review_does_not_pass(case, stage):
+    from agent_adapters.stage_evidence import StageModelTransportFailure
+    from agent_core.modeling import ModelError, ModelErrorKind
+    session = PlanningSession("turn_planning", case.app._id("stage/root"))
+    request = case.app._request("stage_intent", session)
+    model = case.models.inner
+    if stage == "stage_review":
+        identity, proposal = asyncio.run(case.app.models.call(request, case.token))
+        request = case.app._request(stage, session, proposal_id=identity, proposal=proposal)
+        model = case.models.outer
+    invoke = model.invoke
+    def failed(envelope, timeout, token):
+        invoke(envelope, timeout, token)
+        save_provider_stop(case, envelope, "model_idle_timeout", transport_end="timeout")
+        return ModelError(ModelErrorKind.TIMED_OUT, "model_idle_timeout")
+    model.invoke = failed
+    for _ in range(2):
+        with pytest.raises(StageModelTransportFailure) as failure:
+            asyncio.run(case.app.models.call(request, case.token))
+        assert failure.value.category == "dependency" and failure.value.retryable is False
+        assert len(model.calls) == 3
+        case.app.models.reconcile(case.app.task_id)
+    assert not case.app.store.list_d4_unresolved_operations(case.app.task_id)
+    assert not case.app.store.list_stage_turns(case.app.task_id) and not case.tools.calls
+    assert all(case.app.store.load_d4_operation(r.model_request_id).completion.result_kind == "failed" for r in model.calls)
+    from agent_adapters.web.task_result import _stage_task_result
+    view = _stage_task_result(case.path, dict(task_run_id=case.app.task_id, mode="simulated"),
+                             case.app.store, case.args["config"])
+    assert view["recovery"] == {"required": True, "reason": "stage.model_transport_failed"}
+
+
+@pytest.mark.parametrize("window", ["provider_saved", "result_saved"])
+def test_transport_failure_reconciles_crash_before_settlement_without_recalling_original(case, monkeypatch, window):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    invoke = case.models.inner.invoke
+    def controlled(envelope, timeout, token):
+        valid = invoke(envelope, timeout, token)
+        if len(case.models.inner.calls) == 1:
+            save_provider_stop(case, envelope, "model_idle_timeout", transport_end="timeout")
+            return ModelError(ModelErrorKind.TIMED_OUT, "model_idle_timeout")
+        return valid
+    case.models.inner.invoke = controlled
+    request = case.app._request("stage_intent", PlanningSession("turn_planning", case.app._id("stage/root")))
+    if window == "provider_saved":
+        save = case.app.evidence.save
+        def stop(kind, identity, value):
+            if kind == "result": raise RuntimeError("controlled crash before stage result")
+            return save(kind, identity, value)
+        monkeypatch.setattr(case.app.evidence, "save", stop)
+    else:
+        monkeypatch.setattr(case.app.store, "complete_d4_operation", lambda _: (_ for _ in ()).throw(RuntimeError("controlled crash")))
+    with pytest.raises(RuntimeError, match="controlled crash"):
+        asyncio.run(case.app.models.call(request, case.token))
+    monkeypatch.undo()
+    case.app.models.reconcile(case.app.task_id)
+    assert case.app.store.load_d4_operation(request.model_request_id).completion.result_kind == "failed"
+    assert isinstance(asyncio.run(case.app.models.call(request, case.token))[1], TurnIntent)
+    assert len(case.models.inner.calls) == 2 and not case.tools.calls
+
+
+@pytest.mark.parametrize("exit_confirmed,changed_binding", [(True, False), (False, False), (True, True)])
+def test_only_confirmed_supervision_transport_failure_degrades_after_two_corrections(case, exit_confirmed, changed_binding):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    actions = []
+    def action(request, raw):
+        if request.stage == "stage_action":
+            actions.append(request)
+            if len(actions) <= 5:
+                return dict(kind="mcp_call", tool_name="shell.run_bash", arguments={"script": "controlled read"})
+        return raw
+    case.models.inner.transform = action
+    invoke = case.models.outer.invoke
+    def outer(envelope, timeout, token):
+        valid = invoke(envelope, timeout, token)
+        if envelope.request.stage == "stage_supervision":
+            save_provider_stop(case, envelope, "model_idle_timeout", exit_confirmed=exit_confirmed,
+                               changed_binding=changed_binding, transport_end="timeout")
+            return ModelError(ModelErrorKind.TIMED_OUT, "model_idle_timeout")
+        return valid
+    case.models.outer.invoke = outer
+    if exit_confirmed and not changed_binding:
+        assert asyncio.run(case.app.run(case.token)).turn.achievement is not None
+        assert len(case.tools.calls) == 5
+        from agent_adapters.web.task_result import _stage_task_result
+        from agent_core.sqlite_control_store import SqliteControlStore
+        with SqliteControlStore.open_readonly(case.path / "control.sqlite") as store:
+            view = _stage_task_result(case.path, dict(task_run_id=case.app.task_id, mode="simulated"), store, case.args["config"])
+            assert store._connection.total_changes == 0
+        assert not view["recovery"]["required"] and not view["errors"]
+        assert [f["code"] for f in view["model_failures"]] == ["stage.supervision_unavailable"]
+    else:
+        with pytest.raises(OperationRecoveryRequired, match="model_outcome_unknown"):
+            asyncio.run(case.app.run(case.token))
+        assert len(actions) == 4
+    calls = [r for r in case.models.outer.calls if r.stage == "stage_supervision"]
+    assert len(calls) == (3 if exit_confirmed and not changed_binding else 1)
+    assert all(case.app.store.load_d4_operation(r.model_request_id).application_ref is None for r in calls)
+
+
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+def test_known_transport_settles_but_never_retries_after_task_stop(case, stop):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    invoke = case.models.inner.invoke
+    deadline = case.app.state.task_run.deadline_at
+    def stopped(envelope, timeout, token):
+        invoke(envelope, timeout, token)
+        save_provider_stop(case, envelope, "model_idle_timeout", transport_end="timeout")
+        if stop == "cancel": case.token.is_cancelled = True
+        else: case.now.value = deadline + 1
+        return ModelError(ModelErrorKind.TIMED_OUT, "model_idle_timeout")
+    case.models.inner.invoke = stopped
+    request = case.app._request("stage_intent", PlanningSession("turn_planning", case.app._id("stage/root")))
+    with pytest.raises(OperationRecoveryRequired, match="dispatch_stopped"):
+        asyncio.run(case.app.models.call(request, case.token))
+    assert len(case.models.inner.calls) == 1 and not case.tools.calls
+    assert not case.app.store.list_d4_unresolved_operations(case.app.task_id)
+
+
+def test_unknown_second_attempt_is_not_recalled_or_degraded(case):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    invoke = case.models.inner.invoke
+    def controlled(envelope, timeout, token):
+        invoke(envelope, timeout, token)
+        if len(case.models.inner.calls) == 1:
+            save_provider_stop(case, envelope, "model_idle_timeout", transport_end="timeout")
+            return ModelError(ModelErrorKind.TIMED_OUT, "model_idle_timeout")
+        raise RuntimeError("controlled unknown attempt")
+    case.models.inner.invoke = controlled
+    request = case.app._request("stage_intent", PlanningSession("turn_planning", case.app._id("stage/root")))
+    for _ in range(2):
+        with pytest.raises(OperationRecoveryRequired, match="model_outcome_unknown"):
+            asyncio.run(case.app.models.call(request, case.token))
+        case.app.models.reconcile(case.app.task_id)
+    assert len(case.models.inner.calls) == 2 and not case.tools.calls
+    assert len(case.app.store.list_d4_unresolved_operations(case.app.task_id)) == 1
+
+
+def test_capacity_recovery_does_not_reset_two_shared_corrections(case):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    from agent_core.turn_modeling import digest, stable_id
+    invoke = case.models.inner.invoke
+    def controlled(envelope, timeout, token):
+        invoke(envelope, timeout, token)
+        if len(case.models.inner.calls) <= 2:
+            save_provider_stop(case, envelope, "model_idle_timeout", transport_end="timeout")
+            return ModelError(ModelErrorKind.TIMED_OUT, "model_idle_timeout")
+        return D8ModelResponse('{"bad":"shape"}')
+    case.models.inner.invoke = controlled
+    request = case.app._request("stage_intent", PlanningSession("turn_planning", case.app._id("stage/root")))
+    first_correction = stable_id(case.app.task_id, "stage/correction/" + request.model_request_id)
+    capacity = case.app.models.capacity_port
+    fits = capacity.fits
+    capacity.fits = lambda envelope, policy: envelope.request.model_request_id != first_correction and fits(envelope, policy)
+    async def recover(source, token):
+        summary_request = replace(source, model_request_id=str(uuid4()), stage="stage_summary",
+            role_config_ref=case.models.outer.role_config.role_config_ref, proposal=None, proposal_operation_id=None,
+            correction_of_model_request_id=None, frozen_contract_ref=None)
+        summary_id, _ = await case.app.models.call(summary_request, token)
+        case.app.store.mark_d4_operation_applied(summary_id, "controlled-summary/" + summary_id)
+        case.app.evidence.save("capacity-recovery", source.model_request_id,
+            {"source_request_sha256": digest(asdict(source)), "summary_operation_id": summary_id})
+        return replace(source, model_request_id=stable_id(case.app.task_id,
+            "stage/capacity/" + source.model_request_id + "/" + summary_id),
+            capacity_recovery_of=source.model_request_id, frozen_contract_ref=None)
+    case.app.models.recover_capacity = recover
+    for _ in range(2):
+        with pytest.raises(StageStateError, match="model_output_unusable"):
+            asyncio.run(case.app.models.call(request, case.token))
+    assert len(case.models.inner.calls) == 3 and len(case.models.outer.calls) == 1
+    assert [case.app.evidence.correction_depth(r) for r in case.models.inner.calls] == [0, 1, 2]
+    last = case.models.inner.calls[-1]
+    with pytest.raises(StageStateError, match="correction_limit_exceeded"):
+        case.app.evidence.contract(replace(last, model_request_id=str(uuid4()),
+            correction_of_model_request_id=last.model_request_id, frozen_contract_ref=None))
+    assert not case.tools.calls
+
+
+@pytest.mark.parametrize("code", ["model_connect_timeout", "model_first_output_timeout", "model_idle_timeout",
+    "model_total_timeout", "http_timeout", "model_cancelled"])
+def test_stage_transport_stop_keeps_bound_diagnosis_and_never_retries(case, code):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    from agent_adapters.output_evidence import safe_failure_details
+    original = case.models.inner.invoke
+    def invoke(envelope, timeout, token):
+        original(envelope, timeout, token)
+        save_provider_stop(case, envelope, code)
+        return ModelError(ModelErrorKind.CANCELLED if code == "model_cancelled" else ModelErrorKind.TIMED_OUT, code)
+    case.models.inner.invoke = invoke
+    with pytest.raises(OperationRecoveryRequired) as failure:
+        asyncio.run(case.app.run(case.token))
+    detail = safe_failure_details(failure.value, include_chain=True)["model_call"]
+    identity = case.models.inner.calls[0].model_request_id
+    assert detail["stage"] == "stage_intent" and detail["operation_id"] == identity
+    assert detail["reason"] == "transport_interrupted" and detail["diagnostic_status"] == "bound"
+    assert detail["model_error_code"] == code
+    assert detail.get("timeout_kind") == (None if code == "model_cancelled" else code)
+    assert detail["transport"]["worker_exit_confirmed"] is True
+    assert detail["provider_result_ref"] == "stage-provider-result/" + identity
+    assert "PRIVATE_REASONING" not in json.dumps(safe_failure_details(failure.value, include_chain=True))
+    assert case.app.evidence.read("result", identity) is None
+    assert case.app.store.load_d4_operation(identity).completion is None
+    before = case.app.evidence.read("provider-result", identity)
+    with pytest.raises(OperationRecoveryRequired, match="operation_outcome_unknown"):
+        asyncio.run(case.app.run(case.token))
+    assert case.app.evidence.read("provider-result", identity) == before
+    assert len(case.models.inner.calls) == 1 and not case.tools.calls
+
+
+@pytest.mark.parametrize("exit_confirmed,changed_binding", [(False, False), (True, True)])
+def test_stage_stop_diagnostic_never_settles_or_trusts_other_identity(case, exit_confirmed, changed_binding):
+    from agent_core.modeling import ModelError, ModelErrorKind
+    def invoke(envelope, timeout, token):
+        save_provider_stop(case, envelope, "model_total_timeout",
+            exit_confirmed=exit_confirmed, changed_binding=changed_binding)
+        return ModelError(ModelErrorKind.TIMED_OUT, "d8_transport_outcome_unknown")
+    case.models.inner.invoke = invoke
+    with pytest.raises(OperationRecoveryRequired) as failure:
+        asyncio.run(case.app.run(case.token))
+    detail = failure.value.context["model_call"]
+    assert detail["diagnostic_status"] == ("binding_mismatch" if changed_binding else "bound")
+    assert ("provider_result_ref" in detail) is not changed_binding
+    if not changed_binding:
+        assert detail["transport"]["worker_exit_confirmed"] is False
+    assert case.app.store.list_d4_operations(case.app.task_id)[0].completion is None
+
+
+def test_stage_transport_can_close_diagnostic_after_budget_without_new_generation(case, monkeypatch):
+    import time
+    from agent_adapters import stage_evidence
+    from agent_core.modeling import ModelError, ModelErrorKind
+    monkeypatch.setattr(stage_evidence, "TASK_DEADLINE_STAGES", frozenset())
+    monkeypatch.setattr(stage_evidence, "model_call_timeout", lambda model, remaining: .03)
+    monkeypatch.setattr(stage_evidence, "MODEL_DIAGNOSTIC_GRACE_SECONDS", .3)
+    calls = []
+    def invoke(envelope, timeout, token):
+        calls.append(envelope.request.model_request_id)
+        while not token.is_cancelled:
+            time.sleep(.002)
+        assert token.is_timed_out
+        time.sleep(.025)  # Simulate worker cleanup / immutable diagnostic IO.
+        save_provider_stop(case, envelope, "model_total_timeout")
+        return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
+    case.models.inner.invoke = invoke
+    with pytest.raises(OperationRecoveryRequired) as failure:
+        asyncio.run(case.app.run(case.token))
+    detail = failure.value.context["model_call"]
+    assert detail["diagnostic_status"] == "bound" and detail["timeout_kind"] == "model_total_timeout"
+    assert detail["limit_seconds"] == .03 and .03 <= detail["elapsed_seconds"] < .6
+    assert len(calls) == 1 and case.app.evidence.read("result", calls[0]) is None
+
+
+@pytest.mark.parametrize("stop", ["watchdog", "cancel", "deadline", "late_proposal"])
+def test_stage_watchdog_grace_is_bounded_and_never_accepts_late_or_cancelled_proposal(case, monkeypatch, stop):
+    import threading
+    import time
+    from agent_adapters import stage_evidence
+    monkeypatch.setattr(stage_evidence, "TASK_DEADLINE_STAGES", frozenset())
+    monkeypatch.setattr(stage_evidence, "model_call_timeout", lambda model, remaining: .025)
+    monkeypatch.setattr(stage_evidence, "MODEL_DIAGNOSTIC_GRACE_SECONDS", .3 if stop == "late_proposal" else .03)
+    release, ended = threading.Event(), threading.Event()
+    def invoke(envelope, timeout, token):
+        try:
+            if stop == "cancel": case.token.is_cancelled = True
+            if stop == "deadline": case.now.value += 4000
+            if stop == "late_proposal": time.sleep(.04)
+            else: release.wait(1)
+            return D8ModelResponse(json.dumps({"kind": "turn_intent", "description": "late",
+                "completion_criterion": "must not register", "support_refs": []}))
+        finally:
+            ended.set()
+    case.models.inner.invoke = invoke
+    try:
+        with pytest.raises(OperationRecoveryRequired) as failure:
+            asyncio.run(case.app.run(case.token))
+        detail = failure.value.context["model_call"]
+        assert detail["reason"] == {"watchdog": "watchdog_timeout", "cancel": "user_cancelled",
+            "deadline": "task_deadline", "late_proposal": "generation_budget_expired"}[stop]
+        operation = case.app.store.list_d4_operations(case.app.task_id)[0]
+        assert operation.completion is None and case.app.evidence.read("result", operation.start.operation_id) is None
+        assert not case.app.store.list_stage_turns(case.app.task_id)
+    finally:
+        release.set()
+        assert ended.wait(1)
+
+
+def test_stage_adapter_exception_reports_safe_cause(case):
+    from agent_adapters.output_evidence import safe_failure_details
+    def invoke(envelope, timeout, token):
+        raise ConnectionError("PRIVATE_PROVIDER_ERROR")
+    case.models.inner.invoke = invoke
+    with pytest.raises(OperationRecoveryRequired) as failure:
+        asyncio.run(case.app.run(case.token))
+    details = safe_failure_details(failure.value, include_chain=True)
+    assert details["model_call"]["reason"] == "adapter_exception"
+    assert details["model_call"]["exception_type"] == "ConnectionError"
+    assert "PRIVATE_PROVIDER_ERROR" not in json.dumps(details)
+
+
+def test_stage_stop_links_actual_provider_adapter_metadata_without_network(case):
+    from agent_adapters.deepseek_roles import D8DeepSeekModel, role_config, TRANSPORT
+    from agent_adapters.deepseek_model import DeepSeekSettings
+    from agent_core.modeling import ModelError, ModelErrorKind
+    from agent_core.output_contracts import D8OutputRequest
+    from agent_core.stage_planning import model_contract
+    role = role_config("inner_action", version=17)
+    settings = DeepSeekSettings(role.model, "offline-stage-boundary-secret", base_url=TRANSPORT["base_url"],
+        allow_custom_endpoint=TRANSPORT["base_url"] != "https://api.deepseek.com")
+    calls = []
+    class Transport:
+        def _invoke_payload(self, payload, timeout, token, *, diagnostic):
+            calls.append(payload)
+            diagnostic.update(transport_end="timeout", elapsed_seconds=.1, reasoning_chars=12,
+                content_chars=0, worker_exit_confirmed=True, first_output_seconds=.01, last_output_seconds=.09)
+            return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
+    model = D8DeepSeekModel(role, settings, transport=Transport())
+    model.bind_diagnostics(case.app.evidence)
+    request = replace(case.app._request("stage_intent", PlanningSession("turn_planning", case.app._id("stage/root"))),
+        role_config_ref=role.role_config_ref)
+    contract = model_contract(request)
+    envelope = D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": contract["schema"]},
+        contract["instruction"], None)
+    with pytest.raises(OperationRecoveryRequired) as failure:
+        asyncio.run(case.app.models._invoke(model, envelope, 1, case.token, case.app.state.task_run.deadline_at))
+    detail = failure.value.context["model_call"]
+    assert len(calls) == 1 and calls[0]["reasoning_effort"] == "max" and "max_tokens" not in calls[0]
+    assert detail["diagnostic_status"] == "bound" and detail["timeout_kind"] == "model_total_timeout"
+    assert detail["transport"]["reasoning_chars"] == 12 and detail["transport"]["content_chars"] == 0
+    assert detail["provider_result_ref"] == "stage-provider-result/" + request.model_request_id
+
+
 def test_fact_owner_schema_update_rolls_back_without_losing_canonical_fact(case, monkeypatch):
     import sqlite3
     from agent_core import stage_storage
@@ -1181,6 +1773,9 @@ def test_fact_owner_schema_update_rolls_back_without_losing_canonical_fact(case,
     asyncio.run(case.app.close())
     with sqlite3.connect(path) as db:
         before = db.execute("SELECT * FROM facts").fetchall()
+        db.execute("DROP TABLE stage_plan_bindings")
+        db.execute("DROP TABLE stage_branches")
+        db.execute("DROP TABLE stage_review_queue")
         db.execute("DELETE FROM schema_versions WHERE version>=33")
     original = stage_storage.FACT_SCHEMA
     monkeypatch.setattr(stage_storage, "FACT_SCHEMA", original.replace("CREATE INDEX idx_facts_context", "CREATE INDX idx_facts_context"))
@@ -1602,18 +2197,20 @@ def test_failed_tools_cannot_skip_owned_mcp_and_store_close(mcp_failure):
         async def stop():
             closed.append("tools")
             raise original
+        async def stop_reviews():
+            closed.append("reviews")
         async def close_mcp():
             assert asyncio.current_task() is owner
             closed.append("mcp")
             if mcp_failure: raise ValueError("secondary cleanup failure")
-        app = SimpleNamespace(_stop_tools=stop, mcp=SimpleNamespace(close=close_mcp),
+        app = SimpleNamespace(_stop_tools=stop, reviews=SimpleNamespace(stop=stop_reviews), mcp=SimpleNamespace(close=close_mcp),
             store=SimpleNamespace(close=lambda: closed.append("store")))
         with pytest.raises(RuntimeError) as caught:
             await StageApplication.close(app)
         assert caught.value is original
         if mcp_failure: assert "stage.cleanup_failed:mcp" in caught.value.__notes__
     asyncio.run(exercise())
-    assert closed == ["tools", "mcp", "store"]
+    assert closed == ["reviews", "tools", "mcp", "store"]
 
 
 @pytest.mark.parametrize("failure", ["corrupt", "io"])

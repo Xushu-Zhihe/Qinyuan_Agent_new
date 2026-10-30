@@ -42,7 +42,7 @@ def failure_diagnostics(evidence, store, task_id):
         if (claim is None or claim['task_run_id'] != task_id
                 or failure['model_request_id'] != claim['model_request_id']
                 or failure['request_sha256'] != digest(claim) or operation.start.context_sha256 != digest(claim)
-                or failure['phase'] not in {'http_execute','receipt_save','receipt_apply'}
+                or failure['phase'] not in {'http_execute','response_evidence_save','receipt_save','receipt_apply'}
                 or failure['code'] not in SAFE_MODEL_ERROR_CODES
                 or failure['result_sha256'] is not None and (result is None or failure['result_sha256'] != digest(result))):
             raise ExecutionRecoveryRequired('d22_experiment_failure_diagnostic_invalid')
@@ -90,8 +90,8 @@ class HttpExperiments:
 
     async def _strategy(self, owner=None, *, start=False):
         if self.stage:
-            if owner is not None:
-                await self.app._supervise(owner, self.app._token)
+            # Stage supervision is owned by the foreground loop. A tool
+            # callback must not start a model while that loop waits for tools.
             return False
         self.app.supervision.poll()
         if start and owner is not None and self.app.sessions.due(owner):
@@ -186,6 +186,7 @@ class HttpExperiments:
         from agent_adapters.output_evidence import safe_failure_details, SAFE_MODEL_ERROR_CODES
         code = str(error) if isinstance(error,ExecutionRecoveryRequired) and str(error) in SAFE_MODEL_ERROR_CODES else "d22_experiment_receipt_settlement_failed"
         if phase == "http_execute":code = "d22_experiment_request_outcome_unknown"
+        elif phase == "response_evidence_save":code = "http.response_evidence_save_failed"
         if self.evidence.read("experiment-failure",operation_id) is None:
             self.evidence.save("experiment-failure",operation_id,dict(
                 model_request_id=claim["model_request_id"], request_sha256=digest(claim),
@@ -311,6 +312,9 @@ class HttpExperiments:
             phase = 'receipt_apply'
             self.mcp._apply(app.store.load_d4_operation(identity),claim,result)
         except BaseException as error:
+            if (phase == 'http_execute' and isinstance(error,HttpCapabilityError)
+                    and error.context.get('phase') == 'response_evidence_save'):
+                phase = 'response_evidence_save'
             code = self.record_failure(identity,claim,result if phase=='receipt_apply' else None,phase,error)
             self.log.error('experiment.request_unknown' if phase=='http_execute' else 'experiment.receipt_failed',
                 run=claim['task_run_id'],request=parent,exec=identity,phase=phase,

@@ -39,6 +39,43 @@ def challenge(name="one"):
     }
 
 
+def test_windows_security_api_is_explicit_fixed_scope_and_origin_checked(tmp_path, monkeypatch):
+    store = Workbench(tmp_path)
+    setup = store.windows_security
+    setup.supported = True
+    setup.state["supported"] = True
+    actions = []
+
+    def invoke(action):
+        actions.append(action)
+        return {"status": "not_excluded", "verified": True, "reason": None, "exact_rule_present": False}
+
+    monkeypatch.setattr(setup, "_invoke", invoke)
+    server = WorkbenchServer(("127.0.0.1", 0), store)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_port
+        status, current = call(port, "GET", "/api/windows-security")
+        assert status == 200 and current["data_dir"] == str(tmp_path.resolve())
+        assert current["status"] == "unknown" and actions == []
+        status, _ = call(port, "POST", "/api/windows-security", origin="https://other.test")
+        assert status == 403 and actions == []
+        for body in ({"action": "Apply", "data_dir": "C:\\"}, {"action": "disable_protection"}, {"action": ["Apply"]}):
+            assert call(port, "POST", "/api/windows-security", body)[0] == 400
+        assert actions == []
+        assert call(port, "POST", "/api/windows-security", {"action": "Check"})[0] == 202
+        setup.worker.join(3)
+        status, checked = call(port, "GET", "/api/windows-security")
+        assert checked["status"] == "not_excluded" and checked["verified"] and actions == ["Check"]
+        # Missing Defender configuration must not affect existing task operations.
+        assert call(port, "POST", "/api/challenges", challenge())[0] == 201
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
+
+
 def test_client_disconnect_while_sending_progress_does_not_write_another_response():
     class DisconnectedWriter:
         calls = 0

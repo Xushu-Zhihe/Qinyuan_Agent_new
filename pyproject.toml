@@ -43,6 +43,7 @@ include = ["Agents*", "LLMs*", "MCPs*", "Sandbox*", "Skills*", "tools*", "agent_
 exclude = ["MCPs.Dirsearch_Mcp.test*"]
 
 [tool.setuptools.package-data]
+agent_adapters = ["*.ps1"]
 Skills = ["**/*.md", "**/*.py", "**/*.json"]
 "MCPs.Mcp_client" = ["registry.json"]
 "MCPs.LibcSearcher_Mcp" = ["database.json"]

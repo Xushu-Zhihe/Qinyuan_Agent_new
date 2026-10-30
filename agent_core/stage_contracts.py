@@ -39,6 +39,7 @@ class TurnPlanningState(StrEnum):
     ACTIVE = "active"
     WAITING_CHILD = "waiting_child"
     EXHAUSTED = "exhausted"
+    SUPERSEDED = "superseded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +158,7 @@ class StageConclusionChange(D8ConclusionChange):
 
 @dataclass(frozen=True, slots=True)
 class StagePlanningDecision:
-    kind: Literal["select_road", "return_to_parent", "request_final_validation", "wait_for_tools"]
+    kind: Literal["select_road", "return_to_parent", "request_final_validation", "wait_for_tools", "wait_for_review"]
     reason: str
     support_refs: tuple[str, ...]
     road_id: str | None = None
@@ -175,8 +176,8 @@ TurnPlanningProposal: TypeAlias = (
 class TurnPlanningReview:
     """Review the exact proposal; semantic edits return to the same Inner.
 
-    For accepted Road candidates, accepted_road_indices explicitly selects
-    their order. It is empty for other proposal kinds and non-accept verdicts.
+    For Roads, indices select semantically admissible candidates and suggest
+    priority to their Inner planner. It is empty for other kinds/non-accept.
     """
 
     decision: Literal["accept", "revise", "reject"]
@@ -203,9 +204,70 @@ class StageFactProposal:
 
 
 @dataclass(frozen=True, slots=True)
+class StageFactBatch:
+    candidates: tuple[StageFactProposal, ...]
+
+    @property
+    def support_refs(self):
+        return tuple(dict.fromkeys(ref for value in self.candidates for ref in value.support_refs))
+
+    @property
+    def reason(self):
+        return "Independent conclusion candidates"
+
+
+@dataclass(frozen=True, slots=True)
+class StageFactBatchReview:
+    decisions: tuple[TurnPlanningReview, ...]
+
+    @property
+    def decision(self):
+        return "accept" if any(item.decision == "accept" for item in self.decisions) else "reject"
+
+    @property
+    def reason(self):
+        return "Per-candidate review decisions"
+
+    @property
+    def support_refs(self):
+        return tuple(dict.fromkeys(ref for item in self.decisions for ref in item.support_refs))
+
+
+def fact_candidates(value):
+    return (tuple(enumerate(value.candidates)) if isinstance(value, StageFactBatch)
+            else ((None, value),) if isinstance(value, StageFactProposal) else ())
+
+
+def reviewed_fact(value, review, index):
+    """Exact proposal order is the per-claim identity within a batch."""
+    if isinstance(value, StageFactBatch):
+        if (type(index) is not int or not 0 <= index < len(value.candidates)
+                or not isinstance(review, StageFactBatchReview) or len(review.decisions) != len(value.candidates)):
+            raise ValueError("stage.fact_batch_binding_invalid")
+        return value.candidates[index], review.decisions[index]
+    if index is not None or not isinstance(value, StageFactProposal) or not isinstance(review, TurnPlanningReview):
+        raise ValueError("stage.fact_binding_invalid")
+    return value, review
+
+
+def fact_verification_ref(review_id, index=None):
+    return "stage:" + review_id + ("" if index is None else ":" + str(index))
+
+
+def fact_review_parts(reference):
+    parts = reference.removeprefix("stage:").split(":")
+    index = None if len(parts) == 1 else int(parts[1])
+    if (len(parts) not in {1, 2} or index is not None and index < 0
+            or reference != fact_verification_ref(parts[0], index)):
+        raise ValueError("stage.fact_binding_invalid")
+    return parts[0], index
+
+
+@dataclass(frozen=True, slots=True)
 class StageFactApplication:
     fact_id: str
     review_operation_id: str
+    candidate_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +295,29 @@ class StageReviewBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class StageQueuedReview:
+    """A queue entry is not acceptance or a formal knowledge record."""
+
+    proposal_operation_id: str
+    state: Literal["pending", "blocked", "settled", "superseded"]
+    review_operation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StageBranchFork:
+    proposal_operation_id: str
+    review_operation_id: str | None = None
+    target_session: PlanningSession | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StageSessionBranch:
+    branch_id: str
+    proposal_operation_id: str
+    review_operation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StageStateChange:
     """Atomic command; the enclosing ControlMutation owns run and mutation IDs."""
 
@@ -243,6 +328,11 @@ class StageStateChange:
     facts: tuple[StageFactApplication, ...] = ()
     applications: tuple[str, ...] = ()
     revisions: tuple[D8RevisionRecord, ...] = ()
+    review_submissions: tuple[str, ...] = ()
+    blocked_reviews: tuple[StageReviewBinding, ...] = ()
+    branches: tuple[StageBranchFork, ...] = ()
+    planning_submissions: tuple[str, ...] = ()
+    discarded_decisions: tuple[StageReviewBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,7 +340,7 @@ class StageModelEvidence:
     session: PlanningSession
     context_sha256: str
     evidence_sha256: str
-    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | MCPCall | StageToolBatch | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
+    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | StageFactBatch | StageFactBatchReview | MCPCall | StageToolBatch | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
     proposal_operation_id: str | None = None
     proposal_sha256: str | None = None
 
@@ -268,3 +358,17 @@ class StageEvidencePort(Protocol):
     def read_model_result(self, operation: D4OperationRecord) -> StageModelEvidence: ...
 
     def read_history_result(self, operation: D4OperationRecord) -> tuple[D8HistoryItem, ...]: ...
+
+    def request(self, identity: str): ...
+
+    def read(self, kind: str, identity: str) -> dict | None: ...
+
+    def correction_depth(self, request) -> int: ...
+
+    def transport_failure(self, request, settled: dict | None = None) -> dict | None: ...
+
+    def review_sources(self, request) -> tuple[tuple[str, StageModelEvidence], ...]: ...
+
+    def review_rejections(self, review_id: str) -> tuple[str, ...]: ...
+
+    def review_interruptions(self, review_id: str) -> tuple[str, ...]: ...

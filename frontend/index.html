@@ -31,6 +31,7 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3.2"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
             </span>模型角色
           </button>
+          <button class="nav-item" type="button" data-view="security"><span class="nav-icon" aria-hidden="true">◇</span>Windows 安全配置</button>
         </nav>
 
         <div class="rail-foot">
@@ -191,11 +192,16 @@
                 </label>
                 <button id="start-run" class="primary-button" type="button">开始 Agent</button>
                 <button id="resume-run" class="secondary-button" type="button" hidden>恢复运行</button>
+                <label id="extend-run-control" class="run-mode" hidden>增加分钟
+                  <input id="extend-run-minutes" type="number" min="1" step="1" value="30" aria-label="增加运行分钟数" style="width:5rem">
+                  <button id="extend-run" class="secondary-button" type="button">加时</button>
+                </label>
                 <button id="cancel-run" class="danger-button" type="button" hidden>取消运行</button>
                 <button id="cleanup-run" class="secondary-button" type="button" hidden>重试资源清理</button>
               </div>
             </header>
 
+            <p id="windows-security-hint" class="run-read-error" hidden>Windows 证据目录排除尚未核验，安全扫描可能影响证据读取。<a href="#security">打开安全配置</a>；仍可继续运行。</p>
             <div id="run-stages" class="run-stages" aria-label="运行阶段"></div>
             <div id="run-summary" class="run-summary"></div>
             <p id="run-read-error" class="run-read-error" role="status" hidden></p>
@@ -205,7 +211,7 @@
                 <header class="graph-heading">
                   <div class="graph-title">
                     <h3>解题关系图</h3>
-                    <p>实线：归属　虚线：轮次顺序</p>
+                    <p>实线：归属　虚线：阶段接续</p>
                   </div>
                   <div id="run-focus" class="run-focus" aria-live="polite"></div>
                   <div class="graph-tools" aria-label="画布缩放">
@@ -215,13 +221,15 @@
                     <button id="graph-fit" type="button">适配</button>
                   </div>
                 </header>
-                <div id="run-graph" class="run-scroll graph-viewport" aria-label="已提交的 TaskRun、Turn 和 Intent 关系图"></div>
+                <div id="run-graph" class="run-scroll graph-viewport" aria-label="已提交的 TaskRun、Turn 和 Road 关系图"></div>
               </section>
 
               <aside class="run-column detail-column" aria-label="解题记录面板">
+                <div id="run-scope-heading" class="timeline-heading"><strong id="run-scope-label">全任务</strong><button id="run-scope-all" class="quiet-button" type="button" hidden>查看全任务</button></div>
                 <div class="run-tabs" role="tablist" aria-label="解题记录">
                   <button id="run-tab-detail" type="button" role="tab" aria-controls="run-pane-detail" aria-selected="true" class="active">详情</button>
                   <button id="run-tab-evidence" type="button" role="tab" aria-controls="run-pane-evidence" aria-selected="false">证据</button>
+                  <button id="run-tab-activity" type="button" role="tab" aria-controls="run-pane-activity" aria-selected="false">审核与分支</button>
                   <button id="run-tab-log" type="button" role="tab" aria-controls="run-pane-log" aria-selected="false">日志</button>
                 </div>
                 <div id="run-pane-detail" class="run-pane run-scroll" role="tabpanel" aria-labelledby="run-tab-detail">
@@ -229,13 +237,26 @@
                   <section id="run-stop" class="run-stop"></section>
                 </div>
                 <div id="run-pane-evidence" class="run-pane run-scroll" role="tabpanel" aria-labelledby="run-tab-evidence" hidden>
-                  <h4>已验证观察 · Facts</h4><div id="run-facts"></div>
+                  <h4>User’Fact · 全任务用户提示</h4>
+                  <form id="user-hint-form">
+                    <label class="field"><span>给当前任务的提示 · 待验证</span><textarea id="user-hint-content" maxlength="8192" rows="3" placeholder="例如：可以先检查附件内依赖的实际版本。"></textarea></label>
+                    <button id="user-hint-submit" class="secondary-button" type="submit">提交提示</button>
+                    <p id="user-hint-status" class="run-meta" role="status">下一次新决策可读取；不会打断当前生成，也不会自动成为已验证事实。</p>
+                  </form>
+                  <div id="run-user-hints"></div>
+                  <h4 id="run-facts-heading">全任务 Facts</h4><div id="run-facts"></div>
                   <h4 id="run-candidate-heading">待验证候选 · Pending</h4><div id="run-candidates"></div>
                   <h4>分类失败摘要</h4><div id="run-failures"></div>
                 </div>
                 <div id="run-pane-log" class="run-pane" role="tabpanel" aria-labelledby="run-tab-log" hidden>
                   <div class="timeline-heading"><strong>执行时间线</strong><span id="timeline-scope">全部</span><button id="clear-run-filter" class="quiet-button" type="button" hidden>查看全部</button></div>
                   <div id="run-timeline" class="run-scroll"></div>
+                </div>
+                <div id="run-pane-activity" class="run-pane run-scroll" role="tabpanel" aria-labelledby="run-tab-activity" hidden>
+                  <p class="run-meta">待审提案不代表正式成果。未结算记录不证明 worker 仍存活；分支不是环境快照。</p>
+                  <h4>审核队列与逐项结论</h4><div id="run-review-queue"></div>
+                  <h4>会话分支与原前缀</h4><div id="run-branches"></div>
+                  <h4>未采用的生成</h4><div id="run-discarded"></div>
                 </div>
               </aside>
             </div>
@@ -300,6 +321,34 @@
                 <button id="purge-task" class="danger-button" type="button" hidden>永久清理</button>
               </div>
             </div>
+          </section>
+        </section>
+
+        <section id="security-view" class="view" hidden aria-labelledby="security-title">
+          <div class="page-head">
+            <div><p class="eyebrow">LOCAL ENVIRONMENT</p><h1 id="security-title">Windows 安全配置</h1>
+              <p class="subheading">管理当前工作台的证据目录排除。未配置或无法核验时，仍允许开始任务。</p></div>
+          </div>
+          <section class="c-panel security-panel">
+            <h2>Microsoft Defender · 证据目录</h2>
+            <p id="security-status" role="status" aria-live="polite">尚未检查</p>
+            <p id="security-reason"></p>
+            <p id="security-diagnostic" class="section-meta"></p>
+            <dl class="security-scope">
+              <dt>数据目录</dt><dd id="security-data-dir">—</dd>
+              <dt>本项目排除规则</dt><dd id="security-pattern">—</dd>
+              <dt>精确规则</dt><dd id="security-rule">尚未核验</dd>
+              <dt>实时保护 / 防篡改</dt><dd id="security-protection">尚未读取</dd>
+              <dt>最近检查 / 操作时间</dt><dd id="security-checked-at">尚未检查</dd>
+            </dl>
+            <div class="form-actions">
+              <button id="security-check" class="secondary-button" type="button">检查（管理员）</button>
+              <button id="security-apply" class="primary-button" type="button">配置排除（管理员）</button>
+              <button id="security-remove" class="danger-button" type="button">撤销本项目规则（管理员）</button>
+            </div>
+            <p class="subheading">仅排除所有运行的 stage-evidence 目录；其中保存的真实恶意样本也会跳过常规内容扫描。实时保护与防篡改设置保持原状，其他排除规则保持原状。</p>
+            <p class="subheading">点击按钮后按 Windows 管理员提示确认。配置助手的独立子进程使用 ExecutionPolicy Bypass 加载内置脚本，仅该子进程放宽脚本检查，不更改全局执行策略，组织策略和 Defender 权限限制仍有效。页面自动更新操作进度，结果以显示的核验时间为准；外部修改安全设置后请重新检查。撤销只移除上面这一条精确规则，其他规则可能仍覆盖此目录。</p>
+            <details><summary>脚本与故障处理</summary><p id="security-script" class="subheading"></p><p class="subheading">取消管理员确认、组织策略或脚本执行策略限制，都会显示“无法确认”；不会关闭保护、自动重试或禁止任务运行。命令行使用说明见 README 的 Windows 安全配置。</p></details>
           </section>
         </section>
 

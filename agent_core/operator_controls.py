@@ -66,9 +66,17 @@ def submit(store, task_id, operation_id, action, payload):
                 value=state[key]
                 if value is not None and (type(value) not in {int,float} or not math.isfinite(value) or value<=now):raise ValueError("operator_configuration_invalid")
         else:
+            if state is None and stage is not None and action in {"extend_question", "user_hint"}:
+                state={"paused":False,"question_deadline_at":task.deadline_at,
+                    "overall_deadline_at":None,"platform_deadline_at":None,"overall_ceiling_at":None}
             if state is None:raise ValueError("operator_not_configured")
             state=dict(state)
-            if action in {"pause","resume"}:
+            if action=="user_hint":
+                if (set(payload)!={"content"} or not isinstance(payload["content"],str)
+                        or not payload["content"].strip() or len(payload["content"])>8192):
+                    raise ValueError("operator_hint_invalid")
+                if stage is None:raise ValueError("operator_scope_invalid")
+            elif action in {"pause","resume"}:
                 if payload:raise ValueError("operator_payload_invalid")
                 if action=="resume" and store.blocking_d4_operations(task_id):raise ValueError("operator_unknown_operation")
                 state["paused"]=action=="pause"
@@ -95,6 +103,20 @@ def submit(store, task_id, operation_id, action, payload):
         return state
     except BaseException:
         db.rollback();raise
+
+
+def user_hints(store, task_id):
+    """Read original operator text, never promote it to verified knowledge."""
+    from agent_core.turn_modeling import digest
+    items=[]
+    for row in store._connection.execute(
+            "SELECT operation_id,request_json,created_at FROM task_operator_controls WHERE task_run_id=? ORDER BY rowid",
+            (task_id,)):
+        request=json.loads(row[1])
+        if request["action"]=="user_hint":
+            item=dict(operation_id=row[0],author="local_operator",created_at=row[2],content=request["payload"]["content"])
+            items.append({**item,"source_version":digest(item)})
+    return tuple(items)
 
 
 def enable(controller):

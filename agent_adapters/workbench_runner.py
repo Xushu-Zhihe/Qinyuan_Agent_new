@@ -569,6 +569,40 @@ class Runner:
     def resume(self, challenge_id: str):
         return self._d9_operation(challenge_id, 'resume')
 
+    def live_control(self, challenge_id, value):
+        """Single-task UI uses the original trusted operator transaction."""
+        if (not isinstance(value, dict) or set(value) != {"run_id", "operation_id", "action", "payload"}
+                or not isinstance(value["action"], str) or value["action"] not in {"extend_question", "user_hint"}
+                or not isinstance(value["operation_id"], str) or not isinstance(value["payload"], dict)):
+            raise WorkbenchError("operator_payload_invalid")
+        from agent_core.sqlite_control_store import SqliteControlStore
+        from agent_core.controller import TaskRunController
+        from agent_core.operator_controls import current
+        with self.workbench.lock:
+            run = self._current(challenge_id)
+            if run is None:
+                raise WorkbenchError("operator_task_not_active", 409)
+            if run["run_id"] != value["run_id"]:
+                raise WorkbenchError("operator_run_changed", 409)
+            directory = self._find_agent_directory(Path(run["directory"]))
+            if directory is None:
+                raise WorkbenchError("operator_task_initializing", 409)
+            try:
+                with SqliteControlStore.open(directory / "control.sqlite") as store:
+                    if store.load_stage_run_config(directory.name) is None:
+                        raise WorkbenchError("operator_scope_invalid", 409)
+                    if (Path(run["directory"]) / "competition-binding.json").is_file() and current(store, directory.name) is None:
+                        raise WorkbenchError("operator_task_initializing", 409)
+                    if run["status"] != "running" and store._connection.execute(
+                            "SELECT 1 FROM task_operator_controls WHERE operation_id=? AND task_run_id=?",
+                            (value["operation_id"], directory.name)).fetchone() is None:
+                        raise WorkbenchError("operator_task_not_active", 409)
+                    control = TaskRunController.submit_operator_control(store, directory.name,
+                        value["operation_id"], value["action"], value["payload"])
+            except ValueError as error:
+                raise WorkbenchError(str(error), 409) from None
+        return {"operation_id": value["operation_id"], "operator_control": control}
+
     def operator_control(self,challenge_id,action,*,seconds=None,operation_id=None):
         """A separate narrow CLI command can reach an active worker's control ledger."""
         operation_id=operation_id or str(uuid4())

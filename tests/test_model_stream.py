@@ -237,9 +237,9 @@ def progress_worker(connection, settings, payload, timeout):
         connection.send({"diagnostic": {"reasoning_chars": 1, "response_utf8_bytes": 20}})
     while True:
         count += 1
-        if case == "progress":
+        if case in {"progress", "reasoning_only"}:
             connection.send({"diagnostic": {"reasoning_chars": count, "response_utf8_bytes": count * 20}})
-            if count == 6:
+            if count == 6 and case == "progress":
                 connection.send({"payload": {"content": "{}", "finish_reason": "stop"}})
                 return
         else:
@@ -252,14 +252,15 @@ def unconnected_worker(connection, settings, payload, timeout):
 
 
 @pytest.mark.parametrize("case,code", [("first", "model_first_output_timeout"), ("idle", "model_idle_timeout"),
-    ("total", "model_total_timeout"), ("connect", "model_connect_timeout"), ("progress", None)])
+    ("total", "model_total_timeout"), ("reasoning_only", "model_total_timeout"),
+    ("connect", "model_connect_timeout"), ("progress", None)])
 def test_semantic_timers_ignore_heartbeat_and_confirm_worker_exit(case, code):
     settings = DeepSeekSettings("offline", "private-key", timeout_seconds=4,
         first_output_timeout_seconds=.18 if case == "first" else 3,
         idle_timeout_seconds=.14, connect_timeout_seconds=.9 if case == "connect" else 2)
     adapter = DeepSeekModelAdapter(settings, worker=unconnected_worker if case == "connect" else progress_worker)
     detail = {}
-    result = adapter._invoke_payload({"stream": True, "case": case}, .9 if case == "total" else 4,
+    result = adapter._invoke_payload({"stream": True, "case": case}, .9 if case in {"total", "reasoning_only"} else 4,
         SimpleNamespace(is_cancelled=False), diagnostic=detail)
     assert detail["worker_exit_confirmed"] is True and detail["elapsed_seconds"] < 5
     if code:
@@ -268,6 +269,9 @@ def test_semantic_timers_ignore_heartbeat_and_confirm_worker_exit(case, code):
     else: assert result == {"content": "{}", "finish_reason": "stop"}
     if case == "first": assert "first_output_seconds" not in detail and detail["keepalive_lines"] > 1
     if case in {"idle", "progress"}: assert detail["first_output_seconds"] <= detail["last_output_seconds"]
+    if case == "reasoning_only":
+        assert detail["reasoning_chars"] > 1 and detail.get("content_chars", 0) == 0
+        assert detail["first_output_seconds"] <= detail["last_output_seconds"]
 
 
 def test_shared_policy_unwraps_and_respects_configuration_and_task_deadline():
@@ -277,6 +281,16 @@ def test_shared_policy_unwraps_and_respects_configuration_and_task_deadline():
         adapter = SimpleNamespace(adapter=SimpleNamespace(adapter=SimpleNamespace(settings=replace(settings, timeout_seconds=limit))))
         assert model_call_timeout(adapter, 500) == min(limit, 500)
     assert model_call_timeout(object(), 700) == 600
+
+
+def test_stage_absolute_budget_already_expired_does_not_start_worker():
+    settings = DeepSeekSettings("offline", "private-key")
+    adapter = DeepSeekModelAdapter(settings, worker=unconnected_worker)
+    detail = {}
+    result = adapter._invoke_payload({"stream": True}, 600,
+        SimpleNamespace(is_cancelled=True, is_timed_out=True), diagnostic=detail)
+    assert result.kind is ModelErrorKind.TIMED_OUT and result.short_reason == "model_total_timeout"
+    assert detail == {"transport_end": "not_dispatched", "worker_exit_confirmed": True}
 
 
 @pytest.mark.parametrize("field,value", [("timeout_seconds", 0), ("idle_timeout_seconds", float("nan")),
@@ -354,6 +368,44 @@ def test_virtual_long_generation_exceeds_old_180_but_not_task_deadline(monkeypat
         assert result.short_reason == expected and detail["elapsed_seconds"] == remaining
     else:
         assert result["content"] == "{}" and detail["elapsed_seconds"] == 221
+
+
+@pytest.mark.parametrize("initial_deadline,extend_at,connect_at", [(90, 80, 1), (5, 4, 7)])
+def test_planning_transport_ignores_role_total_and_extends_same_virtual_request(monkeypatch, initial_deadline, extend_at, connect_at):
+    now, deadline, starts = [0.0], [float(initial_deadline)], []
+    scheduled = [(connect_at, {"connected": True})] + [(n, {"diagnostic": {"reasoning_chars": n}})
+        for n in (20, 70, 120, 170, 220)] + [(221, {"payload": {"content": "{}", "finish_reason": "stop"}})]
+    class Token:
+        task_deadline_only = True
+        @property
+        def remaining_seconds(self): return max(0, deadline[0] - now[0])
+        @property
+        def is_cancelled(self): return self.remaining_seconds <= 0
+        @property
+        def is_timed_out(self): return self.remaining_seconds <= 0
+    class Pipe:
+        def poll(self, delay):
+            now[0] += 1
+            if now[0] == extend_at: deadline[0] = 400
+            return bool(scheduled and scheduled[0][0] <= now[0])
+        def recv(self): return scheduled.pop(0)[1]
+        def close(self): pass
+    class Process:
+        pid, alive = 1, True
+        def start(self): starts.append(True)
+        def is_alive(self): return self.alive
+        def terminate(self): self.alive = False
+        def join(self, timeout): pass
+        def kill(self): self.alive = False
+        def close(self): pass
+    monkeypatch.setattr(deepseek_model.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(deepseek_model.multiprocessing, "get_context", lambda mode: SimpleNamespace(
+        Pipe=lambda **kw: (Pipe(), Pipe()), Process=lambda **kw: Process()))
+    detail = {}
+    result = DeepSeekModelAdapter(DeepSeekSettings("offline", "private-key", timeout_seconds=40))._invoke_payload(
+        {"stream": True}, 90, Token(), diagnostic=detail)
+    assert result == {"content": "{}", "finish_reason": "stop"}
+    assert len(starts) == 1 and detail["elapsed_seconds"] == 221 and detail["worker_exit_confirmed"]
 
 
 @pytest.mark.parametrize("raw", [b"data:\n" * 200, b":" + b"x" * 200 + b"\n"])

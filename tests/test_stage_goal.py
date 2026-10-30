@@ -187,7 +187,10 @@ def test_candidate_schema_migration_failure_preserves_registry_and_feedback(case
     path = directory / "control.sqlite"
     with sqlite3.connect(path) as db:
         before = db.execute("SELECT * FROM d7_candidate_registry").fetchall()
-        db.execute("DELETE FROM schema_versions WHERE version=34")
+        db.execute("DROP TABLE stage_plan_bindings")
+        db.execute("DROP TABLE stage_branches")
+        db.execute("DROP TABLE stage_review_queue")
+        db.execute("DELETE FROM schema_versions WHERE version>=34")
     schema = stage_storage.CANDIDATE_SCHEMA
     monkeypatch.setattr(stage_storage, "CANDIDATE_SCHEMA", schema + "\nBROKEN MIGRATION;")
     with pytest.raises(StorageError, match="schema migration failed"):
