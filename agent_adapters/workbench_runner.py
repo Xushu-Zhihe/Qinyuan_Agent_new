@@ -795,6 +795,21 @@ class Runner:
                         except Exception:
                             pass
 
+                    try:
+                        for container in client.containers.list(all=True, filters={
+                            "label": [
+                                f"qinyuan.task_run_id={task_run_id}",
+                                "qinyuan.component=tool-download",
+                            ]
+                        }):
+                            try:
+                                container.stop(timeout=1)
+                                container.remove(force=True)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
                     # Remove networks
                     for network_type in ["in", "out"]:
                         try:

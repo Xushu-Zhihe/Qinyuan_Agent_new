@@ -168,8 +168,10 @@ class T6TargetNetwork:
                 security_opt=["no-new-privileges:true"],
                 user="10001:10001",
                 tmpfs={"/tools-download": "rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700"},
-                mem_limit="128m",
-                memswap_limit="128m",
+                # The download worker runs inside this container and writes into
+                # a 256 MiB tmpfs; 128 MiB would OOM-kill the target forwarder.
+                mem_limit="512m",
+                memswap_limit="512m",
                 pids_limit=64,
             )
             private.connect(proxy, aliases=["target.qinyuan"])

@@ -3,15 +3,49 @@ import asyncio
 import hashlib
 import io
 import json
+import os
+import sys
 from pathlib import Path, PurePosixPath
 import tarfile
 import time
+from urllib.parse import urlsplit
 from uuid import UUID
 from docker.errors import NotFound
 from Sandbox.tool_download_worker import MAX_DOWNLOAD_BYTES
 
 DOWNLOAD_STOP_GRACE_SECONDS = 5.0
 DOWNLOAD_TAR_OVERHEAD_BYTES = 1024 * 1024
+DOWNLOAD_ALLOWED_HOSTS_ENV = "QINYUAN_DOWNLOAD_ALLOWED_HOSTS"
+
+
+def _normalize_host(value):
+    return str(value).strip().lower().rstrip(".")
+
+
+def host_allowed(host, allowed_hosts):
+    """Exact host, or a leading-dot suffix such as ``.githubusercontent.com``."""
+    host = _normalize_host(host)
+    if not host:
+        return False
+    for entry in allowed_hosts or ():
+        entry = _normalize_host(entry)
+        if not entry:
+            continue
+        if entry.startswith("."):
+            if host == entry[1:] or host.endswith(entry):
+                return True
+        elif host == entry:
+            return True
+    return False
+
+
+def _configured_allowed_hosts():
+    raw = os.environ.get(DOWNLOAD_ALLOWED_HOSTS_ENV, "")
+    return frozenset(
+        item.strip().lower().rstrip(".")
+        for item in raw.split(",")
+        if item.strip()
+    )
 
 
 class ToolDownloadError(RuntimeError):
@@ -69,17 +103,30 @@ def installation_archive(contents, arguments, operation_id):
                 archive.addfile(info);directories.add(str(parent))
             info=tarfile.TarInfo(relative);info.size=len(payload);info.mode=0o600;info.uid=info.gid=10001
             archive.addfile(info, io.BytesIO(payload))
+            # The tar output already owns a copy; release each verified payload
+            # so a single large artifact does not sit in memory three times.
+            contents[name] = b""
     return output.getvalue()
 
 
 class ToolDownload:
-    def __init__(self, sandbox, task, operation_id, evidence):
+    def __init__(self, sandbox, task, operation_id, evidence, *, allowed_hosts=None,
+                 forbidden_target=None):
         UUID(operation_id)
         self.sandbox, self.task, self.operation_id, self.evidence = sandbox, task, operation_id, evidence
         self.client = sandbox._runtime.client
         self.worker = self.exec_id = self.pid = self.stream = None
         self.temporary = False
         self.stopping = False
+        if allowed_hosts is None:
+            self.allowed_hosts = _configured_allowed_hosts()
+        else:
+            if isinstance(allowed_hosts, str):
+                allowed_hosts = allowed_hosts.split(",")
+            self.allowed_hosts = frozenset(
+                _normalize_host(item) for item in allowed_hosts if _normalize_host(item)
+            )
+        self.forbidden_target = forbidden_target
         self.lease = {"task_run_id": task.task_run_id, "operation_id": operation_id}
 
     def record(self, **values):
@@ -98,6 +145,9 @@ class ToolDownload:
             self.worker = self.client.containers.get(network.forwarder_id)
             self.owned(self.worker, "t6-target-network")
             if self.worker.status != "running":raise ToolDownloadError("download.forwarder_not_running")
+            memory = (self.worker.attrs.get("HostConfig") or {}).get("Memory")
+            if isinstance(memory, int) and 0 < memory < 512 * 1024 * 1024:
+                raise ToolDownloadError("download.forwarder_memory_insufficient")
         else:
             self.temporary = True
             name = "Ayui-download-" + self.task.task_run_id + "-" + self.operation_id
@@ -162,10 +212,24 @@ class ToolDownload:
         except NotFound:return
         raise ToolDownloadUnknown("download.worker_cleanup_unknown")
 
+    def _source_allowed(self, url):
+        try:
+            host = _normalize_host(urlsplit(url).hostname or "")
+        except (TypeError, ValueError):
+            return False
+        return host_allowed(host, self.allowed_hosts)
+
     def prepare(self, arguments, timeout):
+        url = arguments.get("url")
+        if url and not self._source_allowed(url):
+            raise ToolDownloadError("download.source_not_allowed")
+        target = self.forbidden_target
+        network = getattr(self.task, "target_network", None)
+        if target is None and network is not None:
+            target = network.target_url
         config = {"arguments": dict(arguments), "task_run_id": self.task.task_run_id,
                   "operation_id": self.operation_id, "timeout": timeout,
-                  "target": self.task.target_network.target_url if self.task.target_network else None}
+                  "allowed_hosts": sorted(self.allowed_hosts), "target": target}
         code = Path(__file__).with_name("tool_download_worker.py").read_text(encoding="utf-8")
         try:
             self.acquire(timeout)
@@ -196,8 +260,10 @@ class ToolDownload:
             if inspection.get("Running"):
                 raise ToolDownloadUnknown("download.worker_exit_unconfirmed")
             if inspection.get("ExitCode") != 0:
-                raise ToolDownloadError("download.worker_failed")
+                detail = bytes(stderr[-4096:]).decode("utf-8", errors="replace").strip()
+                raise ToolDownloadError("download.worker_failed" + (": " + detail if detail else ""))
             manifest, contents=verified_artifacts(bytes(data), arguments, self.task.task_run_id,self.operation_id)
+            data.clear()
             if self.stopping:raise ToolDownloadError("download.cancelled_before_install")
             # Recheck current TaskRun ownership before copying bytes into its existing container.
             self.sandbox._verify_active(self.task.task_run_id,self.task.sandbox_id)
@@ -205,7 +271,8 @@ class ToolDownload:
             if not target.put_archive("/tools", installation_archive(contents,arguments,self.operation_id)):
                 raise ToolDownloadUnknown("download.artifact_transfer_unknown")
             prepared = {"wheelhouse": "/tools/wheels/"+self.operation_id,
-                        "wheel_hashes": {PurePosixPath(a["name"]).name:a["sha256"] for a in manifest["artifacts"] if a["name"].startswith("wheels/")}}
+                        "wheel_hashes": {PurePosixPath(a["name"]).name:a["sha256"] for a in manifest["artifacts"] if a["name"].startswith("wheels/")},
+                        "preparation_errors": list(manifest.get("errors") or [])}
             self.record(state="prepared", manifest=manifest, prepared=prepared)
             return prepared
         except ToolDownloadError as error:
@@ -218,11 +285,17 @@ class ToolDownload:
             self.record(state="unknown")
             raise ToolDownloadUnknown("download.outcome_unknown") from None
         finally:
+            # A cleanup error must not turn a known failure into an unknown
+            # outcome. The original known/unknown classification is preserved;
+            # only a successful body whose cleanup is unconfirmed becomes Unknown.
+            active = sys.exc_info()[0]
             try:self.cleanup()
             except Exception:
                 self.record(cleanup="unknown")
-                raise ToolDownloadUnknown("download.worker_cleanup_unknown") from None
-            if self.temporary:self.record(cleanup="confirmed")
+                if active is None:
+                    raise ToolDownloadUnknown("download.worker_cleanup_unknown") from None
+            else:
+                if self.temporary:self.record(cleanup="confirmed")
 
     async def run(self, arguments, timeout):
         worker=asyncio.create_task(asyncio.to_thread(self.prepare,arguments,timeout))
@@ -233,9 +306,18 @@ class ToolDownload:
                 await asyncio.wait_for(asyncio.to_thread(self.interrupt),timeout=DOWNLOAD_STOP_GRACE_SECONDS)
                 await asyncio.wait_for(asyncio.shield(worker),timeout=DOWNLOAD_STOP_GRACE_SECONDS)
             except Exception:pass
-            if worker.done() and not worker.cancelled() and not isinstance(worker.exception(), ToolDownloadUnknown):
-                code = "download.preparation_cancelled" if isinstance(stopped, asyncio.CancelledError) else "download.preparation_timeout"
-                self.record(state="failed",code=code)
-                raise ToolDownloadError(code) from None
+            if worker.done() and not worker.cancelled():
+                error = worker.exception()
+                if isinstance(error, ToolDownloadError):
+                    # Prefer the real, known failure over a synthetic timeout that
+                    # happened to race with the worker's last moment.  Keep the
+                    # established cancellation code for a worker that observed the
+                    # stop itself.
+                    if str(error) != "download.cancelled_before_install":
+                        raise error
+                if not isinstance(error, ToolDownloadUnknown):
+                    code = "download.preparation_cancelled" if isinstance(stopped, asyncio.CancelledError) else "download.preparation_timeout"
+                    self.record(state="failed",code=code)
+                    raise ToolDownloadError(code) from None
             self.record(state="unknown",code="download.worker_stop_unconfirmed")
             raise ToolDownloadUnknown("download.worker_stop_unconfirmed") from None

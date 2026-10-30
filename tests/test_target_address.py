@@ -126,6 +126,19 @@ def test_forwarder_requires_private_start_argument(forwarder):
         with pytest.raises(TargetAddressError):parse(args)
 
 
+def test_forwarder_reaps_exited_helpers(forwarder, monkeypatch):
+    import threading
+    stop = threading.Event()
+    calls = []
+    def waitpid(*args):
+        calls.append(args)
+        stop.set()
+        return (123, 0)
+    monkeypatch.setattr(forwarder["os"], "waitpid", waitpid)
+    forwarder["reap_children"](stop)
+    assert calls == [(-1, getattr(forwarder["os"], "WNOHANG", 1))]
+
+
 @pytest.mark.parametrize("code,expected",[(111,"target_connection_refused"),(101,"target_network_unreachable"),(None,"target_connect_timeout")])
 def test_forwarder_classifies_known_connect_failure_without_retrying_request(forwarder,monkeypatch,code,expected):
     import errno

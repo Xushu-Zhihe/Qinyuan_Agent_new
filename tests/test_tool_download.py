@@ -115,6 +115,169 @@ class Evidence:
     def save(self,kind,key,value):self.rows.append((kind,key,dict(value)))
 
 
+def test_source_allowlist_is_fail_closed_before_any_worker():
+    task=SimpleNamespace(task_run_id=str(uuid4()))
+    sandbox=SimpleNamespace(_runtime=SimpleNamespace(client=object()))
+    broker=ToolDownload(sandbox,task,str(uuid4()),Evidence(),allowed_hosts={"source.test"})
+    with pytest.raises(ToolDownloadError,match="download.source_not_allowed"):
+        broker.prepare({"url":"https://evil.test/tool","sha256":"0"*64},10)
+    assert broker._source_allowed("https://source.test/tool")
+    assert not broker._source_allowed("https://sub.source.test/tool")
+    assert ToolDownload(sandbox,task,str(uuid4()),Evidence(),
+                        allowed_hosts={".example.com"})._source_allowed("https://a.example.com/x")
+
+
+def test_worker_public_addresses_enforces_source_allowlist(monkeypatch):
+    monkeypatch.setattr(worker.socket,"getaddrinfo",lambda *a,**k:[(2,1,6,"",("8.8.8.8",443))])
+    with pytest.raises(ValueError,match="download.source_not_allowed"):
+        worker.public_addresses("evil.test",443,set(),{"source.test"})
+    assert worker.public_addresses("source.test",443,set(),{"source.test"})
+
+
+def test_installer_is_bounded_and_atomic():
+    plan=install_tool(name="sevenzip",url="https://source.test/7zip.zip",sha256="0"*64,
+                      archive_format="zip",executable_path="7zz")
+    script=plan["sandbox_command"]["arguments"][1]
+    assert "__SHA256__" not in script and "__TIMEOUT_SECONDS__" not in script
+    assert "sha256_file" in script and "read_bytes()" not in script
+    assert "MAX_ARCHIVE_MEMBERS" in script and "MAX_EXTRACTED_BYTES" in script
+    assert "os.link(source, staging)" in script
+    assert "os.replace(temporary, receipt)" in script
+    assert "read_receipt()" in script
+    assert "shell=True" not in script
+
+
+def test_reserved_platform_names_are_rejected():
+    for name in ("python3","timeout","curl","nmap","bash"):
+        with pytest.raises(ValueError,match="platform executable"):
+            install_tool(name=name,url="https://source.test/tool",sha256="0"*64)
+
+
+def _offline_code(tmp_path, archive_format="zip", **kwargs):
+    payload = io.BytesIO()
+    if archive_format == "zip":
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("7zz", b"portable executable")
+    else:
+        with tarfile.open(fileobj=payload, mode="w:xz") as archive:
+            content = b"portable executable"
+            info = tarfile.TarInfo("7zz")
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    raw = payload.getvalue()
+    sha = hashlib.sha256(raw).hexdigest()
+    root = tmp_path / "tools"
+    (root / "sources").mkdir(parents=True)
+    (root / "sources" / sha).write_bytes(raw)
+    monkeypatch = kwargs.pop("monkeypatch")
+    monkeypatch.setenv("QINYUAN_OFFLINE_TOOL_INSTALL", "1")
+    plan = install_tool(name="sevenzip", url="https://source.test/tool", sha256=sha,
+                        archive_format=archive_format, executable_path="7zz")
+    code = plan["sandbox_command"]["arguments"][1].replace(
+        "ROOT = Path('/tools')", "ROOT = Path(" + repr(str(root)) + ")"
+    )
+    return root, code
+
+
+def test_offline_install_recovers_from_corrupt_receipt(tmp_path, monkeypatch):
+    root, code = _offline_code(tmp_path, monkeypatch=monkeypatch)
+    exec(compile(code, "installer", "exec"), {})
+    (root / "receipts/sevenzip.json").write_text("{broken")
+    exec(compile(code, "installer", "exec"), {})
+    assert (root / "apps/sevenzip/7zz").read_bytes() == b"portable executable"
+
+
+def test_offline_install_rejects_oversized_archive(tmp_path, monkeypatch):
+    root, code = _offline_code(tmp_path, monkeypatch=monkeypatch)
+    code = code.replace("MAX_EXTRACTED_BYTES = 240 * 1024 * 1024", "MAX_EXTRACTED_BYTES = 10")
+    with pytest.raises(RuntimeError, match="archive expands"):
+        exec(compile(code, "installer", "exec"), {})
+
+
+def test_offline_install_prunes_unreferenced_artifacts(tmp_path, monkeypatch):
+    root, code = _offline_code(tmp_path, monkeypatch=monkeypatch)
+    current = {item.name for item in (root / "sources").iterdir()}
+    (root / "sources/dead").write_bytes(b"dead")
+    (root / "sources/keep").write_bytes(b"keep")
+    (root / "wheels").mkdir()
+    (root / "wheels/old").mkdir()
+    (root / "wheels/keep").mkdir()
+    (root / "receipts").mkdir()
+    (root / "receipts/old.json").write_text(json.dumps({
+        "source_sha256": "keep", "wheelhouse": str(root / "wheels/keep")
+    }))
+    exec(compile(code, "installer", "exec"), {})
+    names = {item.name for item in (root / "sources").iterdir()}
+    assert current <= names and "dead" not in names and "keep" in names
+    wheels = {item.name for item in (root / "wheels").iterdir()}
+    assert wheels == {"keep"}
+
+
+def test_python_fallback_uses_per_tool_target_and_wrapper(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    root = tmp_path / "tools"
+    wheelhouse = root / "wheels" / "op"
+    wheelhouse.mkdir(parents=True)
+    wheel = wheelhouse / "demo-1-py3-none-any.whl"
+    wheel.write_bytes(b"wheel bytes")
+    sha = hashlib.sha256(b"wheel bytes").hexdigest()
+    monkeypatch.setenv("QINYUAN_OFFLINE_TOOL_INSTALL", "1")
+    monkeypatch.setenv("QINYUAN_TOOL_WHEELHOUSE", str(wheelhouse))
+    monkeypatch.setenv("QINYUAN_TOOL_WHEEL_HASHES", json.dumps({wheel.name: sha}))
+    plan = install_tool(name="demo", python_package="demo", python_version="1")
+    code = plan["sandbox_command"]["arguments"][1]
+    assert "environment['TMPDIR']" in code and "'.tmp-'" in code
+    code = code.replace(
+        "ROOT = Path('/tools')", "ROOT = Path(" + repr(str(root)) + ")"
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+        exec(compile(code, "installer", "exec"), {})
+    target = root / "python/demo"
+    wrapper = root / "apps/demo/bin/python3"
+    assert target.is_dir() and wrapper.is_file()
+    assert str(target) in wrapper.read_text()
+    receipt = json.loads((root / "receipts/demo.json").read_text())
+    assert receipt["kind"] == "python"
+    assert receipt["path"] == str(wrapper)
+    assert receipt["python_target"] == str(target)
+    with __import__("contextlib").redirect_stdout(io.StringIO()) as out:
+        exec(compile(code, "installer", "exec"), {})
+    assert json.loads(out.getvalue().strip().splitlines()[-1])["status"] == "already_installed"
+
+
+def test_worker_native_survives_invalid_wheel(tmp_path, monkeypatch):
+    import sys
+    class Output:
+        def __init__(self):self.buffer=io.BytesIO()
+        def write(self,value):return len(value)
+        def flush(self):pass
+    output=Output()
+    monkeypatch.setattr(sys,"stdout",output)
+    monkeypatch.setattr(worker.os,"setsid",lambda:None,raising=False)
+    monkeypatch.setattr(worker,"Path",lambda value:tmp_path if value=="/tools-download" else Path(value))
+    def fetch(url,path,expected,remaining,forbidden,allowed_hosts=None):
+        path.write_bytes(b"native")
+        return {"name":"native","sha256":hashlib.sha256(b"native").hexdigest(),"size":6}
+    def download(arguments,**kwargs):
+        destination=Path(arguments[arguments.index("--dest")+1])
+        (destination/"bad.whl").mkdir()
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(worker,"fetch",fetch)
+    monkeypatch.setattr(worker.subprocess,"run",download)
+    worker.main({"operation_id":str(uuid4()),"task_run_id":str(uuid4()),"timeout":10,
+        "allowed_hosts":["source.test"],
+        "arguments":{"url":"https://source.test/native","sha256":"0"*64,
+                     "python_package":"fallback","python_version":"1"}})
+    with tarfile.open(fileobj=io.BytesIO(output.buffer.getvalue()),mode="r:") as archive:
+        manifest=json.load(archive.extractfile("manifest.json"))
+        assert manifest["status"]=="completed"
+        assert [a["name"] for a in manifest["artifacts"]]==["native"]
+        assert any("download.invalid_wheel" in item for item in manifest["errors"])
+        assert archive.extractfile("native").read()==b"native"
+
+
 @pytest.mark.parametrize("reuse", [False,True])
 @pytest.mark.parametrize("tamper", [False,True])
 def test_broker_reuses_forwarder_or_cleans_temporary_worker_without_host_files(reuse,tamper):
@@ -251,7 +414,7 @@ def test_native_success_still_prepares_configured_offline_python_fallback(tmp_pa
     monkeypatch.setattr(sys,"stdout",output)
     monkeypatch.setattr(worker.os,"setsid",lambda:None,raising=False)
     monkeypatch.setattr(worker,"Path",lambda value:tmp_path if value=="/tools-download" else Path(value))
-    def fetch(url,path,expected,remaining,forbidden):
+    def fetch(url,path,expected,remaining,forbidden,allowed_hosts=None):
         path.write_bytes(b"native")
         return {"name":"native","sha256":hashlib.sha256(b"native").hexdigest(),"size":6}
     def download(arguments,**kwargs):

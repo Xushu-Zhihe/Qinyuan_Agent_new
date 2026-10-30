@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-from textwrap import dedent
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -19,8 +18,13 @@ _MODULE_PATTERN = re.compile(
 )
 _SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 _ARCHIVE_FORMATS = frozenset({"raw", "zip", "tar", "tar.gz", "tar.xz"})
+_RESERVED_NAMES = frozenset({
+    "sh", "bash", "dash", "python", "python3", "pip", "pip3", "timeout",
+    "sleep", "curl", "wget", "nmap", "gdb", "file", "readelf", "objdump",
+    "nm", "strings", "php", "pwsh", "powershell", "tar", "unzip", "zip",
+    "subfinder", "amass", "httpx", "ffuf", "dirsearch", "nuclei", "jadx",
+})
 _DEFAULT_BOOTSTRAP_TIMEOUT = 300
-_BOOTSTRAP_BUDGET = 300
 
 
 mcp = FastMCP(
@@ -67,6 +71,8 @@ def _effective_timeout(value: int | None) -> int:
 def _validate_name(value: str, label: str) -> str:
     if not isinstance(value, str) or _NAME_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{label} must be a safe non-empty name")
+    if value.lower() in _RESERVED_NAMES:
+        raise ValueError(f"{label} must not shadow a platform executable")
     return value
 
 
@@ -127,205 +133,8 @@ def _validate_module(value: str) -> str:
 
 
 def _script(**values: object) -> str:
-    encoded = {key: json.dumps(value, ensure_ascii=True) for key, value in values.items()}
-    script = dedent(
-        f"""
-        import hashlib
-        import json
-        import os
-        import shutil
-        import subprocess
-        import sys
-        import tarfile
-        import tempfile
-        import time
-        import urllib.request
-        import zipfile
-        from pathlib import Path, PurePosixPath
-
-        NAME = {encoded['name']}
-        URL = {encoded['url']}
-        SHA256 = {encoded['sha256']}
-        ARCHIVE_FORMAT = {encoded['archive_format']}
-        EXECUTABLE_PATH = {encoded['executable_path']}
-        SELF_TEST_ARGS = {encoded['self_test_args']}
-        PYTHON_PACKAGE = {encoded['python_package']}
-        PYTHON_VERSION = {encoded['python_version']}
-        PYTHON_MODULE = {encoded['python_module']}
-        TIMEOUT = {encoded['timeout_seconds']}
-        MAX_BYTES = 256 * 1024 * 1024
-        ROOT = Path('/tools')
-        OFFLINE = os.environ.get('QINYUAN_OFFLINE_TOOL_INSTALL') == '1'
-        WHEELHOUSE = os.environ.get('QINYUAN_TOOL_WHEELHOUSE', '')
-        WHEEL_HASHES = json.loads(os.environ.get('QINYUAN_TOOL_WHEEL_HASHES', '{{}}'))
-        DEADLINE = time.monotonic() + TIMEOUT
-
-        def remaining():
-            value = DEADLINE - time.monotonic()
-            if value <= 0:
-                raise TimeoutError('tool bootstrap budget exhausted')
-            return value
-
-        def safe_relative(value):
-            path = PurePosixPath(value.replace('\\\\', '/'))
-            if path.is_absolute() or '..' in path.parts or not path.parts:
-                raise ValueError('archive contains an unsafe path')
-            return Path(*path.parts)
-
-        def extract_zip(source, destination):
-            with zipfile.ZipFile(source) as archive:
-                for member in archive.infolist():
-                    relative = safe_relative(member.filename)
-                    target = destination / relative
-                    if member.is_dir():
-                        target.mkdir(parents=True, exist_ok=True)
-                        continue
-                    if ((member.external_attr >> 16) & 0o170000) == 0o120000:
-                        raise ValueError('archive symlinks are not allowed')
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with archive.open(member) as source_file, target.open('wb') as target_file:
-                        shutil.copyfileobj(source_file, target_file)
-
-        def extract_tar(source, destination):
-            with tarfile.open(source, 'r:*') as archive:
-                for member in archive.getmembers():
-                    relative = safe_relative(member.name)
-                    target = destination / relative
-                    if member.isdir():
-                        target.mkdir(parents=True, exist_ok=True)
-                        continue
-                    if not member.isfile():
-                        raise ValueError('archive links and special files are not allowed')
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    source_file = archive.extractfile(member)
-                    if source_file is None:
-                        raise ValueError('archive member cannot be read')
-                    with source_file, target.open('wb') as target_file:
-                        shutil.copyfileobj(source_file, target_file)
-
-        def run_self_test(path):
-            if not SELF_TEST_ARGS:
-                return
-            result = subprocess.run(
-                [str(path), *SELF_TEST_ARGS],
-                cwd=str(path.parent),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=min(15, remaining()),
-                check=False,
-                text=True,
-            )
-            if result.returncode != 0:
-                raise RuntimeError('native tool self-test failed')
-
-        def install_native():
-            if not URL or not SHA256:
-                raise ValueError('native installation requires URL and SHA256')
-            ROOT.mkdir(parents=True, exist_ok=True)
-            staging = ROOT / ('.download-' + NAME)
-            install_root = ROOT / 'apps' / NAME
-            staging.unlink(missing_ok=True)
-            if install_root.exists():
-                shutil.rmtree(install_root)
-            source = ROOT / 'sources' / SHA256.lower()
-            if OFFLINE:
-                if not source.is_file():
-                    raise ValueError('verified native source was not prepared')
-                shutil.copyfile(source, staging)
-            else:
-                request = urllib.request.Request(URL, headers={{'User-Agent': 'qinyuan-agent'}})
-                total = 0
-                with urllib.request.urlopen(request, timeout=min(30, remaining())) as response, staging.open('wb') as target:
-                    while True:
-                        chunk = response.read(min(1024 * 1024, int(remaining())))
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > MAX_BYTES:
-                            raise ValueError('download exceeds 256 MiB')
-                        target.write(chunk)
-            digest = hashlib.sha256(staging.read_bytes()).hexdigest()
-            if digest != SHA256:
-                raise ValueError('download SHA256 does not match')
-            if ARCHIVE_FORMAT == 'raw':
-                executable = ROOT / 'bin' / NAME
-                executable.parent.mkdir(parents=True, exist_ok=True)
-                staging.replace(executable)
-            else:
-                install_root.mkdir(parents=True, exist_ok=True)
-                if ARCHIVE_FORMAT == 'zip':
-                    extract_zip(staging, install_root)
-                else:
-                    extract_tar(staging, install_root)
-                executable = install_root / safe_relative(EXECUTABLE_PATH)
-                if not executable.is_file():
-                    raise ValueError('configured executable is missing from archive')
-            executable.chmod(0o755)
-            run_self_test(executable)
-            staging.unlink(missing_ok=True)
-            return executable
-
-        def install_python():
-            if not PYTHON_PACKAGE or not PYTHON_VERSION:
-                raise ValueError('Python fallback is not configured')
-            target = ROOT / 'python'
-            target.mkdir(parents=True, exist_ok=True)
-            package = PYTHON_PACKAGE + '==' + PYTHON_VERSION
-            environment = dict(os.environ)
-            environment['PYTHONPATH'] = str(target) + os.pathsep + environment.get('PYTHONPATH', '')
-            offline_args = []
-            if OFFLINE:
-                wheelhouse = Path(WHEELHOUSE)
-                if not WHEEL_HASHES or not wheelhouse.is_relative_to(ROOT / 'wheels'):
-                    raise ValueError('verified Python wheels were not prepared')
-                for name, expected in WHEEL_HASHES.items():
-                    wheel = wheelhouse / name
-                    if wheel.parent != wheelhouse or not wheel.is_file() or hashlib.sha256(wheel.read_bytes()).hexdigest() != expected:
-                        raise ValueError('prepared Python wheel changed')
-                offline_args = ['--no-index', '--find-links', str(wheelhouse)]
-            subprocess.run(
-                [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', '--no-input',
-                 '--only-binary=:all:', *offline_args, '--target', str(target), package],
-                timeout=remaining(), check=True, env=environment,
-            )
-            if PYTHON_MODULE:
-                subprocess.run(
-                    [sys.executable, '-c', 'import ' + PYTHON_MODULE],
-                    timeout=min(15, remaining()),
-                    check=True,
-                    env=environment,
-                )
-            return target
-
-        ROOT.mkdir(parents=True, exist_ok=True)
-        receipt_dir = ROOT / 'receipts'
-        receipt_dir.mkdir(parents=True, exist_ok=True)
-        receipt = receipt_dir / (NAME + '.json')
-        binding = hashlib.sha256(json.dumps([URL, SHA256, ARCHIVE_FORMAT, EXECUTABLE_PATH, SELF_TEST_ARGS,
-            PYTHON_PACKAGE, PYTHON_VERSION, PYTHON_MODULE], sort_keys=True).encode()).hexdigest()
-        if (receipt.is_file() and json.loads(receipt.read_text()).get('request_sha256') == binding
-                and Path(json.loads(receipt.read_text())['path']).exists()):
-            print(json.dumps({{'status': 'already_installed', 'path': json.loads(receipt.read_text())['path']}}))
-            raise SystemExit(0)
-        errors = []
-        installed = None
-        if URL:
-            try:
-                installed = install_native()
-            except Exception as error:
-                errors.append('native: ' + type(error).__name__)
-        if installed is None:
-            try:
-                installed = install_python()
-            except Exception as error:
-                errors.append('python: ' + type(error).__name__)
-        if installed is None:
-            raise RuntimeError('tool installation failed: ' + '; '.join(errors))
-        receipt.write_text(json.dumps({{'name': NAME, 'path': str(installed), 'errors': errors, 'request_sha256': binding}}), encoding='utf-8')
-        print(json.dumps({{'status': 'installed', 'path': str(installed), 'fallback_errors': errors}}))
-        """
-    ).strip()
-    return script
+    from MCPs.Download_Mcp.install_script import render
+    return render(values)
 
 
 def _bootstrap_plan(script: str, timeout_seconds: int) -> dict[str, Any]:
@@ -335,7 +144,6 @@ def _bootstrap_plan(script: str, timeout_seconds: int) -> dict[str, Any]:
             "arguments": ["-c", script],
             "timeout_seconds": timeout_seconds,
         },
-        "bootstrap": {"compensate_seconds": _BOOTSTRAP_BUDGET},
         "request": {"operation": "tool_bootstrap"},
     }
 

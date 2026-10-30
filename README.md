@@ -88,6 +88,12 @@ if (-not (Test-Path .env)) {
 
 真实运行使用的 Sandbox 镜像由 [docker_profile.py](agent_adapters/docker_profile.py) 固定，当前镜像标签为 `qinyuan/pentest-sandbox:0.3.4`，实际按配置中的镜像 ID 连接。重建同名镜像后需要核对 ID，Agent 不会自动拉取镜像。远程目标使用的转发镜像为 `qinyuan/t6-target-forwarder:0.1.0`。
 
+工具下载的 native URL 源默认拒绝；真实运行需要显式设置 `QINYUAN_DOWNLOAD_ALLOWED_HOSTS`（逗号分隔的精确主机名，或 `.example.com` 表示该域及子域）。Python 包仍只允许 PyPI 的 `pypi.org` 与 `files.pythonhosted.org`。下载源还必须是公网 HTTPS，且不能命中当前 TaskRun 的 target origin/endpoint。
+
+下载 worker 会在 target forwarder 容器内执行，forwarder 内存必须至少 512m。旧运行遗留的 128m forwarder 可用 `docker update --memory 512m --memory-swap 512m Ayui-forwarder-<task_run_id>` 原地调整；不支持时先走应用 cleanup，再用新 TaskRun 重建。
+
+Python fallback 现在安装到 `/tools/python/<name>`，并在 `/tools/apps/<name>/bin/python3` 生成设置好 `PYTHONPATH` 的 wrapper；使用返回的 wrapper 路径，不要假设 `python3` 会自动看到该包。pip 的临时目录放在 `/tools` 下，避免 `/tmp` 的 64m 限制。
+
 新建真实运行时，会在 TaskRun 开始计时前最多等待 Docker 引擎就绪 10 秒；已就绪立即继续。该等待不会启动 Docker Desktop，恢复、取消和清理也不会重复增加这段等待。
 
 ## 使用工作台

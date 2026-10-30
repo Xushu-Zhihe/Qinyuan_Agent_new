@@ -1,0 +1,185 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="1740" viewBox="0 0 2000 1740" role="img" aria-labelledby="title description">
+  <title id="title">Qinyuan_Agent · 双 LLM 阶段探索（v3）</title>
+  <desc id="description">当前双 LLM 架构：Inner 提出阶段与单层 Road，提交后从不可变规划前缀派生独立 Road 会话，在原授权内探索；单 Outer 排队审核，Fact 相邻兼容项逐项合批。待审与正式接受分开，目标不原地改写。实质意见关闭派发并确认取消，回原作者上下文；排序不同回原 Road 规划 Inner 决定保留或切换。当前 Turn 收尾确认后原 Inner 才提后继 Intent，提交后直接规划 Road 和探索，不等待后继规划审核。正式 Fact 单一存储，Turn.Fact 为带引用成果视图；可信独立验证决定最终成功。恢复会话不回滚环境，未知不重放。选择性环境恢复仍为未启用候选；真实效果尚未验证。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#50657d"/></marker>
+    <marker id="data-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#148578"/></marker>
+    <marker id="return-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#3376bd"/></marker>
+    <style>
+      text{font-family:"Microsoft YaHei","Noto Sans CJK SC","Segoe UI",sans-serif;fill:#21364e}
+      .title{font-size:38px;font-weight:700}.subtitle{font-size:20px;fill:#5a6e83}
+      .section{font-size:25px;font-weight:700}.heading{font-size:22px;font-weight:700}
+      .body{font-size:18px;fill:#3d536b}.small{font-size:16px;fill:#61748a}
+      .label{font-size:16px;fill:#50657d}.badge{font-size:17px;font-weight:700;fill:#536b84}
+      .panel{fill:#fff;stroke:#d5e0eb;stroke-width:1.5}
+      .model{fill:#f4effc;stroke:#9a82c6;stroke-width:1.8}
+      .control{fill:#eef4fd;stroke:#799bc3;stroke-width:1.8}
+      .knowledge{fill:#edf8f4;stroke:#66a995;stroke-width:1.8}
+      .tool{fill:#edf7fa;stroke:#73a9b8;stroke-width:1.8}
+      .candidate{fill:#fff9eb;stroke:#c8a357;stroke-width:1.8;stroke-dasharray:8 5}
+      .flow{fill:none;stroke:#50657d;stroke-width:2.4;marker-end:url(#arrow);stroke-linejoin:round}
+      .data{fill:none;stroke:#148578;stroke-width:2.4;stroke-dasharray:8 5;marker-end:url(#data-arrow);stroke-linejoin:round}
+      .return{fill:none;stroke:#3376bd;stroke-width:2.6;stroke-dasharray:9 5;marker-end:url(#return-arrow);stroke-linejoin:round}
+      .rule{stroke:#dce5ee;stroke-width:1.2}
+    </style>
+  </defs>
+  <rect width="2000" height="1740" fill="#f3f6fa"/>
+  <text x="40" y="66" class="title">Qinyuan_Agent · 双 LLM 阶段探索（v3）</text>
+  <text x="40" y="106" class="subtitle">阶段目标 → 独立路线 → 可靠成果 → 后继规划；受阻时回父规划，保留已验证成果。</text>
+  <rect x="1610" y="34" width="350" height="46" rx="12" fill="#e7eef7"/>
+  <text x="1785" y="64" text-anchor="middle" class="badge">当前架构 · 本地受控验证</text>
+  <text x="1960" y="108" text-anchor="end" class="small">运行策略：async_planning_v1</text>
+
+  <g id="task-run-scope">
+    <rect x="40" y="140" width="1920" height="115" rx="18" class="control"/>
+    <text x="70" y="179" class="heading">TaskRun · Origin / Goal / 授权 / 原 deadline / 统一资源边界</text>
+    <text x="70" y="217" class="body">最终目标与权限不因阶段切换而扩大；调度、执行、持久化和状态提交由可信程序持有。</text>
+    <text x="1925" y="217" text-anchor="end" class="small">入口初始化根规划；模型提案，程序核验执行。</text>
+  </g>
+
+  <rect x="40" y="285" width="1250" height="1145" rx="20" class="panel"/>
+  <text x="80" y="329" class="section">A · 一个 Turn 内：阶段目标与 Road 探索</text>
+  <g id="turn-intent">
+    <rect x="80" y="365" width="1170" height="100" rx="14" class="control"/>
+    <text x="105" y="403" class="heading">Turn.Intent · 本阶段要获得什么，以及怎样判断获得了</text>
+    <text x="105" y="439" class="body">阶段依据：自然语言＋实际引用；待审与正式接受分开，目标不原地改写。</text>
+  </g>
+  <path d="M250 465V525" class="flow"/>
+  <text x="269" y="501" class="label">当前阶段与有效上下文</text>
+
+  <g id="turn-planning-session">
+    <rect x="80" y="525" width="350" height="135" rx="14" class="model"/>
+    <text x="103" y="563" class="heading">Inner · Turn 规划会话</text>
+    <text x="103" y="597" class="body">本阶段 Road；后继阶段目标</text>
+    <text x="103" y="631" class="body">保留规划上下文，可接收后代反馈</text>
+  </g>
+  <path d="M430 592H490" class="data"/>
+  <text x="460" y="577" text-anchor="middle" class="label">入队</text>
+  <g id="outer-planning-review">
+    <rect x="490" y="525" width="350" height="135" rx="14" class="model"/>
+    <text x="513" y="563" class="heading">Outer · 审核与策略监督</text>
+    <text x="513" y="597" class="body">单消费者：规划 / 成果 / 收尾</text>
+    <text x="513" y="631" class="body">排序仅建议，回原规划 Inner 决定</text>
+  </g>
+  <path d="M840 592H900" class="flow"/>
+  <text x="870" y="577" text-anchor="middle" class="label">裁决</text>
+  <g id="trusted-control">
+    <rect x="900" y="525" width="350" height="135" rx="14" class="control"/>
+    <text x="923" y="563" class="heading">可信程序 · 唯一控制提交</text>
+    <text x="923" y="597" class="body">核验权限、来源、版本及绑定</text>
+    <text x="923" y="631" class="body">暂定登记与正式接受分别核验</text>
+  </g>
+  <path d="M255 660V720" class="flow"/>
+  <text x="278" y="697" class="label">提交后继续，审核排队</text>
+  <path d="M1075 660V720" class="flow"/>
+  <text x="1057" y="697" text-anchor="end" class="label">待审规划可在原授权内探索</text>
+
+  <g id="road-alternatives">
+    <rect x="80" y="720" width="1170" height="195" rx="16" fill="#f8fafc" stroke="#c7d5e4" stroke-width="1.5"/>
+    <text x="104" y="756" class="heading">Road · 同一阶段内的单层备选方向</text>
+    <text x="1225" y="756" text-anchor="end" class="small">可增补 / 排序；无须全部执行；不表示并发派发</text>
+    <rect x="100" y="778" width="350" height="115" rx="12" class="model"/>
+    <text x="120" y="810" class="heading">Road A · 当前选中</text>
+    <text x="120" y="842" class="body">从规划前缀派生的独立会话</text>
+    <text x="120" y="873" class="small">连续探索、工具反馈、结束申请</text>
+    <rect x="490" y="778" width="350" height="115" rx="12" class="model"/>
+    <text x="510" y="810" class="heading">Road B · 备选方向</text>
+    <text x="510" y="842" class="body">共享规划前缀，各自续接历史</text>
+    <text x="510" y="873" class="small">失败不自动否定可靠发现</text>
+    <rect x="880" y="778" width="350" height="115" rx="12" class="model"/>
+    <text x="900" y="810" class="heading">Road … · 其余候选</text>
+    <text x="900" y="842" class="body">阶段达成后仍保留候选</text>
+    <text x="900" y="873" class="small">供后续父规划重新评估</text>
+  </g>
+  <path d="M255 915V995" class="flow" marker-start="url(#arrow)"/>
+  <text x="278" y="949" class="label">受控派发</text>
+  <text x="278" y="976" class="label">已知结果回同一 Road</text>
+  <text x="745" y="958" class="small">排序不同：确认暂停 → 原规划 Inner 决定保留 / 切路。</text>
+
+  <g id="execution-and-evidence">
+    <rect x="80" y="995" width="350" height="140" rx="14" class="tool"/>
+    <text x="103" y="1033" class="heading">Tools / MCP / Sandbox</text>
+    <text x="103" y="1067" class="body">原授权内的工具与执行环境</text>
+    <text x="103" y="1101" class="small">公开检索走独立可信 API 通道</text>
+    <path d="M430 1065H490" class="flow"/>
+    <rect x="490" y="995" width="350" height="140" rx="14" class="knowledge"/>
+    <text x="513" y="1033" class="heading">原始证据与 Inner 提案</text>
+    <text x="513" y="1067" class="body">保存实际请求、结果与来源</text>
+    <text x="513" y="1101" class="small">观察 / 工作记录 / 候选 ≠ 正式 Fact</text>
+    <path d="M840 1065H900" class="flow"/>
+    <rect x="900" y="995" width="350" height="140" rx="14" class="model"/>
+    <text x="923" y="1033" class="heading">Outer 队列审核与可信提交</text>
+    <text x="923" y="1067" class="body">Fact 可逐项合批；待审不是成果</text>
+    <text x="923" y="1101" class="small">程序核验后提交，不由模型直接写入</text>
+  </g>
+  <path d="M1075 1135V1200" class="data"/>
+  <text x="1057" y="1174" text-anchor="end" class="label">实际证据支持的正式成果</text>
+  <g id="fact-view">
+    <rect x="80" y="1200" width="1170" height="170" rx="14" class="knowledge"/>
+    <text x="105" y="1240" class="heading">正式 Fact · 单一存储　→　Turn.Fact · 带引用的成果视图</text>
+    <text x="105" y="1277" class="body">保留原事实 ID、版本、来源与范围；可综合不同 Road 的有效成果。</text>
+    <text x="105" y="1312" class="body">按需联动祖先 Turn.Fact，不强求关系；引用未变事实不重复语义审核，新综合结论仍审核。</text>
+    <text x="105" y="1346" class="small">阶段达成记录与规划活动分开。后继受阻不抹去已达成成果；当前适用性仍须按实际条件判断。</text>
+  </g>
+  <path d="M80 1280H59V592H80" class="data"/>
+  <text x="80" y="1405" class="small">左侧绿线：有效成果与引用回到规划上下文。图中职责节点不等于独立模型调用，也不要求新增文件。</text>
+
+  <rect x="1320" y="285" width="640" height="1145" rx="20" class="panel"/>
+  <text x="1350" y="329" class="section">B · 阶段接续与父规划恢复</text>
+  <text x="1350" y="359" class="small">每个 Turn 都具有左侧的规划、Road 与成果视图。</text>
+  <g id="stage-succession">
+    <rect x="1360" y="390" width="520" height="110" rx="14" class="control"/>
+    <text x="1384" y="426" class="heading">T0 · 当前阶段</text>
+    <text x="1384" y="458" class="body">按阶段依据达成；保留成果与规划会话</text>
+    <text x="1384" y="485" class="small">收尾确认 → 原 Inner 提 Intent → 续接 Road</text>
+    <path d="M1620 500V570" class="flow"/>
+    <text x="1640" y="542" class="label">后继规划不等待自身审核</text>
+    <rect x="1360" y="570" width="520" height="110" rx="14" class="control"/>
+    <text x="1384" y="606" class="heading">T1 · 后继阶段 / T2 的直接父规划</text>
+    <text x="1384" y="638" class="body">自身规划待审也可在原授权内探索</text>
+    <text x="1384" y="665" class="small">恢复时纳入新信息，不仅续写旧上下文</text>
+    <path d="M1620 680V750" class="flow"/>
+    <text x="1640" y="722" class="label">达成后安排下一直接后继</text>
+    <rect x="1360" y="750" width="520" height="110" rx="14" class="control"/>
+    <text x="1384" y="786" class="heading">T2 · 当前探索阶段</text>
+    <text x="1384" y="818" class="body">可用路线无法继续 → 反馈给 T1</text>
+    <text x="1384" y="845" class="small">携带范围明确的失败与可靠成果</text>
+    <path d="M1880 805H1925V625H1880" class="return"/>
+    <text x="1360" y="900" class="body" style="fill:#3376bd">蓝色回线：只回直接父规划，不固定跳回根阶段。</text>
+    <text x="1360" y="933" class="body">若 T1 也无法继续，再向其直接父规划 T0 反馈。</text>
+    <text x="1360" y="966" class="small">单 Road 成功 ≠ Turn 达成 ≠ TaskRun 成功。</text>
+  </g>
+  <g id="selective-recovery-proposal">
+    <rect x="1350" y="1000" width="580" height="195" rx="14" class="candidate"/>
+    <text x="1374" y="1036" class="heading" style="fill:#876321">候选机制 · 条件变化下的选择性恢复</text>
+    <text x="1374" y="1073" class="body">恢复输入：失败条件＋可靠成果＋已知环境变化。</text>
+    <text x="1374" y="1107" class="body">优先复核受影响的前提，不重做全部探索。</text>
+    <text x="1374" y="1141" class="body">只用明确引用与已知变化，不自动猜测因果。</text>
+    <text x="1374" y="1175" class="small">未启用候选；重新观察与修订规则仍待细化。</text>
+  </g>
+  <g id="independent-final-validation">
+    <rect x="1350" y="1225" width="580" height="145" rx="14" class="knowledge"/>
+    <text x="1374" y="1264" class="heading">最终成功 · 可信独立验证</text>
+    <text x="1374" y="1300" class="body">最终答案候选 → 原独立验证 → TaskRun 结果</text>
+    <text x="1374" y="1335" class="body">阶段成果或 Outer 的判断不能替代最终验证。</text>
+  </g>
+  <text x="1350" y="1405" class="small">阶段达成可以汇集多条 Road 的有效成果。</text>
+
+  <rect x="40" y="1460" width="1920" height="225" rx="20" class="panel"/>
+  <text x="70" y="1503" class="section">共同边界 · 宽容表达，严格执行</text>
+  <line x1="680" y1="1530" x2="680" y2="1658" class="rule"/>
+  <line x1="1320" y1="1530" x2="1320" y2="1658" class="rule"/>
+  <text x="70" y="1548" class="heading">恢复与证据</text>
+  <text x="70" y="1583" class="body">恢复规划不回滚现实世界；未知执行不自动重放。</text>
+  <text x="70" y="1616" class="body">历史成功保留，当前可用性不能凭旧记录假定。</text>
+  <text x="70" y="1649" class="small">业务失败、技术错误、未知结果与完整性问题分开。</text>
+  <text x="710" y="1548" class="heading">分支与调度</text>
+  <text x="710" y="1583" class="body">排序不同暂停执行分支，回原 Road 规划 Inner。</text>
+  <text x="710" y="1616" class="body">Inner 决定保留或换路，续接原执行历史。</text>
+  <text x="710" y="1649" class="small">收尾先确认；后继 Intent 提交后直接规划 Road。</text>
+  <text x="1350" y="1548" class="heading">图与实现</text>
+  <text x="1350" y="1583" class="body">紫：模型职责　蓝：可信控制　绿：证据 / 知识</text>
+  <text x="1350" y="1616" class="body">黄虚框：候选机制；本图不代表代码或效果验收。</text>
+  <text x="1350" y="1649" class="small">不强制增加调用、字段或层级，不设代码量指标。</text>
+  <text x="40" y="1720" class="small">架构与协议：restrict/Architecture.md · restrict/protocol.md；实现及验收：Plan/architecture_upgrade_v3_plan.md / architecture_upgrade_v3_acceptance.md。</text>
+</svg>

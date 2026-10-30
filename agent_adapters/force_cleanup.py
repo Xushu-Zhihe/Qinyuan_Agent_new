@@ -72,6 +72,31 @@ def force_cleanup_task(workbench: Workbench, challenge_id: str) -> dict:
                         except Exception as e:
                             cleanup_result["errors"].append(f"Error stopping container: {e}")
 
+                    # Temporary download workers have operation-scoped names and
+                    # are not covered by the fixed-name list above.
+                    try:
+                        workers = client.containers.list(all=True, filters={
+                            "label": [
+                                f"qinyuan.task_run_id={task_run_id}",
+                                "qinyuan.component=tool-download",
+                            ]
+                        })
+                        for container in workers:
+                            try:
+                                container.stop(timeout=1)
+                                container.remove(force=True)
+                                cleanup_result["containers_stopped"].append(container.name)
+                            except docker.errors.NotFound:
+                                pass
+                            except Exception as e:
+                                cleanup_result["errors"].append(
+                                    f"Error stopping download worker: {e}"
+                                )
+                    except Exception as e:
+                        cleanup_result["errors"].append(
+                            f"Error listing download workers: {e}"
+                        )
+
                     # Remove networks
                     for network_type in ["in", "out"]:
                         network_name = f"qinyuan-t6-{network_type}-{task_run_id}"

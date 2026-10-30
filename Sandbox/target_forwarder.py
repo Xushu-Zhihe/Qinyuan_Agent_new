@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import select
 import socket
 import sys
 import threading
+import time
 
 sys.path.insert(0, "/opt/qinyuan")
 from target_address import TargetAddress, TargetAddressError
@@ -79,11 +81,27 @@ def target_from_arguments(arguments):
     return TargetAddress.from_url(arguments[-1], allow_private_ipv4=private)
 
 
+def reap_children(stop=None):
+    """PID 1 must reap exec/pip children or a long task accumulates zombies."""
+    # WNOHANG is Unix-only; the forwarded process runs in the Linux sidecar.
+    # The fallback keeps the unit test importable on Windows.
+    wait_flag = getattr(os, "WNOHANG", 1)
+    while stop is None or not stop.is_set():
+        try:
+            pid, _status = os.waitpid(-1, wait_flag)
+        except ChildProcessError:
+            time.sleep(0.1)
+            continue
+        if pid == 0:
+            time.sleep(0.1)
+
+
 def main() -> int:
     try:
         target = target_from_arguments(sys.argv[1:])
     except TargetAddressError:
         return 2
+    threading.Thread(target=reap_children, name="child-reaper", daemon=True).start()
     family = socket.AF_INET
     listener = socket.socket(family, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -102,6 +102,7 @@ class MCPExecutionResult:
             "stderr":self.stderr,
             "stdout_truncated":self.stdout_truncated,
             "stderr_truncated": self.stderr_truncated,
+            "timed_out": self.timed_out,
         }
 
 def load_registry(path: str | Path) -> MCPRegistryConfig:
@@ -701,7 +702,11 @@ class MCPManager:
         )
 
         if result.timed_out:
-            status = "outcome_unknown"
+            # The sandbox timeout wrapper returning 124 is a known-ended command
+            # failure, not an unknown side effect. Treating it as unknown aborts
+            # the whole TaskRun and prevents the model from choosing a smaller
+            # tool or a shorter operation.
+            status = "failed"
         elif result.exit_code == 0:
             status = "completed"
         else:

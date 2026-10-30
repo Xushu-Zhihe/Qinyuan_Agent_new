@@ -41,7 +41,9 @@ class D8SandboxAdapter:
         context = prepared[1]
         prefix = ("import os\nos.environ['QINYUAN_OFFLINE_TOOL_INSTALL']='1'\n"
                   "os.environ['QINYUAN_TOOL_WHEELHOUSE']=" + repr(context["wheelhouse"]) + "\n"
-                  "os.environ['QINYUAN_TOOL_WHEEL_HASHES']=" + repr(json.dumps(context["wheel_hashes"])) + "\n")
+                  "os.environ['QINYUAN_TOOL_WHEEL_HASHES']=" + repr(json.dumps(context["wheel_hashes"])) + "\n"
+                  "os.environ['QINYUAN_TOOL_PREPARATION_ERRORS']=" +
+                  repr(json.dumps(list(context.get("preparation_errors") or ()))) + "\n")
         return replace(request, arguments=("-c", prefix + request.arguments[1]))
 
     def interrupt_for_agent(self, agent_id):

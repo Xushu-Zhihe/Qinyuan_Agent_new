@@ -15,6 +15,13 @@ from agent_core.turn_modeling import digest
 from qinyuan_core import get_logger
 
 
+INSTALL_RESERVE_SECONDS = 60
+
+
+class DownloadArgumentError(ValueError):
+    """A download.install_tool call failed local argument validation."""
+
+
 def _trace(event, **fields):
     """Localize repeated discovery; silent unless QINYUAN_DEBUG_TRACE is set."""
     import os
@@ -306,11 +313,18 @@ class MCPPlanExecutor:
                     raise SandboxPolicyError("download.task_run_preparation_unavailable")
                 from MCPs.Download_Mcp.server import install_tool
                 try:installation = install_tool(**dict(call.arguments))
-                except (TypeError, ValueError):raise SandboxPolicyError("download.arguments_invalid") from None
-                preparation_limit = min(maximum, remaining, installation["sandbox_command"]["timeout_seconds"])
+                except (TypeError, ValueError) as error:
+                    raise DownloadArgumentError(str(error) or "download.arguments_invalid") from None
+                install_timeout = installation["sandbox_command"]["timeout_seconds"]
+                # Keep a reserve for the actual install: otherwise a slow fetch can
+                # consume the whole shared budget and the install is killed by the
+                # host timeout (exit 124) instead of failing as a known tool error.
+                preparation_limit = min(maximum, remaining,
+                                        max(5, install_timeout - INSTALL_RESERVE_SECONDS))
                 preparation_started = monotonic()
                 self.service.prepared_download = None
-                preparation = ToolDownload(self.service.sandbox, self.app.state.task_run, identity, self.evidence)
+                preparation = ToolDownload(self.service.sandbox, self.app.state.task_run, identity,
+                                           self.evidence, forbidden_target=target)
                 # Reuse the latest successful preparation for the exact same tool
                 # selection in this TaskRun. A later failure invalidates that shortcut.
                 prepared = None
@@ -359,10 +373,15 @@ class MCPPlanExecutor:
                     or response.qualified_name != call.tool_name):
                 raise D3RecoveryRequired("mcp.execution_binding_changed")
             payload = self.app.redactor.redact_value(response if public else response.to_tool_payload())
+        except DownloadArgumentError as exc:
+            payload = {"ok": False, "status": "rejected", "tool": call.tool_name,
+                       "code": "download.arguments_invalid", "detail": str(exc)[:512],
+                       "category": "authorization"}
         except ToolDownloadError as exc:
             payload = {"ok": False, "status": "failed", "tool": call.tool_name,
-                       "code": str(exc), "category": ("integrity" if "sha256" in str(exc) else
-                           "authorization" if "not_allowed" in str(exc) or "non_public" in str(exc) else "dependency")}
+                       "code": str(exc), "detail": str(exc)[:512],
+                       "category": ("integrity" if "sha256" in str(exc) else
+                           "authorization" if "not_allowed" in str(exc) or "non_public" in str(exc) or "source" in str(exc) else "dependency")}
         except (MCPCommandPlanError, SandboxPolicyError):
             payload = {"ok": False, "status": "rejected",
                        "tool": call.tool_name, "code": "mcp.command_rejected"}
