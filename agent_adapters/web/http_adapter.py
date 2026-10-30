@@ -34,7 +34,7 @@ from agent_core.web_contracts import (
     D7_WEB_RESPONSE_HEADERS,
 )
 from agent_core.sqlite_control_store import SqliteControlStore
-from qinyuan_core import CodedError, get_logger
+from qinyuan_core import Category, CodedError, get_logger
 
 MAX_D7_HTTP_REQUEST_BYTES = D7_WEB_MAX_REQUEST_BODY_BYTES
 MAX_D7_HTTP_RESPONSE_BYTES = D7_WEB_MAX_RESPONSE_BODY_BYTES
@@ -64,6 +64,16 @@ _TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
 class HttpCapabilityError(CodedError):
     """Fixed, non-sensitive D7 HTTP adapter error."""
+
+
+class HttpProtocolMismatch(HttpCapabilityError):
+    """The authorized peer answered with bytes that are not an HTTP status line.
+
+    A recoverable capability mismatch, not an unknown side effect: the planner
+    must be able to stop using HTTP for this target and switch channel.
+    """
+
+    category = Category.DEPENDENCY
 
 
 def _uuid4(value: object, name: str) -> str:

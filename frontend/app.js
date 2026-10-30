@@ -186,6 +186,7 @@ function renderRun(run, events = [], progress = null) {
   $("cancel-run").textContent = recoverableCancel ? "结束并清理" : run?.status === "paused" ? "取消并清理" : "取消运行";
   const terminal = ["achieved", "assumed_achieved", "partial", "inconclusive", "failed", "cancelled", "deadline_exceeded"].includes(run?.result?.task_run?.status);
   $("cleanup-run").hidden = run?.status !== "recovery_required" || !terminal || run?.result?.cleanup?.status === "succeeded";
+  $("force-repair").hidden = !run || !["recovery_required", "failed", "cancelled", "deadline_exceeded"].includes(run.status);
   const report = progress || run?.result;
   const editable = run?.status === "running" && report?.goal_validation && report.task_run?.deadline_at > Date.now() / 1000;
   $("extend-run-control").hidden = !report?.goal_validation;
@@ -271,6 +272,14 @@ async function cleanupRun() {
   const id = state.selected; if (!id) return;
   try { const run = await request(`/api/challenges/${id}/cleanup`, { method: "POST" }); renderRun(run); await loadTasks(); notify("已启动资源清理；成功后可归档题目"); }
   catch (error) { notify(`资源清理未启动：${error.message}`); }
+}
+async function forceRepair() {
+  const id = state.selected; if (!id) return;
+  try {
+    const result = await request(`/api/challenges/${id}/force-repair`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    await loadTasks(); await refreshRun(id);
+    notify(`已强行修正：删除 ${result.deleted_runs} 条运行记录，题目回到草稿；备份 ${result.backup.split(/[\\/]/).pop()}`);
+  } catch (error) { notify(`强行修正失败：${error.message}`); }
 }
 async function resumeRun() {
   const id = state.selected; if (!id) return;
@@ -444,6 +453,7 @@ document.addEventListener("DOMContentLoaded", () => {
   for (const action of ["Check", "Apply", "Remove"]) $("security-" + action.toLowerCase()).addEventListener("click", () => changeWindowsSecurity(action));
 });
 document.addEventListener("DOMContentLoaded", () => $("resume-run").addEventListener("click", resumeRun));
+document.addEventListener("DOMContentLoaded", () => $("force-repair").addEventListener("click", forceRepair));
 
 window.addEventListener("competition-submit",async event=>{
   const challengeId=event.detail.challengeId;

@@ -5,6 +5,7 @@ from __future__ import annotations
 from agent_adapters.web.http_adapter import (
     MAX_D7_HTTP_RESPONSE_BYTES,
     HttpCapabilityError,
+    HttpProtocolMismatch,
     D7HttpOrigin,
     D7HttpWireResponse,
 )
@@ -76,6 +77,13 @@ class D7SandboxHttpTransport:
             )
         except TaskRunSandboxError as exc:
             if exc.outcome == "outcome_unknown":
+                diagnostic = getattr(exc, "http_diagnostic", None) or {}
+                if (diagnostic.get("worker_phase") == "response_headers"
+                        and diagnostic.get("error_type") == "BadStatusLine"):
+                    # The peer sent a line that is not an HTTP status line. That
+                    # is a known protocol mismatch the planner can route around,
+                    # not an unknown side effect of the request.
+                    raise HttpProtocolMismatch("d22_http_protocol_mismatch") from exc
                 raise HttpCapabilityError("outcome_unknown") from exc
             raise HttpCapabilityError("d7_http_dispatch_rejected") from exc
         except (TypeError, ValueError) as exc:

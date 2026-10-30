@@ -19,7 +19,7 @@ class SubmissionEvidence(FileD8HandoffEvidence):
 
 def frozen_binding(path,declaration):
     value=immutable_read(Path(path))
-    if (not isinstance(value,dict) or set(value)-{"schedule"}!={"request_id","profile","question","platform_deadline_at"}
+    if (not isinstance(value,dict) or set(value)-{"schedule","attachment_id"}!={"request_id","profile","question","platform_deadline_at"}
         or value["request_id"]!=declaration["request_id"]
         or declaration.get("contract_version")!=22):raise ValueError("competition_run_binding_invalid")
     return value

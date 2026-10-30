@@ -12,6 +12,13 @@ PLATFORM_POLL_SECONDS=5.0
 FINISHED={"achieved","failed","deadline_exceeded","cancelled","inconclusive"}
 
 
+def _default_description(value):
+    """Session-level note appended to every challenge description; empty disables it."""
+    if value is None:return ""
+    if not isinstance(value,str) or len(value)>16000:raise WorkbenchError("competition_session_invalid")
+    return value.strip()
+
+
 class CompetitionSchedules:
     def __init__(self,workbench,*,clock=time.time):
         self.workbench=workbench;self.clock=clock
@@ -53,6 +60,9 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         result=dict(row);challenge=row["state"]["challenge_id"]
         if challenge is not None:
             try:result["runtime"]=self.workbench.runner.runtime_control(challenge)
+            except WorkbenchError as error:
+                result["runtime"]=None
+                if error.code!="challenge_not_found":result["runtime_error"]="operator_state_read_failed"
             except (ValueError,OSError):result["runtime_error"]="operator_state_read_failed"
         return result
 
@@ -75,7 +85,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
     def start(self,value):
         from agent_adapters.workbench import http_methods
         required={"profile_id","default_scheme","question_minutes","overall_minutes","queue","http_methods","mode"}
-        if not isinstance(value,dict) or set(value)-{"platform_deadline_at"}!=required:raise WorkbenchError("competition_session_invalid")
+        if not isinstance(value,dict) or set(value)-{"platform_deadline_at","default_description","default_description_enabled"}!=required:raise WorkbenchError("competition_session_invalid")
         if self.workbench.protocol_version!=3 or self.workbench.execution_profile!="d8_v22":raise WorkbenchError("competition_requires_contract22",409)
         if self.workbench.d7_mode=="simulated":raise WorkbenchError("mode_configuration_mismatch",409)
         if value["mode"]!="real" or value["default_scheme"] not in {"http","https"}:raise WorkbenchError("competition_session_invalid")
@@ -92,7 +102,9 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         ceiling=value.get("platform_deadline_at")
         if ceiling is not None and (type(ceiling) not in {int,float} or not math.isfinite(ceiling) or not self.clock()<ceiling or end>ceiling):raise WorkbenchError("competition_extension_exceeds_platform")
         config=dict(profile=profile,queue=queue,default_scheme=value["default_scheme"],mode=value["mode"],
-                    question_seconds=value["question_minutes"]*60,http_methods=methods,platform_deadline_at=ceiling)
+                    question_seconds=value["question_minutes"]*60,http_methods=methods,platform_deadline_at=ceiling,
+                    default_description=_default_description(value.get("default_description")),
+                    default_description_enabled=bool(value.get("default_description_enabled")))
         state=dict(status="running",reason=None,index=0,current_ref=None,challenge_id=None,deadline_at=end,
                    stop_after_current=False,last_platform_check=0,platform=None,retry_operation=None)
         identity=str(uuid4())
@@ -151,6 +163,14 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         action=value["action"];row=self.get(identity);state=row["state"]
         if state["status"]=="finished":raise WorkbenchError("competition_session_finished",409)
         if action=="pause" and set(value)=={"action"}:return self.pause(identity)
+        if action=="finish" and set(value)=={"action"}:
+            challenge=state.get("challenge_id")
+            if challenge is not None:
+                run=self.workbench.runner.status(challenge)
+                if run is not None and run["status"] in {"starting","running","cancelling","cleaning"}:
+                    raise WorkbenchError("competition_finish_requires_pause",409)
+            self.update(identity,status="finished",reason="operator_finished",pending_control=None,retry_operation=None)
+            self.wake.set();return self.get(identity)
         if action=="stop_after_current" and set(value)=={"action","enabled"} and type(value["enabled"]) is bool:
             self.update(identity,stop_after_current=value["enabled"]);self.wake.set();return self.get(identity)
         if action=="resume" and set(value)=={"action"}:
@@ -396,7 +416,9 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 if item is None or item["state"]!="available":return
             target=self.target(row,item);self.live(identity)
             task=self.workbench.competitions.import_question(row["config"]["profile"]["id"],dict(remote_ref=item["remote_ref"],endpoint=target,
-                deadline_minutes=row["config"]["question_seconds"]//60,http_methods=row["config"]["http_methods"]),check_active=lambda:self.live(identity))
+                deadline_minutes=row["config"]["question_seconds"]//60,http_methods=row["config"]["http_methods"],
+                default_description=row["config"].get("default_description",""),
+                default_description_enabled=bool(row["config"].get("default_description_enabled"))),check_active=lambda:self.live(identity))
             self.update(identity,challenge_id=task["id"]);row=self.get(identity);state=row["state"];challenge=task["id"]
             if not target and not task["attachments"]:raise WorkbenchError("competition_question_input_required",409)
             self.live(identity)

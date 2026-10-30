@@ -25,6 +25,14 @@ def _trace(event, **fields):
           " ".join(f"{k}={v}" for k, v in fields.items()), file=sys.stderr, flush=True)
 
 
+class ToolArgumentError(Exception):
+    """A tool call refused before dispatch because its own arguments are invalid.
+
+    This is correctable input, not a policy denial: ``args[0]`` carries the
+    validator's message so the same tool can be retried with fixed arguments.
+    """
+
+
 _DECORATIVE_SCHEMA_KEYS = frozenset({"description", "default", "title", "examples",
                                      "$comment", "deprecated"})
 
@@ -362,7 +370,12 @@ class MCPPlanExecutor:
                     raise SandboxPolicyError("download.task_run_preparation_unavailable")
                 from MCPs.Download_Mcp.server import install_tool
                 try:installation = install_tool(**dict(call.arguments))
-                except (TypeError, ValueError):raise SandboxPolicyError("download.arguments_invalid") from None
+                except (TypeError, ValueError) as invalid:
+                    # Keep the validator's own message: a wrong argument is
+                    # correctable input, and hiding it behind a policy denial
+                    # teaches the model that this tool is unavailable.
+                    detail = str(invalid) or type(invalid).__name__
+                    raise ToolArgumentError("download.arguments_invalid: " + detail) from None
                 preparation_limit = min(maximum, remaining, installation["sandbox_command"]["timeout_seconds"])
                 preparation_started = monotonic()
                 self.service.prepared_download = None
@@ -419,11 +432,16 @@ class MCPPlanExecutor:
             payload = {"ok": False, "status": "failed", "tool": call.tool_name,
                        "code": str(exc), "category": ("integrity" if "sha256" in str(exc) else
                            "authorization" if "not_allowed" in str(exc) or "non_public" in str(exc) else "dependency")}
+        except ToolArgumentError as exc:
+            code, _, detail = str(exc).partition(": ")
+            payload = {"ok": False, "status": "rejected", "tool": call.tool_name,
+                       "code": code or "tool.arguments_invalid", "detail": detail, "category": "input"}
         except (MCPCommandPlanError, SandboxPolicyError) as exc:
             planner_rejected = isinstance(exc, MCPCommandPlanError) and exc.args == ("mcp.planner_rejected",)
             payload = {"ok": False, "status": "rejected",
                        "tool": call.tool_name, "code": "mcp.planner_rejected" if planner_rejected else "mcp.command_rejected",
-                       "category": "input" if planner_rejected else "policy"}
+                       "category": "input" if planner_rejected else "policy",
+                       "detail": str(exc)}
         except BaseException as exc:
             if not pending.done():
                 pending.cancel()

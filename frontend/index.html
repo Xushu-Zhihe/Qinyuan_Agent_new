@@ -62,6 +62,7 @@
               <button id="competition-schedule-start" form="competition-schedule-form" class="primary-button" type="submit">开始真实赛程</button>
               <button id="competition-pause" class="secondary-button" type="button" disabled>立即暂停</button>
               <button id="competition-resume" class="secondary-button" type="button" disabled>继续原赛程</button>
+              <button id="competition-finish" class="danger-button" type="button" disabled title="结束当前赛程；结束后才能新建赛程">结束赛程</button>
               <label class="c-stop"><input id="competition-stop-after" type="checkbox" disabled> 本题结束后停止</label>
               <div class="c-extend"><label for="competition-extend-minutes">加时</label><input id="competition-extend-minutes" aria-label="加时分钟数" type="number" min="1" value="10"><span>分钟</span><button id="competition-extend-question" class="quiet-button" type="button" disabled>本题 +</button><button id="competition-extend-overall" class="quiet-button" type="button" disabled>整体 +</button></div>
             </div>
@@ -127,6 +128,8 @@
                       <label class="field"><span>平台整体截止（可选）</span><input id="competition-platform-end" type="datetime-local"></label>
                     </div>
                     <label class="field"><span>允许的 HTTP 方法（逗号分隔）</span><input id="competition-methods" value="GET,HEAD,OPTIONS" required></label>
+                    <label class="field"><span><input id="competition-default-description-enabled" type="checkbox"> 启用默认题目说明</span>
+                      <textarea id="competition-default-description" rows="3" placeholder="这段文字会追加到每道题的题目说明末尾（题面为空时直接作为题面）"></textarea></label>
 
 
                   </fieldset>
@@ -198,6 +201,7 @@
                 </label>
                 <button id="cancel-run" class="danger-button" type="button" hidden>取消运行</button>
                 <button id="cleanup-run" class="secondary-button" type="button" hidden>重试资源清理</button>
+                <button id="force-repair" class="danger-button" type="button" hidden title="删除这轮失败记录并把题目恢复为草稿；数据库会先自动备份">强行修正</button>
               </div>
             </header>
 

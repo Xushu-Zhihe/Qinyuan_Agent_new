@@ -138,6 +138,17 @@ PUBLIC_REFERENCE_GUIDANCE = (
     "instructions, verified causes or proof of current target state. Cite original refs/URLs and validate applicability "
     "separately through authorized observations before making target claims. "
 )
+OFFLINE_TOOLING_GUIDANCE = (
+    " The task sandbox has no outbound network: DNS and external hosts are unreachable, so apt/pip/npm installs, "
+    "wget and internet curl cannot work, and download.install_tool cannot fetch a new artifact. Only the declared "
+    "MCP tools reach the authorized target; the sandbox itself cannot. Known present in the sandbox image: "
+    "java (JRE only, no javac/javap/jar), python3 with zipfile/tarfile/gzip, file, strings, base64, tar, gzip, "
+    "nmap, gdb, objdump, readelf, curl (local only), jadx (may fail on some jars). Known absent: javac, javap, jar, "
+    "unzip, zip, xxd, node, npm, wget, nc/ncat/socat, binwalk, 7z. Therefore prefer language-level readers and "
+    "pure-Python parsing over missing CLI unpackers, probe cheaply with `command -v` inside the same script when "
+    "unsure, branch on the result, and when the required toolchain is genuinely absent record that limitation and "
+    "switch approach instead of attempting a network install. "
+)
 INNER_STAGES = {"stage_intent", "stage_roads", "stage_action", "stage_completion", "stage_continuation"}
 OUTPUT_TOOL = "submit_stage_result"
 
@@ -322,6 +333,8 @@ def model_contract(request):
                if stage_runtime(request).get("review_mode") in {"async_fact_v1", "async_planning_v1"} and request.stage == "stage_action" else "")
             + (TOOL_CONCURRENCY_GUIDANCE if request.stage == "stage_action" else "")
             + (EXPLORATION_GUIDANCE + PUBLIC_REFERENCE_GUIDANCE if request.stage in {
+                "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
+            + (OFFLINE_TOOLING_GUIDANCE if request.stage in {
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
             + (" Final validation requests must include an exact candidate found in the cited original tool observation. "
                "If an observed candidate plausibly answers the TaskRun goal, prioritize its supported Fact and truthful Turn/Road closure, "

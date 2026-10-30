@@ -61,8 +61,14 @@ def fail(code=None,error=None):
     name=type(error).__name__ if error is not None else None
     if error is not None and name not in {"TimeoutError","ConnectionRefusedError","ConnectionResetError","RemoteDisconnected","IncompleteRead","SSLError","UnicodeEncodeError","InvalidURL","BadStatusLine","OSError","ValueError","TypeError","KeyError"}:
         name="OtherError"
-    print(json.dumps({"error":"d7_http_transport_failed","phase":phase,
-        "code":"http.worker."+(code or phase+"_failed"),"error_type":name},separators=(",",":")),flush=True)
+    payload={"error":"d7_http_transport_failed","phase":phase,
+        "code":"http.worker."+(code or phase+"_failed"),"error_type":name}
+    if name=="BadStatusLine":
+        # The peer answered with bytes that are not an HTTP status line. Keep
+        # that first line so the failure reports what the service actually spoke.
+        line=getattr(error,"line",None) or (error.args[0] if error.args else "")
+        payload["line"]=str(line)[:160]
+    print(json.dumps(payload,separators=(",",":")),flush=True)
     raise SystemExit(1)
 
 try:
@@ -402,10 +408,14 @@ class D7SandboxHttpRuntime:
                 errors = {"TimeoutError", "ConnectionRefusedError", "ConnectionResetError", "RemoteDisconnected",
                     "IncompleteRead", "SSLError", "UnicodeEncodeError", "InvalidURL", "BadStatusLine", "OSError",
                     "ValueError", "TypeError", "KeyError", "OtherError", None}
-                if (isinstance(failure, dict) and set(failure) == {"error", "phase", "code", "error_type"}
+                keys = {"error", "phase", "code", "error_type"}
+                if (isinstance(failure, dict) and set(failure) in (keys, keys | {"line"})
                         and failure["error"] == "d7_http_transport_failed" and failure["phase"] in phases
                         and failure["code"] in codes and failure["error_type"] in errors):
                     diagnostic.update(worker_phase=failure["phase"], worker_code=failure["code"], error_type=failure["error_type"])
+                    line = failure.get("line")
+                    if isinstance(line, str) and len(line) <= 160 and "\x00" not in line:
+                        diagnostic["worker_line"] = line
                 unknown("worker_exit_nonzero")
             if stderr:
                 unknown("worker_stderr")

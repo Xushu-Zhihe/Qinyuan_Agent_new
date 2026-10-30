@@ -27,6 +27,7 @@ SAFE_HTTP_ERROR_CODES = frozenset({
     "evidence_capacity_exceeded",
     "d20_http_outcome_unknown", "d20_http_cancelled_after_result",
     "d20_http_failure_diagnostic_write_failed", "outcome_unknown",
+    "d22_http_protocol_mismatch",
     "d7_http_dispatch_rejected", "d7_http_transport_failed", "d7_http_session_closed",
     "d7_http_transport_response_invalid", "d7_http_response_invalid",
     "d7_http_response_too_large", "d7_http_evidence_protection_failed",

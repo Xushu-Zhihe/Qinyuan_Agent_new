@@ -118,6 +118,25 @@ def test_inner_receives_results_and_selects_next_tool(linked, status):
 
 
 @pytest.mark.parametrize("output_case", [22], indirect=True)
+def test_invalid_tool_arguments_stay_correctable_input(linked):
+    """A wrong argument must not read as a policy denial the model cannot fix."""
+    case = linked
+    from agent_adapters.mcp_plan_executor import ToolArgumentError
+    case.tools.status = "rejected"
+    case.tools.error = ToolArgumentError(
+        "download.arguments_invalid: python_package and python_version must be provided together")
+    seen = select_then_inspect(case)
+    asyncio.run(case.app.run(case.token))
+    observations = [m["content"] for m in seen[-1]["messages"] if m["role"] == "tool"]
+    feedback = [o["mcp_tool_result"] for o in observations if "mcp_tool_result" in o]
+    assert feedback and all(r["status"] == "rejected" for r in feedback)
+    assert all(r["category"] == "input" for r in feedback)
+    assert all(r["code"] == "download.arguments_invalid" for r in feedback)
+    # The validator's own words survive, so the retry can fix the same tool.
+    assert all("python_version" in r["detail"] for r in feedback)
+
+
+@pytest.mark.parametrize("output_case", [22], indirect=True)
 def test_unknown_execution_is_not_reissued_on_resume(linked):
     case = linked
     case.tools.error = TimeoutError("not saved to ordinary diagnostics")

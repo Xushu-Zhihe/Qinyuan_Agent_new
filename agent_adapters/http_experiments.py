@@ -12,12 +12,14 @@ from agent_core.actions import MCPCall
 from agent_core.operation_accounting import D4OperationStart
 from agent_core.stage_storage import StageStateError
 from agent_core.turn_modeling import digest
-from agent_adapters.web.http_adapter import D7HttpRequest, HttpCapabilityError, D7HttpPolicy
+from agent_adapters.web.http_adapter import (D7HttpRequest, HttpCapabilityError, HttpProtocolMismatch,
+    D7HttpPolicy)
 from Sandbox.http_experiment import HttpExperimentProcess, MAX_SCRIPT_BYTES
 from Sandbox.task_run_sandbox import TaskRunSandboxError
 from qinyuan_core import get_logger
 
 TOOL = 'http.run_experiment'
+PROTOCOL_MISMATCH = 'd22_http_protocol_mismatch'
 SCRIPT_ERRORS = frozenset({'SyntaxError','NameError','TypeError','ValueError','KeyError','IndexError',
     'AttributeError','ZeroDivisionError','AssertionError','ImportError','ModuleNotFoundError','PermissionError',
     'RuntimeError','TimeoutError','MemoryError','RecursionError','OSError'})
@@ -50,7 +52,9 @@ def failure_diagnostics(evidence, store, task_id):
         rows.append(dict(execution_id=identity,model_request_id=claim['model_request_id'],
             phase=failure['phase'],code=failure['code'],result_saved=failure['result_sha256'] is not None,
             active=operation.completion is None or parent is None or parent.application_ref is None,
-            category='unknown' if failure['phase']=='http_execute' else 'integrity' if failure['phase']=='receipt_apply' else 'persistence',
+            category=('dependency' if failure['code']==PROTOCOL_MISMATCH else
+                'unknown' if failure['phase']=='http_execute' else
+                'integrity' if failure['phase']=='receipt_apply' else 'persistence'),
             exception_types=failure['exception_types'],error_codes=failure['error_codes']))
     return rows
 
@@ -129,6 +133,15 @@ class HttpExperiments:
 
     def validate_receipt(self, operation, claim, result):
         """Recheck the protected originals, not script-reported responses."""
+        payload = result.get('payload') or {}
+        if payload.get('status') == 'rejected':
+            # A rejected request produced no response receipt to re-read; its
+            # failure evidence is the bound experiment-failure record instead.
+            failure = self.evidence.read('experiment-failure', operation.start.operation_id)
+            if (failure is None or failure.get('code') != PROTOCOL_MISMATCH
+                    or failure.get('request_sha256') != digest(claim)):
+                raise ExecutionRecoveryRequired('d22_experiment_source_changed')
+            return
         web = self.app.web
         web.attach()
         source = claim['experiment_request']
@@ -185,7 +198,10 @@ class HttpExperiments:
     def record_failure(self, operation_id, claim, result, phase, error):
         from agent_adapters.output_evidence import safe_failure_details, SAFE_MODEL_ERROR_CODES
         code = str(error) if isinstance(error,ExecutionRecoveryRequired) and str(error) in SAFE_MODEL_ERROR_CODES else "d22_experiment_receipt_settlement_failed"
-        if phase == "http_execute":code = "d22_experiment_request_outcome_unknown"
+        if phase == "http_execute":
+            # A peer that answered with non-HTTP bytes is a known protocol
+            # mismatch; only an unreadable outcome stays genuinely unknown.
+            code = PROTOCOL_MISMATCH if isinstance(error, HttpProtocolMismatch) else "d22_experiment_request_outcome_unknown"
         elif phase == "response_evidence_save":code = "http.response_evidence_save_failed"
         if self.evidence.read("experiment-failure",operation_id) is None:
             self.evidence.save("experiment-failure",operation_id,dict(
@@ -316,6 +332,20 @@ class HttpExperiments:
                     and error.context.get('phase') == 'response_evidence_save'):
                 phase = 'response_evidence_save'
             code = self.record_failure(identity,claim,result if phase=='receipt_apply' else None,phase,error)
+            if isinstance(error, HttpProtocolMismatch):
+                # Known and recoverable: the peer does not speak HTTP. Report a
+                # failed observation so the planner can switch channel, instead
+                # of ending the TaskRun as an unknown side effect.
+                from agent_core.operation_accounting import D4OperationCompletion
+                rejected = dict(request_sha256=digest(claim), finished_at=app.clock(),
+                    payload=dict(status='rejected', tool=TOOL, code=code, exit_code=1, stdout='', stderr='',
+                        http_request=saved, failure=dict(category='dependency', phase=phase, code=code)))
+                self.evidence.save('mcp-result', identity, rejected)
+                app.store.complete_d4_operation(D4OperationCompletion(identity, rejected['finished_at'],
+                    'rejected', 'mcp-result/' + identity, digest(rejected)))
+                self.log.warning('experiment.protocol_mismatch',run=claim['task_run_id'],request=parent,
+                    exec=identity,phase=phase,category='dependency',code=code,error_type=type(error).__name__)
+                raise HttpProtocolMismatch(code) from error
             self.log.error('experiment.request_unknown' if phase=='http_execute' else 'experiment.receipt_failed',
                 run=claim['task_run_id'],request=parent,exec=identity,phase=phase,
                 category='unknown' if phase=='http_execute' else 'integrity' if phase=='receipt_apply' else 'persistence',
@@ -397,10 +427,11 @@ class HttpExperiments:
                         code=getattr(error,'code',error.args[0] if len(error.args)==1 else None)
                         if code not in SAFE_HTTP_ERROR_CODES | {'d22_experiment_method_not_authorized','d22_experiment_request_invalid'}:
                             code='d22_experiment_request_rejected'
+                        category='dependency' if code==PROTOCOL_MISMATCH else 'policy'
                         self.log.warning('experiment.request_rejected',run=session['task_run_id'],request=parent,
-                            category='policy',code=code)
+                            category=category,code=code)
                         finished = dict(status='rejected',code=code,output='',
-                            failure=dict(category='policy',phase='target_request',code=code))
+                            failure=dict(category=category,phase='target_request',code=code))
                         break
                     await self._strategy(intent_id, start=True)
                     phase = 'bridge_reply'

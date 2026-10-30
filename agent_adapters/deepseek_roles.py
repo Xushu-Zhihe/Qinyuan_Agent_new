@@ -651,13 +651,19 @@ def _build_payload(envelope, role, *, context_loader=None):
                    "target.qinyuan on that endpoint's authorized port; the container has no direct target route. "
                    "Preserve the original HTTP Host and HTTPS identity/SNI and certificate verification, for example "
                    "using curl --connect-to. Do not replace the authorized endpoint or disable TLS verification. "
-                   "http.run_experiment already handles this transport routing.")
+                   "http.run_experiment already handles this transport routing. That relay is byte-transparent: if the "
+                   "authorized service does not speak HTTP (the reply is not a valid status line, or a raw banner/menu "
+                   "appears), stop retrying HTTP and reach the same target.qinyuan:<authorized port> with a socket from "
+                   "shell.run_bash or run_pwntools instead, recording the banner as an observation. Only the authorized "
+                   "port is reachable, and an interactive protocol needs one script that connects, reads, computes and "
+                   "writes in a single run.")
         system += (" When http.run_experiment is declared, one selection can execute a conditional Python experiment "
                    "inside the current TaskRun container: call request(method, relative_path_query, headers={}, body=''). "
                    "It returns status, body bytes, text, content_type and evidence_ref; cookies persist via the trusted client. "
                    "Use loops/branches and local comparisons to test one hypothesis without a model call per HTTP request. "
-                   "Do not precommit an unrelated chain. Direct sockets and subprocess creation are disabled; no model keys "
-                   "are available in the container. Every request remains subject to the current origin, allowed methods, "
+                   "Do not precommit an unrelated chain. Inside that experiment script, direct sockets and subprocess "
+                   "creation are disabled; no model keys are available in the container. Every request remains subject "
+                   "to the current origin, allowed methods, "
                    "deadline and strategy stop. Print only a concise unreviewed summary; cite returned evidence refs "
                    "when later proposing important Facts. No printed statement proves a request or a verified conclusion.")
     if stage == "inner_plan" and role_contract_version(role) == 22:

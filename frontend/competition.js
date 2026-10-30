@@ -196,6 +196,7 @@ const CompetitionPage = (() => {
     for (const id of ["pause","resume","stop-after","extend-overall"]) el(id).disabled = sessionBusy || !active;
     el("pause").disabled = sessionBusy || !active || session.state.status !== "running";
     el("resume").disabled = sessionBusy || !active || !["paused","needs_attention"].includes(session.state.status);
+    el("finish").disabled = sessionBusy || !active || session.state.status === "pausing";
     el("queue").disabled = el("fill-queue").disabled = sessionBusy || Boolean(active) || current?.adapter!=="benchmark";
     el("adapter").disabled = el("url").disabled = busy || Boolean(active && session.config.profile.id===current?.id);
     el("extend-question").disabled = sessionBusy || !active || !session?.state.challenge_id;
@@ -349,7 +350,9 @@ const CompetitionPage = (() => {
     try {
       const value = {profile_id:current.id,default_scheme:el("scheme").value,question_minutes:Number(el("question-minutes").value),
         overall_minutes:Number(el("overall-minutes").value),queue:el("queue").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean),
-        http_methods:el("methods").value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean),mode:"real"};
+        http_methods:el("methods").value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean),mode:"real",
+        default_description:el("default-description").value,
+        default_description_enabled:el("default-description-enabled").checked};
       if (el("platform-end").value) value.platform_deadline_at = new Date(el("platform-end").value).getTime()/1000;
       session = await request("/api/competition/sessions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(value)});
     } catch(e) {el("schedule-error").textContent = errors[e.message] || `创建失败：${e.message}`;return;}
@@ -371,6 +374,7 @@ const CompetitionPage = (() => {
     el("fill-queue").addEventListener("click",()=> {el("queue").value = current?.adapter === "benchmark" ? previewItems.filter(x=>!x.is_completed).map(x=>x.remote_ref).join("\n") : "";renderQueue();});
     el("pause").addEventListener("click",()=>scheduleCommand({action:"pause"}));
     el("resume").addEventListener("click",()=>scheduleCommand({action:"resume"}));
+    el("finish").addEventListener("click",()=>{ if (confirm("结束当前赛程？结束后本轮不可继续，但题目与证据会保留。")) scheduleCommand({action:"finish"}); });
     el("stop-after").addEventListener("change",()=>scheduleCommand({action:"stop_after_current",enabled:el("stop-after").checked}));
     el("extend-question").addEventListener("click",()=>extend("extend_question"));
     el("extend-overall").addEventListener("click",()=>extend("extend_overall"));

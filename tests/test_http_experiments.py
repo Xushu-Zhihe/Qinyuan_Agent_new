@@ -714,3 +714,26 @@ def test_receipt_failure_is_durable_before_close_and_public_without_replay(http_
         {**failure,'request_sha256':'0'*64} if kind=='experiment-failure' else read(kind,key))
     with pytest.raises(ExecutionRecoveryRequired,match='d22_experiment_failure_diagnostic_invalid'):
         failure_diagnostics(c.app.mcp.evidence,c.app.store,c.task)
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+def test_peer_that_does_not_speak_http_is_a_recoverable_rejection(http_case):
+    """A non-HTTP peer must fail this tool, not the whole TaskRun."""
+    c=http_case
+    calls=setup(c,"request('GET','/')\nprint('blocked')")
+    from agent_adapters.web.http_adapter import HttpProtocolMismatch
+    class MismatchTransport:
+        def send(self,**kwargs):
+            c.sends.append(kwargs)
+            raise HttpProtocolMismatch('d22_http_protocol_mismatch')
+    c.app.web.transport_factory=lambda _:MismatchTransport()
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required,result
+    report=c.app.mcp.experiments.result(calls[0])
+    assert report['status']=='rejected' and report['code']=='d22_http_protocol_mismatch'
+    assert report['failure']==dict(category='dependency',phase='target_request',code='d22_http_protocol_mismatch')
+    assert len(report['requests'])==1 and len(c.sends)==1
+    failure=c.app.mcp.evidence.read('experiment-failure',report['requests'][0])
+    assert failure['code']=='d22_http_protocol_mismatch' and failure['phase']=='http_execute'
+    # The rejected request is settled: reconciling neither replays nor reopens it.
+    c.app.mcp.reconcile()
+    assert c.app.store.load_d4_operation(report['requests'][0]).completion.result_kind=='rejected'

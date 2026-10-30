@@ -534,6 +534,49 @@ def test_http_worker_failure_preserves_safe_stage_and_remains_unknown(monkeypatc
     assert detail["exec_id"] == "d7-http-exec" and "PRIVATE" not in json.dumps(detail)
 
 
+def test_http_worker_bad_status_line_is_a_recoverable_protocol_mismatch(monkeypatch):
+    """A peer that answers with non-HTTP bytes must not end the TaskRun as unknown."""
+    import http.client
+    from agent_adapters.output_evidence import safe_failure_details
+    from agent_adapters.web.http_adapter import HttpProtocolMismatch
+
+    class Connection:
+        def __init__(self, *args, **kwargs): pass
+        def putrequest(self, *args, **kwargs): pass
+        def putheader(self, *args): pass
+        def endheaders(self, body): pass
+        def getresponse(self): raise http.client.BadStatusLine("HTTP/9.9 not-a-status")
+        def close(self): pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+    request = dict(scheme="http", host="example.test", port=80, authority="example.test:80", method="GET",
+        path_query="/", headers=[], body_b64="", timeout_seconds=2, max_response_bytes=2097152,
+        max_header_bytes=65536, max_header_count=100, max_header_value_bytes=8192)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode()+b"\n")))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), pytest.raises(SystemExit) as stopped:
+        exec(_HTTP_WORKER, {})
+    assert stopped.value.code == 1
+    failure = json.loads(output.getvalue())
+    assert failure["error_type"] == "BadStatusLine"
+    assert failure["code"] == "http.worker.response_headers_failed"
+    assert failure["line"] == "HTTP/9.9 not-a-status"
+
+    task = str(uuid4()); config = _config(task)
+    api = _ExecApi(_frame(1, output.getvalue().encode()))
+    api.exec_inspect = lambda identity: dict(Running=False, ExitCode=1)
+    sandbox, sandbox_id = _sandbox(task, api)
+    transport = D7SandboxHttpTransport(sandbox, sandbox_id=sandbox_id, run_config=config,
+        network_binding=_network_binding(), target_network=_TargetNetwork())
+    with pytest.raises(HttpProtocolMismatch, match="d22_http_protocol_mismatch") as caught:
+        transport.send(origin=transport_origin(config.endpoint), method="GET", path_query="/", headers=(), body=b"",
+            timeout_seconds=3, max_response_bytes=2097152)
+    detail = safe_failure_details(caught.value, include_chain=True)["http_diagnostic"]
+    assert detail["worker_phase"] == "response_headers"
+    assert detail["error_type"] == "BadStatusLine"
+    assert detail["worker_line"] == "HTTP/9.9 not-a-status"
+
+
 @pytest.mark.parametrize("branch,state,stderr", [
     ("worker_still_running", dict(Running=True, ExitCode=None), b""),
     ("worker_exit_nonzero", dict(Running=False, ExitCode=137), b""),

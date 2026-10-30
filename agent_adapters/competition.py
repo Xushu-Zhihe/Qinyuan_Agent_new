@@ -417,7 +417,7 @@ class CompetitionConnections:
 
     def import_question(self,identity,value,*,check_active=None):
         """Import only platform-observed questions; platform actions remain separate."""
-        if not isinstance(value,dict) or set(value)-{"remote_ref","endpoint","deadline_minutes","step_timeout_seconds","http_methods"} or "remote_ref" not in value:
+        if not isinstance(value,dict) or set(value)-{"remote_ref","endpoint","deadline_minutes","step_timeout_seconds","http_methods","default_description","default_description_enabled"} or "remote_ref" not in value:
             raise WorkbenchError("competition_import_invalid")
         if self.workbench.execution_profile != "d8_v22":raise WorkbenchError("competition_requires_contract22",409)
         observed_at=time.time()
@@ -451,21 +451,35 @@ class CompetitionConnections:
             with self.workbench._db() as db:
                 existing=db.execute("SELECT challenge_id FROM competition_questions WHERE scope_sha256=? AND remote_ref=?",(scope,remote)).fetchone()
             if existing is not None:
-                local=self.workbench.get(existing["challenge_id"])
-            else:
+                try:local=self.workbench.get(existing["challenge_id"])
+                except WorkbenchError as error:
+                    if error.code!="challenge_not_found":raise
+                    with self.workbench._db() as db:
+                        db.execute("DELETE FROM competition_questions WHERE challenge_id=?",(existing["challenge_id"],))
+                    existing=None
+            if existing is None:
                 category=item.get("category","").lower()
-                from agent_adapters.workbench import VALID_CATEGORIES
+                from agent_adapters.workbench import VALID_CATEGORIES, merged_description
                 if category not in VALID_CATEGORIES:category="misc"
                 minutes=value.get("deadline_minutes",60)
                 description=item["description"]
                 selected=next((raw for raw,match in zip(item["addresses"],matches) if match),None) if target else None
                 if selected:description += "\n\n平台所选入口："+selected
+                if value.get("default_description_enabled"):
+                    description=merged_description(description,value.get("default_description"))
                 local=self.workbench.create(dict(title=item["display_name"][:160],category=category,
                     description=description,endpoint=target,deadline_minutes=minutes,
                     step_timeout_seconds=value.get("step_timeout_seconds",60),
                     http_methods=value.get("http_methods",["GET","HEAD","OPTIONS"])))
                 with self.workbench._db() as db:
                     db.execute("INSERT INTO competition_questions VALUES (?,?,?,?,?)",(local["id"],identity,scope,remote,json.dumps(snapshot,ensure_ascii=True)))
+            if value.get("default_description_enabled") and local["status"]=="draft" and not local["archived"]:
+                from agent_adapters.workbench import merged_description
+                merged=merged_description(local["description"],value.get("default_description"))
+                if merged!=(local["description"] or ""):
+                    local=self.workbench.update(local["id"],dict(title=local["title"],category=local["category"],
+                        description=merged,endpoint=local["endpoint"],deadline_minutes=local["deadline_minutes"],
+                        step_timeout_seconds=local["step_timeout_seconds"],http_methods=local["http_methods"]))
         try:
             return self._import_attachment(profile,item,local,check_active)
         except (WorkbenchError,OSError) as error:
