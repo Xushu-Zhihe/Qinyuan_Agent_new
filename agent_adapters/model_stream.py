@@ -35,50 +35,106 @@ class ModelStreamError(ValueError):
         super().__init__(code)
 
 
-def read_chat_stream(response, limit, report):
+def read_chat_stream(response, limit, report, *, allow_tool_calls=False):
     buffer = b""
     data_lines = []
     event_bytes = 0
     content = []
+    tool_calls = {}
+    tool_metadata_bytes = 0
     finish = None
+    done_seen = False
+    stream_error = None
     usage = None
     counts = {"response_utf8_bytes": 0, "content_chars": 0, "content_utf8_bytes": 0,
               "reasoning_chars": 0, "reasoning_utf8_bytes": 0, "sse_events": 0, "keepalive_lines": 0}
 
     def progress(end):
-        report(**counts, stream_end=end, finish_reason=safe_finish_reason(finish), usage=numeric_usage(usage))
+        report(**counts, stream_end=end, finish_reason=safe_finish_reason(finish), usage=numeric_usage(usage),
+               finish_seen=finish is not None, done_seen=done_seen, stream_error=stream_error)
 
-    def invalid():
+    def invalid(branch, path, value):
+        nonlocal stream_error
+        stream_error = {"branch": branch, "event_index": counts["sse_events"], "field_path": path,
+                        "observed_type": "null" if value is None else type(value).__name__}
         raise ModelStreamError("provider_stream_invalid")
 
     def event(raw):
-        nonlocal finish, usage
+        nonlocal finish, usage, tool_metadata_bytes, done_seen
         counts["sse_events"] += 1
         if raw == b"[DONE]":
+            done_seen = True
             if finish is None:
-                invalid()
+                invalid("done_without_finish", "$.choices[0].finish_reason", finish)
+            if sorted(tool_calls) != list(range(len(tool_calls))):
+                invalid("tool_index_sequence_invalid", "$.choices[0].delta.tool_calls", list(tool_calls))
             return True
         try:
             value = json.loads(raw)
         except (ValueError, UnicodeError):
-            invalid()
+            invalid("event_json_invalid", "$", raw)
         if not isinstance(value, dict):
-            invalid()
+            invalid("event_type_invalid", "$", value)
         if isinstance(value.get("usage"), dict):
             usage = value["usage"]
         choices = value.get("choices")
         if choices == [] and isinstance(value.get("usage"), dict):
             return False
-        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-            invalid()
+        if not isinstance(choices, list):
+            invalid("choices_type_invalid", "$.choices", choices)
+        if len(choices) != 1:
+            invalid("choices_count_invalid", "$.choices", choices)
+        if not isinstance(choices[0], dict):
+            invalid("choice_type_invalid", "$.choices[0]", choices[0])
         choice = choices[0]
         if choice.get("index", 0) != 0:
-            invalid()
+            invalid("choice_index_invalid", "$.choices[0].index", choice.get("index"))
         delta = choice.get("delta")
         if not isinstance(delta, dict):
-            invalid()
-        if delta.get("tool_calls") or delta.get("function_call"):
-            invalid()
+            invalid("delta_type_invalid", "$.choices[0].delta", delta)
+        if delta.get("function_call"):
+            invalid("legacy_function_call", "$.choices[0].delta.function_call", delta["function_call"])
+        if delta.get("tool_calls"):
+            if not allow_tool_calls or finish is not None or not isinstance(delta["tool_calls"], list):
+                invalid("tool_calls_not_allowed" if not allow_tool_calls else "tool_calls_after_finish" if finish is not None
+                        else "tool_calls_type_invalid", "$.choices[0].delta.tool_calls", delta["tool_calls"])
+            for position, item in enumerate(delta["tool_calls"]):
+                path = f"$.choices[0].delta.tool_calls[{position}]"
+                if not isinstance(item, dict):
+                    invalid("tool_item_type_invalid", path, item)
+                if type(item.get("index")) is not int or item["index"] < 0:
+                    invalid("tool_index_invalid", path + ".index", item.get("index"))
+                if set(item) - {"index", "id", "type", "function"}:
+                    invalid("tool_fields_invalid", path, item)
+                index = item["index"]
+                if index not in tool_calls:
+                    tool_call = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                    tool_calls[index] = tool_call
+                    tool_metadata_bytes += len(json.dumps(tool_call).encode("utf-8"))
+                tool_call = tool_calls[index]
+                if "type" in item and item["type"] != "function":
+                    invalid("tool_type_invalid", path + ".type", item["type"])
+                if "id" in item:
+                    if not isinstance(item["id"], str):
+                        invalid("tool_id_type_invalid", path + ".id", item["id"])
+                    if tool_call["id"] and tool_call["id"] != item["id"]:
+                        invalid("tool_id_changed", path + ".id", item["id"])
+                    if not tool_call["id"]:
+                        tool_metadata_bytes += len(json.dumps(item["id"], ensure_ascii=False).encode("utf-8")) - 2
+                    tool_call["id"] = item["id"]
+                function = item.get("function", {})
+                if not isinstance(function, dict):
+                    invalid("tool_function_type_invalid", path + ".function", function)
+                if set(function) - {"name", "arguments"}:
+                    invalid("tool_function_fields_invalid", path + ".function", function)
+                for key, part in function.items():
+                    if not isinstance(part, str):
+                        invalid("tool_function_field_type", path + ".function." + key, part)
+                    tool_call["function"][key] += part
+                    counts["content_chars"] += len(part)
+                    counts["content_utf8_bytes"] += len(part.encode("utf-8"))
+                if counts["content_utf8_bytes"] + counts["reasoning_utf8_bytes"] + tool_metadata_bytes > limit:
+                    raise ModelStreamError("response_rejected", "response_limit", "invalid_response")
         if delta.get("refusal"):
             raise ModelStreamError("provider_refused", "response_rejected", "refused")
         for key, prefix in (("content", "content"), ("reasoning_content", "reasoning")):
@@ -86,17 +142,18 @@ def read_chat_stream(response, limit, report):
             if text is None:
                 continue
             if not isinstance(text, str) or (finish is not None and text):
-                invalid()
+                invalid("text_after_finish" if finish is not None and isinstance(text, str) else "text_type_invalid",
+                        "$.choices[0].delta." + key, text)
             counts[prefix + "_chars"] += len(text)
             counts[prefix + "_utf8_bytes"] += len(text.encode("utf-8"))
-            if counts["content_utf8_bytes"] + counts["reasoning_utf8_bytes"] > limit:
+            if counts["content_utf8_bytes"] + counts["reasoning_utf8_bytes"] + tool_metadata_bytes > limit:
                 raise ModelStreamError("response_rejected", "response_limit", "invalid_response")
             if key == "content" and text:
                 content.append(text)
         reason = choice.get("finish_reason")
         if reason is not None:
             if not isinstance(reason, str) or not reason or finish is not None:
-                invalid()
+                invalid("finish_reason_invalid", "$.choices[0].finish_reason", reason)
             finish = reason
         return False
 
@@ -119,7 +176,10 @@ def read_chat_stream(response, limit, report):
                         event_bytes = 0
                         if event(raw):
                             progress("done")
-                            return {"choices": [{"message": {"content": "".join(content)},
+                            message = {"content": "".join(content)}
+                            if tool_calls:
+                                message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+                            return {"choices": [{"message": message,
                                                  "finish_reason": finish}], "usage": usage}, counts["reasoning_chars"]
                 elif line.startswith(b":"):
                     counts["keepalive_lines"] += 1

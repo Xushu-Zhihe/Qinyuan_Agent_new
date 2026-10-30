@@ -15,6 +15,7 @@ from agent_adapters.web.web_request import D7WebRequest
 from agent_adapters.workbench import Workbench, WorkbenchError
 from agent_adapters.workbench_runner import D7_ALLOWED_METHODS
 from agent_core.web_contracts import canonical_web_origin
+from agent_core.operation_accounting import D4BudgetPolicy
 
 
 class _Process:
@@ -54,15 +55,16 @@ def _write_valid_env(path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("category", ["web", "pwn"])
 def test_real_profile_builds_authorized_web_request_and_keeps_secret_in_env_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, category
 ):
     env_file = tmp_path / ".env"
     _write_valid_env(env_file)
     monkeypatch.setattr("agent_adapters.workbench_runner.D7_ENV_FILE", env_file)
     workbench = Workbench(tmp_path / "data", protocol_version=3, d7_mode="real")
     challenge = workbench.create(
-        _challenge(endpoint="http://node4.anna.nssctf.cn:23522/")
+        {**_challenge(endpoint="http://node4.anna.nssctf.cn:23522/"), "category": category}
     )
 
     with patch.dict(
@@ -87,6 +89,7 @@ def test_real_profile_builds_authorized_web_request_and_keeps_secret_in_env_file
     request_text = request_path.read_text(encoding="utf-8")
     request = json.loads(request_text)
     assert request["protocol_version"] == 3
+    assert f"题型（任务提供）：{category}" in request["task_request"]["goal"]
     assert request["task_request"]["target"] == {
         "attachments": [],
         "endpoints": [{"url": "http://node4.anna.nssctf.cn:23522"}],
@@ -108,7 +111,7 @@ def test_real_profile_builds_authorized_web_request_and_keeps_secret_in_env_file
     }
     assert request["dual_llm_config"]["inner_role"]["prompt_template"] == "qinyuan.d7.inner.v1"
     assert request["dual_llm_config"]["inner_role"]["model"] == "deepseek-chat"
-    assert request["dual_llm_config"]["d4_budget"]["total"] == 48
+    assert request["dual_llm_config"]["d4_budget"]["total"] == D4BudgetPolicy().total
     D7WebRequest.parse(request)
     assert "fixture-secret" not in request_text
     assert "ambient-secret" not in request_text

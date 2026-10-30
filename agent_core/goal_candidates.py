@@ -170,7 +170,7 @@ class D7AnswerCandidate:
             if self.plan_id is not None or self.execution_id is not None or self.web_execution_binding is not None:
                 raise ValueError("MCP candidate cannot carry a Plan or Execution")
             if not self.source_ref.startswith("mcp-result/"):raise ValueError("MCP source reference invalid")
-            _uuid4(self.source_ref.removeprefix("mcp-result/"), "MCP operation")
+            _uuid4_or5(self.source_ref.removeprefix("mcp-result/"), "MCP operation")
         else:
             raise ValueError("source_kind must be d3, web or mcp")
 

@@ -2,7 +2,7 @@
 from dataclasses import asdict
 import json
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.turn_modeling import digest
 
 
@@ -33,7 +33,7 @@ def freeze_policy(app, packet):
                     head['last_ref'], None, (), 'Frozen relation selection', None, kind, owner.intent_id)
                 try:
                     goal, old_ref = app.revisions._relation_details(action, base)
-                except D3RecoveryRequired as exc:
+                except ExecutionRecoveryRequired as exc:
                     if str(exc) not in {'d8_parent_success_relation_missing',
                                         'd8_support_relation_version_changed',
                                         'd8_dependency_relation_version_changed'}:
@@ -61,7 +61,7 @@ def context(raw_request, stage):
     packet = json.loads(raw_request['history_context'])
     policy = packet.get('s5_policy')
     if not isinstance(policy, dict) or type(policy.get('version')) is not int or policy.get('version') != 1:
-        raise D3RecoveryRequired('s5_frozen_policy_unavailable')
+        raise ExecutionRecoveryRequired('s5_frozen_policy_unavailable')
     visible = list(packet['items'])
     cursors = []
     for retrieval in packet.get('retrieved', []):

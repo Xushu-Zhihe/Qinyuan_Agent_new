@@ -210,7 +210,7 @@ def test_corrupt_bound_progress_pauses_and_preserves_evidence(tmp_path, monkeypa
 @pytest.mark.parametrize('output_case', [13], indirect=True)
 @pytest.mark.parametrize('classification', ['meaningful','repetitive','inconclusive'])
 def test_restricted_progress_uses_joint_choices_and_never_opens_tools(output_case, monkeypatch, classification):
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     case = output_case
     records = []
     def query(e, raw):

@@ -33,6 +33,13 @@ D7_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 D7_ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 
 
+def challenge_goal(challenge):
+    """Carry the saved classification through the existing task context."""
+    return (f"题型（任务提供）：{challenge['category']}\n"
+        "将题型作为可依据证据修正的分析背景，用于规划、工具选择与监督；"
+        "它不扩大工具、文件或网络访问授权。\n\n题目描述（原文）：\n" + challenge["description"])
+
+
 @dataclass
 class ActiveRun:
     run_id: str
@@ -258,7 +265,7 @@ class Runner:
                     "protocol_version": 3,
                     "request_id": str(uuid4()),
                     "task_request": {
-                        "goal": challenge["description"],
+                        "goal": challenge_goal(challenge),
                         "target": {
                             "source_root": str(input_dir.resolve()),
                             "attachments": [
@@ -327,7 +334,7 @@ class Runner:
                     "protocol_version": 3,
                     "request_id": str(uuid4()),
                     "task_request": {
-                        "goal": challenge["description"],
+                        "goal": challenge_goal(challenge),
                         "target": {
                             "attachments": [],
                             "endpoints": [{"url": origin}],
@@ -358,7 +365,7 @@ class Runner:
                 request = {
                     "protocol_version": 2,
                     "task_request": {
-                        "goal": challenge["description"],
+                        "goal": challenge_goal(challenge),
                         "target": {"attachments": [
                             {"kind": "local_path", "path": "input/" + name}
                             for name in names
@@ -562,6 +569,40 @@ class Runner:
     def resume(self, challenge_id: str):
         return self._d9_operation(challenge_id, 'resume')
 
+    def live_control(self, challenge_id, value):
+        """Single-task UI uses the original trusted operator transaction."""
+        if (not isinstance(value, dict) or set(value) != {"run_id", "operation_id", "action", "payload"}
+                or not isinstance(value["action"], str) or value["action"] not in {"extend_question", "user_hint"}
+                or not isinstance(value["operation_id"], str) or not isinstance(value["payload"], dict)):
+            raise WorkbenchError("operator_payload_invalid")
+        from agent_core.sqlite_control_store import SqliteControlStore
+        from agent_core.controller import TaskRunController
+        from agent_core.operator_controls import current
+        with self.workbench.lock:
+            run = self._current(challenge_id)
+            if run is None:
+                raise WorkbenchError("operator_task_not_active", 409)
+            if run["run_id"] != value["run_id"]:
+                raise WorkbenchError("operator_run_changed", 409)
+            directory = self._find_agent_directory(Path(run["directory"]))
+            if directory is None:
+                raise WorkbenchError("operator_task_initializing", 409)
+            try:
+                with SqliteControlStore.open(directory / "control.sqlite") as store:
+                    if store.load_stage_run_config(directory.name) is None:
+                        raise WorkbenchError("operator_scope_invalid", 409)
+                    if (Path(run["directory"]) / "competition-binding.json").is_file() and current(store, directory.name) is None:
+                        raise WorkbenchError("operator_task_initializing", 409)
+                    if run["status"] != "running" and store._connection.execute(
+                            "SELECT 1 FROM task_operator_controls WHERE operation_id=? AND task_run_id=?",
+                            (value["operation_id"], directory.name)).fetchone() is None:
+                        raise WorkbenchError("operator_task_not_active", 409)
+                    control = TaskRunController.submit_operator_control(store, directory.name,
+                        value["operation_id"], value["action"], value["payload"])
+            except ValueError as error:
+                raise WorkbenchError(str(error), 409) from None
+        return {"operation_id": value["operation_id"], "operator_control": control}
+
     def operator_control(self,challenge_id,action,*,seconds=None,operation_id=None):
         """A separate narrow CLI command can reach an active worker's control ledger."""
         operation_id=operation_id or str(uuid4())
@@ -663,6 +704,45 @@ class Runner:
 
     def validation_check(self, challenge_id: str, selection: dict):
         return self._d9_operation(challenge_id, 'validation-check', selection)
+
+    def human_decision(self, challenge_id: str, selection: dict):
+        """A short trusted control command; the waiting worker retains its ownership."""
+        if (not isinstance(selection, dict) or set(selection) != {"candidate_id", "action", "operation_id"}
+                or selection["action"] not in {"accept", "continue", "end"}):
+            raise WorkbenchError("stage.human_decision_invalid")
+        from uuid import UUID
+        try:
+            if any(str(UUID(selection[k])) != selection[k] or UUID(selection[k]).version != 4
+                    for k in ("candidate_id", "operation_id")):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            raise WorkbenchError("stage.human_decision_invalid") from None
+        with self.workbench.lock, self._lock:
+            self.workbench.schedules.check_task_operation(challenge_id, "human-decision")
+            run = self._current(challenge_id)
+            directory = Path(run["directory"]) if run else None
+            agent_dir = self._find_agent_directory(directory) if directory else None
+            if agent_dir is None or run["agent_task_run_id"] is not None and agent_dir.name != run["agent_task_run_id"]:
+                raise WorkbenchError("run_identity_unavailable", 409)
+            declaration = immutable_read(agent_dir / "run.json")
+            request = json.loads((directory / "request.json").read_bytes())
+            if (declaration.get("task_run_id") != agent_dir.name or declaration.get("goal_validation") != "human"
+                    or declaration.get("request_id") != request.get("request_id")):
+                raise WorkbenchError("stage.human_decision_invalid", 409)
+            command = [sys.executable, "-m", "agent", "human-decision", "--state-dir", str(agent_dir.parent),
+                "--task-run-id", agent_dir.name, "--candidate-id", selection["candidate_id"],
+                "--operation-id", selection["operation_id"], "--decision", selection["action"]]
+        try:
+            completed = subprocess.run(command, cwd=directory, env=self._subprocess_environment(3),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                **self._scheduled_process_options(True))
+            output = json.loads(completed.stdout)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            raise WorkbenchError("stage.human_decision_outcome_unknown", 503) from None
+        if completed.returncode or output.get("exit_code"):
+            errors = output.get("errors", [])
+            raise WorkbenchError(errors[0]["code"] if errors else "stage.human_decision_rejected", 409)
+        return self.status(challenge_id)
 
     def _d9_operation(self, challenge_id, operation, selection=None):
         """Only the CLI owns checks, continuation and persisted transitions."""

@@ -2,7 +2,7 @@
 from dataclasses import asdict, dataclass
 import json
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.handoff_contracts import checked_refs, handoff_json
 from agent_core.turn_modeling import digest
 
@@ -88,7 +88,7 @@ def resolution_schema(request):
 def parse_saved_resolution(app, request_id, raw):
     saved = app.sessions.evidence.read("request", request_id)
     if saved is None:
-        raise D3RecoveryRequired("d22_resolution_request_missing")
+        raise ExecutionRecoveryRequired("d22_resolution_request_missing")
     return parse_resolution(raw, saved["request"])
 
 
@@ -125,11 +125,11 @@ def validate_continuation_reuse(app, request_id):
     record = next((r for r in app.store.list_d8_tree_records(app.state.task_run.task_run_id)
                    if r.record_id == marker.get("record_id") and r.kind == "evaluation_continued"), None)
     if record is None:
-        raise D3RecoveryRequired("d22_continuation_reuse_changed")
+        raise ExecutionRecoveryRequired("d22_continuation_reuse_changed")
     from agent_core.handoff_contracts import D8HandoffRequest
     saved = app.handoff.evidence.read("request", record.model_request_id)
     if saved is None:
-        raise D3RecoveryRequired("d22_continuation_reuse_changed")
+        raise ExecutionRecoveryRequired("d22_continuation_reuse_changed")
     original = D8HandoffRequest.from_dict(saved)
     policy = evaluation_policy(original, json.loads(original.prior_summary)["s4_evaluation_policy"])
     decision = app.handoff._known_call(original)
@@ -142,7 +142,7 @@ def validate_continuation_reuse(app, request_id):
             or handoff_json(asdict(proposal)) != handoff_json(policy["proposal"])
             or not marker.get("scope_sha256") or marker["scope_sha256"] != policy.get("continuation_scope_sha256")
             or decision is None or decision["outcome"] != "valid" or decision["raw"]["decision"] != "continue"):
-        raise D3RecoveryRequired("d22_continuation_reuse_changed")
+        raise ExecutionRecoveryRequired("d22_continuation_reuse_changed")
     return dict(reused=True, review_record_id=record.record_id, review_request_id=record.model_request_id,
                 reason=decision["raw"]["reason"])
 
@@ -154,7 +154,7 @@ def reuse_continuation(app, request_id, intent_id, proposal):
     if app.handoff.evidence.read("decision", identity) is None:
         frozen = app.sessions.evidence.read("request", request_id)
         if frozen is None:
-            raise D3RecoveryRequired("d22_resolution_request_missing")
+            raise ExecutionRecoveryRequired("d22_resolution_request_missing")
         context = packet(frozen["request"])["intent_execution"]
         marker = context.get("last_review")
         if not marker or stop_request(app, intent_id) is not None:
@@ -184,14 +184,14 @@ def reuse_continuation(app, request_id, intent_id, proposal):
 
 
 def validate_resolution(app, request, proposal):
-    from agent_core.dual_llm_modeling import D3ProposalRejected
+    from agent_core.dual_llm_modeling import ExecutionProposalRejected
     stop = packet(request)["intent_execution"].get("stop_requested")
     if stop and not stop.get("review_latest_evidence") and not closure_only(request) and proposal.outcome not in {"failed", "inconclusive"}:
-        raise D3ProposalRejected("d22_strategy_stop_summary_required")
+        raise ExecutionProposalRejected("d22_strategy_stop_summary_required")
     available = visible_items(request)
     selected = checked_refs(list(proposal.evidence_refs), set(available))
     if any(available[r]["source_status"] != "available" or available[r].get("conflict") for r in selected):
-        raise D3ProposalRejected("d22_resolution_source_unavailable")
+        raise ExecutionProposalRejected("d22_resolution_source_unavailable")
     candidate_refs = {r for c in proposal.next_intent_candidates
                       for r in (*c.evidence_refs, *c.dependency_refs)}
     live = {i.ref: i for i in app.handoff.history()}
@@ -201,19 +201,19 @@ def validate_resolution(app, request, proposal):
         if (item is None or item["source_status"] != "available" or item.get("conflict")
                 or current_item is None or current_item.source_status != "available" or current_item.conflict
                 or app.revisions is not None and not app.revisions.reliable(current_item)):
-            raise D3ProposalRejected("d22_resolution_source_unavailable")
+            raise ExecutionProposalRejected("d22_resolution_source_unavailable")
     frozen = {i["fact_id"]: i["ref"] for i in packet(request)["intent_execution"]["facts"]}
     intent_id = request["context"]["intent_id"] if isinstance(request, dict) else request.context.intent_id
     current = {i["fact_id"]: i["ref"] for i in facts(app, intent_id)}
     if any(i not in frozen or frozen[i] != current.get(i) or frozen[i] not in selected for i in proposal.fact_ids):
-        raise D3ProposalRejected("d22_resolution_fact_not_effective")
+        raise ExecutionProposalRejected("d22_resolution_fact_not_effective")
     if proposal.outcome == "succeeded":
         intent = next(i for i in app.state.intents if i.intent_id == intent_id)
         app.validator._allowed(app.state.task_run.task_run_id, intent.turn_id, intent_id, "complete_intent", None)
     for fact_id in proposal.fact_ids:
         supports = [r for r in app.store.list_d8_conclusions(app.state.task_run.task_run_id) if r.fact_id == fact_id]
         if not supports:
-            raise D3RecoveryRequired("d22_resolution_fact_source_missing")
+            raise ExecutionRecoveryRequired("d22_resolution_fact_source_missing")
         support = supports[-1]
         if support.plan_id is None:
             app.evidence_conclusions.validate_fact(next(f for f in app.state.facts if f.fact_id==fact_id),app.state)
@@ -221,7 +221,7 @@ def validate_resolution(app, request, proposal):
         binding = app.store.load_d3_plan_binding(support.plan_id)
         result = app.store.load_d3_plan_result(support.plan_id)
         if result is None or result.supporting_fact_id != fact_id:
-            raise D3RecoveryRequired("d22_resolution_fact_result_changed")
+            raise ExecutionRecoveryRequired("d22_resolution_fact_result_changed")
         app.conclusions.check_support(app.state, binding, result.proof_id, fact_id)
 
 
@@ -275,7 +275,7 @@ def make_request(app, intent_id, inner_id, proposal):
     from agent_core.handoff_contracts import D8HandoffRequest
     frozen = app.sessions.evidence.read("request", inner_id)
     if frozen is None:
-        raise D3RecoveryRequired("d22_resolution_request_missing")
+        raise ExecutionRecoveryRequired("d22_resolution_request_missing")
     validate_resolution(app, frozen["request"], proposal)
     intent = next(i for i in app.state.intents if i.intent_id == intent_id)
     chosen, _, context = app.handoff.select("execution", intent.turn_id, intent_id)
@@ -293,7 +293,7 @@ def make_request(app, intent_id, inner_id, proposal):
     all_items = {i.ref: i for i in chosen}
     for ref in required:
         if ref not in by_ref or by_ref[ref].source_status != "available" or by_ref[ref].conflict:
-            raise D3RecoveryRequired("d22_resolution_source_changed")
+            raise ExecutionRecoveryRequired("d22_resolution_source_changed")
         all_items[ref] = by_ref[ref]
     selected = tuple(all_items.values())
     fact_refs = [next(i.ref for i in selected if i.record_id == fid) for fid in proposal.fact_ids]
@@ -418,7 +418,7 @@ def close_stop_observation(app, intent_id):
     if proof is None:
         if stop_request(app, intent_id)["decision"] == "request_intent_resolution":
             return  # Finish this already admitted bounded Plan; do not open another one.
-        raise D3RecoveryRequired("d22_stop_observation_unavailable")
+        raise ExecutionRecoveryRequired("d22_stop_observation_unavailable")
     complete_observation(app, binding, proof)
 
 
@@ -448,11 +448,11 @@ async def resolve(app, request_id, intent_id, proposal, token):
             from qinyuan_core import get_logger
             get_logger("ctrl").info("intent.resolution", run=request.task_run_id, intent=intent_id,
                 request=final.model_request_id, outcome="awaiting_adjudication", category="technical_result")
-            raise D3RecoveryRequired("d22_awaiting_adjudication")
+            raise ExecutionRecoveryRequired("d22_awaiting_adjudication")
         # The reviewer could not produce a readable verdict. The Intent is unjudged,
         # not the run state, so degrade locally and let the tree pick a sibling.
         if not app.handoff.note_evaluation_fallback("d22_resolution_review_invalid"):
-            raise D3RecoveryRequired("d22_resolution_review_unavailable")
+            raise ExecutionRecoveryRequired("d22_resolution_review_unavailable")
         record = D8TreeRecord(app._id("evaluation/" + final.model_request_id), request.task_run_id,
             intent.turn_id, intent_id, "inconclusive", final.model_request_id,
             request.support_fact_id, request_id)
@@ -488,7 +488,7 @@ def validate_record(app, request, record):
     if (not enabled(app.config) or not isinstance(inner, IntentResolution)
             or record.inner_request_id != policy["inner_request_id"]
             or handoff_json(asdict(inner)) != handoff_json(policy["proposal"])):
-        raise D3RecoveryRequired("d22_resolution_proposal_changed")
+        raise ExecutionRecoveryRequired("d22_resolution_proposal_changed")
     frozen = app.sessions.evidence.read("request", record.inner_request_id)
     validate_resolution(app, frozen["request"], inner)
 
@@ -508,10 +508,10 @@ def reconcile(app):
             continue
         operation = app.store.load_d3_operation(record.inner_request_id)
         if operation is None:
-            raise D3RecoveryRequired("d22_resolution_operation_missing")
+            raise ExecutionRecoveryRequired("d22_resolution_operation_missing")
         if operation.application_ref is not None:
             if operation.application_ref != record.record_id:
-                raise D3RecoveryRequired("d22_resolution_application_changed")
+                raise ExecutionRecoveryRequired("d22_resolution_application_changed")
             continue
         raw = app.handoff.evidence.read("request", record.model_request_id)
         if json.loads(raw["prior_summary"]).get("s4_evaluation_policy", {}).get("version") not in {2, 3}:
@@ -524,14 +524,14 @@ def reconcile(app):
 def result_summary(app, record):
     request = app.handoff.evidence.read("request", record.model_request_id)
     if request is None:
-        raise D3RecoveryRequired("d22_resolution_request_missing")
+        raise ExecutionRecoveryRequired("d22_resolution_request_missing")
     policy = json.loads(request["prior_summary"]).get("s4_evaluation_policy", {})
     if policy.get("policy") != POLICY:
         return None
     from agent_core.handoff_contracts import D8HandoffRequest
     result = app.handoff._known_call(D8HandoffRequest.from_dict(request))
     if result is None or result["outcome"] != "valid":
-        raise D3RecoveryRequired("d22_resolution_result_missing")
+        raise ExecutionRecoveryRequired("d22_resolution_result_missing")
     return dict(kind=record.kind, inner_summary=policy["proposal"]["reason"],
         reviewed_summary=result["raw"]["reason"], evidence_refs=result["raw"]["evidence_refs"],
         identity="reviewed_intent_result_not_verified_fact", scope="conditions_and_tested_domain_at_decision_time")
@@ -621,8 +621,8 @@ def validate_working(app, request, note):
     if request.stage == "fact_proposal":
         app.conclusions._scope(request.observation)
         if list(note.evidence_refs) != working_refs(request):
-            from agent_core.dual_llm_modeling import D3ProposalRejected
-            raise D3ProposalRejected("d22_working_source_changed")
+            from agent_core.dual_llm_modeling import ExecutionProposalRejected
+            raise ExecutionProposalRejected("d22_working_source_changed")
         return
     live = {i.ref: i for i in app.handoff.history()}
     frozen = visible_items(request)
@@ -631,8 +631,8 @@ def validate_working(app, request, note):
         if (ref not in frozen or item is None or item.source_status != "available" or item.conflict
                 or handoff_json(item.visible()) != handoff_json(frozen[ref])
                 or app.revisions is not None and not app.revisions.reliable(item)):
-            from agent_core.dual_llm_modeling import D3ProposalRejected
-            raise D3ProposalRejected("d22_working_source_changed")
+            from agent_core.dual_llm_modeling import ExecutionProposalRejected
+            raise ExecutionProposalRejected("d22_working_source_changed")
 
 
 def apply_working(app, request_id):
@@ -676,7 +676,7 @@ def budget_stop_reason(store, evidence, task_id):
         if record is not None:
             if record != {"intent_id": intent_id, "reason": record.get("reason")} or record["reason"] not in {
                     "d22_closure_budget_unavailable", "d22_closure_requires_more_budget", "d22_closure_completed_budget_stop"}:
-                raise D3RecoveryRequired("d22_budget_pause_changed")
+                raise ExecutionRecoveryRequired("d22_budget_pause_changed")
             return record["reason"]
     return None
 
@@ -685,7 +685,7 @@ def stop_for_budget(app, intent_id, reason):
     app.handoff.evidence.save("pause", app._id("budget-stop/" + intent_id), {"intent_id": intent_id, "reason": reason})
     from qinyuan_core import get_logger
     get_logger("ctrl").info("budget.closure_stopped", intent=intent_id, reason=reason, category="resource_limit")
-    raise D3RecoveryRequired(reason)
+    raise ExecutionRecoveryRequired(reason)
 
 
 def closing_candidate_used(app, intent_id, marker):
@@ -770,7 +770,7 @@ def stop_request(app, intent_id):
     marker = closure_marker(app, intent_id) if enabled(app.config) else None
     if marker is not None:
         if marker != {"intent_id": intent_id, "checkpoint_sequence": marker.get("checkpoint_sequence")} or type(marker["checkpoint_sequence"]) is not int:
-            raise D3RecoveryRequired("d22_budget_closure_changed")
+            raise ExecutionRecoveryRequired("d22_budget_closure_changed")
         return {"review_id": app._id("budget-closure/" + intent_id), "decision": "request_intent_resolution",
             "reason": "Remaining category budgets are reserved for a bounded end proposal, its review and necessary summary.",
             "fact_candidate_allowed": (stop is None or stop["decision"] == "request_intent_resolution") and not closing_candidate_used(app, intent_id, marker) and not facts(app, intent_id),
@@ -895,7 +895,7 @@ def resume_local(app, intent):
 
 def suspend_local(app, intent, error):
     from agent_core.domain import IntentStatus, ExecutionStatus
-    from agent_core.dual_llm_modeling import D3ProposalRejected
+    from agent_core.dual_llm_modeling import ExecutionProposalRejected
     from agent_core.control_store import UpsertIntent
     from agent_core.handoff_contracts import D8TreeRecord
     from agent_core.review import D2ReviewPaused
@@ -908,7 +908,7 @@ def suspend_local(app, intent, error):
     allowed = {"d22_awaiting_adjudication", "d8_progress_inconclusive", "d8_progress_repetitive",
         "d8_model_output_truncated", "d8_model_output_budget_exhausted", "d8_model_format_rejected",
         "d8_model_invalid", "d8_model_model_error", "d8_model_sensitive_rejected"}
-    if not context_failure and not isinstance(error, (D3ProposalRejected, D2ReviewPaused)) and code not in allowed:return False
+    if not context_failure and not isinstance(error, (ExecutionProposalRejected, D2ReviewPaused)) and code not in allowed:return False
     identity = None
     for op in (() if context_failure else reversed(app.store.list_d4_operations(app.state.task_run.task_run_id))):
         if op.completion is None or op.application_ref is not None or op.start.role is None:continue
@@ -957,7 +957,7 @@ def park_pending_adjudication(app):
                                    app.state.task_run.task_run_id)
     if pending is None:return False
     intent = next(i for i in app.state.intents if i.intent_id == pending["intent_id"])
-    return intent.status is IntentStatus.RUNNING and suspend_local(app, intent, D3RecoveryRequired(pending["reason"]))
+    return intent.status is IntentStatus.RUNNING and suspend_local(app, intent, ExecutionRecoveryRequired(pending["reason"]))
 
 
 async def replan_root_once(app, receipts, token):

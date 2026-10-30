@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import pytest
 
-from agent_adapters.web.http_adapter import D7HttpError
+from agent_adapters.web.http_adapter import HttpCapabilityError
 from agent_adapters.web.sandbox_transport import D7SandboxHttpTransport
 from agent_core.control_store import TargetNetworkBinding
 from agent_core.web_contracts import D7WebAuthorization, D7WebRunConfig
@@ -265,7 +265,7 @@ def test_d7_http_request_header_limits_reject_before_network_or_exec():
         target_network=network,
     )
 
-    with pytest.raises(D7HttpError, match="d7_http_dispatch_rejected"):
+    with pytest.raises(HttpCapabilityError, match="d7_http_dispatch_rejected"):
         transport.send(
             origin=transport_origin(config.endpoint),
             method="GET",
@@ -296,7 +296,7 @@ def test_d7_http_response_header_limits_fail_closed_after_dispatch():
         target_network=network,
     )
 
-    with pytest.raises(D7HttpError, match="outcome_unknown"):
+    with pytest.raises(HttpCapabilityError, match="outcome_unknown"):
         transport.send(
             origin=transport_origin(config.endpoint),
             method="GET",
@@ -481,3 +481,116 @@ def transport_origin(endpoint: str):
     from agent_adapters.web.http_adapter import D7HttpOrigin
 
     return D7HttpOrigin.parse(endpoint)
+
+
+@pytest.mark.parametrize("phase,code", [
+    ("request_prepare", "request_prepare_failed"), ("request_send", "request_send_failed"),
+    ("response_headers", "response_headers_failed"), ("response_body", "response_body_failed"),
+    ("body_limit", "response_body_limit"), ("header_limit", "response_header_limit")])
+def test_http_worker_failure_preserves_safe_stage_and_remains_unknown(monkeypatch, phase, code):
+    import http.client
+    from agent_adapters.output_evidence import safe_failure_details
+    class Response:
+        status = 200
+        def read(self, limit):
+            if phase == "response_body": raise TimeoutError("PRIVATE response body")
+            return b"x" * limit if phase == "body_limit" else b"ok"
+        def getheaders(self):
+            return [("Content-Type", "x" * 8193)] if phase == "header_limit" else []
+    class Connection:
+        def __init__(self, *args, **kwargs): pass
+        def putrequest(self, *args, **kwargs):
+            if phase == "request_prepare": raise ValueError("PRIVATE request")
+        def putheader(self, *args): pass
+        def endheaders(self, body):
+            if phase == "request_send": raise ConnectionResetError("PRIVATE reset")
+        def getresponse(self):
+            if phase == "response_headers": raise http.client.RemoteDisconnected("PRIVATE disconnect")
+            return Response()
+        def close(self): pass
+    monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+    request = dict(scheme="http", host="example.test", port=80, authority="example.test:80", method="GET",
+        path_query="/", headers=[], body_b64="", timeout_seconds=2, max_response_bytes=2097152,
+        max_header_bytes=65536, max_header_count=100, max_header_value_bytes=8192)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode()+b"\n")))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), pytest.raises(SystemExit) as stopped:
+        exec(_HTTP_WORKER, {})
+    assert stopped.value.code == 1
+    failure = json.loads(output.getvalue())
+    assert failure["code"] == "http.worker." + code and "PRIVATE" not in output.getvalue()
+    task = str(uuid4()); config = _config(task)
+    api = _ExecApi(_frame(1, output.getvalue().encode()))
+    api.exec_inspect = lambda identity: dict(Running=False, ExitCode=1)
+    sandbox, sandbox_id = _sandbox(task, api)
+    transport = D7SandboxHttpTransport(sandbox, sandbox_id=sandbox_id, run_config=config,
+        network_binding=_network_binding(), target_network=_TargetNetwork())
+    with pytest.raises(HttpCapabilityError, match="outcome_unknown") as caught:
+        transport.send(origin=transport_origin(config.endpoint), method="GET", path_query="/", headers=(), body=b"",
+            timeout_seconds=3, max_response_bytes=2097152)
+    detail = safe_failure_details(caught.value, include_chain=True)["http_diagnostic"]
+    assert detail["branch"] == "worker_exit_nonzero" and detail["exit_code"] == 1
+    assert detail["worker_phase"] == failure["phase"] and detail["worker_code"] == failure["code"]
+    assert detail["exec_id"] == "d7-http-exec" and "PRIVATE" not in json.dumps(detail)
+
+
+def test_http_worker_bad_status_line_is_a_recoverable_protocol_mismatch(monkeypatch):
+    """A peer that answers with non-HTTP bytes must not end the TaskRun as unknown."""
+    import http.client
+    from agent_adapters.output_evidence import safe_failure_details
+    from agent_adapters.web.http_adapter import HttpProtocolMismatch
+
+    class Connection:
+        def __init__(self, *args, **kwargs): pass
+        def putrequest(self, *args, **kwargs): pass
+        def putheader(self, *args): pass
+        def endheaders(self, body): pass
+        def getresponse(self): raise http.client.BadStatusLine("HTTP/9.9 not-a-status")
+        def close(self): pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+    request = dict(scheme="http", host="example.test", port=80, authority="example.test:80", method="GET",
+        path_query="/", headers=[], body_b64="", timeout_seconds=2, max_response_bytes=2097152,
+        max_header_bytes=65536, max_header_count=100, max_header_value_bytes=8192)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode()+b"\n")))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), pytest.raises(SystemExit) as stopped:
+        exec(_HTTP_WORKER, {})
+    assert stopped.value.code == 1
+    failure = json.loads(output.getvalue())
+    assert failure["error_type"] == "BadStatusLine"
+    assert failure["code"] == "http.worker.response_headers_failed"
+    assert failure["line"] == "HTTP/9.9 not-a-status"
+
+    task = str(uuid4()); config = _config(task)
+    api = _ExecApi(_frame(1, output.getvalue().encode()))
+    api.exec_inspect = lambda identity: dict(Running=False, ExitCode=1)
+    sandbox, sandbox_id = _sandbox(task, api)
+    transport = D7SandboxHttpTransport(sandbox, sandbox_id=sandbox_id, run_config=config,
+        network_binding=_network_binding(), target_network=_TargetNetwork())
+    with pytest.raises(HttpProtocolMismatch, match="d22_http_protocol_mismatch") as caught:
+        transport.send(origin=transport_origin(config.endpoint), method="GET", path_query="/", headers=(), body=b"",
+            timeout_seconds=3, max_response_bytes=2097152)
+    detail = safe_failure_details(caught.value, include_chain=True)["http_diagnostic"]
+    assert detail["worker_phase"] == "response_headers"
+    assert detail["error_type"] == "BadStatusLine"
+    assert detail["worker_line"] == "HTTP/9.9 not-a-status"
+
+
+@pytest.mark.parametrize("branch,state,stderr", [
+    ("worker_still_running", dict(Running=True, ExitCode=None), b""),
+    ("worker_exit_nonzero", dict(Running=False, ExitCode=137), b""),
+    ("worker_stderr", dict(Running=False, ExitCode=0), b"PRIVATE stderr")])
+def test_http_exec_failure_diagnostic_distinguishes_parent_branches(branch, state, stderr):
+    from agent_adapters.output_evidence import safe_failure_details
+    task = str(uuid4()); config = _config(task)
+    api = _ExecApi(_worker_output() + (_frame(2, stderr) if stderr else b""))
+    api.exec_inspect = lambda identity: state
+    sandbox, sandbox_id = _sandbox(task, api)
+    transport = D7SandboxHttpTransport(sandbox, sandbox_id=sandbox_id, run_config=config,
+        network_binding=_network_binding(), target_network=_TargetNetwork())
+    with pytest.raises(HttpCapabilityError, match="outcome_unknown") as caught:
+        transport.send(origin=transport_origin(config.endpoint), method="GET", path_query="/", headers=(), body=b"",
+            timeout_seconds=3, max_response_bytes=2097152)
+    detail = safe_failure_details(caught.value)["http_diagnostic"]
+    assert detail["branch"] == branch and "PRIVATE" not in json.dumps(detail)

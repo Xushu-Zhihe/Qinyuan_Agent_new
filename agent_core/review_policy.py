@@ -46,8 +46,8 @@ def policy_for(request):
             or policy["allowed_action_kinds"] != [a for a in ACTION_KINDS if a in policy["allowed_action_kinds"]]
             or type(policy["max_action_timeout_seconds"]) is not int
             or not 1 <= policy["max_action_timeout_seconds"] <= MAX_ACTION_TIMEOUT):
-        from agent_core.dual_llm_contracts import D3RecoveryRequired
-        raise D3RecoveryRequired("d9_review_policy_invalid")
+        from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+        raise ExecutionRecoveryRequired("d9_review_policy_invalid")
     return policy
 
 

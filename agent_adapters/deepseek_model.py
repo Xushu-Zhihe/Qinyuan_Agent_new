@@ -343,7 +343,8 @@ def _http_worker(
         if payload.get("stream") is True:
             from agent_adapters.model_stream import ModelStreamError, read_chat_stream
             try:
-                data, reasoning_chars = read_chat_stream(response, max_response_bytes, report)
+                data, reasoning_chars = read_chat_stream(response, max_response_bytes, report,
+                    allow_tool_calls=preserve_content and bool(payload.get("tools")))
             except ModelStreamError as exc:
                 report(transport_end=exc.transport_end)
                 connection.send({"error": exc.kind, "reason": exc.code})
@@ -393,7 +394,8 @@ def _http_worker(
             )
             return
         report(**_response_diagnostic(data, message, choice.get("finish_reason"), message.get("content"), reasoning_chars=reasoning_chars))
-        if message.get("tool_calls") or message.get("function_call"):
+        native_output = preserve_content and bool(payload.get("tools"))
+        if message.get("function_call") or message.get("tool_calls") and not native_output:
             _invalid_provider_payload(
                 connection, T6ActionValidationCode.PROVIDER_CONTENT_INVALID,
             )
@@ -414,7 +416,10 @@ def _http_worker(
                 return
             # Do not parse, repair, or persist content or reasoning here. D8 owns
             # the strict content boundary and completion-reason handling.
-            connection.send({"payload": {"content": content or "", "finish_reason": finish}})
+            value = {"content": content or "", "finish_reason": finish}
+            if native_output:
+                value["tool_calls"] = message.get("tool_calls") or []
+            connection.send({"payload": value})
             return
         if choice.get("finish_reason") != "stop":
             _invalid_provider_payload(
@@ -520,18 +525,24 @@ class DeepSeekModelAdapter:
         diagnostic["transport_end"] = "not_dispatched"
         diagnostic["worker_exit_confirmed"] = True
         if cancellation_token.is_cancelled:
+            if getattr(cancellation_token, "is_timed_out", False):
+                return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
             return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
-        timeout = min(float(timeout_seconds), self.settings.timeout_seconds)
+        task_deadline_only = getattr(cancellation_token, "task_deadline_only", False)
+        timeout = (cancellation_token.remaining_seconds if task_deadline_only
+                   else min(float(timeout_seconds), self.settings.timeout_seconds))
         if not math.isfinite(timeout) or timeout <= 0:
             return ModelError(ModelErrorKind.TIMED_OUT, "model_budget_exhausted")
         context = multiprocessing.get_context("spawn")
         reader, writer = context.Pipe(duplex=False)
-        process = context.Process(
-            target=self._worker, args=(writer, self.settings, payload, timeout)
-        )
+        # The parent owns a task-scoped planning deadline which may be extended.
+        # A socket read must not retain a shorter, superseded task budget.
+        worker_timeout = (max(timeout, self.settings.first_output_timeout_seconds, self.settings.idle_timeout_seconds)
+                          if task_deadline_only else timeout)
+        process = context.Process(target=self._worker, args=(writer, self.settings, payload, worker_timeout))
         started = time.monotonic()
         end = started + timeout
-        connect_end = started + min(self.settings.connect_timeout_seconds, timeout)
+        connect_end = started + self.settings.connect_timeout_seconds
         connected = False
         streaming = payload.get("stream") is True
         first_output_end = None
@@ -543,6 +554,8 @@ class DeepSeekModelAdapter:
             diagnostic["transport_end"] = "unknown"
             writer.close()
             while True:
+                if task_deadline_only:
+                    end = time.monotonic() + cancellation_token.remaining_seconds
                 if cancellation_token.is_cancelled:
                     if getattr(cancellation_token, "is_timed_out", False):
                         diagnostic["transport_end"] = "timeout"

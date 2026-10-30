@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, fields, replace
 
 from agent_core.conclusion_contracts import D8ModelRequest, conclusion_digest
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.dual_llm_modeling import D8SessionExecutionRequest
 from agent_core.handoff_contracts import handoff_json
 from agent_core.session_contracts import D8DecisionRecord, D8SessionConclusionRequest, D8SessionChangeRequest
@@ -51,7 +51,7 @@ class IntentSessions:
         data = self.evidence.read("decision", record.record_id)
         if (data is None or conclusion_digest(data) != record.evidence_sha256
                 or data["metadata"] != asdict(record) | {"evidence_sha256": ""}):
-            raise D3RecoveryRequired("d8_session_decision_evidence_unavailable")
+            raise ExecutionRecoveryRequired("d8_session_decision_evidence_unavailable")
         return data
 
     def _result(self, request_id, request):
@@ -59,7 +59,7 @@ class IntentSessions:
             saved = self.app.revisions.evidence.read("request", request_id)
             result = self.app.revisions._known(D8ChangeRequest.from_dict(saved)) if saved is not None else None
             if result is None or result["outcome"] != "valid":
-                raise D3RecoveryRequired("d8_session_repair_result_unavailable")
+                raise ExecutionRecoveryRequired("d8_session_repair_result_unavailable")
             return result["raw"]
         notice = self.app.conclusions.optional_failure(request_id)
         if notice is not None and notice["failed_request_id"] == request_id:
@@ -68,16 +68,16 @@ class IntentSessions:
         if request["stage"] == "fact_proposal":
             result = self.app.conclusions.evidence.read_result(request_id)
             if result is None or result["outcome"] != "valid":
-                raise D3RecoveryRequired("d8_session_conclusion_result_unavailable")
+                raise ExecutionRecoveryRequired("d8_session_conclusion_result_unavailable")
             return result["raw"]
         result = self.app.model_evidence.read(request_id)
         if result is None or result.outcome != "accepted":
-            raise D3RecoveryRequired("d8_session_model_result_unavailable")
+            raise ExecutionRecoveryRequired("d8_session_model_result_unavailable")
         return result.raw
 
     def _safe(self, value):
         if self.app.conclusions._sensitive(value):
-            raise D3RecoveryRequired("d8_session_sensitive_content_rejected")
+            raise ExecutionRecoveryRequired("d8_session_sensitive_content_rejected")
 
     def wrap(self, request):
         from qinyuan_core.logging import timed_phase
@@ -169,14 +169,14 @@ class IntentSessions:
                     context = context_for(target_start)
         else:
             if saved["turn_id"] != turn_id or saved["intent_id"] != intent_id:
-                raise D3RecoveryRequired("d8_session_request_owner_changed")
+                raise ExecutionRecoveryRequired("d8_session_request_owner_changed")
             session_id = saved["request"]["session_id"]
             context = saved["request"]["session_context"]
         result = cls(**values, session_id=session_id, session_context=context)
         if not preview:
             try:
                 self.freeze(result)
-            except D3RecoveryRequired as exc:
+            except ExecutionRecoveryRequired as exc:
                 if self.capacity_error(exc):
                     self._capacity_draft = result
                 raise
@@ -198,7 +198,7 @@ class IntentSessions:
                     or packet.get("session_id") != request.session_id
                     or packet.get("session_scope") != "intent"
                     or (packet.get("turn_id"), packet.get("intent_id")) != (turn_id, intent_id)):
-                raise D3RecoveryRequired("d8_session_scope_changed")
+                raise ExecutionRecoveryRequired("d8_session_scope_changed")
             value = {"turn_id": turn_id, "intent_id": intent_id, "request": asdict(request)}
             context_sha256 = getattr(request, "context_sha256", None)
             if isinstance(context_sha256, str):
@@ -235,7 +235,7 @@ class IntentSessions:
             call = self.store.load_d4_operation(call.start.operation_id)
             snapshot = self.evidence.read("request", call.start.operation_id)
             if snapshot is None:
-                raise D3RecoveryRequired("d8_session_applied_request_missing")
+                raise ExecutionRecoveryRequired("d8_session_applied_request_missing")
             request = snapshot["request"]
             root = request.get("correction_of_model_request_id") or call.start.operation_id
             if root in known:
@@ -295,9 +295,9 @@ class IntentSessions:
         if call is not None and call.application_ref == self.app._id("continuation-reuse/" + record.model_request_id):
             from agent_core.intent_execution import validate_continuation_reuse
             if data["observation"].get("intent_review") != validate_continuation_reuse(self.app, record.model_request_id):
-                raise D3RecoveryRequired("d22_continuation_reuse_changed")
+                raise ExecutionRecoveryRequired("d22_continuation_reuse_changed")
         if technical and not self.app.conclusions.optional_ready(record.model_request_id):
-            raise D3RecoveryRequired("d22_optional_failure_binding_changed")
+            raise ExecutionRecoveryRequired("d22_optional_failure_binding_changed")
         if (call is None or call.start.task_run_id != record.task_run_id or call.completion is None
                 or call.application_ref is None and not signal and not technical or call.start.role != "inner_action"
                 or request is None or root != record.root_request_id
@@ -307,7 +307,7 @@ class IntentSessions:
                                or data["response"].get("kind") != "request_review")
                 or handoff_json(data["response"]) != handoff_json(self._result(record.model_request_id, request["request"]))
                 or data["request"] != self.history_request(request["request"])):
-            raise D3RecoveryRequired("d8_session_decision_binding_changed")
+            raise ExecutionRecoveryRequired("d8_session_decision_binding_changed")
 
     def reviews(self, intent_id):
         result = []
@@ -317,7 +317,7 @@ class IntentSessions:
             root = self.app.review_ledger.read_root(application.review_root_id)
             call = next((c for c in root.get("calls", ()) if c.get("review_id") == application.review_id), None) if isinstance(root, dict) else None
             if call is None:
-                raise D3RecoveryRequired("d8_progress_review_evidence_missing")
+                raise ExecutionRecoveryRequired("d8_progress_review_evidence_missing")
             context = json.loads(call["request"]["context_summary"])
             if "d8_progress" in context:
                 self.app.validator._review_call(application.task_run_id, application.review_id)
@@ -333,7 +333,7 @@ class IntentSessions:
                 if (watermark < 4
                         or progress != self.review_context(intent_id, watermark,
                             mode=progress.get("mode", "ordinary"), execution_refs=progress.get("execution_refs"))):
-                    raise D3RecoveryRequired("d8_progress_applied_window_changed")
+                    raise ExecutionRecoveryRequired("d8_progress_applied_window_changed")
                 result.append((watermark, application, call))
         return result
 
@@ -381,7 +381,7 @@ class IntentSessions:
                 or any(r not in refs for r in progress["decision_refs"])
                 or any(self.app.evidence_conclusions.source(s["ref"], intent_id)["version"] != s["version"]
                        for s in progress["evidence_sources"])):
-            raise D3RecoveryRequired("d22_handoff_progress_source_changed")
+            raise ExecutionRecoveryRequired("d22_handoff_progress_source_changed")
 
     def due(self, intent_id):
         reviews = self.reviews(intent_id)
@@ -427,7 +427,7 @@ class IntentSessions:
             current = self.execution_refs(intent_id)
             refs = current if execution_refs is None else execution_refs
             if current[:len(refs)] != refs:
-                raise D3RecoveryRequired("d22_progress_execution_window_changed")
+                raise ExecutionRecoveryRequired("d22_progress_execution_window_changed")
             tools = {"execution_refs": refs}
             executions.update(refs)
         recent = []
@@ -452,7 +452,7 @@ class IntentSessions:
             return False
         reviews = self.reviews(intent_id)
         if reviews and reviews[-1][2]["response"]["decision"] == "pause_current_intent":
-            raise D3RecoveryRequired("d8_progress_" + reviews[-1][2]["response"]["progress"]["classification"])
+            raise ExecutionRecoveryRequired("d8_progress_" + reviews[-1][2]["response"]["progress"]["classification"])
         intent = next(i for i in self.app.state.intents if i.intent_id == intent_id)
         if intent.status.value != "running":
             return False
@@ -475,7 +475,7 @@ class IntentSessions:
                         or original["intent_id"] != intent_id
                         or marker["decision_count"] != len(rows)
                         or marker["mode"] != ("restricted_repair" if restricted else "ordinary")):
-                    raise D3RecoveryRequired("d8_pending_progress_scope_changed")
+                    raise ExecutionRecoveryRequired("d8_pending_progress_scope_changed")
                 # A combined review may also include observation/rejection sources.
                 # Recover the complete original snapshot instead of asking again.
                 sources = tuple(original["source_versions"])
@@ -489,7 +489,7 @@ class IntentSessions:
             self.app._restricted_progress = previous
         if restricted:
             if output.decision == "pause_current_intent":
-                raise D3RecoveryRequired("d8_progress_" + output.progress.classification)
+                raise ExecutionRecoveryRequired("d8_progress_" + output.progress.classification)
             return False
         # Organize before routing: replan may immediately assemble another inner request.
         if self.app.config.intent_execution_policy == "continuous_v1":
@@ -526,7 +526,7 @@ class IntentSessions:
         try:
             summary = await self.app.handoff.summarize(intent.turn_id, token,
                 decision_prefix=rows[:-1] if recovery else rows[:-4], capacity_recovery=recovery)
-        except D3RecoveryRequired as exc:
+        except ExecutionRecoveryRequired as exc:
             if not self.capacity_error(exc):
                 raise
             summary = None
@@ -559,7 +559,7 @@ class IntentSessions:
                 draft = self._wrap(handoff.wrap_execution_request(request, preview=True), preview=True)
                 if handoff._fits_complete_request(draft, self.app.config.handoff_config.inner_capacity):
                     return True
-            except D3RecoveryRequired as exc:
+            except ExecutionRecoveryRequired as exc:
                 if not (self.capacity_error(exc) or str(exc).startswith("d8_context_paused:")):
                     raise
         return False
@@ -627,14 +627,14 @@ class IntentSessions:
             success = next((r for r in self.app.store.list_d8_tree_records(self.app.state.task_run.task_run_id)
                             if r.intent_id == intent_id and r.kind == "succeeded"), None)
             if success is None:
-                raise D3RecoveryRequired("d22_next_suggestions_without_success")
+                raise ExecutionRecoveryRequired("d22_next_suggestions_without_success")
             raw = self.app.model_evidence.read(success.inner_request_id).raw
             from agent_core.intent_execution import parse_saved_resolution
             return success.inner_request_id, parse_saved_resolution(self.app, success.inner_request_id, raw).next_intent_candidates
         rows = [r for r in self.records(intent_id)
                 if self.payload(r)["request"]["stage"] == "inner_complete"]
         if not rows:
-            raise D3RecoveryRequired("d8_child_completion_suggestions_missing")
+            raise ExecutionRecoveryRequired("d8_child_completion_suggestions_missing")
         data = self.payload(rows[-1])
         from agent_core.session_contracts import parse_next_intents
         snapshot = self.evidence.read("request", rows[-1].model_request_id)

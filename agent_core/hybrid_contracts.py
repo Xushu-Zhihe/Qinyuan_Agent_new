@@ -1,6 +1,6 @@
 """Contract21: a Turn exposes authorized sources; each Plan selects its capability."""
 from dataclasses import dataclass,asdict
-from agent_core.dual_llm_contracts import D3TurnBinding,D3PlanBinding,D3RecoveryRequired
+from agent_core.dual_llm_contracts import D3TurnBinding,D3PlanBinding,ExecutionRecoveryRequired
 from agent_core.dual_llm_modeling import D3PlanProposal,parse_d3_plan_proposal
 from agent_core.http_contracts import HttpTurnBinding,HttpPlanContext
 
@@ -49,9 +49,9 @@ class HybridPlanContext(HttpPlanContext):
 
 
 def attachment_binding(turn,index):
-    if not isinstance(turn,HybridTurnBinding):raise D3RecoveryRequired('d21_hybrid_turn_missing')
+    if not isinstance(turn,HybridTurnBinding):raise ExecutionRecoveryRequired('d21_hybrid_turn_missing')
     matches=[b for b in turn.attachments if b.attachment_index==index]
-    if len(matches)!=1:raise D3RecoveryRequired('d21_attachment_not_authorized')
+    if len(matches)!=1:raise ExecutionRecoveryRequired('d21_attachment_not_authorized')
     return matches[0]
 
 

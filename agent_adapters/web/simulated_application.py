@@ -152,6 +152,12 @@ class _LocalDigestSandbox:
         return None
 
     def destroy(self, sandbox_id: str) -> None:
+        receipt_path = self.directory.parent / "cleanup.json"
+        if receipt_path.is_file():
+            receipt = immutable_read(receipt_path)
+            if receipt.get("sandbox_id") != sandbox_id or receipt.get("status") != "succeeded":
+                raise ValueError("d7_simulated_sandbox_owner_mismatch")
+            return
         active = immutable_read(self.active_path) if self.active_path.exists() else None
         if active is not None and active.get("sandbox_id") != sandbox_id:
             raise ValueError("d7_simulated_sandbox_owner_mismatch")

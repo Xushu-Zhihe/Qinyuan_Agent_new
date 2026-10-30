@@ -64,8 +64,12 @@ class _Text(logging.Formatter):
             value = d.get(key)
             if value not in (None, ""):
                 parts.append(f"{key}={value}")
-        if d.get("code"):
-            parts.append(f"code={d['code']}")
+        for key in ("operation", "request", "phase", "category", "code", "branch", "event_index",
+                    "field_path", "observed_type", "finish_seen", "done_seen", "issue_codes", "in_flight", "error_type", "action_count",
+                    "record_kind", "record_id", "actual_bytes", "limit_bytes", "dispatched", "fact_source", "operation_admission"):
+            value = d.get(key)
+            if value not in (None, ""):
+                parts.append(f"{key}={value}")
         if d.get("msg"):
             parts.append(str(d["msg"]))
         return " ".join(parts)

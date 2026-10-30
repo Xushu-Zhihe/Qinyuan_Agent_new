@@ -18,6 +18,7 @@ from agent_core.command_contracts import (
     T6CommandEvidence,
     T6CommandRecoveryRequired,
     T6EvidenceError,
+    T6EvidenceCapacityError,
     T6ExecutionRecord,
 )
 from agent_core.domain import ExecutionEvidence, FailureAction
@@ -30,6 +31,20 @@ def _encode(value: object) -> bytes:
 
 
 class T6CommandRecorder:
+    @staticmethod
+    def limit(kind):
+        # Stage requests reserve one extra MiB for the original, undispatched
+        # source of bounded compaction. Model admission still uses one MiB.
+        return (2 if kind in {"model-action", "stage-request"} else 1) * 1024 * 1024
+
+    def encode(self, kind, reference, value, *, limit=None):
+        payload = _encode(value)
+        envelope = _encode({"sha256": hashlib.sha256(payload).hexdigest(), "payload": value})
+        maximum = self.limit(kind) if limit is None else limit
+        if len(envelope) > maximum:
+            raise T6EvidenceCapacityError(kind, reference, len(envelope), maximum)
+        return envelope
+
     def __init__(self, directory: Path, *, create: bool = True) -> None:
         self.directory = directory.resolve()
         if create:
@@ -44,10 +59,7 @@ class T6CommandRecorder:
         return self.directory / f"{kind}-{reference}.json"
 
     def _write(self, kind: str, reference: str, value: dict) -> None:
-        payload = _encode(value)
-        envelope = _encode(
-            {"sha256": hashlib.sha256(payload).hexdigest(), "payload": value}
-        )
+        envelope = self.encode(kind, reference, value)
         destination = self._path(kind, reference)
         temporary = self.directory / f".pending-{uuid4()}"
         try:
@@ -66,10 +78,14 @@ class T6CommandRecorder:
 
     def _read(self, kind: str, reference: str) -> dict | None:
         try:
-            raw = self._path(kind, reference).read_bytes()
-            limit = 2 * 1024 * 1024 if kind == "model-action" else 1024 * 1024
-            if len(raw) > limit:
-                raise ValueError("oversized_evidence")
+            with self._path(kind, reference).open("rb") as source:
+                limit = self.limit(kind)
+                actual = os.fstat(source.fileno()).st_size
+                if actual > limit:
+                    raise T6EvidenceCapacityError(kind, reference, actual, limit)
+                raw = source.read(limit + 1)
+                if len(raw) > limit:
+                    raise T6EvidenceCapacityError(kind, reference, len(raw), limit)
             envelope = json.loads(raw)
             payload = envelope["payload"]
             if (

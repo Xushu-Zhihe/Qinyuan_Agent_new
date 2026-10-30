@@ -23,7 +23,7 @@ class BusinessRequest:
     stage: str
     role_config_ref: str
     session_context: str = ""
-    history_context: str = "current-strategic-view"
+    history_context: str = '{"view":"current-strategic-view"}'
     capacity: D8Capacity = D8Capacity()
 
 
@@ -116,7 +116,8 @@ def test_capacity_counts_actual_payload_with_output_and_fixed_margin():
     capacity = deepseek_roles.EstimatedCapacity(deepseek_roles.role_config("outer_planning"), role)
     policy = deepseek_roles.default_capacity_policy()
     assert capacity.fits(env, policy)
-    oversized = replace(env, request=replace(env.request, history_context="大" * (policy.total_units // 3)))
+    oversized = replace(env, request=replace(env.request,
+        history_context=json.dumps({"content": "大" * (policy.total_units // 3)}, ensure_ascii=False)))
     assert not capacity.fits(oversized, policy)
     with pytest.raises(ValueError, match="capacity_binding"):
         capacity.fits(env, replace(policy, measurement_unit="tokens"))
@@ -350,6 +351,7 @@ def test_review_timeout_requires_explicit_worker_exit_receipt(confirmed):
 def test_provider_response_cannot_override_unconfirmed_worker_exit(http_error):
     from agent_core.structured_output import transient_provider_result
     env, role = envelope()
+    env = replace(env, request=replace(env.request, history_context="{}"))
     def invoke(payload, timeout, token, *, diagnostic):
         diagnostic.update(transport_end="http_error" if http_error else "response_received",
                           http_status=503 if http_error else 200, worker_exit_confirmed=False)
@@ -423,10 +425,14 @@ def test_transport_end_diagnostics_distinguish_wire_and_provider_failures(monkey
     assert "private" not in repr(pipe.sent)
 
 
-@pytest.mark.parametrize("failure", ["length", "timeout", "http_402"])
+@pytest.mark.parametrize("failure", ["length", "timeout", "http_402", "stream"])
 def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_path, monkeypatch, failure):
     from agent_adapters.output_evidence import FileD8OutputEvidence
     from agent_core.turn_modeling import digest
+    import qinyuan_core
+    events = []
+    monkeypatch.setattr(qinyuan_core, "get_logger", lambda _: SimpleNamespace(
+        warning=lambda event, **fields: events.append((event, fields))))
     monkeypatch.delenv("QINYUAN_DEBUG_TRACE", raising=False)
     role = deepseek_roles.role_config("outer_planning")
     uid = lambda: str(uuid4())
@@ -435,6 +441,11 @@ def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_p
     stage, schema = output_schema(business)
     env = D8OutputRequest(business, {"version": 1, "stage": stage, "schema": schema}, "Return JSON", None)
     def invoke(payload, timeout, token, *, diagnostic):
+        if failure == "stream":
+            diagnostic.update(http_status=200, transport_end="incomplete_response", finish_seen=False, done_seen=False,
+                stream_error={"branch": "tool_function_field_type", "event_index": 2,
+                    "field_path": "$.choices[0].delta.tool_calls[0].function.name", "observed_type": "null"})
+            return ModelError(ModelErrorKind.PROVIDER_FAILURE, "provider_stream_invalid")
         diagnostic.update(http_status=402 if failure == "http_402" else 200,
                           transport_end="response_received" if failure == "length" else "timeout" if failure == "timeout" else "http_error")
         if failure == "length":
@@ -456,6 +467,13 @@ def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_p
     assert sent["parameters"] == {"model": role.model, "response_format": {"type": "json_object"},
         "stream": True, "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
     assert sent["timeout_seconds"] == 90 and result["request_sha256"] == digest(sent)
+    if failure == "stream":
+        assert result["transport"]["stream_error"]["branch"] == "tool_function_field_type"
+        assert result["transport"]["stream_error"]["event_index"] == 2
+        assert not result["transport"]["finish_seen"] and not result["transport"]["done_seen"]
+        event, fields = next(item for item in events if item[0] == "model.stream_rejected")
+        assert fields["request"] == business.review_id and fields["run"] == business.task_run_id
+        assert fields["branch"] == "tool_function_field_type" and fields["observed_type"] == "null"
     if failure == "length":
         assert result["transport"]["usage"]["completion_tokens"] == 32768
         assert result["transport"]["finish_reason"] == "length" and result["transport"]["content_chars"] == 16
@@ -539,7 +557,7 @@ def test_outer_watchdog_waits_for_adapter_or_keeps_result_unknown(cooperative):
     import asyncio
     import threading
     from agent_core.dual_llm_modeling import D3AuditedModel
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     release = threading.Event()
     seen = []
     def invoke(request, timeout, token):
@@ -557,7 +575,7 @@ def test_outer_watchdog_waits_for_adapter_or_keeps_result_unknown(cooperative):
         if cooperative:
             assert asyncio.run(call).kind is ModelErrorKind.TIMED_OUT
         else:
-            with pytest.raises(D3RecoveryRequired, match="d3_model_call_outcome_unknown"):
+            with pytest.raises(ExecutionRecoveryRequired, match="d3_model_call_outcome_unknown"):
                 asyncio.run(call)
         assert seen == [True]
     finally:
@@ -612,6 +630,16 @@ def test_shared_history_retains_tools_evidence_and_unequal_sections():
     assert restored == {**history, "scope": "old", "session_only": "preserve"}
     assert projected["items"] == {"$ref": "#/history_context/items"}
     assert projected["scope"] == "old"
+
+
+def test_input_sharing_does_not_confuse_schema_refs_with_input_pointers():
+    source = "literal source document" * 30
+    original = {"history": [{"body": source}], "current": {
+        "body": source, "schema": {"$ref": "#/$defs/parameter"}}}
+    projected = deepseek_roles._shared_input(original, reference_key="$input_ref")
+    assert projected["current"]["body"] == {"$input_ref": "#/history/0/body"}
+    assert projected["current"]["schema"] == {"$ref": "#/$defs/parameter"}
+    assert original["current"]["body"] == source
 
 
 @pytest.mark.parametrize("version, marker, valid", [(22, "shared_refs_v1", True),

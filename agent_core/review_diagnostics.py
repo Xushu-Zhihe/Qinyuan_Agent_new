@@ -4,7 +4,7 @@ from dataclasses import asdict
 import json
 import math
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.review_contracts import D2ReviewRequest, D2ModelFailure
 from agent_core.review_policy import ISSUES, issue, policy_for, validate_and_bind, business_issues
 from agent_core.turn_modeling import digest
@@ -62,13 +62,13 @@ class ReviewDiagnostics:
     def _request(self, identity):
         raw = self.output.read("review-request", identity)
         if not isinstance(raw, dict):
-            raise D3RecoveryRequired("d9_review_request_missing")
+            raise ExecutionRecoveryRequired("d9_review_request_missing")
         try:
             request = D2ReviewRequest(**{**raw, "source_versions": tuple(raw["source_versions"])})
         except (TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d9_review_request_invalid") from exc
+            raise ExecutionRecoveryRequired("d9_review_request_invalid") from exc
         if request.review_id != identity or not self.supported(request):
-            raise D3RecoveryRequired("d9_review_request_binding_changed")
+            raise ExecutionRecoveryRequired("d9_review_request_binding_changed")
         return request
 
     def _binding(self, request, finished_at):
@@ -82,16 +82,16 @@ class ReviewDiagnostics:
                 or contract.get("source_request_sha256") != digest(asdict(request))
                 or contract.get("root_request_id") != request.review_root_id
                 or type(finished_at) not in {int, float} or not math.isfinite(finished_at)):
-            raise D3RecoveryRequired("d9_review_contract_binding_changed")
+            raise ExecutionRecoveryRequired("d9_review_contract_binding_changed")
         from agent_core.output_contracts import output_schema, matches_output_contract
         context = json.loads(request.context_summary)
         context.pop("checkpoint", None)
         if (digest(context) != request.context_version
                 or not matches_output_contract(contract["output_contract"], stage, output_schema(request, contract_version=self.config.contract_version)[1], self.config.contract_version)):
-            raise D3RecoveryRequired("d9_review_frozen_policy_changed")
+            raise ExecutionRecoveryRequired("d9_review_frozen_policy_changed")
         root = self.output.read("review-root", request.review_root_id)
         if not isinstance(root, dict) or root.get("task_run_id") != request.task_run_id:
-            raise D3RecoveryRequired("d9_review_root_missing")
+            raise ExecutionRecoveryRequired("d9_review_root_missing")
         first = self._request(root["first_model_request_id"])
         if (first.review_attempt != 1 or first.review_root_id != request.review_root_id
                 or first.task_run_id != request.task_run_id or first.turn_id != request.turn_id
@@ -99,7 +99,7 @@ class ReviewDiagnostics:
                 or first.action_candidate_id != request.action_candidate_id
                 or contract["correction_of_model_request_id"] != (first.review_id if request.review_attempt == 2 else None)
                 or request.review_attempt == 1 and first != request):
-            raise D3RecoveryRequired("d9_review_correction_binding_changed")
+            raise ExecutionRecoveryRequired("d9_review_correction_binding_changed")
         base = {"contract_version": self.config.contract_version, "stage": stage, "task_run_id": request.task_run_id,
                 "model_request_id": request.review_id, "root_request_id": request.review_root_id,
                 "correction_of_model_request_id": contract["correction_of_model_request_id"],
@@ -119,15 +119,15 @@ class ReviewDiagnostics:
         result = self.output.read("review-result", identity)
         if diagnostic is None and binding is None:
             if result is not None:
-                raise D3RecoveryRequired("d9_review_result_evidence_missing")
+                raise ExecutionRecoveryRequired("d9_review_result_evidence_missing")
             return None, None, None
         request = self._request(identity)
         if diagnostic is not None and binding is not None or self.output.read("diagnostic", identity) is not None:
-            raise D3RecoveryRequired("d9_review_diagnostic_conflict")
+            raise ExecutionRecoveryRequired("d9_review_diagnostic_conflict")
         value = diagnostic if diagnostic is not None else binding
         if (not isinstance(value, dict) or type(value.get("base_checkpoint_sequence")) is not int
                 or type(value.get("diagnostic_version" if diagnostic is not None else "binding_version")) is not int):
-            raise D3RecoveryRequired("d9_review_record_invalid")
+            raise ExecutionRecoveryRequired("d9_review_record_invalid")
         base = self._binding(request, value.get("finished_at"))
         if diagnostic is not None:
             issues = diagnostic.get("issues")
@@ -140,24 +140,24 @@ class ReviewDiagnostics:
             if (not isinstance(issues, list) or not 1 <= len(issues) <= 8
                     or any(not isinstance(i, dict) or i.get("code") not in catalog or i != make_issue(i["code"]) for i in issues)
                     or diagnostic != {**base, "diagnostic_version": 1, "issues": issues}):
-                raise D3RecoveryRequired("d9_review_diagnostic_invalid")
+                raise ExecutionRecoveryRequired("d9_review_diagnostic_invalid")
             expected = self.rejected_result(request, diagnostic)
         else:
             from agent_core.output_contracts import decode_response, output_schema
             wire = binding.get("wire_response")
             decoded, issues, terminal, _ = decode_response(wire, output_schema(request, contract_version=self.config.contract_version)[1])
             if issues or terminal:
-                raise D3RecoveryRequired("d9_review_wire_binding_invalid")
+                raise ExecutionRecoveryRequired("d9_review_wire_binding_invalid")
             try:
                 canonical = self._validate(decoded, request)
             except (TypeError, ValueError) as exc:
-                raise D3RecoveryRequired("d9_review_canonical_binding_invalid") from exc
+                raise ExecutionRecoveryRequired("d9_review_canonical_binding_invalid") from exc
             if binding != {**base, "binding_version": 1, "wire_response": wire,
                            "canonical_response": canonical, **self._reason_fields(wire)}:
-                raise D3RecoveryRequired("d9_review_binding_changed")
+                raise ExecutionRecoveryRequired("d9_review_binding_changed")
             expected = self.accepted_result(request, binding)
         if result is not None and result != expected:
-            raise D3RecoveryRequired("d9_review_result_changed")
+            raise ExecutionRecoveryRequired("d9_review_result_changed")
         return diagnostic, binding, expected
 
     def read(self, identity, *, check_operation=False):
@@ -217,7 +217,7 @@ class ReviewDiagnostics:
                     root = FileD2ReviewLedger.read_root(self.ledger, request.review_root_id)
                     call = next((c for c in root.get("calls", []) if c.get("review_id") == request.review_id), None) if root else None
                     if call is None:
-                        raise D3RecoveryRequired("d9_review_call_missing")
+                        raise ExecutionRecoveryRequired("d9_review_call_missing")
                     self.verify_call(request, call)
                 outcome = "provider_failure" if failure["terminal"] else "invalid_response"
                 reason = "d8_" + failure["terminal"] if failure["terminal"] else "d8_output_format_invalid"
@@ -227,7 +227,7 @@ class ReviewDiagnostics:
                     "format_diagnostic_sha256": digest(failure)}
         if expected is not None:
             if self._request(request.review_id) != request:
-                raise D3RecoveryRequired("d9_review_known_request_changed")
+                raise ExecutionRecoveryRequired("d9_review_known_request_changed")
             self._check_operation(request, expected)
             if repair:
                 self.output.save("review-result", request.review_id, expected)
@@ -240,10 +240,10 @@ class ReviewDiagnostics:
         if expected is not None:
             if self.output.read("review-result", request.review_id) is None:
                 if not readonly or not self.progress(request):
-                    raise D3RecoveryRequired("d9_review_result_missing")
+                    raise ExecutionRecoveryRequired("d9_review_result_missing")
                 self.needs_repair = True
             if any(call.get(k) != v for k, v in self.call_values(expected).items()):
-                raise D3RecoveryRequired("d9_review_call_binding_changed")
+                raise ExecutionRecoveryRequired("d9_review_call_binding_changed")
         else:
             if call.get("reason") == "d4_admission_repaired_before_provider_dispatch":
                 return None
@@ -252,7 +252,7 @@ class ReviewDiagnostics:
             diagnostic = StructuredOutput(SimpleNamespace(config=self.config), self.output).diagnostic(request.review_id)
             if diagnostic is None:
                 if call.get("outcome") in {"accepted", "rejected", "invalid_response"}:
-                    raise D3RecoveryRequired("d9_review_evidence_required")
+                    raise ExecutionRecoveryRequired("d9_review_evidence_required")
                 return None
             self._binding(request, diagnostic["finished_at"])
             outcome = "provider_failure" if diagnostic["terminal"] else "invalid_response"
@@ -260,13 +260,13 @@ class ReviewDiagnostics:
             values = {"outcome": outcome, "reason": reason, "provider_request_id": None,
                       "response": {"kind": outcome, "reason": reason, "provider_request_id": None}}
             if any(call.get(k) != v for k, v in values.items()):
-                raise D3RecoveryRequired("d9_review_format_call_changed")
+                raise ExecutionRecoveryRequired("d9_review_format_call_changed")
             op = self._operation(request, diagnostic["finished_at"])
             if op.completion is not None and (op.completion.evidence_sha256 != digest(completion_evidence(call))
                     or op.completion.result_kind != ("failed" if diagnostic["terminal"] else "rejected")
                     or op.completion.evidence_ref != request.review_id
                     or op.completion.finished_at < diagnostic["finished_at"]):
-                raise D3RecoveryRequired("d9_review_format_completion_changed")
+                raise ExecutionRecoveryRequired("d9_review_format_completion_changed")
         return expected
 
     def _operation(self, request, finished_at):
@@ -277,7 +277,7 @@ class ReviewDiagnostics:
                 or op.start.base_checkpoint_sequence != request.checkpoint_id
                 or op.start.budget_policy_ref != self.config.d4_budget.budget_policy_ref
                 or finished_at < op.start.started_at):
-            raise D3RecoveryRequired("d9_review_operation_binding_changed")
+            raise ExecutionRecoveryRequired("d9_review_operation_binding_changed")
         return op
 
     def _check_operation(self, request, result):
@@ -291,7 +291,7 @@ class ReviewDiagnostics:
                     or op.completion.evidence_ref != request.review_id
                     or op.completion.evidence_sha256 != digest(completion_evidence(call, result))
                     or op.completion.finished_at < result["finished_at"]):
-                raise D3RecoveryRequired("d9_review_completion_changed")
+                raise ExecutionRecoveryRequired("d9_review_completion_changed")
 
     def projection(self, operations):
         rows = []
@@ -301,22 +301,22 @@ class ReviewDiagnostics:
             request = self.output.read("review-request", identity)
             if request is None:
                 if any(self.output.read(k, identity) is not None for k in ("review-binding", "review-result")):
-                    raise D3RecoveryRequired("d9_review_request_missing")
+                    raise ExecutionRecoveryRequired("d9_review_request_missing")
                 contract = self.output.read("contract", identity)
                 if contract is not None and (contract.get("stage") == "review"
                         or self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and contract.get("stage") == "progress_review"):
-                    raise D3RecoveryRequired("d9_review_request_missing")
+                    raise ExecutionRecoveryRequired("d9_review_request_missing")
                 diagnostic = self.output.read("business-diagnostic", identity)
                 if diagnostic is not None and (diagnostic.get("stage") == "review"
                         or self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and diagnostic.get("stage") == "progress_review"):
-                    raise D3RecoveryRequired("d9_review_request_missing")
+                    raise ExecutionRecoveryRequired("d9_review_request_missing")
                 for root in self.ledger.list_roots(op.start.task_run_id):
                     for call in root.get("calls", []):
                         if call.get("review_id") == identity:
                             fields = call["request"]
                             saved = D2ReviewRequest(**{**fields, "source_versions": tuple(fields["source_versions"])})
                             if self.supported(saved):
-                                raise D3RecoveryRequired("d9_review_request_missing")
+                                raise ExecutionRecoveryRequired("d9_review_request_missing")
                 continue
             record = self.read(identity, check_operation=True)
             from agent_adapters.review_ledger import FileD2ReviewLedger
@@ -324,7 +324,7 @@ class ReviewDiagnostics:
             root = FileD2ReviewLedger.read_root(self.ledger, saved.review_root_id)
             call = next((c for c in root.get("calls", []) if c.get("review_id") == identity), None) if root else None
             if call is None and op.completion is not None:
-                raise D3RecoveryRequired("d9_review_call_missing")
+                raise ExecutionRecoveryRequired("d9_review_call_missing")
             if call is not None and call.get("outcome") not in {"started", "unknown"}:
                 self.verify_call(saved, call, readonly=True)
             if record is not None:

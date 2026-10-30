@@ -163,7 +163,9 @@ def install_tool(
 ) -> dict[str, Any]:
     """Install a verified native artifact, then a pinned Python fallback.
 
-    archive_format accepts raw, zip, tar, tar.gz or tar.xz.
+    Supply either url+sha256 (native) or python_package+python_version
+    (fallback); python_package alone is rejected. archive_format accepts raw,
+    zip, tar, tar.gz or tar.xz.
     """
 
     normalized_name = _validate_name(name, "name")

@@ -145,8 +145,8 @@ def selection_context(app, turn, intent):
     request = app.handoff.evidence.read("request", registration.model_request_id)
     result = app.handoff.evidence.read("result", registration.model_request_id)
     if request is None or result is None or result.get("outcome") != "valid":
-        from agent_core.dual_llm_contracts import D3RecoveryRequired
-        raise D3RecoveryRequired("d22_intent_selection_source_missing")
+        from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+        raise ExecutionRecoveryRequired("d22_intent_selection_source_missing")
     return {"identity": "model_priority_selection_not_fact", "intent_id": intent.intent_id,
         "model_request_id": registration.model_request_id, "suggestion_request_id": request.get("suggestion_request_id"),
         "priority": intent.priority, "source_sha256": digest(result),
@@ -187,7 +187,7 @@ class IntentTurnProposal:
 def parse_directions(request,raw,revisions):
     from agent_core.handoff_contracts import checked_refs
     from agent_core.modeling import IntentCandidate
-    from agent_core.handoff import D8PlanningResult,D8DependencyCandidatesRejected
+    from agent_core.handoff import D8PlanningResult,DependencyCandidatesRejected
     raw = without_order_reason(request, raw)
     if not isinstance(raw,dict):raise ValueError('intent.planning_invalid')
     if raw.get('kind')=='exhausted':
@@ -211,7 +211,7 @@ def parse_directions(request,raw,revisions):
             continue
         kept.append(IntentCandidate(item['description'],item['intent_type']))
         deps.append(refs)
-    if not kept:raise D8DependencyCandidatesRejected(rejected)
+    if not kept:raise DependencyCandidatesRejected(rejected)
     return D8PlanningResult(IntentTurnProposal(request.goal,tuple(kept)),tuple(deps),tuple(rejected))
 
 

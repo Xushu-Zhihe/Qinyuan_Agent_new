@@ -256,6 +256,15 @@ def _persisted_candidate(
                 for item in ledger.list_d7_answer_candidates(task_run_id)
             ):
                 raise ValueError("candidate_not_owned")
+            if ledger.load_stage_run_config(task_run_id) is not None:
+                from agent_adapters.stage_evidence import StageEvidence
+                from agent_core.competition_candidates import validate_mcp_source
+                if candidate.source_kind != "mcp":
+                    raise ValueError("stage_candidate_source_invalid")
+                validate_mcp_source(ledger, candidate, StageEvidence(run_dir / "stage-evidence", ledger, create=False))
+                if registered is not None and registered != candidate:
+                    raise ValueError("candidate_row_changed")
+                return candidate
             turns = {item.turn_id: item for item in state.turns}
             intents = {item.intent_id: item for item in state.intents}
             turn = turns.get(candidate.turn_id)
@@ -485,7 +494,7 @@ class D7CandidateEvidenceStore:
                 or not isinstance(metadata.created_at, (int, float))
                 or not math.isfinite(metadata.created_at)
                 or metadata.model_request_id is not None
-                and not _is_uuid4(metadata.model_request_id)
+                and not _is_uuid4_or5(metadata.model_request_id)
             ):
                 raise ValueError("binding")
             return metadata

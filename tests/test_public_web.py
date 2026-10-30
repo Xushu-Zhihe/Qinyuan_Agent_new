@@ -8,7 +8,7 @@ import pytest
 from agent_adapters import public_web as web
 from agent_adapters.mcp_plan_executor import MCPPlanExecutor
 from agent_core.actions import MCPCall
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from test_output import output_case
 from test_mcp_link import Tools
 from test_chain_multi_turn import ProcessLoss
@@ -186,13 +186,13 @@ def test_known_result_recovers_without_replay_and_tampering_is_rejected(search_c
                     {**value,'payload':{**value['payload'],'stdout':'tampered source body'}})
         return value
     monkeypatch.setattr(c.app.mcp.evidence,'read',changed)
-    with pytest.raises(D3RecoveryRequired,match='mcp.result_binding_changed'):c.app.mcp.feedback(op.start.operation_id)
+    with pytest.raises(ExecutionRecoveryRequired,match='mcp.result_binding_changed'):c.app.mcp.feedback(op.start.operation_id)
 
 
 @pytest.mark.parametrize('output_case',[22],indirect=True)
 def test_frozen_capability_cannot_silently_disappear(search_case):
     c=search_case;c.app.mcp.public_web=None
-    with pytest.raises(D3RecoveryRequired,match='retrieval.configuration_unavailable'):asyncio.run(c.app.mcp.open())
+    with pytest.raises(ExecutionRecoveryRequired,match='retrieval.configuration_unavailable'):asyncio.run(c.app.mcp.open())
     assert not c.backend.calls
 
 
@@ -304,7 +304,7 @@ def test_worker_loss_is_not_relabelled_as_a_known_network_response(monkeypatch,s
         diagnostic.update(worker_exit_confirmed=stopped,transport_end='worker_lost')
         return ModelError(ModelErrorKind.PROVIDER_FAILURE,'model_worker_lost')
     monkeypatch.setattr(DeepSeekModelAdapter,'_invoke_payload',lost)
-    with pytest.raises(D3RecoveryRequired,match='retrieval.'+code):
+    with pytest.raises(ExecutionRecoveryRequired,match='retrieval.'+code):
         web.DeepSeekRetrieval(KEY).invoke(MCPCall('web.search',{'query':'public docs'}),5,NS(is_cancelled=False),None)
 
 

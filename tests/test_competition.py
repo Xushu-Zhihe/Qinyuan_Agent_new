@@ -16,14 +16,15 @@ from test_workbench import call
 
 @pytest.fixture
 def platform(tmp_path):
-    state = SimpleNamespace(payload=[], status=200, headers={}, requests=[])
+    state = SimpleNamespace(payload=[], status=200, headers={}, requests=[], routes={})
     class Upstream(BaseHTTPRequestHandler):
         def log_message(self, *args):pass
         def do_GET(self):
             state.requests.append((self.command,self.path,dict(self.headers)))
-            body = state.payload if isinstance(state.payload,bytes) else json.dumps(state.payload).encode()
-            self.send_response(state.status)
-            for key,value in state.headers.items():self.send_header(key,value)
+            status,body,headers=state.routes.get(self.path,(state.status,state.payload,state.headers))
+            body = body if isinstance(body,bytes) else json.dumps(body).encode()
+            self.send_response(status)
+            for key,value in headers.items():self.send_header(key,value)
             self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
         def do_POST(self):
             state.requests.append((self.command,self.path,dict(self.headers)))
@@ -187,3 +188,106 @@ def test_transport_timeout_stays_technical(platform,monkeypatch):
     monkeypatch.setattr(competition.http.client,"HTTPConnection",TimeoutConnection)
     with pytest.raises(WorkbenchError,match="competition_timeout"):
         competition._read(profile,str(uuid4()))
+
+
+def arena_attachment(p, url=None, body=b"controlled archive bytes"):
+    p.payload={"code":200,"data":{"agent":{},"attempt":{"id":11905,"state_label":"active",
+        "remaining_seconds":600,"problem":{"type_label":"Crypto","content":"controlled attachment task",
+        "container":None,"annex":{"name":"equivalent.zip","size":len(body),"url":url or p.url+"/archive"}}}}}
+    p.routes["/archive"]=(200,body,{})
+    return body
+
+
+def import_attachment(p, profile):
+    p.workbench.protocol_version=3;p.workbench.execution_profile="d8_v22"
+    return p.workbench.competitions.import_question(profile["id"],{"remote_ref":11905})
+
+
+def test_platform_attachment_uses_original_registration_and_reuses_verified_bytes(platform):
+    import hashlib
+    p=platform;profile,token=p.profile("arena");body=arena_attachment(p)
+    task=import_attachment(p,profile)
+    file,=task["attachments"]
+    assert file["name"]=="equivalent.zip" and file["byte_size"]==len(body)
+    assert file["sha256"]==hashlib.sha256(body).hexdigest()
+    assert (p.workbench.uploads/task["id"]/file["id"]).read_bytes()==body
+    assert import_attachment(p,profile)["attachments"]==task["attachments"]
+    downloads=[r for r in p.requests if r[1]=="/archive"]
+    assert len(downloads)==1 and downloads[0][2]["Authorization"]=="Bearer "+token
+    assert token not in p.workbench.database.read_bytes().decode("utf-8",errors="ignore")
+    assert p.workbench.runner.status(task["id"]) is None
+
+
+def test_cross_origin_attachment_redirect_strips_all_platform_auth(platform,monkeypatch):
+    from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+    from Sandbox import tool_download_worker
+    p=platform;profile,token=p.profile("arena");body=arena_attachment(p)
+    requests=[]
+    class CDN(BaseHTTPRequestHandler):
+        def log_message(self,*args):pass
+        def do_GET(self):
+            requests.append(dict(self.headers));self.send_response(200)
+            self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
+    cdn=ThreadingHTTPServer(("127.0.0.1",0),CDN)
+    worker=threading.Thread(target=cdn.serve_forever,daemon=True);worker.start()
+    p.routes["/archive"]=(302,b"",{"Location":f"http://127.0.0.1:{cdn.server_port}/file"})
+    # The controlled CDN is local; production still rejects cross-origin private addresses.
+    monkeypatch.setattr(tool_download_worker,"public_addresses",lambda host,port,forbidden:socket_addresses(host,port))
+    try:
+        assert len(import_attachment(p,profile)["attachments"])==1
+        assert requests and "Authorization" not in requests[0] and "BENCHMARK_TOKEN" not in requests[0]
+        assert token not in json.dumps(requests)
+    finally:
+        cdn.shutdown();cdn.server_close();worker.join(timeout=3)
+
+
+def socket_addresses(host,port):
+    import socket
+    return socket.getaddrinfo(host,port,type=socket.SOCK_STREAM)
+
+
+@pytest.mark.parametrize("failure",["http","size","private","oversized","redirect","scheme","name","storage"])
+def test_attachment_failure_does_not_register_partial_bytes_or_start_agent(platform,monkeypatch,failure):
+    p=platform;profile,_=p.profile("arena");arena_attachment(p)
+    expected="competition_attachment_http_403"
+    if failure=="http":p.routes["/archive"]=(403,b"private upstream body",{})
+    elif failure=="size":p.routes["/archive"]=(200,b"short",{});expected="competition_attachment_size_mismatch"
+    elif failure=="private":p.payload["data"]["attempt"]["problem"]["annex"]["url"]="http://127.0.0.1:1/private";expected="competition_attachment_url_rejected"
+    elif failure=="oversized":p.payload["data"]["attempt"]["problem"]["annex"]["size"]=64*1024*1024+1;expected="competition_attachment_too_large"
+    elif failure=="redirect":p.routes["/archive"]=(302,b"",{"Location":"/archive"});expected="competition_attachment_redirect_limit"
+    elif failure=="scheme":p.payload["data"]["attempt"]["problem"]["annex"]["url"]="file:///private";expected="competition_attachment_url_rejected"
+    elif failure=="name":p.payload["data"]["attempt"]["problem"]["annex"]["name"]="../private";expected="competition_attachment_metadata_invalid"
+    else:
+        def unavailable():raise OSError("controlled local storage failure")
+        monkeypatch.setattr(competition.tempfile,"TemporaryFile",unavailable)
+        expected="competition_attachment_store_failed"
+    with pytest.raises(WorkbenchError,match=expected):import_attachment(p,profile)
+    task,=p.workbench.list()
+    assert not task["attachments"] and p.workbench.runner.status(task["id"]) is None
+    assert not list(p.workbench.uploads.rglob("*.part"))
+
+
+def test_attachment_registration_interruption_reuses_identical_registered_file(platform,monkeypatch):
+    p=platform;profile,_=p.profile("arena");arena_attachment(p)
+    register=p.workbench.add_attachment
+    def interrupted(*args):
+        register(*args)
+        raise OSError("controlled interruption after attachment registration")
+    monkeypatch.setattr(p.workbench,"add_attachment",interrupted)
+    with pytest.raises(WorkbenchError,match="competition_attachment_store_failed"):import_attachment(p,profile)
+    task,=p.workbench.list();original=task["attachments"]
+    assert len(original)==1
+    monkeypatch.setattr(p.workbench,"add_attachment",register)
+    assert import_attachment(p,profile)["attachments"]==original
+    before=len(p.requests)
+    assert import_attachment(p,profile)["attachments"]==original
+    assert len(p.requests)==before+1  # Refresh platform metadata, reuse the registered download.
+
+
+def test_changed_registered_attachment_is_not_silently_downloaded_over(platform):
+    p=platform;profile,_=p.profile("arena");arena_attachment(p)
+    task=import_attachment(p,profile);file,=task["attachments"]
+    path=p.workbench.uploads/task["id"]/file["id"];path.write_bytes(b"changed")
+    before=len([r for r in p.requests if r[1]=="/archive"])
+    with pytest.raises(WorkbenchError,match="competition_attachment_integrity_failed"):import_attachment(p,profile)
+    assert len([r for r in p.requests if r[1]=="/archive"])==before and path.read_bytes()==b"changed"

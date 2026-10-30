@@ -10,7 +10,7 @@ import pytest
 
 from agent_adapters import task_cli
 from agent_adapters.output_evidence import FileD8OutputEvidence
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.governance_policy import context, materialize
 from agent_core.output_contracts import decode_response
 from test_public_simulation import request
@@ -240,7 +240,7 @@ def test_known_binding_damage_pauses_without_another_model_call(s5_case, damage)
         path.write_text('{}', encoding='utf-8')
     else:
         next((c.directory/'d8-output').glob('*selection-request-'+identity+'.json')).unlink()
-    with pytest.raises(D3RecoveryRequired):
+    with pytest.raises(ExecutionRecoveryRequired):
         c.app.selection_bindings.check_task(c.task)
     assert before == {name: len(model.calls) for name, model in c.models.items()}
 
@@ -321,17 +321,17 @@ def test_summary_keeps_partial_order_and_empty_question_references(s5_case):
 @pytest.mark.parametrize('output_case', [15], indirect=True)
 def test_governance_unknown_does_not_redispatch_on_reopen(s5_case):
     from agent_core.modeling import ModelError, ModelErrorKind
-    from agent_core.operation_accounting import D4RecoveryRequired
+    from agent_core.operation_accounting import OperationRecoveryRequired
     c = s5_case
     actor = hold(c)
     c.models['inner'].transform = lambda e, raw: ModelError(ModelErrorKind.TIMED_OUT, 'known_test_timeout') if e.output_contract['stage'] == 'conclusion_repair' else modern(e, raw)
     identity = str(uuid4())
-    with pytest.raises((D3RecoveryRequired, D4RecoveryRequired), match='outcome_unknown'):
+    with pytest.raises((ExecutionRecoveryRequired, OperationRecoveryRequired), match='outcome_unknown'):
         asyncio.run(c.app.repair_conclusions(actor, identity, c.token))
     assert c.app.revisions.evidence.read('result', identity) is None
     before = len(c.models['inner'].calls)
     reopen(c)
-    with pytest.raises((D3RecoveryRequired, D4RecoveryRequired), match='outcome_unknown'):
+    with pytest.raises((ExecutionRecoveryRequired, OperationRecoveryRequired), match='outcome_unknown'):
         asyncio.run(c.app.repair_conclusions(actor, identity, c.token))
     assert len(c.models['inner'].calls) == before
 
@@ -418,7 +418,7 @@ def test_sensitive_governance_is_not_bound_or_sent_for_review(s5_case):
         return {**change_wire(e, 'withdraw'), 'reason': marker}
     c.models['inner'].transform = propose
     before = len(c.models['fact'].calls)
-    with pytest.raises(D3RecoveryRequired):
+    with pytest.raises(ExecutionRecoveryRequired):
         asyncio.run(c.app.repair_conclusions(actor, str(uuid4()), c.token))
     assert len(c.models['fact'].calls) == before
     assert all(marker not in path.read_text(encoding='utf-8') for path in c.directory.rglob('*.json'))

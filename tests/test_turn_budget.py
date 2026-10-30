@@ -16,7 +16,7 @@ from agent_core.operation_accounting import D4_CATEGORY_LIMITS
 from agent_core.contracts import TaskRequest
 from agent_core.control_store import StorageError
 from agent_core.dual_llm_contracts import D3RunConfig, D3Authorization
-from agent_core.operation_accounting import D4BudgetPolicy, D4BudgetExhausted
+from agent_core.operation_accounting import D4BudgetPolicy, OperationBudgetExhausted
 from agent_core.turn_contracts import D1RoleConfig
 
 
@@ -111,7 +111,7 @@ def test_d7_allows_turns_until_a_budget_blocks_the_next(tmp_path):
             assert result.overall_goal == "not_evaluated"
             try:
                 asyncio.run(register_next(app, token))
-            except D4BudgetExhausted:
+            except OperationBudgetExhausted:
                 blocked = True
                 break
         assert blocked

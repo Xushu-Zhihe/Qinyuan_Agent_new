@@ -1,6 +1,6 @@
 """Narrow HTTP schemas and model-selected tree goals for contract20."""
 import json
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 
 
 
@@ -10,7 +10,7 @@ def policy(request):
     if not isinstance(value,dict) or set(value) not in (
             {'endpoint','allowed_methods','authorization_sha256'},
             {'endpoint','allowed_methods','authorization_sha256','attachment_indices'}):
-        raise D3RecoveryRequired('d20_http_planning_policy_missing')
+        raise ExecutionRecoveryRequired('d20_http_planning_policy_missing')
     return value
 
 
@@ -69,7 +69,7 @@ def evaluation(app,intent_id,fact_id,history):
     fact=next((i for i in history if i.record_id==fact_id),None)
     execution=next((i for i in history if i.record_id==source.execution_id),None)
     if goal is None or fact is None or execution is None:
-        raise D3RecoveryRequired('d20_http_evaluation_sources_missing')
+        raise ExecutionRecoveryRequired('d20_http_evaluation_sources_missing')
     return dict(version=1,intent_id=intent_id,local_goal=intent.description,plan_id=plan.plan_id,
         template='http_request',observation_mode='new_observation',goal_ref=goal.ref,support_fact_ref=fact.ref,
         required_observation_refs=[execution.ref],

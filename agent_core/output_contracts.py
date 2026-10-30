@@ -21,6 +21,7 @@ class D8OutputRequest:
 class D8ModelResponse:
     content: object
     finish_reason: str = "stop"
+    tool_calls: tuple[dict, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,9 @@ CLAIM = obj({"subject_ref": S, "observation_scope": S, "claim_key": text(128),
 
 
 def output_schema(request, *, contract_version=None):
+    from agent_core.stage_planning import StageModelRequest, schema as stage_schema
+    if isinstance(request, StageModelRequest):
+        return request.stage, stage_schema(request)
     stage, schema = _base_output_schema(request, contract_version=contract_version)
     if contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
         from agent_core.governance_policy import patch_schema
@@ -177,8 +181,8 @@ def _base_output_schema(request, *, contract_version=None):
         if contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and progress:
             from agent_core.progress_policy import progress_schema, policy_for
             if policy_for(request)['version'] != (2 if contract_version in {16, 17, 18, 19, 20, 21, 22} else 1):
-                from agent_core.dual_llm_contracts import D3RecoveryRequired
-                raise D3RecoveryRequired('s6_review_text_policy_version_changed')
+                from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+                raise ExecutionRecoveryRequired('s6_review_text_policy_version_changed')
             return "progress_review", progress_schema(request)
         if contract_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and not progress:
             from agent_core.review_policy import review_schema
@@ -221,8 +225,8 @@ def _base_output_schema(request, *, contract_version=None):
         if contract_version in {17, 18, 19, 20, 21, 22}:
             from agent_core.execution_feasibility import KEY
             if KEY not in json.loads(request.history_context):
-                from agent_core.dual_llm_contracts import D3RecoveryRequired
-                raise D3RecoveryRequired('d17_plan_execution_context_missing')
+                from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+                raise ExecutionRecoveryRequired('d17_plan_execution_context_missing')
         if contract_version in {16, 17, 18, 19, 20, 21, 22}:
             from agent_core.plan_policy import plan_schema
             return stage, {"anyOf": [plan_schema(request), CHANGE, *READS]}
@@ -364,8 +368,8 @@ def shape_issues(value, schema, path="$"):
         return [D8FormatIssue("enum_mismatch", path, "allowed_choice", actual)]
     result = []
     if actual == "object":
-        fields = schema["properties"]
-        for key in schema["required"]:
+        fields = schema.get("properties", {})
+        for key in schema.get("required", ()):
             if key not in value:
                 expected_type = fields[key].get("type", "allowed_shape")
                 expected_type = "|".join(expected_type) if isinstance(expected_type, list) else expected_type
@@ -466,7 +470,10 @@ def _depth(text):
     return maximum
 
 
-def decode_response(response, schema):
+NATIVE_TRAILING_BRACE_POLICY = "native_single_trailing_brace_v1"
+
+
+def decode_response(response, schema, *, normalization_policy=None, json_error_details=False):
     """Return safe issues and explicit terminal status without retaining text."""
     finish = "stop"
     if isinstance(response, D8ModelResponse):
@@ -497,6 +504,34 @@ def decode_response(response, schema):
             response = json.loads(encoded, object_pairs_hook=_pairs, parse_constant=_nonfinite, parse_float=_float)
         except _DuplicateKey:
             return None, [D8FormatIssue("json_duplicate_key", "$", "unique_fields", "duplicate")], None, units
+        except json.JSONDecodeError as error:
+            import re
+            code = "json_parse_failed"
+            actual = f"invalid_json_at_char_{error.pos}"
+            if error.msg == "Extra data":
+                code = ("output_trailing_markup" if re.search(r"</?[|\uff5c]+DSML[|\uff5c]+", encoded[error.pos:])
+                    else "json_trailing_data")
+                suffix = encoded[error.pos:].strip(" \t\r\n")
+                actual = f"trailing_data_at_char_{error.pos}"
+                if suffix == "}":
+                    actual += ";single_extra_right_brace"
+                elif all(c in "} \t\r\n" for c in suffix):
+                    actual += f";extra_right_braces_{suffix.count('}')}"
+                else:
+                    actual += ";non_brace_trailing_data"
+                if suffix == "}" and normalization_policy == NATIVE_TRAILING_BRACE_POLICY:
+                    # The strict decoder already consumed the complete prefix
+                    # with the same duplicate-key and finite-number checks.
+                    response = json.loads(encoded[:error.pos], object_pairs_hook=_pairs,
+                        parse_constant=_nonfinite, parse_float=_float)
+                    units["normalization"] = {"policy": normalization_policy,
+                        "offset": error.pos, "removed_characters": 1}
+                else:
+                    return None, [D8FormatIssue(code, "$", "single_complete_json",
+                        actual if json_error_details else "invalid")], None, units
+            else:
+                return None, [D8FormatIssue(code, "$", "single_complete_json",
+                    actual if json_error_details else "invalid")], None, units
         except (ValueError, RecursionError):
             return None, [D8FormatIssue("json_parse_failed", "$", "valid_json", "invalid")], None, units
     else:
@@ -514,4 +549,7 @@ def decode_response(response, schema):
             response = {k:v for k,v in response.items() if k != "exploration_group"}
     issues = [D8FormatIssue(i.code, i.path if len(i.path) <= 128 else "$", i.expected, i.actual)
               for i in shape_issues(response, schema)]
+    if (issues and isinstance(response, dict) and set(response) == {"version", "stage", "schema"}
+            and isinstance(response["schema"], dict)):
+        issues = [D8FormatIssue("output_envelope_invalid", "$", "direct_result_object", "contract_envelope")]
     return response if not issues else None, issues, None, units

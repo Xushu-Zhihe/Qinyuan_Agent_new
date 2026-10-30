@@ -38,7 +38,7 @@ from agent_core.dual_llm_contracts import (
     D3OperationCompletion,
     D3OperationStart,
     D3PlanBinding,
-    D3RecoveryRequired,
+    ExecutionRecoveryRequired,
     D3TurnBinding,
 )
 from agent_core.intent_postconditions import FileDigestObservation
@@ -126,16 +126,16 @@ class D3WorkspaceOperations:
     def _budget(self, token: CancellationToken) -> float:
         state = self.state
         if token.is_cancelled or state.task_run.status is not TaskRunStatus.RUNNING:
-            raise D3RecoveryRequired("d3_workspace_dispatch_stopped")
+            raise ExecutionRecoveryRequired("d3_workspace_dispatch_stopped")
         remaining = min(60.0, state.task_run.deadline_at - self.clock())
         if remaining <= 0:
-            raise D3RecoveryRequired("d3_workspace_deadline_elapsed")
+            raise ExecutionRecoveryRequired("d3_workspace_deadline_elapsed")
         return remaining
 
     @staticmethod
     def _read_budget(token: CancellationToken) -> float:
         if token.is_cancelled:
-            raise D3RecoveryRequired("d3_readonly_query_cancelled")
+            raise ExecutionRecoveryRequired("d3_readonly_query_cancelled")
         return 60.0
 
     def _start(
@@ -181,7 +181,7 @@ class D3WorkspaceOperations:
             or record.start.resource_ref
             != (receipt.claim.intent_id if category == "intent_stop" else operation_id)
         ):
-            raise D3RecoveryRequired("d3_known_receipt_operation_mismatch")
+            raise ExecutionRecoveryRequired("d3_known_receipt_operation_mismatch")
         if record.completion is None:
             self.ledger.complete_d3_operation(
                 D3OperationCompletion(
@@ -198,7 +198,7 @@ class D3WorkspaceOperations:
             or record.completion.result_kind
             != ("completed" if receipt.status == "confirmed" else "failed")
         ):
-            raise D3RecoveryRequired("d3_known_receipt_completion_mismatch")
+            raise ExecutionRecoveryRequired("d3_known_receipt_completion_mismatch")
         if receipt.status == "confirmed":
             self.ledger.mark_d3_operation_applied(operation_id, operation_id)
 
@@ -215,7 +215,7 @@ class D3WorkspaceOperations:
             or receipt.sandbox_path
             != f"/workspace/input/d3-attachment-{binding.attachment_index}"
         ):
-            raise D3RecoveryRequired("d3_frozen_import_unavailable")
+            raise ExecutionRecoveryRequired("d3_frozen_import_unavailable")
         return receipt
 
     def read_artifact(self, version_id: str) -> D3ArtifactReceipt:
@@ -232,7 +232,7 @@ class D3WorkspaceOperations:
             or operation.completion.evidence_sha256 != digest(asdict(receipt))
             or operation.application_ref != version_id
         ):
-            raise D3RecoveryRequired("d3_artifact_version_unconfirmed")
+            raise ExecutionRecoveryRequired("d3_artifact_version_unconfirmed")
         return receipt
 
     async def prepare_artifact(
@@ -268,7 +268,7 @@ class D3WorkspaceOperations:
             or turn is None
             or turn.status is not TurnStatus.RUNNING
         ):
-            raise D3RecoveryRequired("d3_artifact_owner_mismatch")
+            raise ExecutionRecoveryRequired("d3_artifact_owner_mismatch")
         existing = self.evidence.read_artifact(artifact_version_id)
         if existing is not None:
             self._repair_known(artifact_version_id, "copy_preparation", existing)
@@ -279,13 +279,13 @@ class D3WorkspaceOperations:
                 or receipt.claim.plan_id != plan_id
                 or receipt.claim.import_id != binding.import_id
             ):
-                raise D3RecoveryRequired("d3_artifact_version_rebound")
+                raise ExecutionRecoveryRequired("d3_artifact_version_rebound")
             return receipt
         if (
             self.evidence.read_artifact_claim(artifact_version_id) is not None
             or self.ledger.load_d3_operation(artifact_version_id) is not None
         ):
-            raise D3RecoveryRequired("d3_artifact_copy_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_artifact_copy_outcome_unknown")
         self._budget(token)
         claim = D3ArtifactClaim(
             artifact_version_id,
@@ -316,9 +316,9 @@ class D3WorkspaceOperations:
                 timeout=self._budget(token),
             )
         except (Exception, asyncio.CancelledError) as exc:
-            raise D3RecoveryRequired("d3_artifact_copy_outcome_unknown") from exc
+            raise ExecutionRecoveryRequired("d3_artifact_copy_outcome_unknown") from exc
         if not isinstance(readback, AttachmentImportReadback):
-            raise D3RecoveryRequired("d3_artifact_copy_result_unknown")
+            raise ExecutionRecoveryRequired("d3_artifact_copy_result_unknown")
         receipt = D3ArtifactReceipt(
             claim,
             readback,
@@ -332,7 +332,7 @@ class D3WorkspaceOperations:
             artifact_version_id, receipt, confirmed=receipt.status == "confirmed"
         )
         if receipt.status != "confirmed":
-            raise D3RecoveryRequired("d3_artifact_integrity_exception")
+            raise ExecutionRecoveryRequired("d3_artifact_integrity_exception")
         return receipt
 
     def record_size(
@@ -352,7 +352,7 @@ class D3WorkspaceOperations:
             or completed.record.exit_code != 0
             or completed.record.stdout_truncated
         ):
-            raise D3RecoveryRequired("d3_size_execution_unavailable")
+            raise ExecutionRecoveryRequired("d3_size_execution_unavailable")
         record: T6ExecutionRecord = completed.record
         observed_status, observed_size = parse_size_output(record.stdout)
         result = D3SizeObservation(
@@ -370,7 +370,7 @@ class D3WorkspaceOperations:
         )
         self.evidence.save_size(result)
         if result.status != "confirmed":
-            raise D3RecoveryRequired("d3_size_integrity_exception")
+            raise ExecutionRecoveryRequired("d3_size_integrity_exception")
         return result
 
     async def observe_digest(
@@ -387,7 +387,7 @@ class D3WorkspaceOperations:
             or artifact.claim.turn_id != binding.turn_id
             or plan.observation_mode != "new_observation"
         ):
-            raise D3RecoveryRequired("d3_digest_artifact_mismatch")
+            raise ExecutionRecoveryRequired("d3_digest_artifact_mismatch")
         existing = self.evidence.read_digest(observation_id)
         if existing is not None:
             self._repair_known(observation_id, "sha_observation", existing)
@@ -401,13 +401,13 @@ class D3WorkspaceOperations:
                 or existing.claim.execution_id != execution_id
                 or existing.status != "confirmed"
             ):
-                raise D3RecoveryRequired("d3_digest_evidence_mismatch")
+                raise ExecutionRecoveryRequired("d3_digest_evidence_mismatch")
             return existing
         if (
             self.evidence.read_digest_claim(observation_id) is not None
             or self.ledger.load_d3_operation(observation_id) is not None
         ):
-            raise D3RecoveryRequired("d3_digest_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_digest_outcome_unknown")
         completed = self.commands.read_completed(execution_id)
         if (
             completed is None
@@ -415,7 +415,7 @@ class D3WorkspaceOperations:
             or completed.record.exit_code != 0
             or completed.record.plan_id != plan.plan_id
         ):
-            raise D3RecoveryRequired("d3_digest_execution_unavailable")
+            raise ExecutionRecoveryRequired("d3_digest_execution_unavailable")
         self._budget(token)
         claim = D3DigestClaim(
             observation_id,
@@ -444,12 +444,12 @@ class D3WorkspaceOperations:
                 timeout=self._budget(token),
             )
         except (Exception, asyncio.CancelledError) as exc:
-            raise D3RecoveryRequired("d3_digest_outcome_unknown") from exc
+            raise ExecutionRecoveryRequired("d3_digest_outcome_unknown") from exc
         if (
             not isinstance(observed, FileDigestObservation)
             or observed.status == "unknown"
         ):
-            raise D3RecoveryRequired("d3_digest_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_digest_outcome_unknown")
         receipt = D3DigestReceipt(
             claim,
             observed,
@@ -461,7 +461,7 @@ class D3WorkspaceOperations:
         self.evidence.save_digest(receipt)
         self._finish(observation_id, receipt, confirmed=receipt.status == "confirmed")
         if receipt.status != "confirmed":
-            raise D3RecoveryRequired("d3_digest_integrity_exception")
+            raise ExecutionRecoveryRequired("d3_digest_integrity_exception")
         return receipt
 
     async def observe_mcp_result(
@@ -483,7 +483,7 @@ class D3WorkspaceOperations:
             or artifact.claim.turn_id != binding.turn_id
             or plan.observation_mode != "new_observation"
         ):
-            raise D3RecoveryRequired("d22_mcp_artifact_mismatch")
+            raise ExecutionRecoveryRequired("d22_mcp_artifact_mismatch")
 
         existing = self.evidence.read_digest(observation_id)
         if existing is not None:
@@ -494,7 +494,7 @@ class D3WorkspaceOperations:
             self.evidence.read_digest_claim(observation_id) is not None
             or self.ledger.load_d3_operation(observation_id) is not None
         ):
-            raise D3RecoveryRequired("d22_mcp_outcome_unknown")
+            raise ExecutionRecoveryRequired("d22_mcp_outcome_unknown")
 
         self._budget(token)
         claim = D3DigestClaim(
@@ -551,7 +551,7 @@ class D3WorkspaceOperations:
             or target.turn_id not in {item.turn_id for item in state.turns}
             or claim_source.task_run_id != state.task_run.task_run_id
         ):
-            raise D3RecoveryRequired("d3_share_target_mismatch")
+            raise ExecutionRecoveryRequired("d3_share_target_mismatch")
         result = self.ledger.load_d3_plan_result(claim_source.plan_id)
         source_binding = self.ledger.load_d3_plan_binding(claim_source.plan_id)
         if (
@@ -563,7 +563,7 @@ class D3WorkspaceOperations:
             or result is not None
             and result.artifact_version_id != artifact_version_id
         ):
-            raise D3RecoveryRequired("d3_share_source_version_mismatch")
+            raise ExecutionRecoveryRequired("d3_share_source_version_mismatch")
         original_verification_status: Literal["verified", "unverified"] = "unverified"
         source_proof_id = source_fact_id = None
         if result is not None and result.outcome == "satisfied":
@@ -583,14 +583,14 @@ class D3WorkspaceOperations:
                 or result.proof_id is None
                 or result.supporting_fact_id is None
             ):
-                raise D3RecoveryRequired("d3_share_source_fact_unavailable")
+                raise ExecutionRecoveryRequired("d3_share_source_fact_unavailable")
             proof, _ = self.proofs.read_verified(fact.source_ref, result.proof_id)
             if (
                 proof.plan_id != claim_source.plan_id
                 or proof.artifact_version_id != artifact_version_id
                 or proof.intent_id != claim_source.intent_id
             ):
-                raise D3RecoveryRequired("d3_share_source_proof_mismatch")
+                raise ExecutionRecoveryRequired("d3_share_source_proof_mismatch")
             original_verification_status = "verified"
             source_proof_id = result.proof_id
             source_fact_id = result.supporting_fact_id
@@ -602,13 +602,13 @@ class D3WorkspaceOperations:
                 or existing.claim.artifact_version_id != artifact_version_id
                 or existing.claim.target_intent_id != target_intent_id
             ):
-                raise D3RecoveryRequired("d3_share_receipt_mismatch")
+                raise ExecutionRecoveryRequired("d3_share_receipt_mismatch")
             return existing
         if (
             self.evidence.read_share_claim(share_id) is not None
             or self.ledger.load_d3_operation(share_id) is not None
         ):
-            raise D3RecoveryRequired("d3_share_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_share_outcome_unknown")
         self._budget(token)
         claim = D3ShareClaim(
             share_id,
@@ -641,9 +641,9 @@ class D3WorkspaceOperations:
                 timeout=self._budget(token),
             )
         except (Exception, asyncio.CancelledError) as exc:
-            raise D3RecoveryRequired("d3_share_outcome_unknown") from exc
+            raise ExecutionRecoveryRequired("d3_share_outcome_unknown") from exc
         if not isinstance(readback, D3ShareReadback):
-            raise D3RecoveryRequired("d3_share_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_share_outcome_unknown")
         expected = AttachmentImportReadback(claim.source_byte_size, claim.source_sha256)
         try:
             receipt = D3ShareReceipt(
@@ -656,11 +656,11 @@ class D3WorkspaceOperations:
                 max(claim.started_at, self.clock()),
             )
         except (TypeError, ValueError) as exc:
-            raise D3RecoveryRequired("d3_share_outcome_unknown") from exc
+            raise ExecutionRecoveryRequired("d3_share_outcome_unknown") from exc
         self.evidence.save_share(receipt)
         self._finish(share_id, receipt, confirmed=receipt.status == "confirmed")
         if receipt.status != "confirmed":
-            raise D3RecoveryRequired("d3_share_integrity_exception")
+            raise ExecutionRecoveryRequired("d3_share_integrity_exception")
         return receipt
 
     async def verify_share(
@@ -670,7 +670,7 @@ class D3WorkspaceOperations:
     ) -> D3ReadbackAudit:
         receipt = self.evidence.read_share(share_id)
         if receipt is None or receipt.status != "confirmed":
-            raise D3RecoveryRequired("d3_share_receipt_unavailable")
+            raise ExecutionRecoveryRequired("d3_share_receipt_unavailable")
         self._repair_known(share_id, "artifact_share", receipt)
         claim = receipt.claim
         artifact = self.read_artifact(claim.artifact_version_id)
@@ -688,7 +688,7 @@ class D3WorkspaceOperations:
                 for item in self.state.intents
             )
         ):
-            raise D3RecoveryRequired("d3_share_manifest_owner_changed")
+            raise ExecutionRecoveryRequired("d3_share_manifest_owner_changed")
         if claim.original_verification_status == "verified":
             result = self.ledger.load_d3_plan_result(source.plan_id)
             fact = next(
@@ -709,14 +709,14 @@ class D3WorkspaceOperations:
                 or fact.status is not FactStatus.VERIFIED
                 or fact.verification_ref != f"d3:{claim.source_proof_id}"
             ):
-                raise D3RecoveryRequired("d3_share_original_verification_changed")
+                raise ExecutionRecoveryRequired("d3_share_original_verification_changed")
             proof, _ = self.proofs.read_verified(fact.source_ref, claim.source_proof_id)
             if (
                 proof.plan_id != source.plan_id
                 or proof.intent_id != source.intent_id
                 or proof.artifact_version_id != claim.artifact_version_id
             ):
-                raise D3RecoveryRequired("d3_share_original_proof_changed")
+                raise ExecutionRecoveryRequired("d3_share_original_proof_changed")
         try:
             source_readback = await asyncio.wait_for(
                 self.sandbox.readback(
@@ -737,7 +737,7 @@ class D3WorkspaceOperations:
                 timeout=self._read_budget(token),
             )
         except (Exception, asyncio.CancelledError) as exc:
-            raise D3RecoveryRequired("d3_share_readback_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_share_readback_unavailable") from exc
         audit = D3ReadbackAudit(
             str(uuid4()),
             share_id,
@@ -750,7 +750,7 @@ class D3WorkspaceOperations:
         )
         self.evidence.save_readback_audit(audit)
         if source_readback != receipt.source or target_readback != receipt.target:
-            raise D3RecoveryRequired("d3_share_content_changed")
+            raise ExecutionRecoveryRequired("d3_share_content_changed")
         return audit
 
     async def audit_unknown(
@@ -769,10 +769,10 @@ class D3WorkspaceOperations:
                 "intent_stop",
             }
         ):
-            raise D3RecoveryRequired("d3_unknown_operation_claim_unavailable")
+            raise ExecutionRecoveryRequired("d3_unknown_operation_claim_unavailable")
         category = operation.start.category
         if operation.start.task_run_id != self.state.task_run.task_run_id:
-            raise D3RecoveryRequired("d3_unknown_operation_owner_mismatch")
+            raise ExecutionRecoveryRequired("d3_unknown_operation_owner_mismatch")
         source_readback = target_readback = None
         process_readback = None
         try:
@@ -782,7 +782,7 @@ class D3WorkspaceOperations:
                     claim is None
                     or self.evidence.read_artifact(operation_id) is not None
                 ):
-                    raise D3RecoveryRequired("d3_artifact_result_not_unknown")
+                    raise ExecutionRecoveryRequired("d3_artifact_result_not_unknown")
                 plan = self.ledger.load_d3_plan_binding(claim.plan_id)
                 turn = plan_turn_binding(self.ledger,plan) if plan is not None else None
                 intent = next(
@@ -812,12 +812,12 @@ class D3WorkspaceOperations:
                     or claim.sandbox_id != self.state.task_run.sandbox_id
                     or claim.source_path != self._import(turn).sandbox_path
                 ):
-                    raise D3RecoveryRequired("d3_unknown_artifact_claim_changed")
+                    raise ExecutionRecoveryRequired("d3_unknown_artifact_claim_changed")
                 source_path, target_path = claim.source_path, claim.path
             elif category == "artifact_share":
                 claim = self.evidence.read_share_claim(operation_id)
                 if claim is None or self.evidence.read_share(operation_id) is not None:
-                    raise D3RecoveryRequired("d3_share_result_not_unknown")
+                    raise ExecutionRecoveryRequired("d3_share_result_not_unknown")
                 artifact = self.read_artifact(claim.artifact_version_id)
                 source = artifact.claim
                 target = next(
@@ -840,7 +840,7 @@ class D3WorkspaceOperations:
                     or target is None
                     or target.turn_id != claim.target_turn_id
                 ):
-                    raise D3RecoveryRequired("d3_unknown_share_claim_changed")
+                    raise ExecutionRecoveryRequired("d3_unknown_share_claim_changed")
                 source_path, target_path = claim.source_path, claim.target_path
             else:
                 claim = self.evidence.read_stop_claim(operation_id)
@@ -850,7 +850,7 @@ class D3WorkspaceOperations:
                     or saved_stop is not None
                     and (saved_stop.claim != claim or saved_stop.status != "unknown")
                 ):
-                    raise D3RecoveryRequired("d3_stop_result_not_unknown")
+                    raise ExecutionRecoveryRequired("d3_stop_result_not_unknown")
                 intent = next(
                     (
                         item
@@ -890,7 +890,7 @@ class D3WorkspaceOperations:
                     )
                     or claim.process_refs != process_refs
                 ):
-                    raise D3RecoveryRequired("d3_unknown_stop_claim_changed")
+                    raise ExecutionRecoveryRequired("d3_unknown_stop_claim_changed")
                 process_readback = await asyncio.wait_for(
                     self.sandbox.query_intent_processes(
                         claim,
@@ -919,10 +919,10 @@ class D3WorkspaceOperations:
                     ),
                     timeout=self._read_budget(token),
                 )
-        except D3RecoveryRequired:
+        except ExecutionRecoveryRequired:
             raise
         except (Exception, asyncio.CancelledError) as exc:
-            raise D3RecoveryRequired(
+            raise ExecutionRecoveryRequired(
                 "d3_unknown_operation_readback_unavailable"
             ) from exc
         audit = D3ReadbackAudit(
@@ -969,7 +969,7 @@ class D3WorkspaceOperations:
                 if reason == "sibling_switch" else {"adjust_turn_target"}
             )
         ):
-            raise D3RecoveryRequired("d3_stop_review_or_owner_mismatch")
+            raise ExecutionRecoveryRequired("d3_stop_review_or_owner_mismatch")
         if any(
             execution.status.value in {"pending", "running"}
             and any(
@@ -978,7 +978,7 @@ class D3WorkspaceOperations:
             )
             for execution in state.executions
         ):
-            raise D3RecoveryRequired("d3_intent_has_pending_execution")
+            raise ExecutionRecoveryRequired("d3_intent_has_pending_execution")
         process_refs = tuple(
             execution.execution_id
             for execution in state.executions
@@ -997,13 +997,13 @@ class D3WorkspaceOperations:
                 or existing.claim.review_id != review_id
                 or existing.claim.process_refs != process_refs
             ):
-                raise D3RecoveryRequired("d3_stop_receipt_mismatch")
+                raise ExecutionRecoveryRequired("d3_stop_receipt_mismatch")
             return existing
         if (
             self.evidence.read_stop_claim(stop_id) is not None
             or self.ledger.load_d3_operation(stop_id) is not None
         ):
-            raise D3RecoveryRequired("d3_stop_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_stop_outcome_unknown")
         self._budget(token)
         claim = D3StopClaim(
             stop_id,
@@ -1028,9 +1028,9 @@ class D3WorkspaceOperations:
                 timeout=self._budget(token),
             )
         except (Exception, asyncio.CancelledError) as exc:
-            raise D3RecoveryRequired("d3_stop_outcome_unknown") from exc
+            raise ExecutionRecoveryRequired("d3_stop_outcome_unknown") from exc
         if not isinstance(readback, D3StopReadback):
-            raise D3RecoveryRequired("d3_stop_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_stop_outcome_unknown")
         try:
             receipt = D3StopReceipt(
                 claim,
@@ -1039,9 +1039,9 @@ class D3WorkspaceOperations:
                 max(claim.started_at, self.clock()),
             )
         except (TypeError, ValueError) as exc:
-            raise D3RecoveryRequired("d3_stop_outcome_unknown") from exc
+            raise ExecutionRecoveryRequired("d3_stop_outcome_unknown") from exc
         self.evidence.save_stop(receipt)
         if receipt.status != "confirmed":
-            raise D3RecoveryRequired("d3_stop_outcome_unknown")
+            raise ExecutionRecoveryRequired("d3_stop_outcome_unknown")
         self._finish(stop_id, receipt, confirmed=True)
         return receipt

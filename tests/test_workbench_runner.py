@@ -69,6 +69,8 @@ def test_start_exposes_running_status_and_cancel_does_not_spawn_twice(tmp_path):
     ):
         run = workbench.runner.start(challenge_id)
         assert run["status"] == workbench.get(challenge_id)["status"] == "running"
+        request = json.loads((Path(run["directory"]) / "request.json").read_text(encoding="utf-8"))
+        assert "题型（任务提供）：misc" in request["task_request"]["goal"]
         assert workbench.runner.cancel(challenge_id)["status"] == "cancelling"
         with pytest.raises(WorkbenchError, match="challenge_already_running"):
             workbench.runner.start(challenge_id)

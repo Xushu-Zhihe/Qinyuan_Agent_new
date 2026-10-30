@@ -4,7 +4,7 @@ import json
 import threading
 from dataclasses import asdict, dataclass, replace
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.handoff_contracts import D8HandoffRequest, D8TreeRecord, handoff_json
 from agent_core.modeling import model_call_timeout, ModelError
 from agent_core.operation_accounting import D4OperationStart
@@ -238,7 +238,7 @@ class StrategySupervision:
                 # Attachment tools keep their existing trusted progress records.
                 operation = app.store.load_d4_operation(identity)
                 if operation.start.resource_ref.startswith("mcp/"):
-                    raise D3RecoveryRequired("mcp.result_binding_changed")
+                    raise ExecutionRecoveryRequired("mcp.result_binding_changed")
                 tool, response, status, signature, method = "attachment", None, operation.completion.result_kind, None, None
             tools[tool] = tools.get(tool, 0) + 1
             if signature is not None:
@@ -430,7 +430,7 @@ class StrategySupervision:
         if result["outcome"] == "valid":
             self.app.store.mark_d4_operation_applied(identity, identity)
         if effect["request_sha256"] != request.context_sha256:
-            raise D3RecoveryRequired("d22_strategy_effect_binding_changed")
+            raise ExecutionRecoveryRequired("d22_strategy_effect_binding_changed")
         if created:
             self._log("strategy.finished", request, outcome=effect["outcome"], code=effect.get("validity_reason", result.get("reason")),
                       decision=(result.get("raw") or {}).get("decision"),
@@ -588,13 +588,13 @@ class StrategySupervision:
                 continue
             snapshot = self.app.sessions.evidence.read("request", identity)
             if snapshot is None or snapshot["intent_id"] != note["intent_id"]:
-                raise D3RecoveryRequired("d22_strategy_interruption_owner_changed")
+                raise ExecutionRecoveryRequired("d22_strategy_interruption_owner_changed")
             if "proposal_sha256" in note:
                 model = self.app.model_evidence.read(identity)
                 review = self.app.handoff.evidence.read("result", note["review_id"])
                 if (model is None or digest(asdict(model)) != note["proposal_sha256"]
                         or review is None or digest(review) != note["review_sha256"]):
-                    raise D3RecoveryRequired("d22_strategy_interruption_source_changed")
+                    raise ExecutionRecoveryRequired("d22_strategy_interruption_source_changed")
             yield identity, snapshot["turn_id"], note
 
     def resume_candidate(self, turn_id):
@@ -677,6 +677,6 @@ def validate_yield_note(app, record, mutation):
             or note is None
             or {k: v for k, v in note.items() if k != "progress"} != {"target_intent_id": target.intent_id, "review_id": proposal.review_id,
                         "reason": proposal.reason, "content": proposal.content, "identity": "strategy_yield_not_technical_failure"}):
-        raise D3RecoveryRequired("d22_strategy_yield_evidence_changed")
+        raise ExecutionRecoveryRequired("d22_strategy_yield_evidence_changed")
     if "progress" in note:
         app.sessions.validate_handoff_progress(record.intent_id, note["progress"])

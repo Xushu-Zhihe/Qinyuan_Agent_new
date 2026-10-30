@@ -82,17 +82,17 @@ from agent_core.dual_llm_contracts import (
     D3_CATEGORY_LIMITS,
     D3_SHA_STEP,
     D3_SIZE_STEP,
-    D3BudgetExhausted,
+    ExecutionBudgetExhausted,
     D3CommitMetadata,
     D3IntentBinding,
     D3OperationCompletion,
-    D3OperationConflict,
+    ExecutionStateConflict,
     D3OperationRecord,
     D3OperationStart,
     D3Outcome,
     D3PlanBinding,
     D3PlanResult,
-    D3RecoveryRequired,
+    ExecutionRecoveryRequired,
     D3ReviewApplication,
     D3RunConfig,
     D3TurnBinding,
@@ -134,15 +134,15 @@ from agent_core.operation_accounting import (
     D4AuditCategory,
     D4AuditEvent,
     D4AuditOutcome,
-    D4BudgetExhausted,
+    OperationBudgetExhausted,
     D4BudgetPolicy,
     D4BudgetUsage,
     D4OperationCategory,
     D4OperationCompletion,
-    D4OperationConflict,
+    OperationIdentityConflict,
     D4OperationRecord,
     D4OperationStart,
-    D4RecoveryRequired,
+    OperationRecoveryRequired,
 )
 from agent_core.process_facts import D5Attempt, D5ProcessFact
 from agent_core.conclusion_contracts import D8Conclusion
@@ -150,6 +150,11 @@ from agent_core.handoff_storage import (
     D8_HANDOFF_SCHEMA, D8_REVISION_SCHEMA, D8_SESSION_SCHEMA, D8_CHANGES, D8_OPERATIONS,
     load_records, validate_handoff_mutation, save_handoff_mutation,
 )
+from agent_core.handoff_contracts import D8HistoryItem
+from agent_core.stage_contracts import (
+    PlanningSession, StageEvidencePort, StageRunConfig, StageStateChange, StageTurnSnapshot, StageQueuedReview,
+)
+from agent_core import stage_storage
 from agent_core.review_contracts import (
     D2AllowedActionKinds,
     D2Constraint,
@@ -172,7 +177,7 @@ from agent_core.turn_contracts import (
     d1_payload,
 )
 
-CURRENT_SCHEMA_VERSION = 31
+CURRENT_SCHEMA_VERSION = 38
 
 MIGRATION_28 = """
 CREATE TABLE d8_conclusions_new (
@@ -1048,11 +1053,13 @@ class SqliteControlStore:
         path: Path,
         *,
         clock: Callable[[], float],
+        stage_evidence: StageEvidencePort | None = None,
     ) -> None:
         self._connection = connection
         self.path = path
         self._clock = clock
         self._schema_version = 0
+        self.stage_evidence = stage_evidence
 
     @classmethod
     def open(
@@ -1060,6 +1067,7 @@ class SqliteControlStore:
         path: str | os.PathLike[str],
         *,
         clock: Callable[[], float] = time.time,
+        stage_evidence: StageEvidencePort | None = None,
     ) -> "SqliteControlStore":
         database_path = Path(path)
         connection: sqlite3.Connection | None = None
@@ -1076,7 +1084,7 @@ class SqliteControlStore:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute("PRAGMA journal_mode = WAL")
-            store = cls(connection, database_path, clock=clock)
+            store = cls(connection, database_path, clock=clock, stage_evidence=stage_evidence)
             store._migrate()
             store._schema_version = CURRENT_SCHEMA_VERSION
             return store
@@ -1343,6 +1351,34 @@ class SqliteControlStore:
                 from agent_core.operator_controls import MIGRATION
                 for statement in _sql_statements(MIGRATION):self._connection.execute(statement)
                 self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)",(31,self._now()))
+            if version < 32:
+                for statement in _sql_statements(stage_storage.SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (32,self._now()))
+            if version < 33:
+                for statement in _sql_statements(stage_storage.FACT_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (33,self._now()))
+            if version < 34:
+                for statement in _sql_statements(stage_storage.CANDIDATE_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (34,self._now()))
+            if version < 35:
+                for statement in _sql_statements(stage_storage.FACT_BATCH_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (35,self._now()))
+            if version < 36:
+                for statement in _sql_statements(stage_storage.REVIEW_QUEUE_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (36,self._now()))
+            if version < 37:
+                for statement in _sql_statements(stage_storage.ASYNC_REVIEW_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (37,self._now()))
+            if version < 38:
+                for statement in _sql_statements(stage_storage.PLAN_BINDING_SCHEMA):
+                    self._connection.execute(statement)
+                self._connection.execute("INSERT INTO schema_versions(version,applied_at) VALUES (?,?)", (38,self._now()))
             if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise StorageError("SQLite migration left invalid foreign keys")
             self._connection.commit()
@@ -2869,12 +2905,20 @@ class SqliteControlStore:
             raise StorageError("D4 operation disappeared while checking disposition")
         return row["unknown_disposition_json"] is not None
 
-    def blocking_d4_operations(self, task_run_id):
-        """Only a currently owned, read-only strategy worker may overlap commits."""
+    def blocking_d4_operations(self, task_run_id, *, tool_resource=None, admitting_stage_review=False):
+        """Process-owned Stage workers are live; all other unfinished work blocks."""
         live = getattr(self, "live_strategy_operation", lambda identity: False)
+        tool = getattr(self, "live_tool_operation", lambda identity: False)
+        model = getattr(self, "live_http_model", lambda identity, resource: False)
+        review = getattr(self, "live_stage_review_operation", lambda identity: False)
+        foreground = getattr(self, "live_stage_foreground_operation", lambda identity: False)
         return tuple(r for r in self.list_d4_unresolved_operations(task_run_id)
                      if not (r.start.category == "review" and r.start.role == "outer_planning"
-                             and live(r.start.operation_id)))
+                             and live(r.start.operation_id))
+                     and not (r.start.category == "tool_dispatch" and tool(r.start.operation_id))
+                     and not review(r.start.operation_id)
+                     and not (admitting_stage_review and foreground(r.start.operation_id))
+                     and not (tool_resource is not None and model(r.start.operation_id, tool_resource)))
 
     def list_d4_unresolved_operations(
         self, task_run_id: str
@@ -2898,7 +2942,7 @@ class SqliteControlStore:
         evidence_sha256: str,
     ) -> None:
         if self._schema_version < 15:
-            raise D4RecoveryRequired("refinement unknown sealing requires schema 15")
+            raise OperationRecoveryRequired("refinement unknown sealing requires schema 15")
         if (
             isinstance(decided_at, bool)
             or not isinstance(decided_at, (int, float))
@@ -2912,13 +2956,13 @@ class SqliteControlStore:
             self._connection.execute("BEGIN IMMEDIATE")
             record = self.load_d4_operation(operation_id)
             if record is None:
-                raise D4OperationConflict("refinement disposition has no operation")
+                raise OperationIdentityConflict("refinement disposition has no operation")
             if record.start.category != "refinement":
-                raise D4OperationConflict("only refinement unknown may be sealed")
+                raise OperationIdentityConflict("only refinement unknown may be sealed")
             if record.completion is not None:
-                raise D4RecoveryRequired("known refinement result cannot be sealed")
+                raise OperationRecoveryRequired("known refinement result cannot be sealed")
             if decided_at < record.start.started_at:
-                raise D4OperationConflict("refinement disposition precedes operation")
+                raise OperationIdentityConflict("refinement disposition precedes operation")
             payload: dict[str, object] = {
                 "disposition": "sealed_not_applied",
                 "operation_id": record.start.operation_id,
@@ -2940,7 +2984,7 @@ class SqliteControlStore:
             existing_raw = row["unknown_disposition_json"]
             if existing_raw is not None:
                 if json.loads(existing_raw) != payload:
-                    raise D4OperationConflict(
+                    raise OperationIdentityConflict(
                         "refinement unknown disposition is immutable"
                     )
             else:
@@ -2954,7 +2998,7 @@ class SqliteControlStore:
             self._rollback_quietly()
             raise
         if not self.is_unknown_refinement_sealed(operation_id):
-            raise D4RecoveryRequired("refinement unknown disposition readback failed")
+            raise OperationRecoveryRequired("refinement unknown disposition readback failed")
 
     def list_d4_operations(self, task_run_id: str) -> tuple[D4OperationRecord, ...]:
         if self._schema_version < 14:
@@ -3027,7 +3071,7 @@ class SqliteControlStore:
         existing = self.load_d4_audit_event(event.event_id)
         if existing is not None:
             if existing != event:
-                raise D4OperationConflict("audit event ID belongs to another payload")
+                raise OperationIdentityConflict("audit event ID belongs to another payload")
             return existing
         self._connection.execute(
             """
@@ -3103,7 +3147,7 @@ class SqliteControlStore:
                 or existing.evidence_sha256 != mutation.request_fingerprint
                 or existing.related_ref != mutation.mutation_id
             ):
-                raise D4OperationConflict("control commit start differs from its D4 audit")
+                raise OperationIdentityConflict("control commit start differs from its D4 audit")
             return existing
         event = self._control_commit_audit_event(
             mutation, "control_commit_started", "known", self._now()
@@ -3186,7 +3230,7 @@ class SqliteControlStore:
             ).fetchone()
             if row is not None:
                 if row["request_fingerprint"] != started.evidence_sha256:
-                    raise D4OperationConflict("control mutation differs from its D4 audit")
+                    raise OperationIdentityConflict("control mutation differs from its D4 audit")
                 resolved = D4AuditEvent(
                     committed_id,
                     task_run_id,
@@ -3214,13 +3258,13 @@ class SqliteControlStore:
         if not isinstance(event, D4AuditEvent):
             raise TypeError("event must be D4AuditEvent")
         if self._d4_policy_and_roles(event.task_run_id) is None:
-            raise D4OperationConflict("audit event requires a registered D4 TaskRun")
+            raise OperationIdentityConflict("audit event requires a registered D4 TaskRun")
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             existing = self.load_d4_audit_event(event.event_id)
             if existing is not None:
                 if existing != event:
-                    raise D4OperationConflict("audit event ID belongs to another payload")
+                    raise OperationIdentityConflict("audit event ID belongs to another payload")
                 self._connection.commit()
                 return existing
             self._insert_d4_audit_event(event)
@@ -3233,10 +3277,13 @@ class SqliteControlStore:
     def _d4_policy_and_roles(
         self, task_run_id: str
     ) -> tuple[D4BudgetPolicy, D1RoleConfig, D1RoleConfig] | None:
+        stage_config = stage_storage.load_config(self, task_run_id)
+        if stage_config is not None:
+            return stage_config.budget, stage_config.outer_role, stage_config.inner_role
         d3_config = self.load_d3_run_config(task_run_id)
         web_config = self.load_d7_web_run_config(task_run_id)
         if d3_config is not None and web_config is not None:
-            raise D4OperationConflict("TaskRun has conflicting D4 configuration owners")
+            raise OperationIdentityConflict("TaskRun has conflicting D4 configuration owners")
         if d3_config is not None:
             if d3_config.d4_budget is None:
                 return None
@@ -3248,11 +3295,11 @@ class SqliteControlStore:
     def d4_budget_usage(self, task_run_id: str) -> D4BudgetUsage:
         configuration = self._d4_policy_and_roles(task_run_id)
         if configuration is None:
-            raise D4OperationConflict("budget usage requires an explicitly registered D4 TaskRun")
+            raise OperationIdentityConflict("budget usage requires an explicitly registered D4 TaskRun")
         budget, _outer_role, _inner_role = configuration
         records = self.list_d4_operations(task_run_id)
         if any(record.start.budget_policy_ref != budget.budget_policy_ref for record in records):
-            raise D4OperationConflict("operation budget differs from frozen configuration")
+            raise OperationIdentityConflict("operation budget differs from frozen configuration")
         counts = tuple(
             (category, sum(record.start.category == category for record in records))
             for category in budget.category_limits
@@ -3268,7 +3315,7 @@ class SqliteControlStore:
     @staticmethod
     def _d4_start_from_d3(start: D3OperationStart, config: D3RunConfig) -> D4OperationStart:
         if config.d4_budget is None:
-            raise D4OperationConflict("D3 operation has no frozen D4 budget")
+            raise OperationIdentityConflict("D3 operation has no frozen D4 budget")
         category = {"outer_model": "planning", "inner_model": "action"}.get(start.category, start.category)
         return D4OperationStart(
             start.operation_id, start.task_run_id, cast(D4OperationCategory, category),
@@ -3281,22 +3328,32 @@ class SqliteControlStore:
         """Admit a start inside the caller's transaction before any dispatch."""
         configuration = self._d4_policy_and_roles(start.task_run_id)
         if configuration is None:
-            raise D4OperationConflict("operation requires an explicitly registered D4 TaskRun")
+            raise OperationIdentityConflict("operation requires an explicitly registered D4 TaskRun")
         budget, outer_role, inner_role = configuration
+        stage_config = stage_storage.load_config(self, start.task_run_id)
+        if start.category == "planning" and start.role != (
+                "inner_action" if stage_config is not None else "outer_planning"):
+            if stage_config is not None:
+                raise stage_storage.StageAdmissionError("planning role differs from the registered framework",
+                    code="stage.planning_role_mismatch")
+            raise OperationIdentityConflict("planning role differs from the registered framework")
         if start.charged and start.category not in budget.category_limits:
-            raise D4OperationConflict("operation category is not enabled in frozen budget")
+            raise OperationIdentityConflict("operation category is not enabled in frozen budget")
         if start.budget_policy_ref != budget.budget_policy_ref:
-            raise D4OperationConflict("operation budget differs from frozen configuration")
+            raise OperationIdentityConflict("operation budget differs from frozen configuration")
         if start.role is not None:
             role = outer_role if start.role == "outer_planning" else inner_role
             if start.role_config_ref != role.role_config_ref:
-                raise D4OperationConflict("model role differs from frozen configuration")
+                if stage_config is not None:
+                    raise stage_storage.StageAdmissionError("model role differs from frozen configuration",
+                        code="stage.model_role_mismatch")
+                raise OperationIdentityConflict("model role differs from frozen configuration")
         existing = self.load_d4_operation(start.operation_id)
         if existing is not None:
             if existing.start != start:
-                raise D4OperationConflict("operation ID belongs to another fixed request")
+                raise OperationIdentityConflict("operation ID belongs to another fixed request")
             if existing.completion is None:
-                raise D4RecoveryRequired("operation result is unknown; do not dispatch again")
+                raise OperationRecoveryRequired("operation result is unknown; do not dispatch again")
             return existing
         from agent_core.operator_controls import check_admission
         check_admission(self,start.task_run_id)
@@ -3306,31 +3363,41 @@ class SqliteControlStore:
             (start.task_run_id,),
         ).fetchone()
         if cancellation is not None:
-            raise D4RecoveryRequired("d4_cancellation_requested")
+            raise OperationRecoveryRequired("d4_cancellation_requested")
         task = self.load_task_run(start.task_run_id)
         if task is None:
-            raise D4OperationConflict("operation requires an explicitly registered D4 TaskRun")
+            raise OperationIdentityConflict("operation requires an explicitly registered D4 TaskRun")
         checkpoint = self._connection.execute(
             "SELECT MAX(sequence) FROM checkpoints WHERE task_run_id = ?",
             (start.task_run_id,),
         ).fetchone()[0]
-        if checkpoint != start.base_checkpoint_sequence:
+        owned_stage_review = stage_config is not None and getattr(self, "admit_stage_review", lambda value: False)(start)
+        if checkpoint != start.base_checkpoint_sequence and not (owned_stage_review and start.base_checkpoint_sequence < checkpoint):
             raise StaleControlStateError("D4 operation was prepared from a stale checkpoint")
         if (
             task.status is not TaskRunStatus.RUNNING
             or not task.started_at <= start.started_at < task.deadline_at
             or self._now() >= task.deadline_at
         ):
-            raise D4OperationConflict("operation requires a running TaskRun before Deadline")
-        if self.blocking_d4_operations(start.task_run_id):
-            raise D4RecoveryRequired("an earlier operation result remains unknown")
+            raise OperationIdentityConflict("operation requires a running TaskRun before Deadline")
+        blockers = self.blocking_d4_operations(start.task_run_id,
+                tool_resource=start.resource_ref if start.category == "tool_dispatch" else None,
+                admitting_stage_review=owned_stage_review)
+        if blockers:
+            raise OperationRecoveryRequired("an earlier operation result remains unconfirmed",
+                operation_id=start.operation_id, blocking_count=len(blockers),
+                blocking_operations=[{"operation_id": r.start.operation_id, "category": r.start.category,
+                    "resource_ref": r.start.resource_ref, "started_at": r.start.started_at}
+                    for r in blockers[:8]])
         records = self.list_d4_operations(start.task_run_id)
+        if stage_config is not None and start.category == "tool_dispatch":
+            stage_storage.validate_tool_start(self, start)
         config = self.load_d3_run_config(start.task_run_id)
-        if start.charged and config.intent_execution_policy != "continuous_v1":
+        if start.charged and stage_config is None and config.intent_execution_policy != "continuous_v1":
             if sum(record.start.charged for record in records) >= budget.total:
-                raise D4BudgetExhausted("D4 total operation-start budget exhausted")
+                raise OperationBudgetExhausted("D4 total operation-start budget exhausted")
             if sum(record.start.category == start.category for record in records) >= getattr(budget, start.category):
-                raise D4BudgetExhausted(f"D4 {start.category} budget exhausted")
+                raise OperationBudgetExhausted(f"D4 {start.category} budget exhausted")
         self._connection.execute(
             "INSERT INTO d4_operations(operation_id, task_run_id, category, resource_ref, charged, start_json) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -3342,12 +3409,12 @@ class SqliteControlStore:
     def _d4_companion_for_d3(self, record: D3OperationRecord) -> D4OperationRecord | None:
         config = self.load_d3_run_config(record.start.task_run_id)
         if config is None:
-            raise D3OperationConflict("operation requires frozen D3 configuration")
+            raise ExecutionStateConflict("operation requires frozen D3 configuration")
         if config.d4_budget is None:
             return None
         companion = self.load_d4_operation(record.start.operation_id)
         if companion is None or companion.start != self._d4_start_from_d3(record.start, config):
-            raise D4OperationConflict("D3 operation differs from its D4 admission")
+            raise OperationIdentityConflict("D3 operation differs from its D4 admission")
         if (
             companion.completion != (
                 D4OperationCompletion(**asdict(record.completion))
@@ -3355,7 +3422,7 @@ class SqliteControlStore:
             )
             or companion.application_ref != record.application_ref
         ):
-            raise D4OperationConflict("D3 operation differs from its D4 completion or application")
+            raise OperationIdentityConflict("D3 operation differs from its D4 completion or application")
         return companion
 
     def begin_d4_operation(self, start: D4OperationStart) -> D4OperationRecord | None:
@@ -3373,13 +3440,13 @@ class SqliteControlStore:
     def _complete_d4_operation(self, completion: D4OperationCompletion) -> D4OperationRecord:
         record = self.load_d4_operation(completion.operation_id)
         if record is None:
-            raise D4OperationConflict("completion has no admitted operation")
+            raise OperationIdentityConflict("completion has no admitted operation")
         if self.is_unknown_refinement_sealed(completion.operation_id):
-            raise D4RecoveryRequired("sealed refinement response cannot be completed")
+            raise OperationRecoveryRequired("sealed refinement response cannot be completed")
         if completion.finished_at < record.start.started_at:
-            raise D4OperationConflict("completion precedes operation start")
+            raise OperationIdentityConflict("completion precedes operation start")
         if record.completion is not None and record.completion != completion:
-            raise D4OperationConflict("known operation completion is immutable")
+            raise OperationIdentityConflict("known operation completion is immutable")
         if record.completion is None:
             self._connection.execute(
                 "UPDATE d4_operations SET completion_json = ? WHERE operation_id = ?",
@@ -3412,7 +3479,7 @@ class SqliteControlStore:
             self.complete_d3_operation(D3OperationCompletion(**asdict(completion)))
             record = self.load_d4_operation(completion.operation_id)
             if record is None:
-                raise D4OperationConflict("D3 operation has no D4 admission")
+                raise OperationIdentityConflict("D3 operation has no D4 admission")
             return record
         try:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -3426,11 +3493,11 @@ class SqliteControlStore:
     def _mark_d4_operation_applied(self, operation_id: str, application_ref: str) -> D4OperationRecord:
         record = self.load_d4_operation(operation_id)
         if record is None or record.completion is None:
-            raise D4RecoveryRequired("unknown operation cannot be applied")
+            raise OperationRecoveryRequired("unknown operation cannot be applied")
         if record.completion.result_kind != "completed":
-            raise D4OperationConflict("unsuccessful operation cannot be applied")
+            raise OperationIdentityConflict("unsuccessful operation cannot be applied")
         if record.application_ref is not None and record.application_ref != application_ref:
-            raise D4OperationConflict("operation application is immutable")
+            raise OperationIdentityConflict("operation application is immutable")
         self._connection.execute(
             "UPDATE d4_operations SET application_ref = ? WHERE operation_id = ?",
             (application_ref, operation_id),
@@ -3444,7 +3511,7 @@ class SqliteControlStore:
             self.mark_d3_operation_applied(operation_id, application_ref)
             record = self.load_d4_operation(operation_id)
             if record is None:
-                raise D4OperationConflict("D3 operation has no D4 admission")
+                raise OperationIdentityConflict("D3 operation has no D4 admission")
             return record
         try:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -3463,16 +3530,16 @@ class SqliteControlStore:
             existing = self.load_d3_operation(start.operation_id)
             if existing is not None:
                 if existing.start != start:
-                    raise D3OperationConflict("operation ID belongs to another fixed request")
+                    raise ExecutionStateConflict("operation ID belongs to another fixed request")
                 if existing.completion is None:
-                    raise D3RecoveryRequired("operation result is unknown; do not dispatch again")
+                    raise ExecutionRecoveryRequired("operation result is unknown; do not dispatch again")
                 self._d4_companion_for_d3(existing)
                 self._connection.commit()
                 return existing
             task = self.load_task_run(start.task_run_id)
             config = self.load_d3_run_config(start.task_run_id)
             if task is None or config is None:
-                raise D3OperationConflict("operation requires an explicitly registered D3 TaskRun")
+                raise ExecutionStateConflict("operation requires an explicitly registered D3 TaskRun")
             checkpoint = self._connection.execute(
                 "SELECT MAX(sequence) FROM checkpoints WHERE task_run_id = ?",
                 (start.task_run_id,),
@@ -3484,30 +3551,30 @@ class SqliteControlStore:
                 or not task.started_at <= start.started_at < task.deadline_at
                 or self._now() >= task.deadline_at
             ):
-                raise D3OperationConflict("operation requires a running TaskRun before Deadline")
+                raise ExecutionStateConflict("operation requires a running TaskRun before Deadline")
             if start.role is not None:
                 role = config.outer_role if start.role == "outer_planning" else config.inner_role
                 if start.role_config_ref != role.role_config_ref:
-                    raise D3OperationConflict("model role differs from frozen configuration")
+                    raise ExecutionStateConflict("model role differs from frozen configuration")
             records = self.list_d3_operations(start.task_run_id)
             if any(record.completion is None for record in records):
-                raise D3RecoveryRequired("an earlier operation result remains unknown")
+                raise ExecutionRecoveryRequired("an earlier operation result remains unknown")
             if any(
                 record.start.category == start.category
                 and record.start.resource_ref == start.resource_ref
                 and start.category not in {"outer_model", "inner_model"}
                 for record in records
             ):
-                raise D3OperationConflict("resource already has a fixed operation ID")
+                raise ExecutionStateConflict("resource already has a fixed operation ID")
             if config.d4_budget is not None:
                 companion = self._begin_d4_operation(self._d4_start_from_d3(start, config))
                 if companion is not None:
-                    raise D4OperationConflict("D4 admission has no matching D3 operation")
+                    raise OperationIdentityConflict("D4 admission has no matching D3 operation")
             limit = D3_CATEGORY_LIMITS[start.category]
             if limit is not None and sum(
                 record.start.category == start.category for record in records
             ) >= limit:
-                raise D3BudgetExhausted(f"D3 {start.category} budget exhausted")
+                raise ExecutionBudgetExhausted(f"D3 {start.category} budget exhausted")
             self._connection.execute(
                 "INSERT INTO d3_operations(operation_id, task_run_id, category, resource_ref, start_json) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -3527,12 +3594,12 @@ class SqliteControlStore:
             self._connection.execute("BEGIN IMMEDIATE")
             record = self.load_d3_operation(completion.operation_id)
             if record is None:
-                raise D3OperationConflict("completion has no admitted operation")
+                raise ExecutionStateConflict("completion has no admitted operation")
             companion = self._d4_companion_for_d3(record)
             if completion.finished_at < record.start.started_at:
-                raise D3OperationConflict("completion precedes operation start")
+                raise ExecutionStateConflict("completion precedes operation start")
             if record.completion is not None and record.completion != completion:
-                raise D3OperationConflict("known operation completion is immutable")
+                raise ExecutionStateConflict("known operation completion is immutable")
             if record.completion is None:
                 self._connection.execute(
                     "UPDATE d3_operations SET completion_json = ? WHERE operation_id = ?",
@@ -3553,12 +3620,12 @@ class SqliteControlStore:
             self._connection.execute("BEGIN IMMEDIATE")
             record = self.load_d3_operation(operation_id)
             if record is None or record.completion is None:
-                raise D3RecoveryRequired("unknown operation cannot be applied")
+                raise ExecutionRecoveryRequired("unknown operation cannot be applied")
             companion = self._d4_companion_for_d3(record)
             if record.completion.result_kind != "completed":
-                raise D3OperationConflict("unsuccessful operation cannot be applied")
+                raise ExecutionStateConflict("unsuccessful operation cannot be applied")
             if record.application_ref is not None and record.application_ref != application_ref:
-                raise D3OperationConflict("operation application is immutable")
+                raise ExecutionStateConflict("operation application is immutable")
             self._connection.execute(
                 "UPDATE d3_operations SET application_ref = ? WHERE operation_id = ?",
                 (application_ref, operation_id),
@@ -4136,7 +4203,7 @@ class SqliteControlStore:
         ):
             raise StorageError("Process_Fact requires accepted, unapplied, bound D5 evidence")
         if self.blocking_d4_operations(mutation.task_run_id):
-            raise D4RecoveryRequired("D5 cannot apply while other outcomes are unknown")
+            raise OperationRecoveryRequired("D5 cannot apply while other outcomes are unknown")
 
     def _save_d5_mutation(self, mutation: ControlMutation, event_sequence: int) -> None:
         if mutation.operation != "append_process_fact":
@@ -4153,6 +4220,10 @@ class SqliteControlStore:
         self._mark_d4_operation_applied(fact.model_request_id, fact.process_fact_id)
 
     def _validate_d7_mutation(self, mutation: ControlMutation) -> None:
+        if mutation.d7 is not None and self.load_stage_run_config(mutation.task_run_id) is not None:
+            from agent_core.stage_storage import validate_goal_mutation
+            validate_goal_mutation(self, mutation)
+            return
         metadata = mutation.d7
         if metadata is not None and metadata.run_config is not None:
             config = metadata.run_config
@@ -4214,7 +4285,7 @@ class SqliteControlStore:
         ):
             raise StorageError("D7 lifecycle requires one immutable TaskRun update")
         if self.blocking_d4_operations(mutation.task_run_id):
-            raise D4RecoveryRequired("D7 feedback cannot apply with unresolved operations")
+            raise OperationRecoveryRequired("D7 feedback cannot apply with unresolved operations")
 
         if mutation.operation == "register_d7_candidate":
             candidate = metadata.candidate
@@ -5477,6 +5548,7 @@ class SqliteControlStore:
             self._validate_d3_mutation(mutation)
             self._validate_d5_mutation(mutation)
             self._validate_d8_mutation(mutation)
+            stage_change = stage_storage.validate(self, mutation)
             self._validate_existing_owners(mutation)
             self._apply_state_changes(
                 mutation,
@@ -5490,6 +5562,7 @@ class SqliteControlStore:
             self._save_d8_mutation(mutation, event_sequence)
             save_handoff_mutation(self, mutation, event_sequence)
             self._save_d7_mutation(mutation, event_sequence)
+            stage_storage.save(self, mutation, stage_change)
             self._insert_event(mutation.event, event_sequence)
             checkpoint = Checkpoint(
                 task_run_id=mutation.task_run_id,
@@ -5551,6 +5624,13 @@ class SqliteControlStore:
         except (IdempotencyConflictError, StaleControlStateError) as exc:
             self._abort_control_commit(mutation, exc)
             raise
+        except stage_storage.StageStateError as exc:
+            self._abort_control_commit(mutation, exc)
+            from qinyuan_core import get_logger
+            get_logger("store").warning("stage.commit_rejected", run=mutation.task_run_id,
+                operation=mutation.mutation_id, category=str(exc.category), code=exc.code, phase="stage_commit",
+                fact_source=exc.context.get("fact_source"))
+            raise
         except StorageError as exc:
             self._abort_control_commit(mutation, exc)
             raise
@@ -5570,6 +5650,24 @@ class SqliteControlStore:
             return tuple(row["task_run_id"] for row in rows)
         except sqlite3.Error as exc:
             raise StorageError("could not read TaskRun ownership index") from exc
+
+    def load_stage_run_config(self, task_run_id: str) -> StageRunConfig | None:
+        return stage_storage.load_config(self, task_run_id)
+
+    def load_turn(self, task_run_id: str, turn_id: str) -> StageTurnSnapshot | None:
+        return stage_storage.load_turn(self, task_run_id, turn_id)
+
+    def list_stage_turns(self, task_run_id: str) -> tuple[StageTurnSnapshot, ...]:
+        return stage_storage.list_turns(self, task_run_id)
+
+    def read_history(self, task_run_id: str, refs: tuple[str, ...]) -> tuple[D8HistoryItem, ...]:
+        return stage_storage.read_history(self, task_run_id, refs)
+
+    def load_stage_session(self, task_run_id: str, session: PlanningSession) -> str | None:
+        return stage_storage.load_session(self, task_run_id, session)
+
+    def list_stage_reviews(self, task_run_id: str) -> tuple[StageQueuedReview, ...]:
+        return stage_storage.list_reviews(self, task_run_id)
 
     def load_task_run(self, task_run_id: str) -> TaskRunSnapshot | None:
         try:
@@ -6022,6 +6120,7 @@ class SqliteControlStore:
             UpsertTaskRun, UpsertTurn, UpsertIntent, UpsertIntentGoal, UpsertPlan, UpsertExecution,
             UpsertFact, AppendPlanValidationRecord, AppendFailureSummary,
             AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion, *D8_CHANGES,
+            StageStateChange,
         ))}
         for ordinal, change in sorted(enumerate(mutation.state_changes), key=lambda entry: order[type(entry[1])]):
             self._validate_change_owner(change, mutation.task_run_id)
@@ -6052,7 +6151,7 @@ class SqliteControlStore:
                 )
             elif isinstance(change, AppendPlanValidationRecord):
                 self._append_plan_validation(change, committed_at)
-            elif isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion, *D8_CHANGES)):
+            elif isinstance(change, (AppendD2ReviewApplication, D3ReviewApplication, D5ProcessFact, D8Conclusion, *D8_CHANGES, StageStateChange)):
                 # Append-only review rows are saved with the same event and checkpoint.
                 pass
             else:
@@ -6103,6 +6202,8 @@ class SqliteControlStore:
         change: StateChange,
         task_run_id: str,
     ) -> None:
+        if isinstance(change, StageStateChange):
+            return  # Validated as one scoped stage command inside this transaction.
         if isinstance(change, UpsertTaskRun):
             if change.task_run_id != task_run_id:
                 raise StorageError("UpsertTaskRun belongs to another TaskRun")

@@ -14,7 +14,7 @@ from agent_core.dual_llm_contracts import D3Authorization, D3RunConfig
 from agent_core.handoff_contracts import D8CapacityPolicy, D8HandoffConfig
 from agent_core.operation_accounting import D8HandoffBudgetPolicy
 from agent_core.conclusion_revision_contracts import D8ChangeRequest
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.turn_contracts import D1RoleConfig
 from test_chain_multi_turn import Clock, Model, ReviewModel, Sandbox, Token, ProcessLoss
 from test_conclusion_review import Inner, FactReviewer, Refinement
@@ -318,7 +318,7 @@ def test_restricted_repair_shares_session_and_counter_but_never_opens_tools(sess
         asyncio.run(case[0].repair_conclusions(actor, str(uuid4()), case[6]))
         assert len(case[2].repair_calls) == 2
     else:
-        with pytest.raises(D3RecoveryRequired, match="d8_progress_" + classification):
+        with pytest.raises(ExecutionRecoveryRequired, match="d8_progress_" + classification):
             asyncio.run(case[0].repair_conclusions(actor, str(uuid4()), case[6]))
         assert len(case[2].repair_calls) == 1
     checks = [json.loads(r.context_summary)["d8_progress"] for r in case[3].calls
@@ -372,11 +372,11 @@ def test_next_intent_suggestion_is_only_registered_by_outer_planning(session_cas
 
 def test_progress_budget_exhaustion_never_allows_fifth_decision(session_case, monkeypatch):
     case = session_case
-    from agent_core.operation_accounting import D4BudgetExhausted
+    from agent_core.operation_accounting import OperationBudgetExhausted
     original = case[0].store.begin_d4_operation
     def limit(start):
         if start.category == "review" and len(case[0].sessions.records()) >= 4:
-            raise D4BudgetExhausted("review")
+            raise OperationBudgetExhausted("review")
         return original(start)
     monkeypatch.setattr(case[0].store, "begin_d4_operation", limit)
     run(case)

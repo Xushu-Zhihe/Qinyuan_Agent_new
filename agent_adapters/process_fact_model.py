@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.modeling import ModelError
 from agent_core.review_contracts import D2ModelFailure, D2ModelResponse
 
@@ -35,7 +35,7 @@ class D5RedactingModel:
         if not self.enabled:
             return self.adapter.invoke(request, *args)
         if not self.configured:
-            raise D3RecoveryRequired("d5_redaction_configuration_unavailable")
+            raise ExecutionRecoveryRequired("d5_redaction_configuration_unavailable")
         safe_request = self.redactor.redact_model_input(request)
         result = self.adapter.invoke(safe_request, *args)
         if (self.preserve_conclusion_change and isinstance(result, dict)

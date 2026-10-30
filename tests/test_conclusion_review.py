@@ -392,7 +392,7 @@ def test_corrupt_saved_review_does_not_apply_or_recall_model(case, monkeypatch):
 
 
 def test_all_nine_limits_sum_to_56_and_stay_charged_after_reopen(case):
-    from agent_core.operation_accounting import D4BudgetExhausted, D4OperationCompletion, D4OperationStart
+    from agent_core.operation_accounting import OperationBudgetExhausted, D4OperationCompletion, D4OperationStart
     app = case[0]
     limits = app.config.d4_budget.category_limits
     assert sum(limits.values()) == app.config.d4_budget.total
@@ -411,7 +411,7 @@ def test_all_nine_limits_sum_to_56_and_stay_charged_after_reopen(case):
     assert before.total_used == sum(limits.values()) and dict(before.category_counts) == limits
     reopen(case)
     assert case[0].store.d4_budget_usage(case[7]) == before
-    with pytest.raises(D4BudgetExhausted):
+    with pytest.raises(OperationBudgetExhausted):
         case[0].store.begin_d4_operation(replace(start, operation_id=str(uuid4())))
     assert not case[3].calls and not case[2].calls
 

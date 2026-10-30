@@ -10,7 +10,7 @@ import pytest
 from agent_adapters.handoff_evidence import FileD8HandoffEvidence
 from agent_adapters.web.http_adapter import D7HttpWireResponse
 from agent_adapters.web.task_result import snapshot_v3_task_result
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.handoff_contracts import handoff_json
 from agent_core.output_contracts import D8OutputRequest
 from agent_core.modeling import ModelError, ModelErrorKind
@@ -28,7 +28,7 @@ def test_capacity_projection_ignores_old_states_and_checks_owner(tmp_path):
     evidence.save("pause", str(uuid4()), receipt)
     assert evidence.capacity_block(task, 4) == receipt
     assert evidence.capacity_block(task, 5) is None
-    with pytest.raises(D3RecoveryRequired, match="owner_changed"):
+    with pytest.raises(ExecutionRecoveryRequired, match="owner_changed"):
         evidence.capacity_block(str(uuid4()), 4)
 
 
@@ -123,7 +123,7 @@ def test_full_request_rejection_organizes_below_history_threshold_and_continues(
     original_read = c.app.handoff.evidence.read
     with monkeypatch.context() as patch:
         patch.setattr(c.app.handoff.evidence,"read",lambda kind,key: altered if kind=="handoff" and key==record.evidence_ref else original_read(kind,key))
-        with pytest.raises(D3RecoveryRequired,match="summary_coverage_binding_changed"):
+        with pytest.raises(ExecutionRecoveryRequired,match="summary_coverage_binding_changed"):
             c.app.handoff.validate_mutation(SimpleNamespace(state_changes=(replace(record,evidence_sha256=conclusion_digest(altered)),)),
                 SimpleNamespace(latest_checkpoint=SimpleNamespace(sequence=record.base_checkpoint_sequence)))
     inner = next(e.request for e in c.exploration_envelopes if e.output_contract["stage"] == "inner_plan")

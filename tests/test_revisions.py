@@ -11,10 +11,10 @@ from agent_adapters.multi_turn_application import D3Application
 from agent_adapters.handoff_evidence import FakeUnicodeCapacity
 from agent_core.conclusion_revision_contracts import D8ChangeRequest, D8ConclusionChange
 from agent_core.contracts import TaskRequest
-from agent_core.dual_llm_contracts import D3Authorization, D3RecoveryRequired, D3RunConfig
+from agent_core.dual_llm_contracts import D3Authorization, ExecutionRecoveryRequired, D3RunConfig
 from agent_core.handoff_contracts import D8CapacityPolicy, D8HandoffConfig
 from agent_core.modeling import ModelError, ModelErrorKind
-from agent_core.operation_accounting import D4RecoveryRequired, D8HandoffBudgetPolicy
+from agent_core.operation_accounting import OperationRecoveryRequired, D8HandoffBudgetPolicy
 from agent_core.turn_contracts import D1RoleConfig
 from test_handoff import HandoffModel
 from test_conclusion_review import Inner, FactReviewer, Refinement
@@ -175,7 +175,7 @@ def test_verified_correction_keeps_old_fact_and_blocks_parent_until_goal_reappro
     assert tuple(asdict(f) for f in c[0].state.facts) == old_bytes
     assert len(c[3].command_calls) == before_tools
     assert c[0].revisions._dirty_turns() == ()
-    with pytest.raises(D3RecoveryRequired, match="support"):
+    with pytest.raises(ExecutionRecoveryRequired, match="support"):
         c[0]._check_dispatch()
     parent = next(i for i in c[0].state.intents if i.status.value == "succeeded")
     repair(c, action(c, "replace_support", [old.fact_id], replacement_ref=new_ref,
@@ -210,7 +210,7 @@ def test_withdraw_restore_appends_new_version_and_requires_support_reapproval(re
     repair(c, action(c, "withdraw", [root]))
     withdrawn = next(i for i in history(c) if i.record_id == root)
     assert withdrawn.effective_ref is None and withdrawn.effective_version_id is None
-    with pytest.raises(D3RecoveryRequired, match="support"):
+    with pytest.raises(ExecutionRecoveryRequired, match="support"):
         c[0]._check_dispatch()
     restored = repair(c, action(c, "restore", [root], replacement_ref=original,
                                  reason="The withdrawal concern was resolved by rechecking the saved source."))
@@ -218,7 +218,7 @@ def test_withdraw_restore_appends_new_version_and_requires_support_reapproval(re
     assert row.current_status == "effective" and row.revision == 3
     assert row.effective_version_id == restored.record_id
     assert c[2].change_calls[-1].prior_changes[0].operation == "withdraw"
-    with pytest.raises(D3RecoveryRequired, match="reapproval"):
+    with pytest.raises(ExecutionRecoveryRequired, match="reapproval"):
         c[0]._check_dispatch()
     parent = next(i for i in c[0].state.intents if i.status.value == "succeeded")
     repair(c, action(c, "replace_support", [root], replacement_ref=original,
@@ -233,7 +233,7 @@ def test_conflict_resolution_different_versions_requires_explanation(revision_ca
     repair(c, action(c, "report_conflict", roots))
     assert all(i.conflict for i in history(c) if i.record_id in roots)
     raw = action(c, "resolve_conflict", roots, resolution="different_scope")
-    with pytest.raises(D3RecoveryRequired, match="explanation"):
+    with pytest.raises(ExecutionRecoveryRequired, match="explanation"):
         repair(c, raw)
     c[2].change_response = lambda req: {"decision": "accept", "reason": "Both scoped observations remain supported.",
                                       "goal_supported": None,
@@ -249,7 +249,7 @@ def test_stale_target_cannot_reuse_an_old_approval(revision_case):
     old = action(c, "withdraw", [root])
     repair(c, old)
     calls = len(c[2].change_calls)
-    with pytest.raises(D3RecoveryRequired, match="head"):
+    with pytest.raises(ExecutionRecoveryRequired, match="head"):
         repair(c, old)
     assert len(c[2].change_calls) == calls
     assert len(c[0].revisions.records()) == 1
@@ -261,11 +261,11 @@ def test_unknown_change_call_never_reissues_after_reopen(revision_case):
     def unknown(request):
         raise RuntimeError("Fake lost provider result")
     c[1].responses.append(unknown)
-    with pytest.raises((D3RecoveryRequired, D4RecoveryRequired), match="unknown"):
+    with pytest.raises((ExecutionRecoveryRequired, OperationRecoveryRequired), match="unknown"):
         asyncio.run(c[0].repair_conclusions(c[8], request_id, c[5]))
     before = len(c[1].change_calls)
     reopen(c)
-    with pytest.raises((D3RecoveryRequired, D4RecoveryRequired), match="unknown"):
+    with pytest.raises((ExecutionRecoveryRequired, OperationRecoveryRequired), match="unknown"):
         asyncio.run(c[0].repair_conclusions(c[8], request_id, c[5]))
     assert len(c[1].change_calls) == before
 
@@ -274,7 +274,7 @@ def test_repair_entry_cannot_dispatch_probe_and_only_corrects_format_once(revisi
     c = revision_case
     before = len(c[3].command_calls)
     c[1].responses.extend([{"kind": "probe"}, {"kind": "probe"}])
-    with pytest.raises(D3RecoveryRequired, match="model_invalid"):
+    with pytest.raises(ExecutionRecoveryRequired, match="model_invalid"):
         asyncio.run(c[0].repair_conclusions(c[8], str(uuid4()), c[5]))
     assert len(c[1].change_calls) == 2
     assert len(c[3].command_calls) == before
@@ -317,7 +317,7 @@ def test_resolving_one_pair_does_not_release_another_conflict(revision_case):
     assert views[a].conflict and views[d].conflict
     assert views[b].current_status == "withdrawn" and not views[b].conflict
     assert views[a].effective_version_id is None
-    with pytest.raises(D3RecoveryRequired):
+    with pytest.raises(ExecutionRecoveryRequired):
         c[0]._check_dispatch()
 
 
@@ -330,7 +330,7 @@ def test_explicit_dependency_needs_separate_approval_from_parent_support(revisio
     repair(c, action(c, "correct", [a.fact_id], replacement_ref=new_ref))
     repair(c, action(c, "replace_support", [a.fact_id], replacement_ref=new_ref,
                      relation_kind="parent_support", relation_owner_id=parent.intent_id))
-    with pytest.raises(D3RecoveryRequired, match="binding"):
+    with pytest.raises(ExecutionRecoveryRequired, match="binding"):
         c[0]._check_dispatch()
     repair(c, action(c, "replace_support", [a.fact_id], replacement_ref=new_ref,
                      relation_kind="intent_dependency", relation_owner_id=c[8]))
@@ -384,7 +384,7 @@ def test_saved_change_survives_fault_without_recalling_models(revision_case, mon
     identity = str(uuid4())
     raw = action(c, "withdraw", [app.state.facts[0].fact_id])
     before_checkpoint = app.state.latest_checkpoint.sequence
-    with pytest.raises((StorageError, D3RecoveryRequired)):
+    with pytest.raises((StorageError, ExecutionRecoveryRequired)):
         repair(c, raw, identity)
     assert fired
     inner_count, reviewer_count = len(c[1].change_calls), len(c[2].change_calls)
@@ -409,7 +409,7 @@ def test_stoppage_during_change_review_never_applies_approval(revision_case, sto
             c[4].now = c[0].state.task_run.deadline_at + 1
         return {"decision": "accept", "reason": "Late Fake approval.", "goal_supported": None, "scope_explanation": None}
     c[2].change_response = stopped
-    with pytest.raises(D3RecoveryRequired, match="stale"):
+    with pytest.raises(ExecutionRecoveryRequired, match="stale"):
         repair(c, action(c, "withdraw", [root]))
     assert not c[0].revisions.records()
     assert next(i for i in history(c) if i.record_id == root).current_status == "effective"
@@ -438,7 +438,7 @@ def test_invalid_verified_text_correction_is_refused_before_review(revision_case
     root = c[0].state.facts[0].fact_id
     before = len(c[2].change_calls)
     ref = next(i.ref for i in history(c) if i.record_id == root)
-    with pytest.raises(D3RecoveryRequired, match="text_cannot_create_fact"):
+    with pytest.raises(ExecutionRecoveryRequired, match="text_cannot_create_fact"):
         repair(c, action(c, "correct", [root], content="A model-only fact claim.", evidence_refs=[ref]))
     assert len(c[2].change_calls) == before and not c[0].revisions.records()
 
@@ -450,7 +450,7 @@ def test_parent_replacement_requires_explicit_original_goal_support(revision_cas
     new_ref = next(i.ref for i in history(c) if i.record_id == b.fact_id)
     c[2].change_response = lambda req: {"decision": "accept", "reason": "The Fact itself is verified.",
                                       "goal_supported": False, "scope_explanation": None}
-    with pytest.raises(D3RecoveryRequired, match="original_goal"):
+    with pytest.raises(ExecutionRecoveryRequired, match="original_goal"):
         repair(c, action(c, "replace_support", [a.fact_id], replacement_ref=new_ref,
                          relation_kind="parent_support", relation_owner_id=parent.intent_id))
     assert not c[0].revisions.records()
@@ -480,18 +480,18 @@ def test_corrupt_change_evidence_never_falls_back_to_old_effective_version(revis
     path = c[0].revisions.evidence.records._path("d8-handoff-handoff", row.evidence_ref)
     path.write_bytes(b"{broken")
     before = len(c[1].change_calls)
-    with pytest.raises(D3RecoveryRequired, match="unavailable"):
+    with pytest.raises(ExecutionRecoveryRequired, match="unavailable"):
         history(c)
     assert len(c[1].change_calls) == before
 
 
 def test_foreign_actor_and_foreign_replacement_are_refused(revision_case):
     c = revision_case
-    with pytest.raises(D3RecoveryRequired, match="actor_scope"):
+    with pytest.raises(ExecutionRecoveryRequired, match="actor_scope"):
         asyncio.run(c[0].repair_conclusions(str(uuid4()), str(uuid4()), c[5]))
     before = len(c[2].change_calls)
     fake = "verified_fact:" + str(uuid4()) + ":" + "0" * 64
-    with pytest.raises(D3RecoveryRequired, match="replacement_unavailable"):
+    with pytest.raises(ExecutionRecoveryRequired, match="replacement_unavailable"):
         repair(c, action(c, "correct", [c[0].state.facts[0].fact_id], replacement_ref=fake))
     assert len(c[2].change_calls) == before and not c[0].revisions.records()
 
@@ -548,14 +548,14 @@ def test_repair_refuses_missing_configuration_before_admission(revision_case, mi
     else:
         c[2].role_config = c[1].role_config
     before = c[0].store.d4_budget_usage(c[7])
-    with pytest.raises(D3RecoveryRequired, match="configuration|role"):
+    with pytest.raises(ExecutionRecoveryRequired, match="configuration|role"):
         asyncio.run(c[0].repair_conclusions(c[8], str(uuid4()), c[5]))
     assert c[0].store.d4_budget_usage(c[7]) == before
     assert not c[1].change_calls and not c[2].change_calls
 
 
 def test_revision_review_shares_eight_start_limit_and_never_gains_budget_on_reopen(revision_case):
-    from agent_core.operation_accounting import D4BudgetExhausted, D4OperationStart, D4OperationCompletion
+    from agent_core.operation_accounting import OperationBudgetExhausted, D4OperationStart, D4OperationCompletion
     c = revision_case
     counts = dict(c[0].store.d4_budget_usage(c[7]).category_counts)
     for _ in range(8 - counts.get("fact_review", 0)):
@@ -566,12 +566,12 @@ def test_revision_review_shares_eight_start_limit_and_never_gains_budget_on_reop
             "outer_planning", c[0].config.outer_role.role_config_ref))
         c[0].store.complete_d4_operation(D4OperationCompletion(identity, c[4](), "rejected", identity, "0" * 64))
     request_id = str(uuid4())
-    with pytest.raises(D4BudgetExhausted):
+    with pytest.raises(OperationBudgetExhausted):
         repair(c, action(c, "withdraw", [c[0].state.facts[0].fact_id]), request_id)
     assert not c[2].change_calls
     calls = len(c[1].change_calls)
     reopen(c)
-    with pytest.raises(D4BudgetExhausted):
+    with pytest.raises(OperationBudgetExhausted):
         asyncio.run(c[0].repair_conclusions(c[8], request_id, c[5]))
     assert len(c[1].change_calls) == calls
     assert dict(c[0].store.d4_budget_usage(c[7]).category_counts)["fact_review"] == 8
@@ -584,7 +584,7 @@ def test_withdraw_current_plan_support_cannot_be_repaired_by_rewriting_plan(revi
     plan = next(p for p in c[0].state.plans if p.intent_id == c[8])
     result = c[0].store.load_d3_plan_result(plan.plan_id)
     repair(c, action(c, "withdraw", [current.fact_id]))
-    with pytest.raises(D3RecoveryRequired, match="conclusion"):
+    with pytest.raises(ExecutionRecoveryRequired, match="conclusion"):
         c[0]._check_dispatch()
     assert c[0].store.load_d3_plan_result(plan.plan_id) == result
     with pytest.raises(ValueError, match="relation"):

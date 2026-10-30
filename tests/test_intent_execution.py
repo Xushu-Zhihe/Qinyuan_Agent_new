@@ -381,7 +381,7 @@ def test_failed_review_requires_saved_observation_not_model_assertion(saved_obse
 
 @pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
 def test_missing_end_review_source_is_not_silently_presented_as_available(http_case, monkeypatch):
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     c = http_case
     install(c, steps=1, stop="failed", no_fact=True)
     assert asyncio.run(c.app.run(c.token)).stop_reason == "search_exhausted"
@@ -389,7 +389,7 @@ def test_missing_end_review_source_is_not_silently_presented_as_available(http_c
     read = c.app.handoff.evidence.read
     monkeypatch.setattr(c.app.handoff.evidence, "read", lambda kind, identity:
         None if kind == "request" and identity == record.model_request_id else read(kind, identity))
-    with pytest.raises(D3RecoveryRequired, match="d22_resolution_request_missing"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d22_resolution_request_missing"):
         c.app.handoff.history()
     assert len(c.sends) == 1
 
@@ -1028,8 +1028,8 @@ def test_insufficient_closure_budget_pauses_without_inventing_an_intent_result(m
     monkeypatch.setattr(execution,"closure_marker",lambda *args:None)
     monkeypatch.setattr(execution,"closure_requirements",lambda *args:dict(action=2,review=2,handoff_summary=2))
     monkeypatch.setattr(execution,"remaining_budget",lambda *args:dict(action=1,review=2,handoff_summary=2))
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
-    with pytest.raises(D3RecoveryRequired,match="d22_closure_budget_unavailable"):
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+    with pytest.raises(ExecutionRecoveryRequired,match="d22_closure_budget_unavailable"):
         execution.prepare_closure(app,"intent")
     assert saved=={"budget-stop/intent":{"intent_id":"intent","reason":"d22_closure_budget_unavailable"}}
 
@@ -1413,7 +1413,7 @@ def test_deadline_at_wait_boundary_commits_terminal_before_resource_cleanup(http
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
 def test_continuous_counts_are_audit_only_but_deadline_still_blocks(http_case):
-    from agent_core.operation_accounting import D4OperationStart, D4OperationCompletion, D4OperationConflict
+    from agent_core.operation_accounting import D4OperationStart, D4OperationCompletion, OperationIdentityConflict
     from agent_core.turn_modeling import stable_id, digest
     c = http_case
     def start(n):
@@ -1428,7 +1428,7 @@ def test_continuous_counts_are_audit_only_but_deadline_still_blocks(http_case):
     assert usage.total_used == c.app.config.d4_budget.total + 1
     assert dict(usage.category_counts)["action"] > c.app.config.d4_budget.category_limits["action"]
     c.clock.now = c.app.state.task_run.deadline_at
-    with pytest.raises(D4OperationConflict):c.app.store.begin_d4_operation(start(999))
+    with pytest.raises(OperationIdentityConflict):c.app.store.begin_d4_operation(start(999))
 
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
@@ -1658,7 +1658,7 @@ def test_identical_continuation_is_reused_but_new_material_is_reviewed(http_case
 @pytest.mark.parametrize('boundary',['receipt','decision'])
 def test_reused_continuation_receipt_recovers_before_apply_and_detects_tampering(http_case,monkeypatch,boundary):
     from test_chain_multi_turn import ProcessLoss
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     c=http_case
     state=install_repeated_resolution(c)
     mark=c.app.store.mark_d3_operation_applied
@@ -1692,7 +1692,7 @@ def test_reused_continuation_receipt_recovers_before_apply_and_detects_tampering
         data=read(kind,key)
         return {**data,'intent_id':'changed'} if kind=='decision' and key==operation.application_ref else data
     monkeypatch.setattr(c.app.handoff.evidence,'read',changed)
-    with pytest.raises(D3RecoveryRequired,match='d22_continuation_reuse_changed'):
+    with pytest.raises(ExecutionRecoveryRequired,match='d22_continuation_reuse_changed'):
         c.app.sessions.validate_record(row,c.app.state)
 
 

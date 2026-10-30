@@ -43,6 +43,7 @@ def _run_state(
         ),
         (_run_state(), 4, "unfinished"),
         (_run_state(task_run_status="awaiting_confirmation"), 4, "unfinished"),
+        (_run_state(task_run_status="assumed_achieved", cleanup_state="confirmed"), 0, "assumed_goal_ended"),
         (
             _run_state(task_run_status="awaiting_external_feedback"),
             4,

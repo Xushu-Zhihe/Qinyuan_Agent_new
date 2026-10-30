@@ -63,11 +63,11 @@ from agent_core.controller import (
 from agent_core.cross_run_artifact_contracts import D6ArtifactReference
 from agent_core.domain import FactStatus, IntentStatus, PlanStatus, TurnStatus
 from agent_core.dual_llm_contracts import (
-    D3BudgetExhausted,
+    ExecutionBudgetExhausted,
     D3OperationCompletion,
     D3OperationStart,
     D3PlanResult,
-    D3RecoveryRequired,
+    ExecutionRecoveryRequired,
     D3ReviewApplication,
     D3ReviewOutput,
     D3RunConfig,
@@ -81,7 +81,7 @@ from agent_core.dual_llm_modeling import (
     D3ModelStage,
     D3OuterContext,
     D3PlanContext,
-    D3ProposalRejected,
+    ExecutionProposalRejected,
     D3SharedArtifactContext,
 )
 from agent_core.fixed_command_gateway import D3FixedCommandGateway, D3FixedCommandPolicy
@@ -96,8 +96,8 @@ from agent_core.modeling import CancellationToken
 from agent_core.multi_turn_control import D3Control
 from agent_core.operation_accounting import (
     D4AuditEvent,
-    D4BudgetExhausted,
-    D4RecoveryRequired,
+    OperationBudgetExhausted,
+    OperationRecoveryRequired,
 )
 from agent_core.process_refinement import ProcessRefinement
 from agent_core.redaction import (
@@ -197,7 +197,7 @@ class _D3ReviewCall:
                 application.output_boundary.evidence.save_review_failure(
                     request, **({"failure": value} if succeeded else {"error": value}))
             except Exception as exc:
-                raise D3RecoveryRequired("d8_review_diagnostic_write_failed") from (value if not succeeded else exc)
+                raise ExecutionRecoveryRequired("d8_review_diagnostic_write_failed") from (value if not succeeded else exc)
         if not succeeded:
             if isinstance(value, (TimeoutError, ConnectionError)):
                 return D2ModelFailure("unknown", "d3_review_call_outcome_unknown")
@@ -515,7 +515,7 @@ class D3Application:
 
     def _validate_process_fact(self, mutation, state) -> None:
         if self.refinement is None:
-            raise D3RecoveryRequired("d5_not_enabled")
+            raise ExecutionRecoveryRequired("d5_not_enabled")
         self.refinement.validate(mutation, state)
 
     def _after_review(self, review_id: str) -> None:
@@ -523,7 +523,7 @@ class D3Application:
             try:
                 self.refinement.after_review(review_id)
             except (D5EvidenceError, OSError, StorageError, CommittedStateReloadError) as exc:
-                raise D3RecoveryRequired("d5_refinement_persistence_recovery_required") from exc
+                raise ExecutionRecoveryRequired("d5_refinement_persistence_recovery_required") from exc
 
     def _id(self, name: str) -> str:
         return stable_id(self.state.task_run.task_run_id, f"d3/{name}")
@@ -536,7 +536,7 @@ class D3Application:
             or self.store.load_d3_run_config(self.state.task_run.task_run_id)
             != self.config
         ):
-            raise D3RecoveryRequired("d3_frozen_role_configuration_changed")
+            raise ExecutionRecoveryRequired("d3_frozen_role_configuration_changed")
 
     def _dispatch_stopped(self) -> bool:
         state = self.state
@@ -557,10 +557,10 @@ class D3Application:
             self.store, "list_d4_unresolved_operations", None
         )
         if not callable(list_unresolved):
-            raise D4RecoveryRequired("d4_operation_ledger_unavailable")
+            raise OperationRecoveryRequired("d4_operation_ledger_unavailable")
         operations = list_unresolved(task_run_id)
         if any(item.start.task_run_id != task_run_id for item in operations):
-            raise D4RecoveryRequired("d4_operation_owner_changed")
+            raise OperationRecoveryRequired("d4_operation_owner_changed")
         return tuple(
             item.start.operation_id
             for item in operations
@@ -587,7 +587,7 @@ class D3Application:
             related_ref,
         )
         if existing is not None and existing != event:
-            raise D4RecoveryRequired("d4_cancellation_intent_binding_changed")
+            raise OperationRecoveryRequired("d4_cancellation_intent_binding_changed")
         self.store.record_d4_audit_event(event)
 
     def _has_cancel_intent(self, task_run_id: str) -> bool:
@@ -659,7 +659,7 @@ class D3Application:
             try:
                 self.refinement.reconcile()
             except (D5EvidenceError, OSError, StorageError, CommittedStateReloadError) as exc:
-                raise D3RecoveryRequired("d5_refinement_persistence_recovery_required") from exc
+                raise ExecutionRecoveryRequired("d5_refinement_persistence_recovery_required") from exc
         for d4_record in self.store.list_d4_operations(task_run_id):
             operation_id = d4_record.start.operation_id
             d3_record = self.store.load_d3_operation(operation_id)
@@ -687,7 +687,7 @@ class D3Application:
                     or evidence.resource_ref != d3_record.start.resource_ref
                     or evidence.role_config_ref != d3_record.start.role_config_ref
                 ):
-                    raise D4RecoveryRequired("d4_model_evidence_binding_changed")
+                    raise OperationRecoveryRequired("d4_model_evidence_binding_changed")
                 self.store.complete_d3_operation(
                     D3OperationCompletion(
                         operation_id,
@@ -715,7 +715,7 @@ class D3Application:
                     or d3_record.start.resource_ref != import_request.sandbox_path
                     or receipt.task_run_id != task_run_id
                 ):
-                    raise D4RecoveryRequired("d4_import_evidence_binding_changed")
+                    raise OperationRecoveryRequired("d4_import_evidence_binding_changed")
                 self.store.complete_d3_operation(
                     D3OperationCompletion(
                         operation_id,
@@ -786,7 +786,7 @@ class D3Application:
                     or turn is None
                     or turn_binding is None
                 ):
-                    raise D4RecoveryRequired("d4_tool_evidence_scope_missing")
+                    raise OperationRecoveryRequired("d4_tool_evidence_scope_missing")
                 is_size = (
                     binding.template == "size_then_sha256" and record.step_index == 0
                 )
@@ -795,10 +795,10 @@ class D3Application:
                     _model_request_id, proposal = self.validator._known_action(
                         task_run_id, plan.plan_id, stage
                     )
-                except D3RecoveryRequired as exc:
-                    raise D4RecoveryRequired("d4_tool_action_proposal_missing") from exc
+                except ExecutionRecoveryRequired as exc:
+                    raise OperationRecoveryRequired("d4_tool_action_proposal_missing") from exc
                 if not isinstance(proposal.action, ProbeAction):
-                    raise D4RecoveryRequired("d4_tool_action_proposal_invalid")
+                    raise OperationRecoveryRequired("d4_tool_action_proposal_invalid")
                 artifact = self.workspace.read_artifact(binding.artifact_version_id)
                 claim = artifact.claim
                 expected_script = (
@@ -822,7 +822,7 @@ class D3Application:
                     or action.working_directory != claim.path.rsplit("/", 1)[0]
                     or action.conditions != expected_conditions
                 ):
-                    raise D4RecoveryRequired("d4_tool_action_command_binding_changed")
+                    raise OperationRecoveryRequired("d4_tool_action_command_binding_changed")
                 command_request = SandboxCommandRequest(
                     operation_id,
                     task_run_id,
@@ -846,7 +846,7 @@ class D3Application:
                     )
                     is None
                 ):
-                    raise D4RecoveryRequired("d4_tool_evidence_not_replayable")
+                    raise OperationRecoveryRequired("d4_tool_evidence_not_replayable")
                 self._gateway(turn_binding, binding)._complete_known(
                     command_request, completed
                 )
@@ -859,7 +859,7 @@ class D3Application:
         evidence = self.model_evidence.read(operation_id)
         completion = d3_record.completion
         if evidence is None or completion is None:
-            raise D4RecoveryRequired("d4_plan_application_evidence_missing")
+            raise OperationRecoveryRequired("d4_plan_application_evidence_missing")
         if (
             evidence.task_run_id != task_run_id
             or evidence.base_checkpoint_sequence
@@ -873,7 +873,7 @@ class D3Application:
             or completion.result_kind
             != ("completed" if evidence.outcome == "accepted" else "rejected")
         ):
-            raise D4RecoveryRequired("d4_plan_application_evidence_binding_changed")
+            raise OperationRecoveryRequired("d4_plan_application_evidence_binding_changed")
 
         matches = []
         for plan in self.state.plans:
@@ -883,7 +883,7 @@ class D3Application:
         if not matches:
             return
         if len(matches) != 1:
-            raise D4RecoveryRequired("d4_plan_application_binding_ambiguous")
+            raise OperationRecoveryRequired("d4_plan_application_binding_ambiguous")
         plan, binding = matches[0]
         plans_for_intent = [
             item for item in self.state.plans if item.intent_id == plan.intent_id
@@ -903,14 +903,14 @@ class D3Application:
             or binding.plan_id != plan.plan_id
             or binding.proposal_request_id != operation_id
         ):
-            raise D4RecoveryRequired("d4_plan_application_binding_changed")
+            raise OperationRecoveryRequired("d4_plan_application_binding_changed")
 
         mutation_id = stable_id(
             task_run_id, f"d3/plan/{plan.intent_id}/{ordinal}/register"
         )
         committed = self.store.load_committed_mutation(task_run_id, mutation_id)
         if committed is None:
-            raise D4RecoveryRequired("d4_plan_application_commit_missing")
+            raise OperationRecoveryRequired("d4_plan_application_commit_missing")
         operation = committed.event.details.get("operation")
         entity_ids = committed.event.details.get("entity_ids")
         valid_register = operation == "register_d3_plan" and entity_ids == [
@@ -929,7 +929,7 @@ class D3Application:
             not (valid_register or valid_replan)
             or committed.event.details.get("result") != plan.plan_id
         ):
-            raise D4RecoveryRequired("d4_plan_application_commit_binding_changed")
+            raise OperationRecoveryRequired("d4_plan_application_commit_binding_changed")
 
         audits = self.store.list_d4_audit_events(task_run_id)
         commit_confirmed = any(
@@ -947,16 +947,16 @@ class D3Application:
             for event in audits
         )
         if not commit_confirmed:
-            raise D4RecoveryRequired("d4_plan_application_commit_audit_missing")
+            raise OperationRecoveryRequired("d4_plan_application_commit_audit_missing")
         if not reload_confirmed:
             try:
                 reloaded = self.controller.reload_state()
             except Exception as exc:
-                raise D4RecoveryRequired(
+                raise OperationRecoveryRequired(
                     "d4_plan_application_reload_unconfirmed"
                 ) from exc
             if reloaded.latest_checkpoint.sequence < committed.checkpoint.sequence:
-                raise D4RecoveryRequired("d4_plan_application_reload_stale")
+                raise OperationRecoveryRequired("d4_plan_application_reload_stale")
             if not any(
                 event.category == "control_reload_confirmed"
                 and event.outcome == "known"
@@ -964,7 +964,7 @@ class D3Application:
                 and event.related_ref == checkpoint_ref
                 for event in self.store.list_d4_audit_events(task_run_id)
             ):
-                raise D4RecoveryRequired("d4_plan_application_reload_unconfirmed")
+                raise OperationRecoveryRequired("d4_plan_application_reload_unconfirmed")
         self.store.mark_d3_operation_applied(operation_id, plan.plan_id)
 
     def _check_dispatch(
@@ -979,43 +979,43 @@ class D3Application:
             )
             if stopped is not None:
                 if stopped == "d4_operation_outcome_unknown":
-                    raise D4RecoveryRequired(stopped)
+                    raise OperationRecoveryRequired(stopped)
                 if stopped.endswith("cleanup_unknown"):
                     raise _D4TerminalStop(stopped, cleanup_unknown=True)
                 if self.state.task_run.status is not TaskRunStatus.RUNNING:
                     raise _D4TerminalStop(stopped)
-                raise D3RecoveryRequired(stopped)
+                raise ExecutionRecoveryRequired(stopped)
             if self._bound_task_run_id is not None and self._has_cancel_intent(
                 self._bound_task_run_id
             ):
-                raise D4RecoveryRequired("d4_cancellation_requested")
+                raise OperationRecoveryRequired("d4_cancellation_requested")
         if self.handoff is not None and self.output_boundary is not None:
             from agent_core.intent_execution import pending_adjudication
             if pending_adjudication(self.store, self.handoff.evidence, self.output_boundary.evidence, self.state.task_run.task_run_id):
-                raise D3RecoveryRequired("d22_awaiting_adjudication")
+                raise ExecutionRecoveryRequired("d22_awaiting_adjudication")
         if self.config.intent_execution_policy:
             from agent_core.intent_execution import budget_stop_reason
             reason = budget_stop_reason(self.store, self.handoff.evidence, self.state.task_run.task_run_id)
             if reason is not None:
-                raise D3RecoveryRequired(reason)
+                raise ExecutionRecoveryRequired(reason)
         if self._dispatch_stopped():
-            raise D3RecoveryRequired("d3_dispatch_stopped")
+            raise ExecutionRecoveryRequired("d3_dispatch_stopped")
         if self._d7_task_has_feedback_conflict(self.state.task_run.task_run_id):
-            raise D3RecoveryRequired("d7_feedback_conflict_reconciliation_required")
+            raise ExecutionRecoveryRequired("d7_feedback_conflict_reconciliation_required")
         for application in self.store.list_d3_review_applications(
             self.state.task_run.task_run_id
         ):
             if application.paused_gate:
                 from agent_core.intent_execution import continuous, suspended_calls
                 if continuous(self.config) and application.review_id in suspended_calls(self.store, self.state.task_run.task_run_id):continue
-                raise D3RecoveryRequired(application.pause_reason or "d3_review_paused")
+                raise ExecutionRecoveryRequired(application.pause_reason or "d3_review_paused")
         if self.revisions is not None and not allow_conclusion_repair:
             self.revisions.check_required()
 
     async def repair_conclusions(self, intent_id, request_id, token):
         """Internal, explicit D8-3 maintenance; no tool or completion dispatch."""
         if self.revisions is None:
-            raise D3RecoveryRequired("d8_revision_not_enabled")
+            raise ExecutionRecoveryRequired("d8_revision_not_enabled")
         with run_lock(self.directory):
             previous_token = self._token
             self._token = token
@@ -1074,19 +1074,19 @@ class D3Application:
         committed_source_root: str | None = None
         if self.config.d6_authorization is None:
             if d6_artifacts is not None:
-                raise D3RecoveryRequired("d6_import_not_authorized")
+                raise ExecutionRecoveryRequired("d6_import_not_authorized")
         else:
             if task_run_id is None or task_run_id != self.config.d6_authorization.task_run_id:
-                raise D3RecoveryRequired("d6_task_run_id_required")
+                raise ExecutionRecoveryRequired("d6_task_run_id_required")
             if (
                 not isinstance(d6_artifacts, tuple)
                 or d6_artifacts != self.config.d6_authorization.local_artifacts
                 or not d6_artifacts
                 or len(d6_artifacts) > 2
             ):
-                raise D3RecoveryRequired("d6_start_artifacts_mismatch")
+                raise ExecutionRecoveryRequired("d6_start_artifacts_mismatch")
             if self.d6_artifact_store is None or self.d6_artifact_transfer is None:
-                raise D3RecoveryRequired("d6_import_services_unavailable")
+                raise ExecutionRecoveryRequired("d6_import_services_unavailable")
             if (
                 len(request.target.attachments) != len(d6_artifacts)
                 or any(item.kind != "local_path" for item in request.target.attachments)
@@ -1100,18 +1100,18 @@ class D3Application:
                         manifest.request
                     )
                 except (D6ArtifactImportError, D6ArtifactImportRecoveryRequired) as exc:
-                    raise D3RecoveryRequired(str(exc)) from exc
+                    raise ExecutionRecoveryRequired(str(exc)) from exc
                 if (
                     verified != manifest
                     or manifest.request.target_task_run_id != task_run_id
                     or manifest.request.source != reference
                     or not manifest.request.non_sensitive
                 ):
-                    raise D3RecoveryRequired("d6_import_manifest_binding_changed")
+                    raise ExecutionRecoveryRequired("d6_import_manifest_binding_changed")
                 imports.append(manifest)
             input_root = Path(imports[0].target_path).parent.resolve(strict=True)
             if any(Path(item.target_path).parent.resolve(strict=True) != input_root for item in imports):
-                raise D3RecoveryRequired("d6_import_input_root_changed")
+                raise ExecutionRecoveryRequired("d6_import_input_root_changed")
             request_payload = request.to_dict()
             request_payload["target"]["attachments"] = [
                 Attachment("local_path", Path(item.target_path).name).to_dict()
@@ -1120,7 +1120,7 @@ class D3Application:
             committed_request = TaskRequest.from_dict(request_payload)
             committed_source_root = str(input_root)
         if self.config.d5_enabled and not self._redaction_configured:
-            raise D3RecoveryRequired("d5_redaction_configuration_unavailable")
+            raise ExecutionRecoveryRequired("d5_redaction_configuration_unavailable")
         if self.config.d5_enabled:
             if not isinstance(request, TaskRequest):
                 raise TaskRequestError("request must be a TaskRequest")
@@ -1151,7 +1151,7 @@ class D3Application:
             or self.inner.adapter.role_config != self.config.inner_role
             or self.review_model.role_config != self.config.outer_role
         ):
-            raise D3RecoveryRequired("d3_adapter_role_configuration_changed")
+            raise ExecutionRecoveryRequired("d3_adapter_role_configuration_changed")
         committed = self.controller.start(
             committed_request,
             committed_request.model_backend or ModelBackend.CODEX_CLI,
@@ -1166,18 +1166,18 @@ class D3Application:
     async def resume(self, task_run_id: str, token: CancellationToken) -> D3Result:
         """Attach to a committed D4 run and resume only from durable evidence."""
         if self.config.d4_budget is None:
-            raise D3RecoveryRequired("d4_resume_requires_explicit_budget")
+            raise ExecutionRecoveryRequired("d4_resume_requires_explicit_budget")
         with run_lock(self.directory):
             if self._bound_task_run_id is None:
                 self.controller.attach(task_run_id)
                 self._bound_task_run_id = task_run_id
             elif self._bound_task_run_id != task_run_id:
-                raise D3RecoveryRequired("d3_application_already_bound_to_another_task")
+                raise ExecutionRecoveryRequired("d3_application_already_bound_to_another_task")
             else:
                 self.controller.reload_state()
             frozen = self.store.load_d3_run_config(task_run_id)
             if frozen != self.config:
-                raise D3RecoveryRequired("d3_frozen_run_configuration_changed")
+                raise ExecutionRecoveryRequired("d3_frozen_run_configuration_changed")
             if self.config.d5_enabled and not self._redaction_configured:
                 return self.result("d5_redaction_configuration_unavailable", recovery_required=True)
             self.store.reconcile_d4_control_commit_audit(task_run_id)
@@ -1193,7 +1193,7 @@ class D3Application:
                     and self.clock() < self.state.task_run.deadline_at):
                 try:
                     await self.answers.reconcile_known(token)
-                except (D3RecoveryRequired, D3ProposalRejected) as exc:
+                except (ExecutionRecoveryRequired, ExecutionProposalRejected) as exc:
                     return self.result(str(exc), recovery_required=True)
                 except (StorageError, OSError):
                     return self.result('d9_candidate_persistence_recovery_required', recovery_required=True)
@@ -1208,20 +1208,20 @@ class D3Application:
             if token.is_cancelled:
                 try:
                     self._persist_cancel_intent()
-                except D4RecoveryRequired as exc:
+                except OperationRecoveryRequired as exc:
                     return self.result(str(exc), recovery_required=True)
             try:
                 self._reconcile_known_d4_operations()
-            except D4RecoveryRequired as exc:
+            except OperationRecoveryRequired as exc:
                 return self.result(str(exc), recovery_required=True)
             if isinstance(self.review_ledger, D4ReviewLedger):
                 try:
                     self.review_ledger.reconcile_known_completions(task_run_id)
-                except D4RecoveryRequired as exc:
+                except OperationRecoveryRequired as exc:
                     return self.result(str(exc), recovery_required=True)
             try:
                 stopped = self._settle_stoppage()
-            except D4RecoveryRequired as exc:
+            except OperationRecoveryRequired as exc:
                 return self.result(str(exc), recovery_required=True)
             if stopped is not None:
                 return self.result(
@@ -1234,7 +1234,7 @@ class D3Application:
             if self.handoff is not None:
                 try:
                     self.handoff.resume_pending_read_once()
-                except (D3RecoveryRequired, OSError, StorageError) as exc:
+                except (ExecutionRecoveryRequired, OSError, StorageError) as exc:
                     return self.result("d8_local_read_recovery_required", recovery_required=True)
         return await self.run(token)
 
@@ -1259,9 +1259,9 @@ class D3Application:
             self._check_dispatch()
             task = self.state.task_run
             if task.status is not TaskRunStatus.RUNNING:
-                raise D3RecoveryRequired("d7_next_turn_requires_running_task")
+                raise ExecutionRecoveryRequired("d7_next_turn_requires_running_task")
             if not self.state.turns or self.state.turns[-1].status is not TurnStatus.COMPLETED:
-                raise D3RecoveryRequired("d7_next_turn_requires_completed_turn")
+                raise ExecutionRecoveryRequired("d7_next_turn_requires_completed_turn")
             ordinal = len(self.state.turns) + 1
             receipts = await self._import_all(token)
             # The next-turn proposal is scoped by the completed prior Turn and
@@ -1311,29 +1311,29 @@ class D3Application:
                 try:
                     self.controller.attach(task_run_id)
                 except Exception as exc:
-                    raise D3RecoveryRequired(
+                    raise ExecutionRecoveryRequired(
                         f"d7_feedback_attach_failed:{type(exc).__name__}"
                     ) from exc
                 self._bound_task_run_id = task_run_id
             elif self._bound_task_run_id != task_run_id:
-                raise D3RecoveryRequired("d7_feedback_task_run_mismatch")
+                raise ExecutionRecoveryRequired("d7_feedback_task_run_mismatch")
             else:
                 try:
                     self.controller.reload_state()
                 except Exception as exc:
-                    raise D3RecoveryRequired(
+                    raise ExecutionRecoveryRequired(
                         f"d7_feedback_reload_failed:{type(exc).__name__}"
                     ) from exc
             if self.state.task_run.task_run_id != task_run_id:
-                raise D3RecoveryRequired("d7_feedback_task_run_mismatch")
+                raise ExecutionRecoveryRequired("d7_feedback_task_run_mismatch")
             if self.store.load_d3_run_config(task_run_id) != self.config:
-                raise D3RecoveryRequired("d3_frozen_run_configuration_changed")
+                raise ExecutionRecoveryRequired("d3_frozen_run_configuration_changed")
             self._check_role()
             self.controller.apply_external_validation_feedback(feedback)
             self.controller.reload_state()
             candidate = self.store.load_d7_answer_candidate(feedback.candidate_id)
             if candidate is None or candidate.task_run_id != task_run_id:
-                raise D3RecoveryRequired("d7_feedback_candidate_unavailable")
+                raise ExecutionRecoveryRequired("d7_feedback_candidate_unavailable")
             records = self.store.list_d7_validation_feedback(
                 task_run_id, candidate.candidate_id, candidate.evidence_version
             )
@@ -1360,7 +1360,7 @@ class D3Application:
             turn_positions = {item.turn_id: index for index, item in enumerate(turns)}
             rejected_turn_position = turn_positions.get(candidate.turn_id)
             if rejected_turn_position is None:
-                raise D3RecoveryRequired("d7_feedback_candidate_turn_unavailable")
+                raise ExecutionRecoveryRequired("d7_feedback_candidate_turn_unavailable")
             candidates = self.store.list_d7_answer_candidates(task_run_id)
             later_candidates = [
                 item
@@ -1388,7 +1388,7 @@ class D3Application:
         if not later_turns:
             try:
                 await self.register_next_d7_turn(token)
-            except D3RecoveryRequired:
+            except ExecutionRecoveryRequired:
                 self.controller.reload_state()
                 if self._d7_task_has_feedback_conflict(task_run_id):
                     return D7FeedbackApplicationResult(
@@ -1472,29 +1472,29 @@ class D3Application:
         """Cancel a D4 TaskRun unless an admitted external result is still unknown."""
         with run_lock(self.directory):
             if self.config.d4_budget is None:
-                raise D3RecoveryRequired("d4_cancel_requires_explicit_budget")
+                raise ExecutionRecoveryRequired("d4_cancel_requires_explicit_budget")
             target_id = task_run_id or self._bound_task_run_id
             if target_id is None:
-                raise D3RecoveryRequired("d3_cancel_requires_task_run_id")
+                raise ExecutionRecoveryRequired("d3_cancel_requires_task_run_id")
             if self._bound_task_run_id is None:
                 try:
                     self.controller.attach(target_id)
                 except Exception as exc:
-                    raise D3RecoveryRequired(
+                    raise ExecutionRecoveryRequired(
                         f"d3_cancel_attach_failed:{type(exc).__name__}"
                     ) from exc
                 self._bound_task_run_id = target_id
             elif target_id != self._bound_task_run_id:
-                raise D3RecoveryRequired("d3_cancel_task_run_mismatch")
+                raise ExecutionRecoveryRequired("d3_cancel_task_run_mismatch")
             else:
                 try:
                     self.controller.reload_state()
                 except Exception as exc:
-                    raise D3RecoveryRequired(
+                    raise ExecutionRecoveryRequired(
                         f"d3_cancel_reload_failed:{type(exc).__name__}"
                     ) from exc
             if self.store.load_d3_run_config(target_id) != self.config:
-                raise D3RecoveryRequired("d3_frozen_run_configuration_changed")
+                raise ExecutionRecoveryRequired("d3_frozen_run_configuration_changed")
             if self.state.task_run.status not in {
                 TaskRunStatus.RUNNING,
                 TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK,
@@ -1528,7 +1528,7 @@ class D3Application:
                             or stopped.endswith("cleanup_unknown")
                         ),
                     )
-            except (D3RecoveryRequired, D4RecoveryRequired, SandboxCleanupError) as exc:
+            except (ExecutionRecoveryRequired, OperationRecoveryRequired, SandboxCleanupError) as exc:
                 return self.result(
                     f"cancel_recovery_required:{type(exc).__name__}",
                     recovery_required=True,
@@ -1539,33 +1539,33 @@ class D3Application:
         """Explicitly reconcile and retry cleanup for a terminal D4 run."""
         with run_lock(self.directory):
             if self.config.d4_budget is None:
-                raise D3RecoveryRequired("d4_cleanup_requires_explicit_budget")
+                raise ExecutionRecoveryRequired("d4_cleanup_requires_explicit_budget")
             target_id = task_run_id or self._bound_task_run_id
             if target_id is None:
-                raise D3RecoveryRequired("d4_cleanup_requires_task_run_id")
+                raise ExecutionRecoveryRequired("d4_cleanup_requires_task_run_id")
             if self._bound_task_run_id is None:
                 try:
                     self.controller.attach(target_id)
                 except Exception as exc:
-                    raise D3RecoveryRequired(
+                    raise ExecutionRecoveryRequired(
                         f"d4_cleanup_attach_failed:{type(exc).__name__}"
                     ) from exc
                 self._bound_task_run_id = target_id
             elif self._bound_task_run_id != target_id:
-                raise D3RecoveryRequired("d3_application_already_bound_to_another_task")
+                raise ExecutionRecoveryRequired("d3_application_already_bound_to_another_task")
             else:
                 try:
                     self.controller.reload_state()
                 except Exception as exc:
-                    raise D3RecoveryRequired(
+                    raise ExecutionRecoveryRequired(
                         f"d4_cleanup_reload_failed:{type(exc).__name__}"
                     ) from exc
             if self.store.load_d3_run_config(target_id) != self.config:
-                raise D3RecoveryRequired("d3_frozen_run_configuration_changed")
+                raise ExecutionRecoveryRequired("d3_frozen_run_configuration_changed")
             try:
                 self.store.reconcile_d4_control_commit_audit(target_id)
             except Exception as exc:
-                raise D3RecoveryRequired(
+                raise ExecutionRecoveryRequired(
                     f"d4_cleanup_commit_audit_failed:{type(exc).__name__}"
                 ) from exc
             if self.state.task_run.status is TaskRunStatus.RUNNING:
@@ -1574,7 +1574,7 @@ class D3Application:
                 )
             try:
                 self.controller.cleanup_sandbox()
-            except (SandboxCleanupError, D4RecoveryRequired) as exc:
+            except (SandboxCleanupError, OperationRecoveryRequired) as exc:
                 return self.result(
                     f"d4_cleanup_unknown:{type(exc).__name__}",
                     recovery_required=True,
@@ -1642,9 +1642,9 @@ class D3Application:
             self._check_role()
             task = self.state.task_run
             if task.status.value not in {"running", "awaiting_external_feedback"}:
-                raise D3RecoveryRequired("d7_candidate_requires_active_task_run")
+                raise ExecutionRecoveryRequired("d7_candidate_requires_active_task_run")
             if not self.state.turns or self.state.turns[-1].status is not TurnStatus.COMPLETED:
-                raise D3RecoveryRequired("d7_candidate_requires_completed_turn")
+                raise ExecutionRecoveryRequired("d7_candidate_requires_completed_turn")
 
             completed_turn = self.state.turns[-1]
             successful_intents = {
@@ -1670,7 +1670,7 @@ class D3Application:
                 None,
             )
             if execution is None:
-                raise D3RecoveryRequired("d7_candidate_execution_unavailable")
+                raise ExecutionRecoveryRequired("d7_candidate_execution_unavailable")
             plan = successful_plans[execution.plan_id]
             turn_binding = self.store.load_d3_turn_binding(completed_turn.turn_id)
             plan_binding = self.store.load_d3_plan_binding(plan.plan_id)
@@ -1685,7 +1685,7 @@ class D3Application:
                 or plan_binding.intent_id != plan.intent_id
                 or plan_result.evidence_sha256 is None
             ):
-                raise D3RecoveryRequired("d7_candidate_source_evidence_unavailable")
+                raise ExecutionRecoveryRequired("d7_candidate_source_evidence_unavailable")
             context = D3CandidateContext(
                 turn_binding,
                 plan_binding,
@@ -1727,10 +1727,10 @@ class D3Application:
             try:
                 receipt = self.imports.read_receipt(import_id)
             except AttachmentImportStorageError as exc:
-                raise D3RecoveryRequired("d3_import_evidence_unavailable") from exc
+                raise ExecutionRecoveryRequired("d3_import_evidence_unavailable") from exc
             if operation is None:
                 if receipt is not None:
-                    raise D3RecoveryRequired("d3_import_receipt_without_start")
+                    raise ExecutionRecoveryRequired("d3_import_receipt_without_start")
                 self._check_dispatch()
                 self.store.begin_d3_operation(
                     D3OperationStart(
@@ -1746,15 +1746,15 @@ class D3Application:
                 try:
                     receipt = await self.importer.import_attachment(request, token)
                 except AttachmentImportRecoveryRequired as exc:
-                    raise D3RecoveryRequired("d3_import_outcome_unknown") from exc
+                    raise ExecutionRecoveryRequired("d3_import_outcome_unknown") from exc
                 except AttachmentImportRejected as exc:
-                    raise D3RecoveryRequired("d3_import_rejected") from exc
+                    raise ExecutionRecoveryRequired("d3_import_rejected") from exc
                 except AttachmentImportConflict as exc:
-                    raise D3RecoveryRequired("d3_import_binding_changed") from exc
+                    raise ExecutionRecoveryRequired("d3_import_binding_changed") from exc
                 except AttachmentImportStorageError as exc:
-                    raise D3RecoveryRequired("d3_import_evidence_unavailable") from exc
+                    raise ExecutionRecoveryRequired("d3_import_evidence_unavailable") from exc
             if receipt is None:
-                raise D3RecoveryRequired("d3_import_outcome_unknown")
+                raise ExecutionRecoveryRequired("d3_import_outcome_unknown")
             if (
                 receipt.task_run_id != task.task_run_id
                 or receipt.sandbox_id != task.sandbox_id
@@ -1767,7 +1767,7 @@ class D3Application:
                     or operation.start.resource_ref != request.sandbox_path
                 )
             ):
-                raise D3RecoveryRequired("d3_import_binding_changed")
+                raise ExecutionRecoveryRequired("d3_import_binding_changed")
             expected = D3OperationCompletion(
                 import_id,
                 receipt.completed_at,
@@ -1779,10 +1779,10 @@ class D3Application:
             self.store.mark_d3_operation_applied(import_id, import_id)
             if self.config.d6_authorization is not None:
                 if self.d6_artifact_store is None or self.d6_artifact_transfer is None:
-                    raise D3RecoveryRequired("d6_import_services_unavailable")
+                    raise ExecutionRecoveryRequired("d6_import_services_unavailable")
                 references = self.config.d6_authorization.local_artifacts
                 if index >= len(references):
-                    raise D3RecoveryRequired("d6_import_attachment_index_unbound")
+                    raise ExecutionRecoveryRequired("d6_import_attachment_index_unbound")
                 try:
                     d6_manifest = self.d6_artifact_store.find_import(
                         task.task_run_id, references[index],
@@ -1791,7 +1791,7 @@ class D3Application:
                         d6_manifest.request,
                     )
                 except (D6ArtifactImportError, D6ArtifactImportRecoveryRequired) as exc:
-                    raise D3RecoveryRequired(str(exc)) from exc
+                    raise ExecutionRecoveryRequired(str(exc)) from exc
                 target_path = Path(d6_manifest.target_path)
                 if (
                     verified_manifest != d6_manifest
@@ -1809,7 +1809,7 @@ class D3Application:
                     or receipt.sandbox_path != request.sandbox_path
                     or receipt.attachment_index != index
                 ):
-                    raise D3RecoveryRequired("d6_attachment_receipt_source_binding_changed")
+                    raise ExecutionRecoveryRequired("d6_attachment_receipt_source_binding_changed")
                 receipt_sha256 = digest(asdict(receipt))
                 try:
                     self.d6_artifact_store.bind_attachment_receipt(
@@ -1823,7 +1823,7 @@ class D3Application:
                         receipt_sha256=receipt_sha256,
                     )
                 except D6ArtifactImportError as exc:
-                    raise D3RecoveryRequired(str(exc)) from exc
+                    raise ExecutionRecoveryRequired(str(exc)) from exc
             receipts.append(receipt)
         return tuple(receipts)
 
@@ -1866,7 +1866,7 @@ class D3Application:
                 }
                 for item in self.state.turns
             ):
-                raise D3RecoveryRequired("d3_turn_proposal_scope_expired")
+                raise ExecutionRecoveryRequired("d3_turn_proposal_scope_expired")
             fresh = D3OuterContext(
                 self.state.task_run.request.goal,
                 receipts,
@@ -1884,7 +1884,7 @@ class D3Application:
                 proposal.attachment_index
                 not in self.config.authorization.attachment_indices
             ):
-                raise D3ProposalRejected("d3_attachment_not_authorized")
+                raise ExecutionProposalRejected("d3_attachment_not_authorized")
 
         if self.config.d4_budget is None:
             request_id, proposal = await self.outer.propose(request, token)
@@ -1893,7 +1893,7 @@ class D3Application:
                 not in self.config.authorization.attachment_indices
             ):
                 self.outer.reject(request_id, "d3_attachment_not_authorized")
-                raise D3ProposalRejected("d3_attachment_not_authorized")
+                raise ExecutionProposalRejected("d3_attachment_not_authorized")
         else:
             self._check_dispatch()
             request_id, proposal = await self.outer.propose(
@@ -1915,7 +1915,7 @@ class D3Application:
         if reference.startswith("d8-decision:") and self.sessions is not None:
             record = next((r for r in self.sessions.records() if r.record_id == reference[12:]), None)
             if record is None:
-                raise D3RecoveryRequired("d8_progress_source_missing")
+                raise ExecutionRecoveryRequired("d8_progress_source_missing")
             self.sessions.validate_record(record, self.state)
             return self.sessions.payload(record)
         if self.handoff is not None:
@@ -1925,7 +1925,7 @@ class D3Application:
                 request = D8HandoffRequest.from_dict(value)
                 result = self.handoff._known_call(request)
                 if result is None:
-                    raise D3RecoveryRequired("d8_tree_source_unknown")
+                    raise ExecutionRecoveryRequired("d8_tree_source_unknown")
                 return {"kind": "d8_tree_model_result", "task_run_id": request.task_run_id,
                         "stage": request.stage, "outcome": result["outcome"],
                         "context_sha256": request.context_sha256}
@@ -1940,7 +1940,7 @@ class D3Application:
                 request = D8ChangeRequest.from_dict(value)
                 result = self.revisions._known(request)
                 if result is None:
-                    raise D3RecoveryRequired("d8_repair_review_source_unknown")
+                    raise ExecutionRecoveryRequired("d8_repair_review_source_unknown")
                 return {"kind": "d8_repair_model_proposal", "task_run_id": request.task_run_id,
                         "stage": request.stage, "outcome": result["outcome"],
                         "context_sha256": request.context_sha256}
@@ -1949,7 +1949,7 @@ class D3Application:
             if request is not None:
                 result = self.conclusions._known(request)
                 if result is None:
-                    raise D3RecoveryRequired("d8_review_source_unknown")
+                    raise ExecutionRecoveryRequired("d8_review_source_unknown")
                 return {"kind": "d8_model_proposal", "task_run_id": request.task_run_id,
                         "stage": request.stage, "outcome": result["outcome"],
                         "context_sha256": request.context_sha256,
@@ -1961,7 +1961,7 @@ class D3Application:
         if operation is not None and operation.start.category == "attachment_import":
             receipt = self.imports.read_receipt(reference)
             if receipt is None:
-                raise D3RecoveryRequired("d3_review_import_source_missing")
+                raise ExecutionRecoveryRequired("d3_review_import_source_missing")
             return {
                 "kind": "attachment_import",
                 "task_run_id": receipt.task_run_id,
@@ -1975,7 +1975,7 @@ class D3Application:
         }:
             model = self.model_evidence.read(reference)
             if model is None:
-                raise D3RecoveryRequired("d3_review_model_source_missing")
+                raise ExecutionRecoveryRequired("d3_review_model_source_missing")
             rejection = self.model_evidence.read_rejection(reference)
             return {
                 "kind": "model_proposal",
@@ -1989,7 +1989,7 @@ class D3Application:
         if operation is not None and operation.start.category == "tool_dispatch":
             completed = self.commands.read_completed(reference)
             if completed is None:
-                raise D3RecoveryRequired("d3_review_execution_source_missing")
+                raise ExecutionRecoveryRequired("d3_review_execution_source_missing")
             record = completed.record
             size = self.workspace_evidence.read_size(reference)
             return {
@@ -2006,7 +2006,7 @@ class D3Application:
         if operation is not None and operation.start.category == "sha_observation":
             observed = self.workspace_evidence.read_digest(reference)
             if observed is None:
-                raise D3RecoveryRequired("d3_review_digest_source_missing")
+                raise ExecutionRecoveryRequired("d3_review_digest_source_missing")
             return {
                 "kind": "digest_observation",
                 "claim": asdict(observed.claim),
@@ -2028,13 +2028,13 @@ class D3Application:
         if operation is not None and operation.start.category == "artifact_share":
             share = self.workspace_evidence.read_share(reference)
             if share is None:
-                raise D3RecoveryRequired("d3_review_share_source_missing")
+                raise ExecutionRecoveryRequired("d3_review_share_source_missing")
             return {
                 "kind": "shared_artifact",
                 "claim": asdict(share.claim),
                 "status": share.status,
             }
-        raise D3RecoveryRequired("d3_review_source_unavailable")
+        raise ExecutionRecoveryRequired("d3_review_source_unavailable")
 
     def _review_request(
         self,
@@ -2056,11 +2056,11 @@ class D3Application:
                 if (not rows or not progress["recent"] or progress["decision_count"] != len(rows)
                         or progress["recent"][-1]["ref"] != "d8-decision:" + rows[-1].record_id
                         or progress["recent"][-1]["ordinal"] != rows[-1].ordinal):
-                    raise D3RecoveryRequired("s3_latest_decision_unavailable")
+                    raise ExecutionRecoveryRequired("s3_latest_decision_unavailable")
             source_ids = tuple(dict.fromkeys((*source_ids, *(r["ref"] for r in progress["recent"]),
                                               *progress.get("execution_refs", ())[-4:])))
         if binding is None or not source_ids:
-            raise D3RecoveryRequired("d3_review_binding_or_sources_missing")
+            raise ExecutionRecoveryRequired("d3_review_binding_or_sources_missing")
         if scope == "turn_start":
             root_name = f"review/start/{turn_id}/{intent_id}"
         elif scope == "action":
@@ -2114,7 +2114,7 @@ class D3Application:
                     else:
                         timeout = min(timeout, item.max_action_timeout_seconds)
             if not actions and (progress is None or progress["mode"] == "ordinary"):
-                raise D3RecoveryRequired("constraint_action_intersection_empty")
+                raise ExecutionRecoveryRequired("constraint_action_intersection_empty")
             unavailable = unavailable_decisions(state, turn_id, intent_id, self.config.max_turns, rolling=bool(self.config.intent_execution_policy))
             decisions = [d for d in stage_decisions(scope) if d not in unavailable]
             context["review_policy"] = {"version": 1, "review_scope": scope,
@@ -2281,7 +2281,7 @@ class D3Application:
             root = self.review_ledger.read_root(request.review_root_id)
             applied = root.get("applied", ()) if isinstance(root, dict) else ()
             if not isinstance(applied, (list, tuple)):
-                raise D3RecoveryRequired("d3_review_application_receipt_invalid")
+                raise ExecutionRecoveryRequired("d3_review_application_receipt_invalid")
             if root is None or not any(
                 isinstance(item, dict) and item.get("review_id") == prior[-1].review_id
                 for item in applied
@@ -2292,7 +2292,7 @@ class D3Application:
                     trigger_reasons=(scope,),
                 )
                 if not isinstance(result.output, D3ReviewOutput):
-                    raise D3RecoveryRequired("d3_review_application_receipt_missing")
+                    raise ExecutionRecoveryRequired("d3_review_application_receipt_missing")
                 self._after_review(result.review_id)
                 return result.review_id, result.output
             application, _, output = self.validator._review_call(
@@ -2303,17 +2303,17 @@ class D3Application:
         if self.handoff is not None and self.output_boundary is not None:
             from agent_core.intent_execution import pending_adjudication
             if pending_adjudication(self.store, self.handoff.evidence, self.output_boundary.evidence, self.state.task_run.task_run_id):
-                raise D3RecoveryRequired("d22_awaiting_adjudication")
+                raise ExecutionRecoveryRequired("d22_awaiting_adjudication")
         if self._dispatch_stopped():
             self.review_ledger.record_not_called(request, "d3_review_dispatch_stopped")
-            raise D3RecoveryRequired("d3_review_not_called")
+            raise ExecutionRecoveryRequired("d3_review_not_called")
         result = self.review_coordinator.review(
             request,
             self.review_call,
             trigger_reasons=(scope,),
         )
         if not isinstance(result.output, D3ReviewOutput):
-            raise D3RecoveryRequired("d3_review_output_missing")
+            raise ExecutionRecoveryRequired("d3_review_output_missing")
         self._after_review(result.review_id)
         return result.review_id, result.output
 
@@ -2335,12 +2335,12 @@ class D3Application:
                 or operation.start.context_sha256 != digest(asdict(claim))
                 or operation.start.resource_ref != claim.share_id
             ):
-                raise D3RecoveryRequired("d3_share_claim_changed")
+                raise ExecutionRecoveryRequired("d3_share_claim_changed")
             if (
                 claim.target_intent_id == intent_id
                 and self.workspace_evidence.read_share(claim.share_id) is None
             ):
-                raise D3RecoveryRequired("d3_share_outcome_unknown")
+                raise ExecutionRecoveryRequired("d3_share_outcome_unknown")
         shared = []
         for receipt in self.workspace_evidence.list_shares(task_run_id):
             claim = receipt.claim
@@ -2386,7 +2386,7 @@ class D3Application:
         turn = next(item for item in self.state.turns if item.turn_id == intent.turn_id)
         binding = self.store.load_d3_turn_binding(turn.turn_id)
         if binding is None:
-            raise D3RecoveryRequired("d3_turn_binding_missing")
+            raise ExecutionRecoveryRequired("d3_turn_binding_missing")
         previous = [item for item in self.state.plans if item.intent_id == intent_id]
         ordinal = len(previous) + 1
         reusable = []
@@ -2394,7 +2394,7 @@ class D3Application:
             result = self.store.load_d3_plan_result(plan.plan_id)
             if result is not None and result.outcome == "satisfied":
                 if result.proof_id is None:
-                    raise D3RecoveryRequired("d3_reusable_proof_missing")
+                    raise ExecutionRecoveryRequired("d3_reusable_proof_missing")
                 reusable.append(result.proof_id)
         context = D3PlanContext(
             turn.turn_target,
@@ -2417,13 +2417,13 @@ class D3Application:
                 None,
             )
             if live_intent is None or live_intent.status is not IntentStatus.RUNNING:
-                raise D3RecoveryRequired("d3_plan_proposal_scope_expired")
+                raise ExecutionRecoveryRequired("d3_plan_proposal_scope_expired")
             live_turn = next(
                 item for item in self.state.turns if item.turn_id == live_intent.turn_id
             )
             live_binding = self.store.load_d3_turn_binding(live_turn.turn_id)
             if live_binding is None:
-                raise D3RecoveryRequired("d3_turn_binding_missing")
+                raise ExecutionRecoveryRequired("d3_turn_binding_missing")
             live_plans = [
                 item for item in self.state.plans if item.intent_id == intent_id
             ]
@@ -2432,7 +2432,7 @@ class D3Application:
                 result = self.store.load_d3_plan_result(plan.plan_id)
                 if result is not None and result.outcome == "satisfied":
                     if result.proof_id is None:
-                        raise D3RecoveryRequired("d3_reusable_proof_missing")
+                        raise ExecutionRecoveryRequired("d3_reusable_proof_missing")
                     live_proofs.append(result.proof_id)
             fresh = D3PlanContext(
                 live_turn.turn_target,
@@ -2457,7 +2457,7 @@ class D3Application:
                 try:
                     self.handoff.validate_read_action(_current, proposal)
                 except (ValueError, TypeError) as exc:
-                    raise D3ProposalRejected("d8_history_read_action_rejected") from exc
+                    raise ExecutionProposalRejected("d8_history_read_action_rejected") from exc
                 return
             from agent_core.intent_execution import IntentResolution, validate_resolution, WorkingRecord, validate_working
             if isinstance(proposal, WorkingRecord):
@@ -2469,7 +2469,7 @@ class D3Application:
             if isinstance(proposal, CompleteIntentAction):
                 visible = json.loads(_current.history_context).get("completion_facts", [])
                 if proposal.fact_ids not in [(i["fact_id"],) for i in visible]:
-                    raise D3ProposalRejected("d22_completion_support_not_visible")
+                    raise ExecutionProposalRejected("d22_completion_support_not_visible")
                 return
             from agent_core.evidence_conclusions import EvidenceCandidate
             if isinstance(proposal,EvidenceCandidate):
@@ -2477,7 +2477,7 @@ class D3Application:
                 return
             if isinstance(proposal, MCPCall):
                 if self.mcp is None:
-                    raise D3ProposalRejected("mcp.not_enabled")
+                    raise ExecutionProposalRejected("mcp.not_enabled")
                 self.mcp.validate(_current, proposal)
                 return
             live_context = _current.context
@@ -2500,7 +2500,7 @@ class D3Application:
                     or proposal.source_proof_id not in live_context.reusable_proof_ids
                 )
             ):
-                raise D3ProposalRejected("d3_plan_template_or_source_unavailable")
+                raise ExecutionProposalRejected("d3_plan_template_or_source_unavailable")
 
         if self.config.d4_budget is None:
             request_id, proposal = await self.inner.propose(request, token)
@@ -2514,7 +2514,7 @@ class D3Application:
                 and proposal.source_proof_id not in context.reusable_proof_ids
             ):
                 self.inner.reject(request_id, "d3_plan_template_or_source_unavailable")
-                raise D3ProposalRejected("d3_plan_template_or_source_unavailable")
+                raise ExecutionProposalRejected("d3_plan_template_or_source_unavailable")
         else:
             decision = await self._propose_inner_plan(request, token, refresh=refresh, validate=validate)
             if decision is None:
@@ -2551,10 +2551,10 @@ class D3Application:
         if proposal.observation_mode == "reuse_saved_proof":
             proof = self.proof_store.read(proposal.source_proof_id)
             if proof is None:
-                raise D3RecoveryRequired("d3_selected_proof_missing")
+                raise ExecutionRecoveryRequired("d3_selected_proof_missing")
             original = self.store.load_d3_plan_result(proof.plan_id)
             if original is None or original.proof_id != proof.proof_id:
-                raise D3RecoveryRequired("d3_selected_proof_result_missing")
+                raise ExecutionRecoveryRequired("d3_selected_proof_result_missing")
             artifact_version_id = proof.artifact_version_id
             source_fact_id = original.supporting_fact_id
         else:
@@ -2585,7 +2585,7 @@ class D3Application:
         if output.decision == "continue_current_intent":
             return False
         if self.sessions is not None and output.decision == "pause_current_intent":
-            raise D3RecoveryRequired("d8_progress_inconclusive")
+            raise ExecutionRecoveryRequired("d8_progress_inconclusive")
         intent = next(
             item for item in self.state.intents if item.intent_id == intent_id
         )
@@ -2606,9 +2606,9 @@ class D3Application:
                 if item.turn_id == turn.turn_id and item.status is IntentStatus.PENDING
             ]
             if not siblings and self.sessions is None:
-                raise D3RecoveryRequired("d3_no_sibling_candidate")
+                raise ExecutionRecoveryRequired("d3_no_sibling_candidate")
             if not siblings and self.config.contract_version in {13, 14, 15, 16, 17, 18, 19, 20, 21, 22} and output.decision == "switch_sibling_intent":
-                raise D3RecoveryRequired("d3_no_sibling_candidate")
+                raise ExecutionRecoveryRequired("d3_no_sibling_candidate")
             if siblings:
                 next_intent = min(siblings, key=lambda item: item.priority)
                 await self._shared_context(next_intent.intent_id, token)
@@ -2665,7 +2665,7 @@ class D3Application:
             )
             self.store.mark_d3_operation_applied(proposal_id, next_binding.turn_id)
             return True
-        raise D3RecoveryRequired("d3_nonterminal_review_decision_invalid")
+        raise ExecutionRecoveryRequired("d3_nonterminal_review_decision_invalid")
 
     def _gateway(self, turn_binding, plan_binding):
         return D3FixedCommandGateway(
@@ -2700,7 +2700,7 @@ class D3Application:
                     self.supervision.yield_intent(*result)
                     return None
             return result
-        except D3ProposalRejected as exc:
+        except ExecutionProposalRejected as exc:
             identity = exc.model_request_id
             if not self.config.intent_execution_policy or identity is None or self.conclusions.optional_format(identity) is None:
                 raise
@@ -2710,22 +2710,22 @@ class D3Application:
             return None
 
     def _reviewable_action_rejection(
-        self, error: D3ProposalRejected, fallback_request_id: str
+        self, error: ExecutionProposalRejected, fallback_request_id: str
     ) -> str:
         request_id = error.model_request_id or fallback_request_id
         evidence = self.model_evidence.read(request_id)
         rejection = self.model_evidence.read_rejection(request_id)
         if evidence is None:
-            raise D4RecoveryRequired(
+            raise OperationRecoveryRequired(
                 f"d4_action_proposal_evidence_missing:{error.code}"
             ) from error
         if evidence.outcome != "accepted" or rejection is None:
             reason = evidence.reason or evidence.outcome
-            raise D4RecoveryRequired(
+            raise OperationRecoveryRequired(
                 f"d4_action_proposal_outcome_requires_recovery:{reason}"
             ) from error
         if evidence.correction_of_model_request_id is not None:
-            raise D4RecoveryRequired(
+            raise OperationRecoveryRequired(
                 f"d4_action_refinement_rejected:{rejection.code}"
             ) from error
         return request_id
@@ -2810,10 +2810,10 @@ class D3Application:
                 or live_intent.status is not IntentStatus.RUNNING
                 or current_plan.status is not PlanStatus.RUNNING
             ):
-                raise D3RecoveryRequired("d3_action_proposal_scope_expired")
+                raise ExecutionRecoveryRequired("d3_action_proposal_scope_expired")
             turn_binding = self.store.load_d3_plan_turn_binding(plan_binding.plan_id)
             if turn_binding is None or turn_binding != turn:
-                raise D3RecoveryRequired("d3_action_turn_binding_changed")
+                raise ExecutionRecoveryRequired("d3_action_turn_binding_changed")
             fresh = D3ActionContext(
                 live_turn.turn_target,
                 turn_binding,
@@ -2842,7 +2842,7 @@ class D3Application:
                 or action.working_directory != path.rsplit("/", 1)[0]
                 or action.conditions != conditions
             ):
-                raise D3ProposalRejected("d3_fixed_probe_rejected")
+                raise ExecutionProposalRejected("d3_fixed_probe_rejected")
             self.validator._allowed(
                 plan_binding.task_run_id,
                 turn.turn_id,
@@ -2861,7 +2861,7 @@ class D3Application:
                 if decision is None:
                     return True
                 request_id, proposal = decision
-        except D3ProposalRejected as exc:
+        except ExecutionProposalRejected as exc:
             if self.config.d4_budget is None:
                 raise
             request_id = self._reviewable_action_rejection(
@@ -2878,7 +2878,7 @@ class D3Application:
                 review_id, output, plan_binding.intent_id, receipts, token
             ):
                 return True
-            raise D3RecoveryRequired(str(exc)) from exc
+            raise ExecutionRecoveryRequired(str(exc)) from exc
         if isinstance(proposal, D8ConclusionChange):
             await self.revisions.review(proposal, plan_binding.intent_id, request_id,
                                         self.revisions.visible_for_execution(request_id), token)
@@ -2904,7 +2904,7 @@ class D3Application:
                 review_id, output, plan_binding.intent_id, receipts, token
             ):
                 return True
-            raise D3RecoveryRequired("d3_fixed_probe_rejected")
+            raise ExecutionRecoveryRequired("d3_fixed_probe_rejected")
         try:
             self.validator._allowed(
                 plan_binding.task_run_id,
@@ -2913,7 +2913,7 @@ class D3Application:
                 "probe",
                 action.timeout_seconds,
             )
-        except D3RecoveryRequired as exc:
+        except ExecutionRecoveryRequired as exc:
             self.inner.reject(request_id, str(exc))
             review_id, output = self._review(
                 turn.turn_id,
@@ -2948,7 +2948,7 @@ class D3Application:
             token,
         )
         if completed.record.status != "completed" or completed.record.exit_code != 0:
-            raise D3RecoveryRequired("d3_fixed_tool_did_not_complete")
+            raise ExecutionRecoveryRequired("d3_fixed_tool_did_not_complete")
         self.store.mark_d3_operation_applied(request_id, tool_id)
         if is_size:
             self.workspace.record_size(plan_binding, tool_id, turn.expected_byte_size)
@@ -3008,7 +3008,7 @@ class D3Application:
         try:
             return await self._review_d8_observation_impl(binding, proof, receipts, token)
         except (StorageError, OSError, T6EvidenceError, CommittedStateReloadError) as exc:
-            raise D3RecoveryRequired("d8_conclusion_persistence_recovery_required") from exc
+            raise ExecutionRecoveryRequired("d8_conclusion_persistence_recovery_required") from exc
 
     async def _review_d8_observation_impl(self, binding, proof, receipts, token):
         if self.config.intent_execution_policy == "continuous_v1":
@@ -3098,12 +3098,12 @@ class D3Application:
                 return await self._review_d8_observation(plan_binding, proof, receipts, token)
         turn = self.store.load_d3_plan_turn_binding(plan_binding.plan_id)
         if turn is None:
-            raise D3RecoveryRequired("d3_plan_turn_missing")
+            raise ExecutionRecoveryRequired("d3_plan_turn_missing")
         if plan_binding.observation_mode == "reuse_saved_proof":
             proof = self.proof_store.read(plan_binding.source_proof_id)
             original = self.store.load_d3_plan_result(proof.plan_id) if proof else None
             if proof is None or original is None or original.outcome != "satisfied":
-                raise D3RecoveryRequired("d3_reused_proof_unavailable")
+                raise ExecutionRecoveryRequired("d3_reused_proof_unavailable")
             result = D3PlanResult(
                 plan_binding.task_run_id,
                 plan_binding.plan_id,
@@ -3153,14 +3153,14 @@ class D3Application:
                 return True
             source = self.conclusions.observation(result.proof_id, historical=True)
             if supporting_fact_id not in {i["fact_id"] for i in self.conclusions.reusable_facts(source)}:
-                raise D3RecoveryRequired("d22_completion_fact_not_effective")
+                raise ExecutionRecoveryRequired("d22_completion_fact_not_effective")
         if (
             binding is None
             or result is None
             or turn is None
             or not historical_support and (result.outcome != "satisfied" or result.supporting_fact_id is None)
         ):
-            raise D3RecoveryRequired("d3_completion_support_unavailable")
+            raise ExecutionRecoveryRequired("d3_completion_support_unavailable")
         fact_id = supporting_fact_id if historical_support else result.supporting_fact_id
         if getattr(binding,'kind',None)!='http_request' and self.conclusions is not None and binding.observation_mode == "new_observation":
             action_id, action = self.validator._known_action(binding.task_run_id, binding.plan_id, "inner_sha256")
@@ -3213,16 +3213,16 @@ class D3Application:
                 or live_result != result
                 or not historical_support and live_result.supporting_fact_id != fact_id
             ):
-                raise D3RecoveryRequired("d3_completion_proposal_scope_expired")
+                raise ExecutionRecoveryRequired("d3_completion_proposal_scope_expired")
             live_turn = next(
                 (item for item in self.state.turns if item.turn_id == intent.turn_id),
                 None,
             )
             if live_turn is None:
-                raise D3RecoveryRequired("d3_completion_turn_missing")
+                raise ExecutionRecoveryRequired("d3_completion_turn_missing")
             turn_binding = self.store.load_d3_plan_turn_binding(binding.plan_id)
             if turn_binding is None or turn_binding != turn:
-                raise D3RecoveryRequired("d3_completion_turn_binding_changed")
+                raise ExecutionRecoveryRequired("d3_completion_turn_binding_changed")
             fresh = D3ActionContext(
                 live_turn.turn_target,
                 turn_binding,
@@ -3246,7 +3246,7 @@ class D3Application:
             if not isinstance(
                 candidate.action, CompleteIntentAction
             ) or candidate.action.fact_ids != (fact_id,):
-                raise D3ProposalRejected("d3_completion_fact_rejected")
+                raise ExecutionProposalRejected("d3_completion_fact_rejected")
             self.validator._allowed(
                 self.state.task_run.task_run_id,
                 intent.turn_id,
@@ -3262,7 +3262,7 @@ class D3Application:
                 request_id, proposal = await self.inner.propose(
                     request, token, refresh=refresh, validate=validate
                 )
-        except D3ProposalRejected as exc:
+        except ExecutionProposalRejected as exc:
             if self.config.d4_budget is None:
                 raise
             request_id = self._reviewable_action_rejection(
@@ -3277,7 +3277,7 @@ class D3Application:
             )
             if await self._route(review_id, output, intent_id, receipts, token):
                 return True
-            raise D3RecoveryRequired(str(exc)) from exc
+            raise ExecutionRecoveryRequired(str(exc)) from exc
         if isinstance(proposal, D8ConclusionChange):
             await self.revisions.review(proposal, intent_id, request_id,
                                         self.revisions.visible_for_execution(request_id), token)
@@ -3295,7 +3295,7 @@ class D3Application:
             )
             if await self._route(review_id, output, intent_id, receipts, token):
                 return True
-            raise D3RecoveryRequired("d3_completion_fact_rejected")
+            raise ExecutionRecoveryRequired("d3_completion_fact_rejected")
         if proposal.review_requested:
             review_id, output = self._review(
                 intent.turn_id,
@@ -3359,7 +3359,7 @@ class D3Application:
             }
         ]
         if not terminal:
-            raise D3RecoveryRequired("d3_terminal_turn_has_no_intent")
+            raise ExecutionRecoveryRequired("d3_terminal_turn_has_no_intent")
         return terminal[-1].intent_id
 
     def _tail(self, turn_id: str) -> None:
@@ -3372,7 +3372,7 @@ class D3Application:
             (turn_id,),
         )
         if output.decision != "acknowledge_turn_end":
-            raise D3RecoveryRequired("d3_tail_review_not_read_only")
+            raise ExecutionRecoveryRequired("d3_tail_review_not_read_only")
 
     async def _run_tree(self, token: CancellationToken) -> D3Result:
         if token.is_cancelled or self.clock() >= self.state.task_run.deadline_at:
@@ -3459,14 +3459,14 @@ class D3Application:
                 continue
             try:
                 await self._drive_tree_intent(current, receipts, token)
-            except (D3RecoveryRequired, D3ProposalRejected, D2ReviewPaused) as exc:
+            except (ExecutionRecoveryRequired, ExecutionProposalRejected, D2ReviewPaused) as exc:
                 from agent_core.intent_execution import suspend_local
                 live = next(i for i in self.state.intents if i.intent_id == current.intent_id)
                 if self.sessions is not None and self.sessions.capacity_error(exc):
                     action = await self.sessions.recover_capacity(live, token)
                     if action == "retry":continue
                     if action != "local":raise
-                    exc = D3RecoveryRequired("d8_context_paused:local_session_capacity")
+                    exc = ExecutionRecoveryRequired("d8_context_paused:local_session_capacity")
                 if suspend_local(self, live, exc):continue
                 raise
 
@@ -3497,7 +3497,7 @@ class D3Application:
             else:
                 await self._complete_intent(current.intent_id, receipts, token)
         else:
-            raise D3RecoveryRequired("d8_current_plan_not_usable")
+            raise ExecutionRecoveryRequired("d8_current_plan_not_usable")
 
     async def _run(self, token: CancellationToken) -> D3Result:
         if self.handoff is not None:
@@ -3509,7 +3509,7 @@ class D3Application:
                 if _os.environ.get("QINYUAN_DEBUG_TRACE"):
                     print("[trace] run.persistence_error", type(exc).__name__,
                           str(exc)[:300], file=_sys.stderr, flush=True)
-                raise D3RecoveryRequired("d8_handoff_persistence_recovery_required") from exc
+                raise ExecutionRecoveryRequired("d8_handoff_persistence_recovery_required") from exc
         self._reconcile_known_d4_operations()
         if isinstance(self.review_ledger, D4ReviewLedger):
             self.review_ledger.reconcile_known_completions(
@@ -3540,7 +3540,7 @@ class D3Application:
             if turn.status is TurnStatus.COMPLETED:
                 return self.result("turn_completed_sandbox_retained")
             if turn.status in {TurnStatus.FAILED, TurnStatus.INCONCLUSIVE}:
-                raise D3RecoveryRequired(
+                raise ExecutionRecoveryRequired(
                     "d3_terminal_turn_requires_separate_next_proposal"
                 )
             if turn.status is TurnStatus.PENDING:
@@ -3566,7 +3566,7 @@ class D3Application:
                     None,
                 )
                 if winner is None:
-                    raise D3RecoveryRequired("d3_running_turn_has_no_active_intent")
+                    raise ExecutionRecoveryRequired("d3_running_turn_has_no_active_intent")
                 plan = [
                     item
                     for item in self.state.plans
@@ -3574,7 +3574,7 @@ class D3Application:
                 ][-1]
                 result = self.store.load_d3_plan_result(plan.plan_id)
                 if result is None or result.supporting_fact_id is None:
-                    raise D3RecoveryRequired("d3_winner_result_missing")
+                    raise ExecutionRecoveryRequired("d3_winner_result_missing")
                 self.control.complete_turn(
                     turn.turn_id, winner.intent_id, result.supporting_fact_id
                 )
@@ -3585,7 +3585,7 @@ class D3Application:
             if not plans:
                 turn_binding = self.store.load_d3_turn_binding(turn.turn_id)
                 if turn_binding is None:
-                    raise D3RecoveryRequired("d3_start_turn_binding_missing")
+                    raise ExecutionRecoveryRequired("d3_start_turn_binding_missing")
                 review_id, output = self._review(
                     turn.turn_id,
                     current.intent_id,
@@ -3602,16 +3602,16 @@ class D3Application:
             plan = plans[-1]
             binding = self.store.load_d3_plan_binding(plan.plan_id)
             if binding is None:
-                raise D3RecoveryRequired("d3_plan_binding_missing")
+                raise ExecutionRecoveryRequired("d3_plan_binding_missing")
             if plan.status is PlanStatus.RUNNING:
                 if await self._run_plan(binding, receipts, token):
                     continue
                 continue
             if plan.status is not PlanStatus.COMPLETED:
-                raise D3RecoveryRequired("d3_current_plan_not_usable")
+                raise ExecutionRecoveryRequired("d3_current_plan_not_usable")
             if await self._complete_intent(current.intent_id, receipts, token):
                 continue
-        raise D3RecoveryRequired("d3_internal_transition_limit")
+        raise ExecutionRecoveryRequired("d3_internal_transition_limit")
 
     async def _wait_continuation(self, token):
         # The per-dispatch lock is released while waiting for recovery/verification.
@@ -3680,38 +3680,38 @@ class D3Application:
                     if self._bound_task_run_id is None:
                         self._bound_task_run_id = attached_task_run_id
                     elif self._bound_task_run_id != attached_task_run_id:
-                        raise D4RecoveryRequired(
+                        raise OperationRecoveryRequired(
                             "d4_controller_task_run_binding_changed"
                         )
                     if (
                         self.store.load_d3_run_config(attached_task_run_id)
                         != self.config
                     ):
-                        raise D4RecoveryRequired("d3_frozen_run_configuration_changed")
+                        raise OperationRecoveryRequired("d3_frozen_run_configuration_changed")
                 if self.config.d5_enabled and not self._redaction_configured:
                     return self.result("d5_redaction_configuration_unavailable", recovery_required=True)
                 return await self._run(token)
             except OperatorPaused:
                 return self.result("operator_paused",recovery_required=False)
             except (
-                D3RecoveryRequired,
-                D3BudgetExhausted,
-                D4BudgetExhausted,
-                D4RecoveryRequired,
-                D3ProposalRejected,
+                ExecutionRecoveryRequired,
+                ExecutionBudgetExhausted,
+                OperationBudgetExhausted,
+                OperationRecoveryRequired,
+                ExecutionProposalRejected,
                 D2ReviewPaused,
             ) as exc:
                 if self.config.d4_budget is not None and (token.is_cancelled or self.clock() >= self.state.task_run.deadline_at):
                     try:
                         task_run_id = self._bound_task_run_id
                         if task_run_id is None:
-                            raise D4RecoveryRequired("d4_cancellation_task_run_unbound")
+                            raise OperationRecoveryRequired("d4_cancellation_task_run_unbound")
                         self._persist_cancel_intent()
                         self._reconcile_known_d4_operations()
                         if isinstance(self.review_ledger, D4ReviewLedger):
                             self.review_ledger.reconcile_known_completions(task_run_id)
                         stopped = self._settle_stoppage()
-                    except (D3RecoveryRequired, D4RecoveryRequired) as recovery_exc:
+                    except (ExecutionRecoveryRequired, OperationRecoveryRequired) as recovery_exc:
                         return self.result(str(recovery_exc), recovery_required=True)
                     if stopped is not None:
                         return self.result(
@@ -3721,7 +3721,7 @@ class D3Application:
                                 or stopped.endswith("cleanup_unknown")
                             ),
                         )
-                if isinstance(exc, (D3BudgetExhausted, D4BudgetExhausted)):
+                if isinstance(exc, (ExecutionBudgetExhausted, OperationBudgetExhausted)):
                     return self.result(
                         f"budget_exhausted:{exc}", recovery_required=False
                     )

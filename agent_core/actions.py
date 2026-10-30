@@ -17,6 +17,8 @@ from agent_core.command_contracts import (
 )
 from agent_core.intent_postconditions import FileSha256, OutputContains, Postcondition
 
+PUBLIC_REFERENCE_TOOLS = frozenset({"web.search", "web.fetch"})
+
 
 class T6ActionValidationCode(StrEnum):
     """Bounded diagnostics for a rejected T6 model response."""

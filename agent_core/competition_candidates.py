@@ -56,16 +56,41 @@ def validate_mcp_source(store,candidate,evidence=None):
     """Ledger ownership first; trusted callers additionally verify immutable files."""
     operation_id=candidate.source_ref.removeprefix("mcp-result/")
     operation=store.load_d4_operation(operation_id)
+    stage = store.load_stage_run_config(candidate.task_run_id) is not None
+    parts = operation.start.resource_ref.split("/") if operation is not None else []
+    experiment = stage and len(parts) == 5 and parts[:3] == ["mcp", candidate.intent_id, "experiment"]
     if (not candidate.source_ref.startswith("mcp-result/") or candidate.plan_id is not None
         or candidate.execution_id is not None or operation is None
         or operation.start.category!="tool_dispatch"
         or operation.start.task_run_id!=candidate.task_run_id
-        or not supports_mcp_candidate(operation,candidate.intent_id)
+        or not (supports_mcp_candidate(operation,candidate.intent_id) or experiment)
         or operation.completion is None or operation.completion.result_kind!="completed"
         or operation.completion.evidence_ref!=candidate.source_ref
         or operation.completion.evidence_sha256!=candidate.evidence_version):
         raise ValueError("mcp_candidate_source_invalid")
     model_id=operation.start.resource_ref.split("/",2)[-1]
+    if stage:
+        from agent_core.stage_contracts import PlanningSession
+        model_id = parts[3] if experiment else parts[2]
+        model = store.load_d4_operation(model_id)
+        turn = store.load_turn(candidate.task_run_id, candidate.turn_id)
+        if (turn is None or not any(r.road_id == candidate.intent_id for r in turn.roads)
+                or model is None or model.start.category != "action" or model.start.role != "inner_action"
+                or model.start.task_run_id != candidate.task_run_id or model.application_ref != (model_id if experiment else operation_id)
+                or model.completion is None or model.completion.result_kind != "completed"):
+            raise ValueError("stage_candidate_source_invalid")
+        if evidence is not None:
+            evidence.observation(operation)
+            source = evidence.read_model_result(model)
+            claim = evidence.read("mcp-call", operation_id)
+            result = evidence.read("mcp-result", operation_id)
+            if (source.session != PlanningSession("road_execution", candidate.intent_id)
+                    or claim is None or result is None or digest(result) != candidate.evidence_version
+                    or digest(claim) != operation.start.context_sha256 or result["request_sha256"] != digest(claim)
+                    or claim["task_run_id"] != candidate.task_run_id or claim["intent_id"] != candidate.intent_id
+                    or claim["model_request_id"] != model_id or result["payload"]["status"] != "completed"):
+                raise ValueError("stage_candidate_evidence_invalid")
+        return operation
     model=store.load_d3_operation(model_id)
     if (model is None or model.start.task_run_id!=candidate.task_run_id or model.start.category!="inner_model"
         or model.application_ref!=operation_id or model.completion is None or model.completion.result_kind!="completed"):

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from agent_adapters.command_recorder import T6CommandRecorder, T6EvidenceError
 from agent_core.artifact_proofs import D3ObservationProof
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.observation_proof import T6ObservationProof
 
 
@@ -48,4 +48,4 @@ class FileD3ProofStore:
                 raise ValueError("D3 proof owner mismatch")
             return proof
         except (T6EvidenceError, TypeError, ValueError, KeyError) as exc:
-            raise D3RecoveryRequired("d3_proof_evidence_unavailable") from exc
+            raise ExecutionRecoveryRequired("d3_proof_evidence_unavailable") from exc

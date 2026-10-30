@@ -4,7 +4,7 @@ from dataclasses import asdict
 import json
 import math
 import re
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.output_contracts import D8ModelResponse, D8OutputRequest, D8FormatIssue, decode_response, output_schema, matches_output_contract
 from agent_core.handoff_contracts import handoff_json
 from agent_core.modeling import ModelError, ModelErrorKind
@@ -77,7 +77,7 @@ class StructuredOutput:
             first = self.evidence.read("review-root", root)
             if request.review_attempt > 1:
                 if first is None or first["task_run_id"] != request.task_run_id:
-                    raise D3RecoveryRequired("d8_output_review_root_unavailable")
+                    raise ExecutionRecoveryRequired("d8_output_review_root_unavailable")
                 correction = first["first_model_request_id"]
         return root, correction
 
@@ -163,7 +163,7 @@ class StructuredOutput:
             from agent_core.execution_feasibility import KEY
             snapshot = self.evidence.read('review-request', correction)
             if not isinstance(snapshot, dict) or digest(snapshot) != contract['source_request_sha256']:
-                raise D3RecoveryRequired('d17_review_correction_request_changed')
+                raise ExecutionRecoveryRequired('d17_review_correction_request_changed')
             if snapshot['review_scope'] != 'turn_end':
                 context = json.loads(snapshot['context_summary'])
                 if KEY in context:
@@ -172,7 +172,7 @@ class StructuredOutput:
             from agent_core.plan_policy import policy_for as plan_policy
             snapshot = self.app.sessions.evidence.read('request', correction)
             if not isinstance(snapshot, dict) or digest(snapshot['request']) != contract['source_request_sha256']:
-                raise D3RecoveryRequired('s6_plan_correction_request_changed')
+                raise ExecutionRecoveryRequired('s6_plan_correction_request_changed')
             if getattr(self.app, 'web', None) is not None:
                 error['http_request_policy'] = self.app.web.policy()
             else:
@@ -197,7 +197,7 @@ class StructuredOutput:
         envelope, record = self._contract(request)
         saved = self.evidence.read("contract", record["model_request_id"])
         if saved is not None and saved != record:
-            raise D3RecoveryRequired("d8_output_frozen_contract_changed")
+            raise ExecutionRecoveryRequired("d8_output_frozen_contract_changed")
         policy = (self.app.config.handoff_config.inner_capacity
                   if record["role_config_ref"] == self.app.config.inner_role.role_config_ref
                   else self.app.config.handoff_config.outer_capacity)
@@ -215,7 +215,7 @@ class StructuredOutput:
             measured = self.evidence.read("input-measurement", record["model_request_id"])
             if measured is not None:
                 if any(current.get(key) != value for key, value in measured.items()):
-                    raise D3RecoveryRequired("d8_input_measurement_changed")
+                    raise ExecutionRecoveryRequired("d8_input_measurement_changed")
             else:
                 self.evidence.save("input-measurement", record["model_request_id"], current)
         self.evidence.save("contract", record["model_request_id"], record)
@@ -229,25 +229,25 @@ class StructuredOutput:
         task, identity = self.identity(safe_request)
         saved = self.evidence.read("contract", identity)
         if saved is None or saved["task_run_id"] != task or saved["safe_request_sha256"] != digest(asdict(safe_request)):
-            raise D3RecoveryRequired("d8_output_request_not_frozen")
+            raise ExecutionRecoveryRequired("d8_output_request_not_frozen")
         stage, schema = output_schema(safe_request, contract_version=self.app.config.contract_version)
         if not matches_output_contract(saved["output_contract"], stage, schema, self.app.config.contract_version):
-            raise D3RecoveryRequired("d8_output_schema_changed")
+            raise ExecutionRecoveryRequired("d8_output_schema_changed")
         correction = saved["correction_of_model_request_id"]
         expected_error = self._error(correction)
         if saved["instruction"] != _instruction(correction is not None, length_limited=expected_error is not None and expected_error["reason"] == "output_length_limit") or saved["correction"] != expected_error:
-            raise D3RecoveryRequired("d8_output_frozen_description_changed")
+            raise ExecutionRecoveryRequired("d8_output_frozen_description_changed")
         # Model workers read frozen files only; SQLite belongs to the dispatch thread.
         if isinstance(safe_request, D5RefinementRequest) and correction is not None:
             if identity != stable_id(task, "d8/refinement/correction/" + correction):
-                raise D3RecoveryRequired("d8_output_correction_owner_changed")
+                raise ExecutionRecoveryRequired("d8_output_correction_owner_changed")
         elif isinstance(safe_request, D2ReviewRequest):
             if safe_request.review_attempt > 1:
                 first = self.evidence.read("review-root", safe_request.review_root_id)
                 if first is None or first["first_model_request_id"] != correction or first["task_run_id"] != task:
-                    raise D3RecoveryRequired("d8_output_correction_owner_changed")
+                    raise ExecutionRecoveryRequired("d8_output_correction_owner_changed")
         elif getattr(safe_request, "correction_of_model_request_id", None) != correction:
-            raise D3RecoveryRequired("d8_output_correction_owner_changed")
+            raise ExecutionRecoveryRequired("d8_output_correction_owner_changed")
         if isinstance(safe_request, D2ReviewRequest) and safe_request.review_attempt == 1:
             self.evidence.save("review-root", safe_request.review_root_id,
                 {"task_run_id": safe_request.task_run_id, "first_model_request_id": safe_request.review_id})
@@ -264,7 +264,7 @@ class StructuredOutput:
         if "optional_output_kind" in result:
             fields.add("optional_output_kind")
             if result["optional_output_kind"] != "fact_candidate" or result.get("stage") != "inner_plan":
-                raise D3RecoveryRequired("d8_output_diagnostic_binding_changed")
+                raise ExecutionRecoveryRequired("d8_output_diagnostic_binding_changed")
         if (contract is None or set(result) != fields or result.get("contract_version") != self.app.config.contract_version
                 or result.get("model_request_id") != identity or result.get("contract_sha256") != digest(contract)
                 or result.get("task_run_id") != contract["task_run_id"] or result.get("stage") != contract["stage"]
@@ -272,7 +272,7 @@ class StructuredOutput:
                 or result.get("correction_of_model_request_id") != contract["correction_of_model_request_id"]
                 or result.get("terminal") not in {None, "output_truncated", "completion_invalid", "output_size_exceeded", "output_depth_exceeded", "output_budget_exhausted"}
                 or not isinstance(result.get("issues"), list) or not 1 <= len(result["issues"]) <= 8):
-            raise D3RecoveryRequired("d8_output_diagnostic_binding_changed")
+            raise ExecutionRecoveryRequired("d8_output_diagnostic_binding_changed")
         names = set()
         def collect(schema):
             names.update(schema.get("properties", {}))
@@ -309,14 +309,14 @@ class StructuredOutput:
                         and 0 <= int(issue["expected"].rsplit("_", 1)[1]) < int(issue["actual"].rsplit("_", 1)[1]) <= 65536)
                     or any(p not in names and p != "<unknown>" and not re.fullmatch(r"[0-9]+", p)
                            for p in issue["path"].split("/")[1:])):
-                raise D3RecoveryRequired("d8_output_diagnostic_fields_invalid")
+                raise ExecutionRecoveryRequired("d8_output_diagnostic_fields_invalid")
         measure = result["output_measurement"]
         if (measure is not None and (not isinstance(measure, dict)
                 or set(measure) != {"utf8_bytes", "unicode_characters", "tokens"}
                 or any(type(measure[k]) is not int or measure[k] < 0 for k in ("utf8_bytes", "unicode_characters"))
                 or measure["tokens"] is not None)
                 or type(result["finished_at"]) not in {int, float} or not math.isfinite(result["finished_at"])):
-            raise D3RecoveryRequired("d8_output_diagnostic_measurement_invalid")
+            raise ExecutionRecoveryRequired("d8_output_diagnostic_measurement_invalid")
         return result
 
     def reconcile_formats(self):
@@ -345,7 +345,7 @@ class StructuredOutput:
                 engine.active_calls.pop(identity)
             contract = self.evidence.read("contract", identity)
             if contract is None or contract.get("model_request_id") != identity:
-                raise D3RecoveryRequired("d8_output_model_audit_changed")
+                raise ExecutionRecoveryRequired("d8_output_model_audit_changed")
             audit = contract["model_audit"]
             if (audit is None or contract["task_run_id"] != task
                     or contract["stage"] != audit["stage"] or contract["role_config_ref"] != audit["role_config_ref"]
@@ -356,7 +356,7 @@ class StructuredOutput:
                     or audit["context_sha256"] != record.start.context_sha256
                     or audit["role_config_ref"] != record.start.role_config_ref
                     or audit["resource_ref"] != record.start.resource_ref):
-                raise D3RecoveryRequired("d8_output_model_audit_changed")
+                raise ExecutionRecoveryRequired("d8_output_model_audit_changed")
             raw, outcome, reason = None, "invalid_structure", "d8_output_format_invalid"
             finished_at = failure["finished_at"] if failure is not None else self.app.clock()
             if cancelled or retained:
@@ -364,7 +364,7 @@ class StructuredOutput:
                         or interruption.get("model_request_id") != identity
                         or interruption.get("request_sha256") != contract["source_request_sha256"]
                         or retained and interruption.get("adapter_exit_confirmed") is not True):
-                    raise D3RecoveryRequired("d8_output_interruption_binding_changed")
+                    raise ExecutionRecoveryRequired("d8_output_interruption_binding_changed")
                 if cancelled:
                     frozen, _ = self.app.selection_bindings._request(identity)
                     expected_envelope = dict(request=frozen["request"], output_contract=contract["output_contract"],
@@ -373,7 +373,7 @@ class StructuredOutput:
                     if (sent is None or sent.get("envelope_sha256") != digest(expected_envelope) or sent.get("model_request_id") != identity or sent.get("task_run_id") != task
                             or sent.get("stage") != audit["stage"] or sent.get("role_config_ref") != audit["role_config_ref"]
                             or provider.get("model_request_id") != identity or provider.get("request_sha256") != digest(sent)):
-                        raise D3RecoveryRequired("d8_output_cancelled_call_binding_changed")
+                        raise ExecutionRecoveryRequired("d8_output_cancelled_call_binding_changed")
                 binding = self.app.selection_bindings.read(identity) if retained else None
                 if binding is not None:
                     raw, outcome, reason = binding["canonical_response"], "accepted", None
@@ -398,7 +398,7 @@ class StructuredOutput:
             return None
         contract = self.evidence.read("contract", identity)
         if result["task_run_id"] != task or contract != self._contract(request)[1]:
-            raise D3RecoveryRequired("d8_output_diagnostic_request_changed")
+            raise ExecutionRecoveryRequired("d8_output_diagnostic_request_changed")
         return result
 
     def retryable_technical_failure(self, request):
@@ -413,14 +413,14 @@ class StructuredOutput:
             if (interruption.get("task_run_id") != request.task_run_id or interruption.get("model_request_id") != identity
                     or interruption.get("request_sha256") != contract["source_request_sha256"]
                     or interruption.get("adapter_exit_confirmed") is not True):
-                raise D3RecoveryRequired("d8_output_interruption_binding_changed")
+                raise ExecutionRecoveryRequired("d8_output_interruption_binding_changed")
             return True
         return transient_provider_result(self.evidence, identity)
 
     def terminal_check(self, request):
         reason = format_stop_reason(self.failure(request))
         if reason is not None:
-            raise D3RecoveryRequired(reason)
+            raise ExecutionRecoveryRequired(reason)
 
     def normalize(self, request, response):
         task, identity = self.identity(request)
@@ -488,7 +488,7 @@ class StructuredOutput:
                 original = self.app.review_diagnostics._request(identity)
                 contract = self.evidence.read("contract", identity)
                 if contract["source_request_sha256"] != digest(asdict(original)):
-                    raise D3RecoveryRequired("d9_review_contract_binding_changed")
+                    raise ExecutionRecoveryRequired("d9_review_contract_binding_changed")
                 return self.app.review_diagnostics.normalize(original, raw)
             if not issues:
                 return raw

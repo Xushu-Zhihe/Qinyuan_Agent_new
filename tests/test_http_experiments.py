@@ -12,7 +12,7 @@ from test_exploration_loop import install
 from test_mcp_link import Tools
 from agent_adapters.mcp_plan_executor import MCPPlanExecutor
 from agent_adapters.http_experiments import TOOL
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 
 
 class ScriptProcess:
@@ -46,6 +46,34 @@ class ScriptProcess:
         self.replies.put(None)
         self.thread.join(2)
         assert not self.thread.is_alive()
+
+
+@pytest.mark.parametrize('http_case', ['continuous'], indirect=True)
+@pytest.mark.parametrize('failure_phase', ['bridge_ready', 'bridge_event', 'script_execution'])
+def test_local_failure_preserves_safe_phase_without_claiming_target_failure(http_case, failure_phase):
+    c = http_case
+    calls = setup(c, "print('controlled')")
+    class FailedProcess:
+        exec_id = 'controlled-failed-process'
+        def __init__(self, *args): self.reads = 0
+        def receive(self):
+            self.reads += 1
+            if failure_phase == 'bridge_ready' or self.reads > 1 and failure_phase == 'bridge_event':
+                raise ValueError('PRIVATE diagnostic text must not be saved')
+            if self.reads == 1: return dict(kind='ready', pid=123)
+            return dict(kind='finished', status='failed', output='', error_type='PermissionError', error_line=1)
+        def close(self): pass
+    c.app.mcp.experiments.runner_factory = FailedProcess
+    result = asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required
+    report = c.app.mcp.experiments.result(calls[0])
+    assert report['status'] == 'failed' and report['requests'] == [] and not c.sends
+    assert report['failure'] == dict(category='script' if failure_phase == 'script_execution' else 'bridge',
+        phase=failure_phase, code=report['code'],
+        error_type='PermissionError' if failure_phase == 'script_execution' else 'ValueError')
+    assert 'PRIVATE' not in json.dumps(report) and not c.app.state.facts
+    c.app.mcp.reconcile()
+    assert not c.sends
 
 
 def setup(case,script,*,fact=False):
@@ -174,7 +202,7 @@ def test_unknown_request_is_not_replayed_or_reported_as_local_script_failure(htt
     assert result.recovery_required and len(c.sends)==2,result
     assert c.app.mcp.experiments.result(calls[0]) is None
     assert len([r for r in c.app.mcp.records() if r.completion is not None])==1
-    with pytest.raises(D3RecoveryRequired):c.app.mcp.reconcile()
+    with pytest.raises(ExecutionRecoveryRequired):c.app.mcp.reconcile()
     assert len(c.sends)==2
 
 
@@ -253,11 +281,11 @@ def test_lost_session_completion_is_not_reexecuted_and_corrupt_response_is_rejec
     read=c.app.web.protected.read
     with monkeypatch.context() as patch:
         patch.setattr(c.app.web.protected,'read',lambda key:b'corrupted' if key==body_id else read(key))
-        with pytest.raises(D3RecoveryRequired,match='source_changed'):
+        with pytest.raises(ExecutionRecoveryRequired,match='source_changed'):
             c.app.evidence_conclusions.source(ref,c.app.state.intents[0].intent_id)
     read=c.app.output_boundary.evidence.read
     monkeypatch.setattr(c.app.output_boundary.evidence,'read',lambda kind,key:None if kind=='experiment-result' else read(kind,key))
-    with pytest.raises(D3RecoveryRequired,match='process_reconciliation_required'):
+    with pytest.raises(ExecutionRecoveryRequired,match='process_reconciliation_required'):
         c.app.mcp.reconcile()
     assert len(c.sends)==1
 
@@ -346,7 +374,7 @@ def test_supervision_counts_individual_batch_requests_and_keeps_script_outcome(h
     assert len(c.sends) == 6 and len(calls) == 1
     read = c.app.mcp.evidence.read
     monkeypatch.setattr(c.app.mcp.evidence, 'read', lambda kind, identity: None if kind == 'mcp-result' else read(kind, identity))
-    with pytest.raises(D3RecoveryRequired, match='mcp.result_binding_changed'):
+    with pytest.raises(ExecutionRecoveryRequired, match='mcp.result_binding_changed'):
         c.app.supervision.exploration_progress(intent)
 
 
@@ -493,11 +521,11 @@ def test_stop_failure_retains_progress_and_requires_exit_confirmation_without_re
     assert c.app.store.load_d3_operation(parent).application_ref is None
     def unavailable(_):raise ConnectionError('private Docker inspection failure')
     c.app.http_sandbox._runtime=NS(client=NS(api=NS(exec_inspect=unavailable)))
-    with pytest.raises(D3RecoveryRequired,match='process_reconciliation_required'):c.app.mcp.reconcile()
+    with pytest.raises(ExecutionRecoveryRequired,match='process_reconciliation_required'):c.app.mcp.reconcile()
     assert experiments.result(parent) is None
     status=dict(ContainerID=c.app.state.task_run.sandbox_id,Running=True)
     c.app.http_sandbox._runtime=NS(client=NS(api=NS(exec_inspect=lambda _:status)))
-    with pytest.raises(D3RecoveryRequired,match='process_reconciliation_required'):c.app.mcp.reconcile()
+    with pytest.raises(ExecutionRecoveryRequired,match='process_reconciliation_required'):c.app.mcp.reconcile()
     status['Running']=False
     c.app.mcp.reconcile()
     restored=experiments.result(parent)
@@ -534,7 +562,7 @@ def test_request_unknown_is_not_masked_by_stop_failure_or_replayed(http_case):
     assert experiments.result(parent) is None
     c.app.http_sandbox._runtime=NS(client=NS(api=NS(exec_inspect=lambda _:
         dict(ContainerID=c.app.state.task_run.sandbox_id,Running=False))))
-    with pytest.raises(D3RecoveryRequired,match='request_outcome_unknown'):c.app.mcp.reconcile()
+    with pytest.raises(ExecutionRecoveryRequired,match='request_outcome_unknown'):c.app.mcp.reconcile()
     assert len(c.sends)==2 and len(calls)==1
 
 
@@ -577,7 +605,7 @@ def test_experiment_detail_does_not_impersonate_a_final_candidate_source(http_ca
     if fallback=='none':
         with monkeypatch.context() as absent:
             absent.setattr(c.app.store,'list_d4_operations',lambda task:())
-            with pytest.raises(D3RecoveryRequired,match='d9_candidate_source_missing'):
+            with pytest.raises(ExecutionRecoveryRequired,match='d9_candidate_source_missing'):
                 c.app.answers._request(c.app.state.intents[0])
     if fallback=='mcp':
         from dataclasses import replace
@@ -634,7 +662,7 @@ def test_optional_exploration_group_preserves_multi_request_source_binding(http_
         with monkeypatch.context() as patch:
             patch.setattr(c.app.model_evidence,'read',lambda key:altered)
             patch.setattr(c.app.store,'load_d3_operation',lambda key:altered_parent)
-            with pytest.raises(D3RecoveryRequired,match='d22_experiment_source_changed'):
+            with pytest.raises(ExecutionRecoveryRequired,match='d22_experiment_source_changed'):
                 c.app.mcp.experiments.validate_receipt(child,claim,saved)
     assert len(c.sends)==9
 
@@ -648,10 +676,10 @@ def test_receipt_failure_is_durable_before_close_and_public_without_replay(http_
     original_save=c.app.mcp.evidence.save;original_apply=c.app.mcp._apply
     code='d22_experiment_source_changed' if phase=='receipt_apply' else 'd8_handoff_evidence_write_recovery_required'
     def save(kind,key,value):
-        if phase=='receipt_save' and kind=='mcp-result':raise D3RecoveryRequired(code)
+        if phase=='receipt_save' and kind=='mcp-result':raise ExecutionRecoveryRequired(code)
         return original_save(kind,key,value)
     def apply(operation,claim,result):
-        if phase=='receipt_apply' and 'experiment_request' in claim:raise D3RecoveryRequired(code)
+        if phase=='receipt_apply' and 'experiment_request' in claim:raise ExecutionRecoveryRequired(code)
         return original_apply(operation,claim,result)
     monkeypatch.setattr(c.app.mcp.evidence,'save',save)
     monkeypatch.setattr(c.app.mcp,'_apply',apply)
@@ -678,11 +706,34 @@ def test_receipt_failure_is_durable_before_close_and_public_without_replay(http_
     assert row['phase']==phase and row['active'] and row['result_saved']==(phase=='receipt_apply')
     assert snapshot['recovery']['reason']==code
     if phase=='receipt_apply':
-        with pytest.raises(D3RecoveryRequired,match=code):c.app.mcp.reconcile()
+        with pytest.raises(ExecutionRecoveryRequired,match=code):c.app.mcp.reconcile()
         assert c.app.mcp.evidence.read('experiment-failure',operation.start.operation_id)==failure
     assert len(c.sends)==1
     read=c.app.mcp.evidence.read
     monkeypatch.setattr(c.app.mcp.evidence,'read',lambda kind,key:
         {**failure,'request_sha256':'0'*64} if kind=='experiment-failure' else read(kind,key))
-    with pytest.raises(D3RecoveryRequired,match='d22_experiment_failure_diagnostic_invalid'):
+    with pytest.raises(ExecutionRecoveryRequired,match='d22_experiment_failure_diagnostic_invalid'):
         failure_diagnostics(c.app.mcp.evidence,c.app.store,c.task)
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+def test_peer_that_does_not_speak_http_is_a_recoverable_rejection(http_case):
+    """A non-HTTP peer must fail this tool, not the whole TaskRun."""
+    c=http_case
+    calls=setup(c,"request('GET','/')\nprint('blocked')")
+    from agent_adapters.web.http_adapter import HttpProtocolMismatch
+    class MismatchTransport:
+        def send(self,**kwargs):
+            c.sends.append(kwargs)
+            raise HttpProtocolMismatch('d22_http_protocol_mismatch')
+    c.app.web.transport_factory=lambda _:MismatchTransport()
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required,result
+    report=c.app.mcp.experiments.result(calls[0])
+    assert report['status']=='rejected' and report['code']=='d22_http_protocol_mismatch'
+    assert report['failure']==dict(category='dependency',phase='target_request',code='d22_http_protocol_mismatch')
+    assert len(report['requests'])==1 and len(c.sends)==1
+    failure=c.app.mcp.evidence.read('experiment-failure',report['requests'][0])
+    assert failure['code']=='d22_http_protocol_mismatch' and failure['phase']=='http_execute'
+    # The rejected request is settled: reconciling neither replays nor reopens it.
+    c.app.mcp.reconcile()
+    assert c.app.store.load_d4_operation(report['requests'][0]).completion.result_kind=='rejected'

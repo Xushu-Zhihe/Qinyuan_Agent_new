@@ -178,6 +178,8 @@ def _dispatch_v3_run_task(args, raw):
         declaration.update(execution_profile=raw["execution_profile"],
                            contract_version=int(raw["execution_profile"].removeprefix("d8_v")))
         declaration["capabilities"] = ["attachment_digest_only", "simulation"]
+        if raw["execution_profile"] == "d8_v22":
+            declaration["goal_validation"] = "external" if (state_dir.parent / "competition-binding.json").is_file() else "human"
     if d8_real:
         from agent_adapters.simulation import real_declaration_binding
         backend = raw["d8_config"]["sandbox_backend"]
@@ -219,10 +221,14 @@ def _dispatch_v3_run_task(args, raw):
         from agent_adapters.web.task_result import snapshot_v3_task_result
 
         phase = _failure_phase()
-        prefix = ("d8_real" if d8_real else "simulation" if "execution_profile" in raw
-                  else "d7_simulation")
-        error_code = f"{prefix}_{phase}_failed"
+        prefix = "task.real" if d8_real else "task.simulated"
+        error_code = f"{prefix}.{phase}_failed"
         failure = {"code": error_code, "phase": phase, **safe_failure_details(exc)}
+        from qinyuan_core import QinyuanError
+        if isinstance(exc, QinyuanError):
+            from qinyuan_core import classify
+            category, cause_code, _ = classify(exc)
+            failure.update(category=str(category), cause_code=cause_code)
         immutable_write(
             directory / ("dispatch-stop-" + str(uuid4()) + ".json"),
             {"stop": "recovery_required", "reason": error_code, "diagnostic": failure},
@@ -390,13 +396,16 @@ def _finish_event_export(exporter) -> tuple[int, str | None]:
 
 
 def _run_v3_simulated_operation(
-    directory: Path, declaration: dict, *, operation: str, events: str | None, competition_request=None
+    directory: Path, declaration: dict, *, operation: str, events: str | None, competition_request=None, human_decision=None
 ) -> dict:
     from agent_adapters.web.simulated_application import run_simulated_task
     extra={}
     if competition_request is not None:
         from agent_adapters.simulation import run_simulated_task
         extra["competition_request"]=competition_request
+    if human_decision is not None:
+        from agent_adapters.simulation import run_simulated_task
+        extra["human_decision"] = human_decision
 
     if not events:
         return run_simulated_task(directory, declaration, operation=operation, **extra)
@@ -855,6 +864,10 @@ def dispatch_v3_existing(args, directory: Path, declaration: dict):
         except (StorageError,sqlite3.Error,OSError):
             return {"protocol_version":3,"task_run_id":task_id,"errors":[{"code":"operator_command_outcome_unknown"}],"exit_code":5}
     result = snapshot_v3_task_result(directory, declaration)
+    if args.command == "human-decision":
+        decision = dict(candidate_id=args.candidate_id, action=args.decision, operation_id=args.operation_id)
+        return operation_result(_run_v3_simulated_operation(directory, declaration, operation="human-decision",
+            events=getattr(args, "events", None), human_decision=decision))
     if args.command in {'competition-submit','competition-end'}:
         try:
             payload=parse_json(sys.stdin.buffer.read(16385),16384)

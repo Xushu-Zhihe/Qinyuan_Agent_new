@@ -34,7 +34,7 @@ from agent_core.web_contracts import (
     D7_WEB_RESPONSE_HEADERS,
 )
 from agent_core.sqlite_control_store import SqliteControlStore
-from qinyuan_core import CodedError
+from qinyuan_core import Category, CodedError, get_logger
 
 MAX_D7_HTTP_REQUEST_BYTES = D7_WEB_MAX_REQUEST_BODY_BYTES
 MAX_D7_HTTP_RESPONSE_BYTES = D7_WEB_MAX_RESPONSE_BODY_BYTES
@@ -62,19 +62,29 @@ _FORBIDDEN_HEADERS = frozenset(
 _TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
 
-class D7HttpError(CodedError):
+class HttpCapabilityError(CodedError):
     """Fixed, non-sensitive D7 HTTP adapter error."""
+
+
+class HttpProtocolMismatch(HttpCapabilityError):
+    """The authorized peer answered with bytes that are not an HTTP status line.
+
+    A recoverable capability mismatch, not an unknown side effect: the planner
+    must be able to stop using HTTP for this target and switch channel.
+    """
+
+    category = Category.DEPENDENCY
 
 
 def _uuid4(value: object, name: str) -> str:
     if not isinstance(value, str):
-        raise D7HttpError(f"{name}_invalid")
+        raise HttpCapabilityError(f"{name}_invalid")
     try:
         parsed = UUID(value)
     except ValueError as exc:
-        raise D7HttpError(f"{name}_invalid") from exc
+        raise HttpCapabilityError(f"{name}_invalid") from exc
     if parsed.version != 4 or str(parsed) != value:
-        raise D7HttpError(f"{name}_invalid")
+        raise HttpCapabilityError(f"{name}_invalid")
     return value
 
 
@@ -87,12 +97,12 @@ class D7HttpOrigin:
     @classmethod
     def parse(cls, value: object) -> D7HttpOrigin:
         if not isinstance(value, str) or any(ord(char) < 32 for char in value):
-            raise D7HttpError("d7_http_origin_invalid")
+            raise HttpCapabilityError("d7_http_origin_invalid")
         try:
             parsed = urlsplit(value)
             port = parsed.port
         except ValueError as exc:
-            raise D7HttpError("d7_http_origin_invalid") from exc
+            raise HttpCapabilityError("d7_http_origin_invalid") from exc
         if (
             parsed.scheme not in {"http", "https"}
             or not parsed.hostname
@@ -102,13 +112,13 @@ class D7HttpOrigin:
             or parsed.query
             or parsed.fragment
         ):
-            raise D7HttpError("d7_http_origin_invalid")
+            raise HttpCapabilityError("d7_http_origin_invalid")
         host = parsed.hostname.lower()
         resolved_port = (
             port if port is not None else (443 if parsed.scheme == "https" else 80)
         )
         if not 1 <= resolved_port <= 65535:
-            raise D7HttpError("d7_http_origin_invalid")
+            raise HttpCapabilityError("d7_http_origin_invalid")
         return cls(parsed.scheme, host, resolved_port)
 
     @property
@@ -208,7 +218,7 @@ class D7HttpEvidenceMetadata:
             or not isinstance(self.created_at, (int, float))
             or not math.isfinite(self.created_at)
         ):
-            raise D7HttpError("d7_http_evidence_metadata_invalid")
+            raise HttpCapabilityError("d7_http_evidence_metadata_invalid")
 
 
 def _is_sha256(value: object) -> bool:
@@ -239,16 +249,16 @@ class D7HttpResponseEvidenceStore:
         self._lock = RLock()
         try:
             if self.run_dir.is_symlink() or not self.run_dir.is_dir():
-                raise D7HttpError("d7_http_evidence_run_directory_invalid")
+                raise HttpCapabilityError("d7_http_evidence_run_directory_invalid")
             new = not self.directory.exists()
             if new and create:
                 self.directory.mkdir()
                 self.protection.restrict_directory(self.directory)
             if self.directory.is_symlink() or not self.directory.is_dir():
-                raise D7HttpError("d7_http_evidence_directory_invalid")
+                raise HttpCapabilityError("d7_http_evidence_directory_invalid")
             identity = getattr(self.protection, "identity", None)
             if not isinstance(identity, str) or not identity.startswith("S-1-"):
-                raise D7HttpError("d7_http_evidence_identity_invalid")
+                raise HttpCapabilityError("d7_http_evidence_identity_invalid")
             self.protection.verify_directory(self.directory)
             owner_path = self.directory / "owner.json"
             owner = {
@@ -262,13 +272,13 @@ class D7HttpResponseEvidenceStore:
                 owner_path.is_symlink()
                 or json.loads(owner_path.read_text("utf-8")) != owner
             ):
-                raise D7HttpError("d7_http_evidence_ownership_invalid")
+                raise HttpCapabilityError("d7_http_evidence_ownership_invalid")
         except WindowsEvidenceProtectionError as exc:
-            raise D7HttpError("d7_http_evidence_protection_failed") from exc
+            raise HttpCapabilityError("d7_http_evidence_protection_failed") from exc
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            if isinstance(exc, D7HttpError):
+            if isinstance(exc, HttpCapabilityError):
                 raise
-            raise D7HttpError("d7_http_evidence_store_invalid") from exc
+            raise HttpCapabilityError("d7_http_evidence_store_invalid") from exc
 
     @staticmethod
     def _encode(value: object) -> bytes:
@@ -280,10 +290,9 @@ class D7HttpResponseEvidenceStore:
             allow_nan=False,
         ).encode("utf-8")
 
-    @staticmethod
-    def _write_exclusive(path: Path, payload: bytes) -> None:
+    def _write_exclusive(self, path: Path, payload: bytes) -> None:
         if path.exists() or path.is_symlink():
-            raise D7HttpError("d7_http_evidence_conflict")
+            raise HttpCapabilityError("d7_http_evidence_conflict")
         descriptor, temporary = tempfile.mkstemp(
             prefix=".d7-http-pending-", dir=path.parent
         )
@@ -292,10 +301,26 @@ class D7HttpResponseEvidenceStore:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            try:
-                os.link(temporary, path)
-            except FileExistsError as exc:
-                raise D7HttpError("d7_http_evidence_conflict") from exc
+            for attempt, delay in enumerate((0.05, 0.1, 0.2, None), 1):
+                try:
+                    os.link(temporary, path)
+                except FileExistsError as exc:
+                    raise HttpCapabilityError("d7_http_evidence_conflict") from exc
+                except OSError as exc:
+                    if getattr(exc, "winerror", None) != 32 or delay is None:
+                        get_logger("store").error("http.evidence_publish_failed", run=self.task_run_id,
+                            evidence_ref=path.name, category="dependency", code="d7_http_evidence_write_failed",
+                            attempts=attempt, winerror=getattr(exc, "winerror", None))
+                        raise
+                    get_logger("store").warning("http.evidence_publish_retry", run=self.task_run_id,
+                        evidence_ref=path.name, category="dependency", winerror=32,
+                        attempt=attempt, retry_delay_seconds=delay)
+                    time.sleep(delay)
+                else:
+                    if attempt > 1:
+                        get_logger("store").info("http.evidence_publish_recovered", run=self.task_run_id,
+                            evidence_ref=path.name, attempts=attempt)
+                    break
         finally:
             Path(temporary).unlink(missing_ok=True)
 
@@ -312,13 +337,13 @@ class D7HttpResponseEvidenceStore:
                 or not owner_path.is_file()
                 or owner_path.stat().st_size > 4096
             ):
-                raise D7HttpError("d7_http_evidence_ownership_invalid")
+                raise HttpCapabilityError("d7_http_evidence_ownership_invalid")
             if json.loads(owner_path.read_text("utf-8")) != expected:
-                raise D7HttpError("d7_http_evidence_ownership_invalid")
-        except D7HttpError:
+                raise HttpCapabilityError("d7_http_evidence_ownership_invalid")
+        except HttpCapabilityError:
             raise
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise D7HttpError("d7_http_evidence_ownership_invalid") from exc
+            raise HttpCapabilityError("d7_http_evidence_ownership_invalid") from exc
 
     def _metadata(self, evidence_id: str) -> D7HttpEvidenceMetadata:
         _uuid4(evidence_id, "evidence_id")
@@ -335,35 +360,35 @@ class D7HttpResponseEvidenceStore:
         }
         try:
             if path.is_symlink() or not path.is_file() or path.stat().st_size > 8192:
-                raise D7HttpError("d7_http_evidence_not_found")
+                raise HttpCapabilityError("d7_http_evidence_not_found")
             value = json.loads(path.read_text("utf-8"))
             if not isinstance(value, dict) or set(value) != fields:
-                raise D7HttpError("d7_http_evidence_metadata_invalid")
+                raise HttpCapabilityError("d7_http_evidence_metadata_invalid")
             metadata = D7HttpEvidenceMetadata(**value)
             if (
                 metadata.task_run_id != self.task_run_id
                 or metadata.evidence_id != evidence_id
             ):
-                raise D7HttpError("d7_http_evidence_ownership_invalid")
+                raise HttpCapabilityError("d7_http_evidence_ownership_invalid")
             return metadata
-        except D7HttpError:
+        except HttpCapabilityError:
             raise
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise D7HttpError("d7_http_evidence_metadata_invalid") from exc
+            raise HttpCapabilityError("d7_http_evidence_metadata_invalid") from exc
 
     def _ciphertext(self, metadata: D7HttpEvidenceMetadata) -> bytes:
         path = self.directory / f"{metadata.evidence_id}.cipher"
         maximum = MAX_D7_HTTP_RESPONSE_BYTES * 2 + 16 * 1024
         try:
             if path.is_symlink() or not path.is_file() or path.stat().st_size > maximum:
-                raise D7HttpError("d7_http_evidence_integrity_failed")
+                raise HttpCapabilityError("d7_http_evidence_integrity_failed")
             value = path.read_bytes()
-        except D7HttpError:
+        except HttpCapabilityError:
             raise
         except OSError as exc:
-            raise D7HttpError("d7_http_evidence_read_failed") from exc
+            raise HttpCapabilityError("d7_http_evidence_read_failed") from exc
         if hashlib.sha256(value).hexdigest() != metadata.cipher_sha256:
-            raise D7HttpError("d7_http_evidence_integrity_failed")
+            raise HttpCapabilityError("d7_http_evidence_integrity_failed")
         return value
 
     def find_by_operation(self, operation_id: str) -> D7HttpEvidenceMetadata | None:
@@ -376,17 +401,17 @@ class D7HttpResponseEvidenceStore:
                 matches = []
                 for path in self.directory.glob("*.meta.json"):
                     if path.is_symlink() or not path.is_file():
-                        raise D7HttpError("d7_http_evidence_metadata_invalid")
+                        raise HttpCapabilityError("d7_http_evidence_metadata_invalid")
                     evidence_id = path.name[: -len(".meta.json")]
                     metadata = self._metadata(evidence_id)
                     if metadata.operation_id == operation_id:
                         self._ciphertext(metadata)
                         matches.append(metadata)
                 if len(matches) > 1:
-                    raise D7HttpError("d7_http_evidence_operation_conflict")
+                    raise HttpCapabilityError("d7_http_evidence_operation_conflict")
                 return matches[0] if matches else None
             except WindowsEvidenceProtectionError as exc:
-                raise D7HttpError("d7_http_evidence_protection_failed") from exc
+                raise HttpCapabilityError("d7_http_evidence_protection_failed") from exc
 
     def read(self, evidence_id: str) -> bytes:
         """Decrypt one response after verifying TaskRun ownership and both hashes."""
@@ -408,7 +433,7 @@ class D7HttpResponseEvidenceStore:
                     or not isinstance(value["body_sha256"], str)
                     or not isinstance(value["body"], str)
                 ):
-                    raise D7HttpError("d7_http_evidence_integrity_failed")
+                    raise HttpCapabilityError("d7_http_evidence_integrity_failed")
                 body = bytes.fromhex(value["body"])
                 body_sha = hashlib.sha256(body).hexdigest()
                 if (
@@ -416,19 +441,19 @@ class D7HttpResponseEvidenceStore:
                     or body_sha != metadata.body_sha256
                     or value["body_sha256"] != metadata.body_sha256
                 ):
-                    raise D7HttpError("d7_http_evidence_integrity_failed")
+                    raise HttpCapabilityError("d7_http_evidence_integrity_failed")
                 return body
             except WindowsEvidenceProtectionError as exc:
-                raise D7HttpError("d7_http_evidence_protection_failed") from exc
-            except D7HttpError:
+                raise HttpCapabilityError("d7_http_evidence_protection_failed") from exc
+            except HttpCapabilityError:
                 raise
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                raise D7HttpError("d7_http_evidence_integrity_failed") from exc
+                raise HttpCapabilityError("d7_http_evidence_integrity_failed") from exc
 
     def save(self, operation_id: str, body: bytes) -> D7HttpEvidenceMetadata:
         _uuid4(operation_id, "operation_id")
         if not isinstance(body, bytes) or len(body) > MAX_D7_HTTP_RESPONSE_BYTES:
-            raise D7HttpError("d7_http_evidence_body_invalid")
+            raise HttpCapabilityError("d7_http_evidence_body_invalid")
         evidence_id = str(uuid4())
         body_sha = hashlib.sha256(body).hexdigest()
         envelope = self._encode({"body_sha256": body_sha, "body": body.hex()})
@@ -445,7 +470,7 @@ class D7HttpResponseEvidenceStore:
                         body
                     ):
                         return existing
-                    raise D7HttpError("d7_http_evidence_operation_conflict")
+                    raise HttpCapabilityError("d7_http_evidence_operation_conflict")
                 ciphertext = self.protection.protect(envelope, entropy)
                 metadata = D7HttpEvidenceMetadata(
                     1,
@@ -465,16 +490,16 @@ class D7HttpResponseEvidenceStore:
                         self.directory / f"{evidence_id}.meta.json",
                         self._encode(asdict(metadata)),
                     )
-                except (OSError, ValueError, TypeError, D7HttpError):
+                except (OSError, ValueError, TypeError, HttpCapabilityError):
                     (self.directory / f"{evidence_id}.cipher").unlink(missing_ok=True)
                     raise
                 return metadata
             except WindowsEvidenceProtectionError as exc:
-                raise D7HttpError("d7_http_evidence_protection_failed") from exc
-            except D7HttpError:
+                raise HttpCapabilityError("d7_http_evidence_protection_failed") from exc
+            except HttpCapabilityError:
                 raise
             except OSError as exc:
-                raise D7HttpError("d7_http_evidence_write_failed") from exc
+                raise HttpCapabilityError("d7_http_evidence_write_failed") from exc
 
 
 class D7HttpEvidenceWriter(Protocol):
@@ -501,18 +526,18 @@ def _validate_owned_run(run_dir: Path, task_run_id: str) -> None:
         or database.is_symlink()
         or not database.is_file()
     ):
-        raise D7HttpError("d7_http_evidence_ownership_invalid")
+        raise HttpCapabilityError("d7_http_evidence_ownership_invalid")
     try:
         with SqliteControlStore.open_readonly(database) as ledger:
             if (
                 ledger.list_task_run_refs() != (task_run_id,)
                 or ledger.load_task_run(task_run_id) is None
             ):
-                raise D7HttpError("d7_http_evidence_ownership_invalid")
-    except D7HttpError:
+                raise HttpCapabilityError("d7_http_evidence_ownership_invalid")
+    except HttpCapabilityError:
         raise
     except Exception as exc:
-        raise D7HttpError("d7_http_evidence_ownership_invalid") from exc
+        raise HttpCapabilityError("d7_http_evidence_ownership_invalid") from exc
 
 
 class D7HttpResponseEvidenceService:
@@ -570,22 +595,22 @@ class D7HttpPolicy:
         self, request: D7HttpRequest
     ) -> tuple[str, str, tuple[tuple[str, str], ...], bytes]:
         if not isinstance(request, D7HttpRequest):
-            raise D7HttpError("d7_http_request_invalid")
+            raise HttpCapabilityError("d7_http_request_invalid")
         _uuid4(request.operation_id, "operation_id")
         if not isinstance(request.method, str):
-            raise D7HttpError("d7_http_method_invalid")
+            raise HttpCapabilityError("d7_http_method_invalid")
         method = request.method.upper()
         if method not in _ALLOWED_METHODS:
-            raise D7HttpError("d7_http_method_forbidden")
+            raise HttpCapabilityError("d7_http_method_forbidden")
         path_query = _valid_path_query(request.path_query)
         if not isinstance(request.body, str):
-            raise D7HttpError("d7_http_body_must_be_utf8_text")
+            raise HttpCapabilityError("d7_http_body_must_be_utf8_text")
         try:
             body = request.body.encode("utf-8", errors="strict")
         except UnicodeEncodeError as exc:
-            raise D7HttpError("d7_http_body_must_be_utf8_text") from exc
+            raise HttpCapabilityError("d7_http_body_must_be_utf8_text") from exc
         if len(body) > MAX_D7_HTTP_REQUEST_BYTES:
-            raise D7HttpError("d7_http_request_too_large")
+            raise HttpCapabilityError("d7_http_request_too_large")
         return method, path_query, _validated_headers(request.headers), body
 
 
@@ -664,21 +689,21 @@ def _valid_path_query(value: object) -> str:
         or "\\" in value
         or any(ord(char) < 32 or ord(char) == 127 for char in value)
     ):
-        raise D7HttpError("d7_http_path_invalid")
+        raise HttpCapabilityError("d7_http_path_invalid")
     try:
         parsed = urlsplit(value)
     except ValueError as exc:
-        raise D7HttpError("d7_http_path_invalid") from exc
+        raise HttpCapabilityError("d7_http_path_invalid") from exc
     if parsed.scheme or parsed.netloc or parsed.fragment:
-        raise D7HttpError("d7_http_path_invalid")
+        raise HttpCapabilityError("d7_http_path_invalid")
     return value
 
 
 def _validated_headers(headers: object) -> tuple[tuple[str, str], ...]:
     if not isinstance(headers, (tuple, list)):
-        raise D7HttpError("d7_http_headers_invalid")
+        raise HttpCapabilityError("d7_http_headers_invalid")
     if len(headers) > D7_WEB_MAX_HEADER_COUNT:
-        raise D7HttpError("d7_http_headers_too_many")
+        raise HttpCapabilityError("d7_http_headers_too_many")
     output: list[tuple[str, str]] = []
     seen: set[str] = set()
     total_bytes = 0
@@ -689,14 +714,14 @@ def _validated_headers(headers: object) -> tuple[tuple[str, str], ...]:
             or not isinstance(item[0], str)
             or not isinstance(item[1], str)
         ):
-            raise D7HttpError("d7_http_headers_invalid")
+            raise HttpCapabilityError("d7_http_headers_invalid")
         name, value = item
         lower = name.lower()
         try:
             name_bytes = name.encode("ascii", errors="strict")
             value_bytes = value.encode("latin-1", errors="strict")
         except UnicodeEncodeError as exc:
-            raise D7HttpError("d7_http_header_rejected") from exc
+            raise HttpCapabilityError("d7_http_header_rejected") from exc
         if (
             not _TOKEN.fullmatch(name)
             or lower in _FORBIDDEN_HEADERS
@@ -708,12 +733,12 @@ def _validated_headers(headers: object) -> tuple[tuple[str, str], ...]:
             or lower == "accept-encoding"
             and value.strip().lower() != "identity"
         ):
-            raise D7HttpError("d7_http_header_rejected")
+            raise HttpCapabilityError("d7_http_header_rejected")
         seen.add(lower)
         total_bytes += len(name_bytes) + len(value_bytes) + 4
         output.append((name, value))
     if total_bytes > D7_WEB_MAX_HEADER_BYTES:
-        raise D7HttpError("d7_http_headers_too_large")
+        raise HttpCapabilityError("d7_http_headers_too_large")
     return tuple(output)
 
 
@@ -721,7 +746,7 @@ def _validated_wire_headers(
     headers: object,
 ) -> tuple[tuple[str, str], ...]:
     if not isinstance(headers, (tuple, list)) or len(headers) > D7_WEB_MAX_HEADER_COUNT:
-        raise D7HttpError("d7_http_headers_invalid")
+        raise HttpCapabilityError("d7_http_headers_invalid")
     output: list[tuple[str, str]] = []
     seen: set[str] = set()
     total_bytes = 0
@@ -732,14 +757,14 @@ def _validated_wire_headers(
             or not isinstance(item[0], str)
             or not isinstance(item[1], str)
         ):
-            raise D7HttpError("d7_http_headers_invalid")
+            raise HttpCapabilityError("d7_http_headers_invalid")
         name, value = item
         lower = name.lower()
         try:
             name_bytes = name.encode("ascii", errors="strict")
             value_bytes = value.encode("latin-1", errors="strict")
         except UnicodeEncodeError as exc:
-            raise D7HttpError("d7_http_header_rejected") from exc
+            raise HttpCapabilityError("d7_http_header_rejected") from exc
         if (
             not _TOKEN.fullmatch(name)
             or lower in (_FORBIDDEN_HEADERS - {"cookie"})
@@ -751,12 +776,12 @@ def _validated_wire_headers(
             or lower == "accept-encoding"
             and value.strip().lower() != "identity"
         ):
-            raise D7HttpError("d7_http_header_rejected")
+            raise HttpCapabilityError("d7_http_header_rejected")
         seen.add(lower)
         total_bytes += len(name_bytes) + len(value_bytes) + 4
         output.append((name, value))
     if total_bytes > D7_WEB_MAX_HEADER_BYTES:
-        raise D7HttpError("d7_http_headers_too_large")
+        raise HttpCapabilityError("d7_http_headers_too_large")
     return tuple(output)
 
 
@@ -764,7 +789,7 @@ def _validated_response_headers(
     headers: object,
 ) -> tuple[tuple[str, str], ...]:
     if not isinstance(headers, tuple) or len(headers) > D7_WEB_MAX_HEADER_COUNT:
-        raise D7HttpError("d7_http_response_headers_invalid")
+        raise HttpCapabilityError("d7_http_response_headers_invalid")
     output: list[tuple[str, str]] = []
     seen_singletons: set[str] = set()
     total_bytes = 0
@@ -775,14 +800,14 @@ def _validated_response_headers(
             or not isinstance(pair[0], str)
             or not isinstance(pair[1], str)
         ):
-            raise D7HttpError("d7_http_response_headers_invalid")
+            raise HttpCapabilityError("d7_http_response_headers_invalid")
         name, value = pair
         lower = name.lower()
         try:
             name_bytes = name.encode("ascii", errors="strict")
             value_bytes = value.encode("latin-1", errors="strict")
         except UnicodeEncodeError as exc:
-            raise D7HttpError("d7_http_response_header_invalid") from exc
+            raise HttpCapabilityError("d7_http_response_header_invalid") from exc
         if (
             not _TOKEN.fullmatch(name)
             or lower not in D7_WEB_RESPONSE_HEADERS
@@ -793,13 +818,13 @@ def _validated_response_headers(
             or lower != "set-cookie"
             and lower in seen_singletons
         ):
-            raise D7HttpError("d7_http_response_header_invalid")
+            raise HttpCapabilityError("d7_http_response_header_invalid")
         if lower != "set-cookie":
             seen_singletons.add(lower)
         total_bytes += len(name_bytes) + len(value_bytes) + 4
         output.append((lower, value))
     if total_bytes > D7_WEB_MAX_HEADER_BYTES:
-        raise D7HttpError("d7_http_response_headers_too_large")
+        raise HttpCapabilityError("d7_http_response_headers_too_large")
     return tuple(output)
 
 
@@ -830,17 +855,17 @@ class D7HttpAdapter:
         self.policy = D7HttpPolicy.for_origin(authorized_origin)
         self.origin = self.policy.origin
         if evidence_store.task_run_id != self.task_run_id:
-            raise D7HttpError("d7_http_evidence_ownership_invalid")
+            raise HttpCapabilityError("d7_http_evidence_ownership_invalid")
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(timeout_seconds)
             or timeout_seconds <= 0
         ):
-            raise D7HttpError("d7_http_timeout_invalid")
+            raise HttpCapabilityError("d7_http_timeout_invalid")
         self.evidence_store = evidence_store
         if transport is None or not callable(getattr(transport, "send", None)):
-            raise D7HttpError("d7_http_transport_required")
+            raise HttpCapabilityError("d7_http_transport_required")
         self.transport = transport
         self.timeout_seconds = float(timeout_seconds)
         self._cookies = _TaskRunCookieJar(self.origin)
@@ -875,7 +900,7 @@ class D7HttpAdapter:
             path_query += "?" + parsed.query
         try:
             return _valid_path_query(path_query), False
-        except D7HttpError:
+        except HttpCapabilityError:
             return None, True
 
     def execute(self, request: D7HttpRequest) -> D7HttpResult:
@@ -884,7 +909,7 @@ class D7HttpAdapter:
         request_url = self.origin.url + path_query
         with self._lock:
             if self._closed:
-                raise D7HttpError("d7_http_session_closed")
+                raise HttpCapabilityError("d7_http_session_closed")
             cookie = self._cookies.request_header(request_url)
             wire_headers = list(headers)
             if not any(name.lower() == "accept-encoding" for name, _ in wire_headers):
@@ -902,23 +927,29 @@ class D7HttpAdapter:
                     timeout_seconds=self.timeout_seconds,
                     max_response_bytes=MAX_D7_HTTP_RESPONSE_BYTES,
                 )
-            except D7HttpError:
+            except HttpCapabilityError:
                 raise
             except Exception as exc:
-                raise D7HttpError("d7_http_transport_failed") from exc
+                raise HttpCapabilityError("d7_http_transport_failed") from exc
             if not isinstance(response, D7HttpWireResponse):
-                raise D7HttpError("d7_http_transport_response_invalid")
+                raise HttpCapabilityError("d7_http_transport_response_invalid")
             if (
                 type(response.status) is not int
                 or not 100 <= response.status <= 599
                 or not isinstance(response.body, bytes)
             ):
-                raise D7HttpError("d7_http_response_invalid")
+                raise HttpCapabilityError("d7_http_response_invalid")
             if len(response.body) > MAX_D7_HTTP_RESPONSE_BYTES:
-                raise D7HttpError("d7_http_response_too_large")
+                raise HttpCapabilityError("d7_http_response_too_large")
             response_headers = _validated_response_headers(response.headers)
             self._cookies.accept(response_headers, path_query)
-            metadata = self.evidence_store.save(operation_id, response.body)
+            try:
+                metadata = self.evidence_store.save(operation_id, response.body)
+            except HttpCapabilityError as exc:
+                # This exchange returned; persistence failure is not a second
+                # network failure, nor a settled operation without its receipt.
+                exc.context["phase"] = "response_evidence_save"
+                raise
             location, blocked = self._redirect_location(response_headers, request_url)
             text_bytes = response.body[:MAX_D7_HTTP_MODEL_TEXT_BYTES]
             body_text = text_bytes.decode("utf-8", errors="ignore")
@@ -945,7 +976,7 @@ class D7HttpAdapter:
         """Program-only session data; callers must protect it before persistence."""
         with self._lock:
             if self._closed:
-                raise D7HttpError("d7_http_session_closed")
+                raise HttpCapabilityError("d7_http_session_closed")
             return {"task_run_id": self.task_run_id, "origin": self.origin.url,
                     "cookies": [dict(vars(cookie), _rest=dict(cookie._rest))
                                 for cookie in self._cookies._jar]}
@@ -955,7 +986,7 @@ class D7HttpAdapter:
         if (not isinstance(value, dict) or set(value) != {"task_run_id", "origin", "cookies"}
                 or value['task_run_id'] != self.task_run_id or value['origin'] != self.origin.url
                 or not isinstance(value['cookies'], list)):
-            raise D7HttpError('d20_http_cookie_owner_changed')
+            raise HttpCapabilityError('d20_http_cookie_owner_changed')
         jar = http.cookiejar.CookieJar()
         keys = {'version', 'name', 'value', 'port', 'port_specified', 'domain', 'domain_specified',
                 'domain_initial_dot', 'path', 'path_specified', 'secure', 'expires', 'discard',
@@ -966,11 +997,11 @@ class D7HttpAdapter:
                     or not isinstance(item['path'], str) or not item['path'].startswith('/')
                     or not isinstance(item['_rest'], dict)
                     or not isinstance(item['name'], str) or not isinstance(item['value'], str)):
-                raise D7HttpError('d20_http_cookie_snapshot_invalid')
+                raise HttpCapabilityError('d20_http_cookie_snapshot_invalid')
             fields = dict(item)
             fields['rest'] = fields.pop('_rest')
             jar.set_cookie(http.cookiejar.Cookie(**fields))
         with self._lock:
             if self._closed:
-                raise D7HttpError('d7_http_session_closed')
+                raise HttpCapabilityError('d7_http_session_closed')
             self._cookies._jar = jar

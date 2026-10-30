@@ -10,7 +10,7 @@ from test_turn_budget import make_case
 
 from agent_adapters.web import candidate_evidence
 from agent_adapters.web.candidate_evidence import D7CandidateEvidenceService
-from agent_core.dual_llm_modeling import D3ProposalRejected
+from agent_core.dual_llm_modeling import ExecutionProposalRejected
 
 
 @pytest.mark.parametrize(
@@ -41,7 +41,7 @@ def test_completed_candidate_rejection_replays_without_model_or_candidate_io(
         model = app.inner.adapter.adapter
         before = len(model.calls)
 
-        with pytest.raises(D3ProposalRejected) as first:
+        with pytest.raises(ExecutionProposalRejected) as first:
             asyncio.run(app.propose_d7_candidate(token, protected))
 
         candidate_requests = [
@@ -67,7 +67,7 @@ def test_completed_candidate_rejection_replays_without_model_or_candidate_io(
             protected, "load_pending_for_request", reject_candidate_evidence_read
         )
 
-        with pytest.raises(D3ProposalRejected) as replay:
+        with pytest.raises(ExecutionProposalRejected) as replay:
             asyncio.run(app.propose_d7_candidate(token, protected))
 
         assert replay.value.code == first.value.code

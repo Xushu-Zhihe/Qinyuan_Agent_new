@@ -78,8 +78,8 @@ def policy(app):
     for index in app.config.authorization.attachment_indices:
         receipt = app.imports.read_receipt(app._id(f"import/{index}"))
         if receipt is None:
-            from agent_core.dual_llm_contracts import D3RecoveryRequired
-            raise D3RecoveryRequired("tcp.attachment_source_missing")
+            from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+            raise ExecutionRecoveryRequired("tcp.attachment_source_missing")
         attachments.append({"attachment_index": index, "import_id": receipt.import_id,
                             "path": receipt.sandbox_path, "sha256": receipt.sha256,
                             "byte_size": receipt.byte_size})

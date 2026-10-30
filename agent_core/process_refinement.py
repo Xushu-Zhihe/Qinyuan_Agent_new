@@ -6,10 +6,10 @@ import threading
 import time
 from dataclasses import asdict, replace
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.modeling import model_call_timeout, ModelError, ModelErrorKind
 from agent_core.operation_accounting import (
-    D4BudgetExhausted,
+    OperationBudgetExhausted,
     D4OperationCompletion,
     D4OperationStart,
 )
@@ -58,7 +58,7 @@ class ProcessRefinement:
         for fact in self.store.list_process_facts(task_run_id):
             candidate = self.evidence.read_candidate(fact.model_request_id)
             if candidate is None or digest(asdict(candidate)) != fact.evidence_sha256:
-                raise D3RecoveryRequired("d5_committed_summary_evidence_unavailable")
+                raise ExecutionRecoveryRequired("d5_committed_summary_evidence_unavailable")
             prior.append((fact, candidate))
         return tuple(prior)
 
@@ -127,10 +127,10 @@ class ProcessRefinement:
     ) -> D5Source | None:
         try:
             return self.sources.read(task_run_id, object_id, kind)
-        except D3RecoveryRequired:
+        except ExecutionRecoveryRequired:
             raise
         except Exception as exc:
-            raise D3RecoveryRequired("d5_source_read_unavailable") from exc
+            raise ExecutionRecoveryRequired("d5_source_read_unavailable") from exc
 
     def _result(self, attempt: D5Attempt, outcome: str, reason: str) -> None:
         self.evidence.save_result(
@@ -147,7 +147,7 @@ class ProcessRefinement:
             or result["outcome"] != "response_unknown"
             or result["reason"] != "not_applied_response_unknown"
         ):
-            raise D3RecoveryRequired("d5_unknown_disposition_evidence_changed")
+            raise ExecutionRecoveryRequired("d5_unknown_disposition_evidence_changed")
         self.store.seal_unknown_refinement(
             attempt.model_request_id,
             decided_at=result["finished_at"],
@@ -155,7 +155,7 @@ class ProcessRefinement:
             evidence_sha256=digest(result),
         )
         if self.evidence.read_result(attempt.model_request_id) != result:
-            raise D3RecoveryRequired("d5_unknown_disposition_evidence_changed")
+            raise ExecutionRecoveryRequired("d5_unknown_disposition_evidence_changed")
 
     def _validate_candidate(
         self, candidate: D5Candidate, attempt: D5Attempt
@@ -181,7 +181,7 @@ class ProcessRefinement:
             not isinstance(fact, D5ProcessFact)
             or fact.task_run_id != state.task_run.task_run_id
         ):
-            raise D3RecoveryRequired("d5_summary_owner_changed")
+            raise ExecutionRecoveryRequired("d5_summary_owner_changed")
         attempt = self.store.load_d5_attempt(fact.model_request_id)
         request = self.evidence.read_request(fact.model_request_id)
         result = self.evidence.read_result(fact.model_request_id)
@@ -196,13 +196,13 @@ class ProcessRefinement:
             or attempt.sources != fact.sources
             or digest(asdict(candidate)) != fact.evidence_sha256
         ):
-            raise D3RecoveryRequired("d5_summary_evidence_changed")
+            raise ExecutionRecoveryRequired("d5_summary_evidence_changed")
         for source in fact.sources:
             if (
                 self._read_source(fact.task_run_id, source.object_id, source.kind)
                 != source
             ):
-                raise D3RecoveryRequired("d5_summary_source_changed")
+                raise ExecutionRecoveryRequired("d5_summary_source_changed")
         if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
             self.output_boundary.app.selection_bindings.verify(request, asdict(candidate))
         self._validate_candidate(candidate, attempt)
@@ -212,13 +212,13 @@ class ProcessRefinement:
         if fact.conflicts != expected or fact.process_fact_id != stable_id(
             fact.task_run_id, f"d5/process/{fact.model_request_id}"
         ):
-            raise D3RecoveryRequired("d5_summary_conflict_or_id_changed")
+            raise ExecutionRecoveryRequired("d5_summary_conflict_or_id_changed")
 
     def _finish_saved(self, attempt: D5Attempt) -> None:
         operation = self.store.load_d4_operation(attempt.model_request_id)
         request = self.evidence.read_request(attempt.model_request_id)
         if operation is None or request is None or request.attempt != attempt:
-            raise D3RecoveryRequired("d5_attempt_binding_unavailable")
+            raise ExecutionRecoveryRequired("d5_attempt_binding_unavailable")
         if self.store.is_unknown_refinement_sealed(attempt.model_request_id):
             self._seal(attempt)
             return
@@ -248,7 +248,7 @@ class ProcessRefinement:
         accepted = result["outcome"] == "accepted"
         if accepted:
             if candidate is None:
-                raise D3RecoveryRequired("d5_accepted_candidate_missing")
+                raise ExecutionRecoveryRequired("d5_accepted_candidate_missing")
             if self.config.contract_version in {15, 16, 17, 18, 19, 20, 21, 22}:
                 self.output_boundary.app.selection_bindings.verify(request, asdict(candidate))
             self._validate_candidate(candidate, attempt)
@@ -262,7 +262,7 @@ class ProcessRefinement:
         if operation.completion is None:
             self.store.complete_d4_operation(completion)
         elif operation.completion != completion:
-            raise D3RecoveryRequired("d5_completion_evidence_changed")
+            raise ExecutionRecoveryRequired("d5_completion_evidence_changed")
         if self.output_boundary is not None:
             self.output_boundary.terminal_check(request)
         if not accepted or operation.application_ref is not None or self.stopped():
@@ -295,7 +295,7 @@ class ProcessRefinement:
         if not self.config.d5_enabled:
             return
         if not self.redactor.configured:
-            raise D3RecoveryRequired("d5_redaction_configuration_unavailable")
+            raise ExecutionRecoveryRequired("d5_redaction_configuration_unavailable")
         state = self.controller.control_state
         task_id = state.task_run.task_run_id
         existing = next(
@@ -314,7 +314,7 @@ class ProcessRefinement:
             return
         budget = self.config.d4_budget
         if budget is None:
-            raise D3RecoveryRequired("d5_budget_configuration_unavailable")
+            raise ExecutionRecoveryRequired("d5_budget_configuration_unavailable")
         usage = self.store.d4_budget_usage(task_id)
         if (
             usage.total_used >= budget.total
@@ -323,7 +323,7 @@ class ProcessRefinement:
             return
         review = self.store.load_d3_review_application(task_id, review_id)
         if review is None or review.paused_gate:
-            raise D3RecoveryRequired("d5_review_not_committed")
+            raise ExecutionRecoveryRequired("d5_review_not_committed")
         sources = tuple(
             source
             for ref in review.source_ids
@@ -341,7 +341,7 @@ class ProcessRefinement:
             return
         projected = tuple(self.sources.project(task_id, source) for source in sources)
         if any(item["status"] != "available" for item in projected):
-            raise D3RecoveryRequired("d5_review_sources_unavailable")
+            raise ExecutionRecoveryRequired("d5_review_sources_unavailable")
         context = self.context_for(review.intent_id)
         safe_sources = tuple(
             self.redactor.redact_value(
@@ -362,7 +362,7 @@ class ProcessRefinement:
         )
         request = D5RefinementRequest(attempt, safe_sources, context)
         if self.adapter.role_config != self.config.outer_role:
-            raise D3RecoveryRequired("d5_frozen_role_changed")
+            raise ExecutionRecoveryRequired("d5_frozen_role_changed")
         start = D4OperationStart(
             attempt.model_request_id,
             task_id,
@@ -380,7 +380,7 @@ class ProcessRefinement:
             self.request_capacity_check(request)
         try:
             self.store.begin_d5_attempt(attempt, start)
-        except D4BudgetExhausted:
+        except OperationBudgetExhausted:
             return
         self._run_request(request)
         self._maybe_correct(attempt)
@@ -406,7 +406,7 @@ class ProcessRefinement:
         if usage.total_used >= budget.total or dict(usage.category_counts)["refinement"] >= budget.refinement:
             return
         if self.adapter.role_config != self.config.outer_role:
-            raise D3RecoveryRequired("d5_frozen_role_changed")
+            raise ExecutionRecoveryRequired("d5_frozen_role_changed")
         for source in root.sources:
             if self._read_source(root.task_run_id, source.object_id, source.kind) != source:
                 # A business/source rejection is not a new format-correction opportunity.
@@ -415,7 +415,7 @@ class ProcessRefinement:
         attempt = saved.attempt if saved is not None else replace(root, model_request_id=identity, started_at=self.clock())
         correction = D5RefinementRequest(attempt, request.safe_sources, request.process_facts)
         if saved is not None and saved != correction:
-            raise D3RecoveryRequired("d8_refinement_correction_request_changed")
+            raise ExecutionRecoveryRequired("d8_refinement_correction_request_changed")
         self.evidence.save_request(correction)
         self.request_capacity_check(correction)
         start = D4OperationStart(identity, root.task_run_id, "refinement", attempt.started_at,
@@ -423,7 +423,7 @@ class ProcessRefinement:
             budget.budget_policy_ref, "outer_planning", attempt.role_config_ref)
         try:
             self.store.begin_d8_refinement_correction(root.model_request_id, attempt, start)
-        except D4BudgetExhausted:
+        except OperationBudgetExhausted:
             return
         self._run_request(correction)
 

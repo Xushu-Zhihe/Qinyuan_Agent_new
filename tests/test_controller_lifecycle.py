@@ -23,7 +23,7 @@ from agent_core.goal_feedback import (
     ExternalValidationFeedback,
     project_candidate_feedback,
 )
-from agent_core.operation_accounting import D4RecoveryRequired
+from agent_core.operation_accounting import OperationRecoveryRequired
 from agent_core.run_outcome import D7RunOutcomeState, map_run_outcome
 from agent_core.runtime import InvalidTransition, TaskRunStatus
 
@@ -301,7 +301,7 @@ def test_close_rejects_non_quiescent_external_feedback_wait(
     controller._persistent_state = state
     registry.claim(task_run_id, controller)
 
-    with pytest.raises(D4RecoveryRequired, match=error):
+    with pytest.raises(OperationRecoveryRequired, match=error):
         controller.close()
 
     assert registry.owner(task_run_id) is controller

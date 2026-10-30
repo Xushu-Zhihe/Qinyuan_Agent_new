@@ -34,6 +34,7 @@ RunOutcomeReason = Literal[
     "terminal_cleanup_not_required",
     "goal_taskrun_mismatch",
     "accepted_goal_achieved",
+    "assumed_goal_ended",
     "cancelled",
     "deadline_exceeded",
     "terminal_error",
@@ -72,6 +73,7 @@ _RUN_OUTCOME_REASONS = frozenset(
         "terminal_cleanup_not_required",
         "goal_taskrun_mismatch",
         "accepted_goal_achieved",
+        "assumed_goal_ended",
         "cancelled",
         "deadline_exceeded",
         "terminal_error",
@@ -158,6 +160,8 @@ def map_run_outcome(state: D7RunOutcomeState) -> D7RunOutcome:
         if state.goal_evaluation != "accepted":
             return D7RunOutcome(5, "goal_taskrun_mismatch")
         return D7RunOutcome(0, "accepted_goal_achieved")
+    if state.task_run_status == "assumed_achieved":
+        return D7RunOutcome(0, "assumed_goal_ended")
     if state.task_run_status == "cancelled":
         return D7RunOutcome(130, "cancelled")
     if state.task_run_status == "deadline_exceeded":

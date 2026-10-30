@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from agent_core.actions import MCPAction, MCPToolCall
-from agent_core.dual_llm_contracts import D3PlanResult, D3RecoveryRequired
+from agent_core.dual_llm_contracts import D3PlanResult, ExecutionRecoveryRequired
 
 if TYPE_CHECKING:
     from agent_adapters.sandbox_adapter import D8SandboxAdapter
@@ -90,25 +90,25 @@ class MCPCapability:
             True if Plan should retry (currently always False)
 
         Raises:
-            D3RecoveryRequired: If execution cannot proceed
+            ExecutionRecoveryRequired: If execution cannot proceed
         """
         if binding.kind != "mcp_action":
-            raise D3RecoveryRequired(f"mcp_capability_wrong_kind:{binding.kind}")
+            raise ExecutionRecoveryRequired(f"mcp_capability_wrong_kind:{binding.kind}")
 
         action = binding.action
         if not isinstance(action, MCPAction):
-            raise D3RecoveryRequired("mcp_capability_action_not_mcp")
+            raise ExecutionRecoveryRequired("mcp_capability_action_not_mcp")
 
         # Verify sandbox is bound
         session = self.sandbox_adapter.get_session(binding.agent_id)
         if session is None:
-            raise D3RecoveryRequired(f"mcp_capability_no_sandbox:{binding.agent_id}")
+            raise ExecutionRecoveryRequired(f"mcp_capability_no_sandbox:{binding.agent_id}")
 
         # Execute tool calls sequentially
         results: list[MCPExecutionResult] = []
         for call in action.calls:
             if token.is_cancelled:
-                raise D3RecoveryRequired("mcp_capability_cancelled")
+                raise ExecutionRecoveryRequired("mcp_capability_cancelled")
 
             result = await self._execute_tool_call(binding.agent_id, call)
             results.append(result)

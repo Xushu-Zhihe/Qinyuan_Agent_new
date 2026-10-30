@@ -20,11 +20,11 @@ from agent_core.dual_llm_contracts import (
 )
 from agent_core.operation_accounting import (
     D4AuditEvent,
-    D4BudgetExhausted,
+    OperationBudgetExhausted,
     D4OperationCompletion,
-    D4OperationConflict,
+    OperationIdentityConflict,
     D4OperationStart,
-    D4RecoveryRequired,
+    OperationRecoveryRequired,
 )
 from agent_core import sqlite_control_store
 from agent_core.sqlite_control_store import SqliteControlStore, CURRENT_SCHEMA_VERSION
@@ -124,7 +124,7 @@ def test_all_eight_limits_sum_to_48_and_failed_starts_remain_charged(tmp_path):
             app.store.complete_d4_operation(_completion(audit))
         usage = app.store.d4_budget_usage(task_run_id)
         assert usage.total_used == D4_TOTAL and usage.audit_only_used == 2
-        with pytest.raises(D4BudgetExhausted):
+        with pytest.raises(OperationBudgetExhausted):
             app.store.begin_d4_operation(_start(case, "action", D4_BUDGET_MATRIX["action"] + 1))
 
         d3_operation_id = stable_id(task_run_id, "d4-total-limit-d3-admission")
@@ -137,7 +137,7 @@ def test_all_eight_limits_sum_to_48_and_failed_starts_remain_charged(tmp_path):
             digest("D3 admission rejected by D4 total budget"),
             "d4-total-limit-resource",
         )
-        with pytest.raises(D4BudgetExhausted):
+        with pytest.raises(OperationBudgetExhausted):
             app.store.begin_d3_operation(d3_start)
         assert app.store.load_d3_operation(d3_operation_id) is None
         assert app.store.load_d4_operation(d3_operation_id) is None
@@ -145,7 +145,7 @@ def test_all_eight_limits_sum_to_48_and_failed_starts_remain_charged(tmp_path):
         store_path = app.directory / "control.sqlite"
         with SqliteControlStore.open(store_path, clock=case[5]) as reopened:
             assert reopened.d4_budget_usage(task_run_id) == usage
-            with pytest.raises(D4BudgetExhausted):
+            with pytest.raises(OperationBudgetExhausted):
                 reopened.begin_d4_operation(_start(case, "planning", D4_BUDGET_MATRIX["planning"] + 1))
     finally:
         app.controller.cancel(str(uuid4()))
@@ -165,7 +165,7 @@ def test_known_d4_start_is_idempotent_but_changed_request_conflicts(
     app.store.complete_d4_operation(completion)
     assert app.store.begin_d4_operation(start).completion == completion
     changed = replace(start, resource_ref="different-resource")
-    with pytest.raises(D4OperationConflict):
+    with pytest.raises(OperationIdentityConflict):
         app.store.begin_d4_operation(changed)
     assert app.store.d4_budget_usage(start.task_run_id).total_used == 1
 
@@ -216,7 +216,7 @@ def test_cancel_audit_permanently_blocks_new_ids_but_allows_known_replay(
     replay = app.store.begin_d4_operation(completed_start)
     assert replay is not None and replay.completion == completion
     rejected_start = _start(case, "tool_dispatch", 1)
-    with pytest.raises(D4RecoveryRequired, match="d4_cancellation_requested"):
+    with pytest.raises(OperationRecoveryRequired, match="d4_cancellation_requested"):
         app.store.begin_d4_operation(rejected_start)
     assert app.store.load_d4_operation(rejected_start.operation_id) is None
     assert (
@@ -389,7 +389,7 @@ def test_d3_admission_rejected_by_category_limit_leaves_no_partial_rows(
         app.config.outer_role.role,
         app.config.outer_role.role_config_ref,
     )
-    with pytest.raises(D4BudgetExhausted):
+    with pytest.raises(OperationBudgetExhausted):
         app.store.begin_d3_operation(d3_start)
     assert app.store.load_d3_operation(operation_id) is None
     assert app.store.load_d4_operation(operation_id) is None
@@ -421,7 +421,7 @@ def test_unknown_review_blocks_d3_category_exhaustion_without_partial_admission(
         app.config.outer_role.role_config_ref,
     )
 
-    with pytest.raises(D4RecoveryRequired):
+    with pytest.raises(OperationRecoveryRequired):
         app.store.begin_d3_operation(d3_start)
 
     assert app.store.load_d3_operation(operation_id) is None
@@ -453,11 +453,11 @@ def test_unknown_refinement_seal_preserves_unknown_and_budget_and_forbids_replay
     assert usage.total_used == 1
     assert dict(usage.category_counts)["refinement"] == 1
 
-    with pytest.raises(D4RecoveryRequired, match="do not dispatch again"):
+    with pytest.raises(OperationRecoveryRequired, match="do not dispatch again"):
         app.store.begin_d4_operation(start)
-    with pytest.raises(D4RecoveryRequired, match="sealed refinement"):
+    with pytest.raises(OperationRecoveryRequired, match="sealed refinement"):
         app.store.complete_d4_operation(_completion(start))
-    with pytest.raises(D4OperationConflict, match="immutable"):
+    with pytest.raises(OperationIdentityConflict, match="immutable"):
         app.store.seal_unknown_refinement(
             start.operation_id,
             decided_at=seal["decided_at"],
@@ -485,7 +485,7 @@ def test_non_refinement_unknown_cannot_be_sealed(d4_scenario_fixture, category):
     start = _start(case, category, 0)
     assert app.store.begin_d4_operation(start) is None
 
-    with pytest.raises(D4OperationConflict, match="only refinement"):
+    with pytest.raises(OperationIdentityConflict, match="only refinement"):
         app.store.seal_unknown_refinement(
             start.operation_id,
             decided_at=start.started_at,
@@ -522,7 +522,7 @@ def test_sealed_refinement_is_exempt_from_lifecycle_gate_but_tool_unknown_is_not
     tool = _start(case, "tool_dispatch", 0)
     assert app.store.begin_d4_operation(tool) is None
     assert app._d4_unknown_operations() == (tool.operation_id,)
-    with pytest.raises(D4RecoveryRequired, match="outcome_unknown"):
+    with pytest.raises(OperationRecoveryRequired, match="outcome_unknown"):
         app.controller.cancel(str(uuid4()))
     assert app.state.task_run.status.value == "running"
 
@@ -689,7 +689,7 @@ def test_d4_review_admission_is_single_authority_past_eight(tmp_path):
         usage = app.store.d4_budget_usage(task)
         assert dict(usage.category_counts)["review"] == limit
         reopened = D4ReviewLedger(tmp_path / "quota-reviews", store=app.store, config=app.config, clock=app.clock)
-        with pytest.raises(D4BudgetExhausted, match="review budget"):
+        with pytest.raises(OperationBudgetExhausted, match="review budget"):
             D2ReviewCoordinator(reopened).review(replace(_request(tmp_path), task_run_id=task,
                 checkpoint_id=app.state.latest_checkpoint.sequence), Model([_accepted()]))
         assert reopened.review_call_count(task) == limit

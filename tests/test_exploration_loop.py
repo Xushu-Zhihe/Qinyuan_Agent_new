@@ -418,7 +418,7 @@ def test_two_phase_facts_keep_same_intent_until_explicit_reviewed_end(http_case)
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
 def test_known_technical_handoff_keeps_sources_visible_without_promoting_facts(http_case, monkeypatch):
     from agent_core.modeling import ModelError, ModelErrorKind
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     c = http_case
     install(c, steps=1, stop="inconclusive")
     inner, outer = c.models[1].invoke, c.models[0].invoke
@@ -456,7 +456,7 @@ def test_known_technical_handoff_keeps_sources_visible_without_promoting_facts(h
     c.app.sessions.validate_handoff_progress(owner, progress)
     source = c.app.evidence_conclusions.source
     monkeypatch.setattr(c.app.evidence_conclusions, "source", lambda *args: {**source(*args), "version": "0" * 64})
-    with pytest.raises(D3RecoveryRequired, match="d22_handoff_progress_source_changed"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d22_handoff_progress_source_changed"):
         c.app.sessions.validate_handoff_progress(owner, progress)
 
 
@@ -568,7 +568,7 @@ def test_observed_fact_and_conditional_inference_keep_separate_review_identity(h
 
 @pytest.mark.parametrize("http_case", ["continuous"], indirect=True)
 def test_old_continuation_dependency_carries_later_completion_without_reopening(http_case, monkeypatch):
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
     from agent_core.handoff_contracts import D8Capacity
     c = http_case
     install(c, steps=1)
@@ -635,11 +635,11 @@ def test_old_continuation_dependency_carries_later_completion_without_reopening(
     original_history = c.app.handoff.history
     monkeypatch.setattr(c.app.handoff, "history", lambda **kwargs: tuple(
         replace(i, source_status="unavailable") if i.ref == seen["later"] else i for i in original_history(**kwargs)))
-    with pytest.raises(D3RecoveryRequired, match="d8_required_source_unavailable_or_changed"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d8_required_source_unavailable_or_changed"):
         c.app.handoff.select("execution", turn, seen["new_intent"])
     monkeypatch.setattr(c.app.handoff, "history", original_history)
     monkeypatch.setattr(c.app.handoff, "capacity", lambda: NS(capacity=D8Capacity(initial_history=8192, visible_history=16384)))
-    with pytest.raises(D3RecoveryRequired, match="d8_context_paused"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d8_context_paused"):
         c.app.handoff.select("execution", turn, seen["new_intent"])
 
 
@@ -674,9 +674,9 @@ def test_evidence_fact_history_index_and_details_continue_same_intent(http_case,
     failures = []
     def transient_source_failure(items):
         if source_failure and not failures:
-            from agent_core.dual_llm_contracts import D3RecoveryRequired
+            from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
             failures.append("d8_read_source_version_changed")
-            raise D3RecoveryRequired(failures[-1])
+            raise ExecutionRecoveryRequired(failures[-1])
         return validate(items)
     monkeypatch.setattr(c.app.handoff, "_validate_frozen_read_sources", transient_source_failure)
     def choose(envelope, *args):

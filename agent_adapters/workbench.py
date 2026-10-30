@@ -14,6 +14,7 @@ import shutil
 import socket
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -59,6 +60,20 @@ def endpoint(value: str, *, allow_private_ipv4=False) -> str:
     return value
 
 
+DEFAULT_DESCRIPTION_MARKER = "\n\n[默认说明]\n"
+
+
+def merged_description(base: object, default: object) -> str:
+    """Append the configured default note once, keeping the 16000-char limit."""
+    text = (default if isinstance(default, str) else "").strip()
+    current = base if isinstance(base, str) else ""
+    if not text or DEFAULT_DESCRIPTION_MARKER in current or text in current:
+        return current
+    if current.strip():
+        return (current.rstrip() + DEFAULT_DESCRIPTION_MARKER + text)[:16000]
+    return (DEFAULT_DESCRIPTION_MARKER.lstrip("\n") + text)[:16000]
+
+
 def challenge_fields(value: object, *, allow_private_ipv4=False) -> tuple[str, str, str, str, int, int]:
     required = {"title", "category", "description", "deadline_minutes", "step_timeout_seconds"}
     if not isinstance(value, dict) or not required <= value.keys() or value.keys() - required - {"endpoint", "http_methods"}:
@@ -102,6 +117,9 @@ class Workbench:
     ):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        from agent_adapters.windows_security import WindowsSecuritySetup
+
+        self.windows_security = WindowsSecuritySetup(self.root)
         self.uploads = self.root / "attachments"
         self.uploads.mkdir(exist_ok=True)
         self.database = self.root / "workbench.sqlite3"
@@ -363,6 +381,31 @@ class Workbench:
                 db.execute('UPDATE challenges SET http_methods_json=? WHERE id=?', (json.dumps(methods), challenge_id))
             return self._get(db, challenge_id)
 
+    def force_repair(self, challenge_id):
+        """Clear a stuck recovery run so the same challenge can start again.
+
+        Refuses while a process is live. The database is copied to a timestamped
+        backup first; run rows are dropped and the challenge returns to draft.
+        """
+        with self.lock, self._db() as db:
+            current = self._get(db, challenge_id)
+            run = current.get("run")
+            if run is not None and run["status"] in {"starting", "running", "cancelling", "cleaning"}:
+                raise WorkbenchError("force_repair_run_active", HTTPStatus.CONFLICT)
+            if run is None and current["status"] == "draft":
+                raise WorkbenchError("force_repair_nothing_to_repair", HTTPStatus.CONFLICT)
+            backup = self.database.with_name(self.database.name + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+            with sqlite3.connect(self.database) as source, sqlite3.connect(backup) as target:
+                source.backup(target)
+            removed = db.execute("DELETE FROM runs WHERE challenge_id=?", (challenge_id,)).rowcount
+            db.execute("UPDATE challenges SET status='draft',updated_at=? WHERE id=?", (now(), challenge_id))
+            for row in db.execute("SELECT id,state_json FROM competition_sessions").fetchall():
+                state = json.loads(row["state_json"])
+                if state.get("challenge_id") == challenge_id and state.get("status") != "finished":
+                    state.update(status="paused", reason="competition_force_repaired", retry_operation=None)
+                    db.execute("UPDATE competition_sessions SET state_json=? WHERE id=?", (json.dumps(state), row["id"]))
+            return {"challenge_id": challenge_id, "deleted_runs": removed, "backup": str(backup)}
+
     def archive(self, challenge_id):
         with self.lock, self._db() as db:
             current = self._get(db, challenge_id)
@@ -595,6 +638,18 @@ class Handler(BaseHTTPRequestHandler):
             mime = "text/html" if name.endswith(".html") else "text/javascript" if name.endswith(".js") else "text/css"
             self._send(HTTPStatus.OK, (FRONTEND / name).read_bytes(), mime + "; charset=utf-8")
             return
+        if parts == ["api", "windows-security"]:
+            setup = self.server.workbench.windows_security
+            if self.command == "GET":
+                self._send(HTTPStatus.OK, setup.snapshot())
+            elif self.command == "POST":
+                value = self._json()
+                if not isinstance(value, dict) or set(value) != {"action"} or not isinstance(value["action"], str):
+                    raise WorkbenchError("windows_security_invalid_action")
+                self._send(HTTPStatus.ACCEPTED, setup.start(value["action"]))
+            else:
+                raise WorkbenchError("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
+            return
         if parts == ["api", "health"] and self.command == "GET":
             self._send(HTTPStatus.OK, {"status": "ready", "agent_execution": "connected", "capabilities": {
                 "current_cli": (
@@ -720,6 +775,11 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 5 and parts[3] == "executions" and self.command == "GET":
                 self._send(HTTPStatus.OK, workbench.runner.execution(challenge_id, canonical_id(parts[4])))
                 return
+            if len(parts) == 4 and parts[3] == "force-repair" and self.command == "POST":
+                if self._json():
+                    raise WorkbenchError("force_repair_fields_invalid")
+                self._send(HTTPStatus.OK, workbench.force_repair(challenge_id))
+                return
             if len(parts) == 4 and parts[3] == "cancel" and self.command == "POST":
                 self._send(HTTPStatus.ACCEPTED, workbench.runner.cancel(challenge_id))
                 return
@@ -747,6 +807,12 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     raise WorkbenchError('d9_validation_check_fields_invalid') from exc
                 self._send(HTTPStatus.ACCEPTED, result)
+                return
+            if len(parts) == 4 and parts[3] == "human-decision" and self.command == "POST":
+                self._send(HTTPStatus.OK, workbench.runner.human_decision(challenge_id, self._json()))
+                return
+            if len(parts) == 4 and parts[3] == "operator-control" and self.command == "POST":
+                self._send(HTTPStatus.OK, workbench.runner.live_control(challenge_id, self._json()))
                 return
             if len(parts) == 4 and parts[3] == "cleanup" and self.command == "POST":
                 self._send(HTTPStatus.ACCEPTED, workbench.runner.cleanup(challenge_id))

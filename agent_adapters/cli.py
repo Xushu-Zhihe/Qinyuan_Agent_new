@@ -86,7 +86,7 @@ def parser():
     directory = candidate.add_mutually_exclusive_group(required=True)
     directory.add_argument("--state-dir")
     directory.add_argument("--run-dir")
-    for command in ("resume", "cancel", "cleanup", "status", "replay", "validation-check", "competition-submit", "competition-end", "operator-control"):
+    for command in ("resume", "cancel", "cleanup", "status", "replay", "validation-check", "competition-submit", "competition-end", "operator-control", "human-decision"):
         item = commands.add_parser(command)
         if command == "status":
             selector = item.add_mutually_exclusive_group(required=True)
@@ -110,6 +110,11 @@ def parser():
             item.add_argument("--operation-id",required=True)
             item.add_argument("--action",required=True,choices=("pause","resume","extend_question","extend_overall"))
             item.add_argument("--seconds",type=int)
+        elif command == "human-decision":
+            item.add_argument("--candidate-id", required=True)
+            item.add_argument("--operation-id", required=True)
+            item.add_argument("--decision", required=True, choices=("accept", "continue", "end"))
+            item.add_argument("--events")
         elif command in {"competition-submit","competition-end"}:
             item.add_argument("--binding-file",required=True)
             item.add_argument("--operation-id",required=True)
@@ -868,7 +873,7 @@ def dispatch(args):
     protocol_version = _persisted_protocol_version(declaration)
     if declaration.get("task_run_id") != args.task_run_id:
         raise ValueError("run_identity_mismatch")
-    if args.command in {'validation-check','competition-submit','competition-end','operator-control'} and protocol_version != 3:
+    if args.command in {'validation-check','competition-submit','competition-end','operator-control','human-decision'} and protocol_version != 3:
         raise ValueError('d9_validation_check_profile_unsupported')
     if protocol_version == 2:
         from agent_adapters.task_cli import dispatch_existing
@@ -993,6 +998,7 @@ def main(argv=None):
 
             from agent_adapters.protected_evidence import ProtectedEvidenceError
             from agent_adapters.web.candidate_evidence import D7CandidateEvidenceError
+            from agent_core.stage_storage import StageStateError
             from agent_adapters.web.candidate_operator_view import (
                 D7CandidateOperatorViewError,
             )
@@ -1003,6 +1009,11 @@ def main(argv=None):
             elif isinstance(exc, (D7CandidateEvidenceError, D7CandidateOperatorViewError)):
                 result = base_result()
                 result.update(exit_code=2, errors=[{"code": exc.code}])
+            elif isinstance(exc, StageStateError):
+                from qinyuan_core import Category
+                result = base_result()
+                result.update(exit_code=2 if category in {Category.INPUT, Category.POLICY, Category.CONFLICT} else 5,
+                    errors=[dict(code=code, category=str(category), phase="stage_control")])
             elif isinstance(exc, (ValueError, OSError)):
                 result = base_result()
                 code = (

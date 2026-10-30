@@ -9,13 +9,13 @@ from uuid import uuid4
 import pytest
 
 from agent_core.actions import CompleteIntentAction, ProbeAction
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.dual_llm_modeling import (
     MAX_D3_CANDIDATE_VALUE_BYTES,
     D3ActionProposal,
     D3AuditedModel,
     D3CandidateFlagAction,
-    D3ProposalRejected,
+    ExecutionProposalRejected,
     parse_d3_action,
 )
 
@@ -96,7 +96,7 @@ def test_candidate_value_uses_exact_utf8_bytes_without_normalizing(value, accept
         assert isinstance(proposal.action, D3CandidateFlagAction)
         assert proposal.action.value == value
     else:
-        with pytest.raises(D3ProposalRejected):
+        with pytest.raises(ExecutionProposalRejected):
             parse_d3_action(_candidate_action(value=value), "inner_candidate")
 
 
@@ -119,7 +119,7 @@ def test_candidate_action_rejects_invalid_binding_metadata(field, value):
     assert isinstance(payload, dict)
     payload[field] = value
 
-    with pytest.raises(D3ProposalRejected):
+    with pytest.raises(ExecutionProposalRejected):
         parse_d3_action(action, "inner_candidate")
 
 
@@ -152,14 +152,14 @@ def test_candidate_action_rejects_invalid_binding_metadata(field, value):
     ],
 )
 def test_candidate_action_envelope_is_exact(raw):
-    with pytest.raises(D3ProposalRejected):
+    with pytest.raises(ExecutionProposalRejected):
         parse_d3_action(raw, "inner_candidate")
 
 
 def test_candidate_parser_does_not_echo_model_supplied_body_in_errors():
     secret = "synthetic-candidate-body"
 
-    with pytest.raises(D3ProposalRejected) as error:
+    with pytest.raises(ExecutionProposalRejected) as error:
         parse_d3_action(_candidate_action(value=secret + "\x00"), "inner_candidate")
 
     assert secret not in str(error.value)
@@ -169,7 +169,7 @@ def test_candidate_stage_waits_for_protected_persistence_before_model_dispatch()
     model = object.__new__(D3AuditedModel)
 
     with pytest.raises(
-        D3RecoveryRequired, match="d3_candidate_protected_store_required"
+        ExecutionRecoveryRequired, match="d3_candidate_protected_store_required"
     ):
         asyncio.run(
             model.propose(
@@ -192,7 +192,7 @@ def test_existing_d3_action_stages_remain_stage_restricted(stage):
         "review_requested": False,
     }
 
-    with pytest.raises(D3ProposalRejected):
+    with pytest.raises(ExecutionProposalRejected):
         parse_d3_action(raw, stage)
 
 

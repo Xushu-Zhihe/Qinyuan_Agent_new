@@ -30,13 +30,13 @@ from agent_core.control_store import StorageError, UpsertIntent, UpsertTurn
 from agent_core.domain import IntentStatus, TurnStatus
 from agent_core.dual_llm_contracts import (
     D3Authorization,
-    D3BudgetExhausted,
+    ExecutionBudgetExhausted,
     D3CommitMetadata,
     D3OperationCompletion,
     D3OperationStart,
     D3Outcome,
     D3PlanResult,
-    D3RecoveryRequired,
+    ExecutionRecoveryRequired,
     D3RunConfig,
 )
 from agent_core.dual_llm_modeling import parse_d3_plan_proposal
@@ -672,7 +672,7 @@ def test_share_explicit_version_is_context_not_fact_and_detects_source_change(sc
     )
     assert len(result.verified_fact_ids) == 1
     sandbox.files[receipt.claim.source_path] = b"changed after sharing"
-    with pytest.raises(D3RecoveryRequired, match="d3_share_content_changed"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_share_content_changed"):
         asyncio.run(app.workspace.verify_share(receipt.claim.share_id, token))
 
 
@@ -682,7 +682,7 @@ def test_unknown_share_readback_keeps_one_share_id_without_completion(scenario):
     binding = app.store.load_d3_plan_binding(app.state.plans[0].plan_id)
     target_intent_id = app.state.intents[1].intent_id
     sandbox.unknown = "share"
-    with pytest.raises(D3RecoveryRequired, match="d3_share_outcome_unknown"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_share_outcome_unknown"):
         asyncio.run(
             app.share_artifact(binding.artifact_version_id, target_intent_id, token)
         )
@@ -708,7 +708,7 @@ def test_unknown_share_readback_keeps_one_share_id_without_completion(scenario):
     assert audit.source == audit.target
     assert app.workspace_evidence.read_share(share_id) is None
     sandbox.unknown = None
-    with pytest.raises(D3RecoveryRequired, match="d3_share_outcome_unknown"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_share_outcome_unknown"):
         asyncio.run(
             app.share_artifact(binding.artifact_version_id, target_intent_id, token)
         )
@@ -882,7 +882,7 @@ def test_changed_share_source_is_rejected_without_verified_fact(scenario):
     binding = app.store.load_d3_plan_binding(app.state.plans[0].plan_id)
     artifact = app.workspace_evidence.read_artifact(binding.artifact_version_id)
     sandbox.files[artifact.claim.path] = b"changed source before share"
-    with pytest.raises(D3RecoveryRequired, match="d3_share_integrity_exception"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_share_integrity_exception"):
         asyncio.run(
             app.share_artifact(
                 binding.artifact_version_id, app.state.intents[1].intent_id, token
@@ -1048,7 +1048,7 @@ def test_share_rejects_wrong_owner_and_cross_intent_path(scenario):
     version_id = app.store.load_d3_plan_binding(
         app.state.plans[0].plan_id
     ).artifact_version_id
-    with pytest.raises(D3RecoveryRequired, match="d3_share_target_mismatch"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_share_target_mismatch"):
         asyncio.run(app.share_artifact(version_id, str(uuid4()), token))
     assert sandbox.share_calls == 0
     receipt = asyncio.run(
@@ -1110,7 +1110,7 @@ def test_d3_operation_limits_survive_reopen_without_goal_failure(
             )
         )
     reopen(scenario)
-    with pytest.raises(D3BudgetExhausted):
+    with pytest.raises(ExecutionBudgetExhausted):
         scenario[0].store.begin_d3_operation(start(limit))
     assert len(scenario[0].store.list_d3_operations(task_run_id)) == limit
     assert scenario[0].state.task_run.status.value == "running"
@@ -1203,7 +1203,7 @@ def test_v1_not_satisfied_result_cannot_be_promoted_to_intent_failure(scenario):
         digest({"unsupported": "not_satisfied"}),
     )
     with pytest.raises(
-        D3RecoveryRequired, match="d3_fixed_rule_has_no_satisfied_result"
+        ExecutionRecoveryRequired, match="d3_fixed_rule_has_no_satisfied_result"
     ):
         app.control.complete_plan(binding, result)
     assert app.store.load_d3_plan_result(plan.plan_id) is None
@@ -1220,7 +1220,7 @@ def test_pending_sibling_cannot_reuse_active_intent_plan_proposal(scenario):
         app.model_evidence.read(first_binding.proposal_request_id).raw
     )
     pending = app.state.intents[1]
-    with pytest.raises(D3RecoveryRequired, match="d3_plan_proposal_owner_mismatch"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_plan_proposal_owner_mismatch"):
         app.control.register_plan(
             pending.intent_id,
             proposal,
@@ -1236,7 +1236,7 @@ def test_pending_sibling_cannot_prepare_target_copy_before_switch(scenario):
     interrupt_after_artifact(scenario)
     pending = app.state.intents[1]
     turn = app.store.load_d3_turn_binding(pending.turn_id)
-    with pytest.raises(D3RecoveryRequired, match="d3_artifact_owner_mismatch"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_artifact_owner_mismatch"):
         asyncio.run(
             app.workspace.prepare_artifact(
                 turn,
@@ -1448,7 +1448,7 @@ def test_unknown_copy_audit_rejects_changed_claim_owner_before_readback(scenario
         path=artifact_path(pending_id, version_id),
     )
     app.workspace_evidence.read_artifact_claim = lambda _version_id: forged
-    with pytest.raises(D3RecoveryRequired, match="d3_unknown_artifact_claim_changed"):
+    with pytest.raises(ExecutionRecoveryRequired, match="d3_unknown_artifact_claim_changed"):
         asyncio.run(app.audit_unknown_operation(version_id, token))
     assert not sandbox.readback_calls
     assert app.store.load_d3_operation(version_id).completion is None

@@ -5,7 +5,7 @@ const CompetitionPage = (() => {
   const endpoint = "/api/competition/profiles";
   const errors = {
     competition_profile_in_use: "活跃赛程锁定平台协议和根地址；可以修正同源凭据。",
-    competition_schedule_active: "已有未结束赛程或正在运行的任务，请先处理当前运行。",
+    competition_schedule_active: "已有未结束赛程；请在比赛控制中继续原赛程，不要从单题页面重复启动。",
     competition_queue_invalid: "Benchmark 请填入不重复的题目标识；Arena 队列留空。",
     competition_arena_local_deadline_active: "本地单题已到期，平台仍有效。赛程等待处理，不自动放弃或领取。",
     competition_platform_operation_unknown: "平台操作结果未知；恢复时只查询状态，不自动重发。",
@@ -26,7 +26,18 @@ const CompetitionPage = (() => {
     competition_target_selection_required: "请选择明确的 HTTP(S) 入口；无协议地址需要你指定。",
     competition_target_protocol_unsupported: "当前启动入口支持 HTTP(S)；其他协议需要单独接入。",
     competition_target_not_in_question: "所选地址不属于这道平台题目。",
-    competition_question_input_required: "请在任务页上传附件或补齐有效入口后启动。",
+    competition_question_input_required: "平台未提供可下载附件或有效入口；请在任务页补齐并保存，再回比赛控制继续原赛程。",
+    competition_attachment_metadata_invalid: "平台附件信息缺少有效名称或下载地址；请核对平台附件信息后继续原赛程。",
+    competition_attachment_url_rejected: "附件下载地址或跳转不符合来源边界；跨域只接受公网 HTTP/HTTPS，不转发平台凭据。",
+    competition_attachment_changed: "平台附件名称或大小已变化，保留原绑定，请先核对当前题目。",
+    competition_attachment_integrity_failed: "本地附件与登记摘要不符，已停止启动 Agent，请核对附件文件。",
+    competition_attachment_too_large: "附件超过现有 64 MiB 输入边界，未导入 Agent。",
+    competition_attachment_size_mismatch: "附件下载不完整或实际大小与平台声明不符；请继续原赛程重新取件。",
+    competition_attachment_timeout: "附件下载超时，赛程已保留；可继续原赛程重试取件。",
+    competition_attachment_tls_failed: "附件下载 TLS 连接失败，赛程已保留。",
+    competition_attachment_transport_failed: "附件下载连接中断，未登记不完整文件；可继续原赛程重试取件。",
+    competition_attachment_redirect_limit: "附件下载跳转过多或缺少地址，赛程已保留。",
+    competition_attachment_store_failed: "附件下载后的本地登记失败；请检查存储后继续原赛程。",
     competition_requires_contract22: "比赛提交需要当前契约22的运行入口。",
     competition_credential_missing: "尚未配置平台凭据，请输入后保存。",
     competition_auth_failed: "平台认证失败，请检查凭据及所属任务。",
@@ -47,6 +58,7 @@ const CompetitionPage = (() => {
     competition_profile_invalid: "配置字段不正确，请检查名称、协议和 1–60 秒读取超时。",
     competition_profile_changed: "配置在读取期间发生变化，请重新检查。"
   };
+  const errorText = code => errors[code] || (/^competition_attachment_http_\d{3}$/.test(code || "") ? `附件下载返回 HTTP ${code.slice(-3)}，赛程已保留；请核对下载权限后继续原赛程。` : null);
   let session = null, sessionBusy = false, previewItems = [], pendingExtension = null;
   let refreshing = false, revision = 0, selectedRemote = "", records = [], dashboardOwner = null, queueSignature = null;
   try {pendingExtension = JSON.parse(sessionStorage.getItem("competition-extension") || "null");} catch {}
@@ -125,13 +137,13 @@ const CompetitionPage = (() => {
       if (item.wrong_count !== undefined && item.wrong_count !== null) card.append(node("p", `错误次数：${item.wrong_count} / ${item.max_wrong_count ?? "未提供上限"}`));
       card.append(node("pre", item.addresses.length ? item.addresses.join("\n") : "平台暂未提供可用目标地址。", "competition-addresses"));
       if (item.attachment) {
-        card.append(node("p", `附件：${item.attachment.name || "未命名"}（请自行下载后在任务页上传）`));
+        card.append(node("p", `附件：${item.attachment.name || "未命名"}（导入题目时自动下载并登记）`));
         if (item.attachment.url) card.append(node("pre", item.attachment.url, "competition-addresses"));
       }
       const form=document.createElement("form");form.className="competition-import";
       const label=node("label","目标入口（需要明确协议）","field");
       const address=document.createElement("select"); address.setAttribute("aria-label","目标入口");
-      address.append(new Option(item.addresses.length ? "请选择入口" : "附件题：在任务页上传文件", ""));
+      address.append(new Option(item.addresses.length ? "请选择入口" : "附件题：导入时自动取件", ""));
       for (const raw of item.addresses) {
         if (/^https?:\/\//i.test(raw)) address.append(new Option(raw,raw));
         else if (!raw.includes("://")) for (const scheme of ["http","https"]) address.append(new Option(`${scheme}://${raw}（请确认协议）`,`${scheme}://${raw}`));
@@ -146,7 +158,7 @@ const CompetitionPage = (() => {
         try {
           const task=await request(`${endpoint}/${current.id}/import`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remote_ref:item.remote_ref,endpoint:address.value})});
           await loadTasks(); selectTask(task.id,false); showView("detail");
-        } catch(e) {status(errors[e.message] || `导入失败：${e.message}`);}
+        } catch(e) {status(errorText(e.message) || `导入失败：${e.message}`);}
         finally {button.disabled=false;busy=false;controls();}
       });
       card.append(form);
@@ -184,6 +196,7 @@ const CompetitionPage = (() => {
     for (const id of ["pause","resume","stop-after","extend-overall"]) el(id).disabled = sessionBusy || !active;
     el("pause").disabled = sessionBusy || !active || session.state.status !== "running";
     el("resume").disabled = sessionBusy || !active || !["paused","needs_attention"].includes(session.state.status);
+    el("finish").disabled = sessionBusy || !active || session.state.status === "pausing";
     el("queue").disabled = el("fill-queue").disabled = sessionBusy || Boolean(active) || current?.adapter!=="benchmark";
     el("adapter").disabled = el("url").disabled = busy || Boolean(active && session.config.profile.id===current?.id);
     el("extend-question").disabled = sessionBusy || !active || !session?.state.challenge_id;
@@ -228,7 +241,7 @@ const CompetitionPage = (() => {
     el("run-settings").querySelector("summary").textContent=active ? "赛程参数 · 已冻结" : "新赛程参数";
     if(active) el("frozen-settings").replaceChildren(...[["无协议入口",session.config.default_scheme?.toUpperCase() || "未提供"],["初始单题预算",`${session.config.question_seconds/60} 分钟`],["允许的 HTTP 方法",session.config.http_methods?.join(", ") || "未提供"]].map(([label,value])=> {const row=node("div");row.append(node("dt",label),node("dd",value));return row;}));
     el("schedule-status").closest(".c-command").dataset.status=state?.status || "idle";
-    el("schedule-status").textContent=state ? `${sessionLabels[state.status] || state.status}${state.reason ? ` · ${errors[state.reason] || state.reason}` : ""}${state.pending_control ? " · 加时待应用" : ""}` : "尚未创建赛程";
+    el("schedule-status").textContent=state ? `${sessionLabels[state.status] || state.status}${state.reason ? ` · ${errorText(state.reason) || state.reason}` : ""}${state.pending_control ? " · 加时待应用" : ""}` : "尚未创建赛程";
     el("bound-source").textContent=session ? `${session.config.profile.adapter.toUpperCase()} · ${session.config.profile.base_url}` : "尚未绑定赛程";
     el("overall-clock").textContent=clock(state?.deadline_at);
     el("question-clock").textContent=runtime ? clock(runtime.deadline_at) : state?.current_ref!==null && state?.current_ref!==undefined ? "尚未计时" : "—";
@@ -337,7 +350,9 @@ const CompetitionPage = (() => {
     try {
       const value = {profile_id:current.id,default_scheme:el("scheme").value,question_minutes:Number(el("question-minutes").value),
         overall_minutes:Number(el("overall-minutes").value),queue:el("queue").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean),
-        http_methods:el("methods").value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean),mode:"real"};
+        http_methods:el("methods").value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean),mode:"real",
+        default_description:el("default-description").value,
+        default_description_enabled:el("default-description-enabled").checked};
       if (el("platform-end").value) value.platform_deadline_at = new Date(el("platform-end").value).getTime()/1000;
       session = await request("/api/competition/sessions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(value)});
     } catch(e) {el("schedule-error").textContent = errors[e.message] || `创建失败：${e.message}`;return;}
@@ -359,6 +374,7 @@ const CompetitionPage = (() => {
     el("fill-queue").addEventListener("click",()=> {el("queue").value = current?.adapter === "benchmark" ? previewItems.filter(x=>!x.is_completed).map(x=>x.remote_ref).join("\n") : "";renderQueue();});
     el("pause").addEventListener("click",()=>scheduleCommand({action:"pause"}));
     el("resume").addEventListener("click",()=>scheduleCommand({action:"resume"}));
+    el("finish").addEventListener("click",()=>{ if (confirm("结束当前赛程？结束后本轮不可继续，但题目与证据会保留。")) scheduleCommand({action:"finish"}); });
     el("stop-after").addEventListener("change",()=>scheduleCommand({action:"stop_after_current",enabled:el("stop-after").checked}));
     el("extend-question").addEventListener("click",()=>extend("extend_question"));
     el("extend-overall").addEventListener("click",()=>extend("extend_overall"));

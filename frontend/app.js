@@ -5,6 +5,17 @@ const $ = (id) => document.getElementById(id);
 let toastTimer;
 let runPoll;
 let runSelection = 0;
+let securityPoll;
+const pendingLiveControls = new Map();
+const liveControlErrors = {
+  operator_task_expired_or_terminal: "任务已到期或结束，不能靠加时恢复。",
+  operator_task_not_active: "当前任务不在运行。",
+  operator_task_initializing: "运行正在初始化，请稍后重试。",
+  operator_extension_exceeds_ceiling: "加时超过整体或平台截止。",
+  operator_hint_invalid: "请输入1至8192字的提示。",
+  operator_extension_invalid: "请输入正整数分钟。",
+  operator_run_changed: "运行已切换，本次提交未应用到新运行。",
+};
 
 function notify(message) {
   const toast = $("toast"); toast.textContent = message; toast.classList.add("show");
@@ -23,7 +34,7 @@ function statusLabel(task) {
   return labels[task.status] || ["draft", task.status || "草稿"];
 }
 const LIVE_STATUSES = ["starting", "running", "cancelling", "cleaning"];
-const PIPE_FIELDS = [["turns", "Turn"], ["intents", "Intent"], ["execs", "执行"], ["facts", "Fact"]];
+const PIPE_FIELDS = [["turns", "Turn"], ["intents", "Road"], ["execs", "执行"], ["facts", "Fact"]];
 
 function runCounts(task) {
   const report = task.run && task.run.result;
@@ -31,8 +42,8 @@ function runCounts(task) {
   const turns = report.turns || [];
   return {
     turns: turns.length,
-    intents: turns.reduce((sum, turn) => sum + ((turn.intents || []).length), 0),
-    execs: (report.executions || []).length,
+    intents: turns.reduce((sum, turn) => sum + ((turn.roads || turn.intents || []).length), 0),
+    execs: (report.tool_operations || report.executions || []).length,
     facts: (report.verified_facts || []).length,
   };
 }
@@ -49,7 +60,7 @@ function renderBoardStats() {
     { tone: "info", label: "已验证 Fact", value: String(facts), hint: "外层复核通过后写入" },
     { tone: recovering ? "warn" : "", label: "待恢复", value: String(recovering), hint: recovering ? "需要显式恢复后才能继续" : "无未知操作" },
   ];
-  host.replaceChildren(...cards.map((item) => {
+  RunView.patchChildren(host, cards.map((item) => {
     const card = document.createElement("div");
     card.className = "stat-card";
     if (item.tone) card.dataset.tone = item.tone;
@@ -62,7 +73,7 @@ function renderBoardStats() {
 }
 
 function renderTaskList() {
-  const list = $("task-list"); list.replaceChildren();
+  const list = document.createDocumentFragment();
   const tasks = state.tasks.filter((task) => state.showArchived || !task.archived);
   renderBoardStats();
   if (!tasks.length) {
@@ -70,6 +81,7 @@ function renderTaskList() {
     empty.className = "empty-state";
     empty.textContent = "还没有题目。创建一道题，选择运行模式后即可启动 Agent。";
     list.append(empty);
+    RunView.patchChildren($("task-list"), Array.from(list.childNodes));
     $("batch-cleanup").hidden = true;
     return;
   }
@@ -77,6 +89,7 @@ function renderTaskList() {
     const [kind, label] = statusLabel(task);
     const live = LIVE_STATUSES.includes(task.run?.status);
     const card = document.createElement("button");
+    card.dataset.key = task.id;
     card.type = "button";
     card.className = [
       "task-card",
@@ -108,7 +121,7 @@ function renderTaskList() {
       const item = document.createElement("span");
       item.className = `pipe-item${key === "facts" && counts ? " accent" : ""}${counts ? "" : " idle"}`;
       const num = document.createElement("b"); num.textContent = counts ? String(counts[key]) : "—";
-      item.append(num, document.createTextNode(text));
+      item.append(num, document.createTextNode(key === "intents" && !task.run?.result?.goal_validation ? "Intent" : text));
       pipe.append(item);
     }
 
@@ -130,6 +143,7 @@ function renderTaskList() {
     }
     list.append(card);
   });
+  RunView.patchChildren($("task-list"), Array.from(list.childNodes));
   $("batch-cleanup").hidden = !state.selectMode || state.selectedTasks.size === 0;
 }
 function renderAttachments() {
@@ -149,12 +163,17 @@ function setHttpMethods(methods = ["GET", "HEAD", "OPTIONS"]) {
   document.querySelectorAll('[name="http-method"]').forEach((input) => { input.checked = methods.includes(input.value); input.disabled = !!state.selected && state.tasks.find((task) => task.id === state.selected)?.status !== "draft"; });
 }
 function resetForm() {
+  $("user-hint-content").value = "";
   setHttpMethods();
   runSelection += 1; RunView.reset(); $("run-panel").hidden = true;
   clearTimeout(runPoll); $("task-id").value = ""; $("task-title").value = ""; $("task-category").value = "pwn"; $("task-deadline").value = "60"; $("step-timeout").value = "60"; $("task-endpoint").value = ""; $("task-description").value = ""; $("editor-title").textContent = "新建题目"; $("editor-state").textContent = "尚未保存"; $("detail-task-title").textContent = "新建题目"; $("detail-task-status").textContent = ""; $("task-actions").hidden = true; state.selected = null; state.pendingFiles = []; $("attachments").value = ""; renderAttachments(); renderTaskList();
 }
 function selectTask(id, navigate = true) {
   const task = state.tasks.find((item) => item.id === id); if (!task) return;
+  if (state.selected !== id) {
+    $("user-hint-content").value = pendingLiveControls.get(`${id}/user_hint`)?.value.payload.content || "";
+    $("user-hint-status").textContent = "下一次新决策可读取；不会打断当前生成，也不会自动成为已验证事实。";
+  }
   clearTimeout(runPoll); runSelection += 1; RunView.reset(); state.selected = id; $("task-id").value = task.id; $("task-title").value = task.title; $("task-category").value = task.category; $("task-deadline").value = task.deadline_minutes || 60; $("step-timeout").value = task.step_timeout_seconds || 60; $("task-endpoint").value = task.endpoint; $("task-description").value = task.description; setHttpMethods(task.http_methods); $("editor-title").textContent = "题目详情"; $("editor-state").textContent = task.archived ? "已归档" : task.status; $("detail-task-title").textContent = task.title; $("detail-task-status").textContent = task.archived ? "已归档" : statusLabel(task)[1]; $("task-actions").hidden = false; $("archive-task").hidden = task.archived; $("restore-task").hidden = !task.archived; $("purge-task").hidden = !task.archived; state.pendingFiles = []; renderAttachments(); renderSavedAttachments(task); if (navigate) showView("detail"); renderRun(task.run); renderTaskList(); refreshRun(id, runSelection);
 }
 function renderRun(run, events = [], progress = null) {
@@ -167,7 +186,16 @@ function renderRun(run, events = [], progress = null) {
   $("cancel-run").textContent = recoverableCancel ? "结束并清理" : run?.status === "paused" ? "取消并清理" : "取消运行";
   const terminal = ["achieved", "assumed_achieved", "partial", "inconclusive", "failed", "cancelled", "deadline_exceeded"].includes(run?.result?.task_run?.status);
   $("cleanup-run").hidden = run?.status !== "recovery_required" || !terminal || run?.result?.cleanup?.status === "succeeded";
+  $("force-repair").hidden = !run || !["recovery_required", "failed", "cancelled", "deadline_exceeded"].includes(run.status);
   const report = progress || run?.result;
+  const editable = run?.status === "running" && report?.goal_validation && report.task_run?.deadline_at > Date.now() / 1000;
+  $("extend-run-control").hidden = !report?.goal_validation;
+  for (const [action, buttonId, inputId] of [["extend_question", "extend-run", "extend-run-minutes"], ["user_hint", "user-hint-submit", "user-hint-content"]]) {
+    const pending = pendingLiveControls.get(`${state.selected}/${action}`);
+    $(buttonId).disabled = pending?.busy || (!editable && !pending);
+    $(inputId).disabled = !!pending || !editable;
+    $(buttonId).textContent = pending ? "确认原提交" : action === "user_hint" ? "提交提示" : "加时";
+  }
   $("resume-run").hidden = ![19, 20, 21, 22].includes(report?.contract_version) || report?.task_run?.status !== "running" || !["paused", "recovery_required"].includes(run?.status) || (report?.recovery?.required && report.recovery.reason !== "operation_or_evidence_unknown");
   RunView.render({ run, events, progress, challengeId: state.selected });
 }
@@ -179,7 +207,7 @@ async function refreshRun(id, selection = runSelection) {
     $("run-read-error").hidden = true;
     renderRun(data.run, data.events, data.progress);
     const task = state.tasks.find((item) => item.id === id);
-    if (task && data.run) { task.run = data.run; task.status = data.run.status; $("editor-state").textContent = task.status; $("detail-task-status").textContent = statusLabel(task)[1]; renderTaskList(); }
+    if (task && data.run) { task.run = { ...data.run, result: data.progress || data.run.result }; task.status = data.run.status; $("editor-state").textContent = task.status; $("detail-task-status").textContent = statusLabel(task)[1]; renderTaskList(); }
   } catch (error) {
     if (state.selected !== id || selection !== runSelection) return;
     $("run-read-error").hidden = false; $("run-read-error").textContent = `进度读取失败，保留上次快照：${error.message}`;
@@ -198,17 +226,60 @@ async function startRun() {
     options.headers = { "Content-Type": "application/json" };
   }
   try { const run = await request(`/api/challenges/${id}/run`, options); renderRun(run); await loadTasks(); await refreshRun(id); notify("Agent 进程已启动"); }
-  catch (error) { notify(`启动失败：${error.message}`); }
+  catch (error) { notify(`启动失败：${error.message === "competition_schedule_active" ? "当前任务由赛程管理，请回比赛控制继续原赛程。" : error.message}`); }
 }
 async function cancelRun() {
   const id = state.selected; if (!id) return;
   try { const run = await request(`/api/challenges/${id}/cancel`, { method: "POST" }); if (state.selected === id) { renderRun(run); const task = state.tasks.find((item) => item.id === id); if (task) task.run = run; await refreshRun(id); } notify("取消请求已发送"); }
   catch (error) { notify(`取消失败：${error.message}`); }
 }
+async function submitLiveControl(action) {
+  const challengeId = state.selected;
+  const run = state.tasks.find(task => task.id === challengeId)?.run;
+  if (!run) return;
+  const key = `${challengeId}/${action}`;
+  let pending = pendingLiveControls.get(key);
+  if (pending?.busy) return;
+  if (!pending) {
+    const payload = action === "user_hint" ? { content: $("user-hint-content").value } : { seconds: Number($("extend-run-minutes").value) * 60 };
+    if (action === "user_hint" && !payload.content.trim()) { notify("请先填写提示。"); return; }
+    if (action === "extend_question" && (!Number.isSafeInteger(payload.seconds) || payload.seconds <= 0 || payload.seconds % 60)) { notify("请输入正整数分钟。"); return; }
+    pending = { value: { run_id: run.run_id, operation_id: crypto.randomUUID(), action, payload }, busy: false };
+    pendingLiveControls.set(key, pending);
+  }
+  pending.busy = true; renderRun(run);
+  try {
+    await request(`/api/challenges/${challengeId}/operator-control`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(pending.value) });
+    pendingLiveControls.delete(key);
+    if (state.selected === challengeId && action === "user_hint") {
+      $("user-hint-content").value = "";
+      $("user-hint-status").textContent = "提示已登记，下一次新决策可读取；当前生成继续使用原上下文。";
+    }
+    notify(action === "user_hint" ? "用户提示已登记" : "任务已加时，在途规划沿原请求等待");
+  } catch (error) {
+    if (Object.hasOwn(liveControlErrors, error.message) || ["operator_operation_conflict", "operator_payload_invalid", "operator_scope_invalid", "operator_task_cancelled"].includes(error.message)) pendingLiveControls.delete(key);
+    notify(liveControlErrors[error.message] || `提交结果待确认，请用原按钮重试：${error.message}`);
+  } finally {
+    pending.busy = false;
+    if (state.selected === challengeId) await refreshRun(challengeId);
+  }
+}
+document.addEventListener("DOMContentLoaded", () => {
+  $("extend-run").addEventListener("click", () => submitLiveControl("extend_question"));
+  $("user-hint-form").addEventListener("submit", event => { event.preventDefault(); submitLiveControl("user_hint"); });
+});
 async function cleanupRun() {
   const id = state.selected; if (!id) return;
   try { const run = await request(`/api/challenges/${id}/cleanup`, { method: "POST" }); renderRun(run); await loadTasks(); notify("已启动资源清理；成功后可归档题目"); }
   catch (error) { notify(`资源清理未启动：${error.message}`); }
+}
+async function forceRepair() {
+  const id = state.selected; if (!id) return;
+  try {
+    const result = await request(`/api/challenges/${id}/force-repair`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    await loadTasks(); await refreshRun(id);
+    notify(`已强行修正：删除 ${result.deleted_runs} 条运行记录，题目回到草稿；备份 ${result.backup.split(/[\\/]/).pop()}`);
+  } catch (error) { notify(`强行修正失败：${error.message}`); }
 }
 async function resumeRun() {
   const id = state.selected; if (!id) return;
@@ -221,6 +292,12 @@ window.addEventListener("d9-validation-check", async (event) => {
   try { const run = await request(`/api/challenges/${challengeId}/validation-check`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(selection) }); renderRun(run); await refreshRun(challengeId); notify("核查请求已交给可信入口；不会自动执行任务"); }
   catch (error) { notify(`核查未启动：${error.message}`); }
 });
+  window.addEventListener("stage-human-decision", async (event) => {
+    const { challengeId, selection } = event.detail;
+    if (!challengeId || challengeId !== state.selected) return;
+    try { const run = await request(`/api/challenges/${challengeId}/human-decision`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(selection) }); renderRun(run); await refreshRun(challengeId); notify("人工决定已登记"); }
+    catch (error) { notify(`人工决定未完成：${error.message}`); }
+  });
 async function loadTasks() { state.tasks = await request("/api/challenges"); renderTaskList(); if (state.selected && state.tasks.some((task) => task.id === state.selected)) selectTask(state.selected, false); else resetForm(); }
 async function saveTask(event) {
   event.preventDefault(); const value = { title: $("task-title").value.trim(), category: $("task-category").value, description: $("task-description").value, endpoint: $("task-endpoint").value.trim(), deadline_minutes: Number($("task-deadline").value), step_timeout_seconds: Number($("step-timeout").value) };
@@ -236,13 +313,72 @@ async function loadModel() { try { const value = await request("/api/model"); $(
 async function saveModel(event) { event.preventDefault(); const key = $("model-key").value; if (!key) { notify("请输入 API Key；页面不会保存它"); return; } try { const value = await request("/api/model", { method: "PUT", body: JSON.stringify({ provider: $("model-provider").value, model: $("model-name").value.trim(), base_url: $("model-url").value.trim(), api_key: key }), headers: { "Content-Type": "application/json" } }); $("model-key").value = ""; $("model-state").textContent = value.key_configured ? "Key 已在内存" : "未配置 Key"; notify("模型配置已应用"); } catch (error) { notify(`配置失败：${error.message}`); } }
 async function saveDualModel(event) { event.preventDefault(); const key = $("dual-model-key").value; const outerModel = $("outer-model-name").value.trim(); const innerModel = $("inner-model-name").value.trim(); if (!key) { notify("请输入 API Key"); return; } if (!outerModel || !innerModel) { notify("请填写外层和内层模型名称"); return; } try { const value = await request("/api/model", { method: "PUT", body: JSON.stringify({ outer_model: outerModel, inner_model: innerModel, api_key: key }), headers: { "Content-Type": "application/json" } }); $("dual-model-key").value = ""; $("dual-model-state").textContent = value.key_configured ? "双角色已配置" : "未配置"; notify("双 LLM 角色配置已应用"); } catch (error) { notify(`配置失败：${error.message}`); } }
 function toggleModelMode(mode) { const isSingle = mode === "single"; $("mode-single").classList.toggle("active", isSingle); $("mode-dual").classList.toggle("active", !isSingle); $("single-model-section").hidden = !isSingle; $("dual-model-section").hidden = isSingle; notify(isSingle ? "已切换到单模型模式" : "已切换到双 LLM 角色模式"); }
+function renderWindowsSecurityHint() {
+  const value = state.windowsSecurity;
+  const realMode = $("run-mode-control").hidden ? state.executionProfile === "d7" : $("run-mode").value === "real";
+  $("windows-security-hint").hidden = !value?.supported || !realMode || (value.verified && value.status === "excluded" && !value.busy);
+}
+function renderWindowsSecurity(value) {
+  state.windowsSecurity = value;
+  const statuses = { excluded: "已核验：证据目录排除已生效", not_excluded: "已核验：证据目录未被排除", unknown: "无法确认当前配置", not_applicable: "当前服务不在 Windows 上，无需此配置" };
+  const failures = { script_execution_blocked: "配置助手被脚本策略阻止，尚未执行 Defender 检查", helper_result_read_failed: "检查回执读取失败，配置状态未确认" };
+  $("security-status").textContent = value.busy ? "正在等待管理员确认或执行检查…" : failures[value.reason] || statuses[value.status] || statuses.unknown;
+  const reasons = {
+    not_checked: "尚未核验；普通权限下看不到排除项，不代表没有配置。",
+    awaiting_administrator_or_check: "请在 Windows 管理员提示中确认；本页自动更新操作结果。",
+    administrator_cancelled: "管理员确认已取消；设置结果未核验，可继续使用工作台。",
+    helper_failed_or_blocked: "配置助手未返回有效结果，可能受权限或脚本执行策略限制。请查看脚本说明或联系管理员。",
+    helper_result_read_failed: "管理员助手已结束，但工作台无法读取检查回执。请检查文件访问权限；不能据此判定排除未配置。",
+    script_execution_blocked: "PowerShell 的执行策略或签名要求拒绝加载脚本，管理员权限不会自动解除。文件安全区域映射也可能触发限制，即使没有下载标记；这不代表 Defender 排除未配置。",
+    administrator_required_to_verify_or_configure: "需要管理员权限才能可靠检查和配置。",
+    exclusions_not_visible: "排除列表不可见，不能判断配置是否完成。",
+    exclusions_read_failed: "无法读取排除列表，请检查 Defender 服务和组织策略。",
+    rule_configuration_failed: "配置未得到确认，可能受组织策略限制；请重新检查。",
+    rule_removal_failed: "撤销未得到确认，请重新检查。",
+    defender_path_check_unavailable: "无法核验目录实际排除状态，不能仅凭规则存在判断生效。",
+    data_directory_not_found: "数据目录不存在，无法核验。",
+    invalid_data_directory: "数据目录无效，请检查工作台启动参数。",
+    use_windows_powershell_exe: "请使用 Windows PowerShell 5.1 运行脚本。",
+    windows_only: "此页面只管理 Windows 主机的 Microsoft Defender。",
+  };
+  $("security-reason").textContent = reasons[value.reason] || (value.action === "Remove" && value.exact_rule_present === false ? (value.status === "excluded" ? "本项目精确规则已撤销，但其他规则仍将此目录排除。" : "本项目精确规则已撤销。") : "结果为最近一次实际检查；外部更改后请重新检查。");
+  $("security-diagnostic").textContent = [value.reason, value.error_type, value.exit_code == null ? null : `exit=${value.exit_code}`, value.errno == null ? null : `errno=${value.errno}`, value.winerror == null ? null : `winerror=${value.winerror}`].filter(Boolean).join(" · ");
+  $("security-data-dir").textContent = value.data_dir || "—";
+  $("security-pattern").textContent = value.pattern || "—";
+  $("security-rule").textContent = value.busy || value.exact_rule_present == null ? "尚未核验" : value.exact_rule_present ? "存在" : "不存在（其他规则仍可能覆盖）";
+  const flag = v => v == null ? "未知" : v ? "开启" : "关闭";
+  $("security-protection").textContent = `${flag(value.real_time_protection_enabled)} / ${flag(value.tamper_protected)}`;
+  $("security-checked-at").textContent = value.checked_at ? new Date(value.checked_at).toLocaleString() : "尚未检查";
+  $("security-script").textContent = `脚本：${value.script_path || "—"}`;
+  for (const action of ["check", "apply", "remove"]) $("security-" + action).disabled = !value.supported || value.busy;
+  renderWindowsSecurityHint();
+}
+async function refreshWindowsSecurity() {
+  clearTimeout(securityPoll);
+  try {
+    const value = await request("/api/windows-security");
+    renderWindowsSecurity(value);
+    if (value.busy || !$("security-view").hidden) securityPoll = setTimeout(refreshWindowsSecurity, value.busy ? 1500 : 10000);
+  } catch (_) {
+    renderWindowsSecurity({ ...state.windowsSecurity, status: "unknown", verified: false, reason: "helper_failed_or_blocked" });
+    if (!$("security-view").hidden) securityPoll = setTimeout(refreshWindowsSecurity, 10000);
+  }
+}
+async function changeWindowsSecurity(action) {
+  renderWindowsSecurity({ ...state.windowsSecurity, busy: true, status: "unknown", verified: false, reason: "awaiting_administrator_or_check" });
+  try {
+    renderWindowsSecurity(await request("/api/windows-security", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }) }));
+  } catch (_) { notify("操作请求结果未确认，正在读取当前状态；不会自动重发。"); }
+  await refreshWindowsSecurity();
+}
 function showView(name, updateHistory = true) {
   if (name !== "detail") { clearTimeout(runPoll); runSelection += 1; }
   document.body.classList.toggle("detail-open", name === "detail");
   document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === (name === "detail" ? "tasks" : name)));
   document.querySelectorAll(".view").forEach((view) => { const active = view.id === `${name}-view`; view.hidden = !active; view.classList.toggle("active", active); });
-  $("current-view").textContent = name === "competition" ? "比赛控制" : name === "model" ? "模型角色" : name === "detail" ? "题目详情" : "任务与运行";
+  $("current-view").textContent = name === "competition" ? "比赛控制" : name === "security" ? "Windows 安全配置" : name === "model" ? "模型角色" : name === "detail" ? "题目详情" : "任务与运行";
   if (name === "model") loadModel();
+  if (name === "security") refreshWindowsSecurity();
   if (name === "competition") CompetitionPage.load();
   if (updateHistory) {
     const route = name === "detail" ? (state.selected ? `#task/${state.selected}` : "#new") : `#${name}`;
@@ -256,7 +392,7 @@ function syncRoute() {
     if (state.tasks.some((task) => task.id === id)) { selectTask(id, false); showView("detail", false); return; }
   }
   if (route === "#new") { resetForm(); showView("detail", false); return; }
-  showView(route === "#competition" ? "competition" : route === "#model" ? "model" : "tasks", false);
+  showView(route === "#competition" ? "competition" : route === "#security" ? "security" : route === "#model" ? "model" : "tasks", false);
 }
 async function health() { try { const value = await request("/api/health"); state.executionProfile = value.capabilities?.execution_profile; $("profile-pill").textContent = state.executionProfile ? `profile ${state.executionProfile}` : `协议 v${value.capabilities?.protocol_version || 3}`; $("http-methods-control").hidden = !["d8_v20", "d8_v21", "d8_v22"].includes(state.executionProfile); $("run-mode").querySelector('option[value="real"]').textContent = value.capabilities?.real_sandbox_backend === "docker" ? "真实模型＋Docker Sandbox" : "真实模型＋本地模拟 Sandbox"; $("run-mode-control").hidden = !["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"].includes(state.executionProfile); if (["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"].includes(state.executionProfile)) { $("run-mode").value = value.capabilities.d7_mode || ""; $("run-mode").disabled = !!value.capabilities.d7_mode; } $("service-status").textContent = value.status === "ready" ? "服务已连接" : "服务状态异常"; $("connection-text").textContent = "回环服务"; } catch (_) { $("service-status").textContent = "服务未连接"; $("connection-text").textContent = "未连接"; $("profile-pill").textContent = "离线"; } }
 function toggleTaskSelection(taskId) {
@@ -310,9 +446,14 @@ async function batchCleanup() {
     notify(`批量清理失败：${error.message}`);
   }
 }
-function init() { document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view))); $("new-task").addEventListener("click", () => { resetForm(); showView("detail"); }); $("back-to-tasks").addEventListener("click", () => showView("tasks")); $("cancel-edit").addEventListener("click", () => showView("tasks")); $("refresh").addEventListener("click", () => loadTasks().catch((error) => notify(`刷新失败：${error.message}`))); $("show-archived").addEventListener("change", (event) => { state.showArchived = event.target.checked; renderTaskList(); }); $("select-mode").addEventListener("change", (event) => { toggleSelectMode(event.target.checked); }); $("batch-cleanup").addEventListener("click", batchCleanup); $("task-form").addEventListener("submit", saveTask); $("attachments").addEventListener("change", (event) => { const files = Array.from(event.target.files); const existing = state.tasks.find((item) => item.id === state.selected); if (state.pendingFiles.length + files.length + (existing?.attachments.length || 0) > 16) { notify("每题最多 16 个附件"); return; } state.pendingFiles.push(...files); renderAttachments(); if (existing) renderSavedAttachments(existing); }); $("archive-task").addEventListener("click", archiveTask); $("restore-task").addEventListener("click", restoreTask); $("purge-task").addEventListener("click", purgeTask); $("start-run").addEventListener("click", startRun); $("cancel-run").addEventListener("click", cancelRun); $("cleanup-run").addEventListener("click", cleanupRun); $("model-form").addEventListener("submit", saveModel); $("dual-model-form").addEventListener("submit", saveDualModel); $("mode-single").addEventListener("click", () => toggleModelMode("single")); $("mode-dual").addEventListener("click", () => toggleModelMode("dual")); $("clear-key").addEventListener("click", async () => { try { await request("/api/model/key", { method: "DELETE" }); $("model-key").value = ""; $("model-state").textContent = "未配置 Key"; notify("服务端内存 Key 已清除"); } catch (error) { notify(`清除失败：${error.message}`); } }); window.addEventListener("popstate", syncRoute); window.addEventListener("hashchange", syncRoute); health(); loadTasks().then(syncRoute).catch((error) => { $("task-list").textContent = `服务未连接：${error.message}`; }); }
+function init() { document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view))); $("new-task").addEventListener("click", () => { resetForm(); showView("detail"); }); $("back-to-tasks").addEventListener("click", () => showView("tasks")); $("cancel-edit").addEventListener("click", () => showView("tasks")); $("refresh").addEventListener("click", () => loadTasks().catch((error) => notify(`刷新失败：${error.message}`))); $("show-archived").addEventListener("change", (event) => { state.showArchived = event.target.checked; renderTaskList(); }); $("select-mode").addEventListener("change", (event) => { toggleSelectMode(event.target.checked); }); $("batch-cleanup").addEventListener("click", batchCleanup); $("task-form").addEventListener("submit", saveTask); $("attachments").addEventListener("change", (event) => { const files = Array.from(event.target.files); const existing = state.tasks.find((item) => item.id === state.selected); if (state.pendingFiles.length + files.length + (existing?.attachments.length || 0) > 16) { notify("每题最多 16 个附件"); return; } state.pendingFiles.push(...files); renderAttachments(); if (existing) renderSavedAttachments(existing); }); $("archive-task").addEventListener("click", archiveTask); $("restore-task").addEventListener("click", restoreTask); $("purge-task").addEventListener("click", purgeTask); $("start-run").addEventListener("click", startRun); $("cancel-run").addEventListener("click", cancelRun); $("cleanup-run").addEventListener("click", cleanupRun); $("model-form").addEventListener("submit", saveModel); $("dual-model-form").addEventListener("submit", saveDualModel); $("mode-single").addEventListener("click", () => toggleModelMode("single")); $("mode-dual").addEventListener("click", () => toggleModelMode("dual")); $("clear-key").addEventListener("click", async () => { try { await request("/api/model/key", { method: "DELETE" }); $("model-key").value = ""; $("model-state").textContent = "未配置 Key"; notify("服务端内存 Key 已清除"); } catch (error) { notify(`清除失败：${error.message}`); } }); window.addEventListener("popstate", syncRoute); window.addEventListener("hashchange", syncRoute); health().then(refreshWindowsSecurity); loadTasks().then(syncRoute).catch((error) => { $("task-list").textContent = `服务未连接：${error.message}`; }); }
 document.addEventListener("DOMContentLoaded", init);
+document.addEventListener("DOMContentLoaded", () => {
+  $("run-mode").addEventListener("change", renderWindowsSecurityHint);
+  for (const action of ["Check", "Apply", "Remove"]) $("security-" + action.toLowerCase()).addEventListener("click", () => changeWindowsSecurity(action));
+});
 document.addEventListener("DOMContentLoaded", () => $("resume-run").addEventListener("click", resumeRun));
+document.addEventListener("DOMContentLoaded", () => $("force-repair").addEventListener("click", forceRepair));
 
 window.addEventListener("competition-submit",async event=>{
   const challengeId=event.detail.challengeId;

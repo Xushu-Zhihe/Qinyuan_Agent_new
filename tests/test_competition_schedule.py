@@ -79,10 +79,11 @@ def test_expired_deadline_cannot_be_extended_or_reactivated(http_case):
 
 @pytest.mark.parametrize("http_case",["continuous"],indirect=True)
 def test_control_state_survives_readonly_reopen_without_migration(http_case):
-    from agent_core.sqlite_control_store import SqliteControlStore
+    from agent_core.sqlite_control_store import SqliteControlStore, CURRENT_SCHEMA_VERSION
     c=http_case;configure(c);command(c,"pause")
     with SqliteControlStore.open_readonly(c.app.store.path) as store:
-        assert store._schema_version==31 and controls.current(store,c.task)["paused"]
+        assert store._schema_version==CURRENT_SCHEMA_VERSION and controls.current(store,c.task)["paused"]
+        assert store._connection.total_changes == 0
         assert store._connection.execute("PRAGMA foreign_key_check").fetchall()==[]
 
 
@@ -445,6 +446,54 @@ def test_waiting_for_attachment_can_extend_budgets_without_inventing_a_taskrun(p
     after=service.command(row["id"],question)
     assert after["state"]["question_seconds"]==660 and service.command(row["id"],question)["state"]["question_seconds"]==660
     assert p.workbench.runner.status(challenge) is None
+
+
+@pytest.mark.parametrize("retry",[False,True])
+def test_arena_attachment_is_downloaded_before_scheduled_start_and_failure_can_resume(platform,monkeypatch,retry):
+    from test_competition import arena_attachment
+    p=platform;body=arena_attachment(p)
+    service,row,_,_=schedule(p,"arena")
+    starts=[]
+    def start(identity,**options):
+        task=p.workbench.get(identity);file,=task["attachments"]
+        assert (p.workbench.uploads/identity/file["id"]).read_bytes()==body
+        assert options["competition_control"]["session_id"]==row["id"]
+        starts.append(identity)
+        fake_run(p,service.get(row["id"]))
+    monkeypatch.setattr(p.workbench.runner,"start",start)
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    if retry:
+        p.routes["/archive"]=(403,b"controlled download refusal",{})
+        service.tick();service.tick();state=service.get(row["id"])["state"]
+        assert state["status"]=="paused" and state["reason"]=="competition_attachment_http_403" and not starts
+        task,=p.workbench.list();assert not task["attachments"]
+        p.routes["/archive"]=(200,body,{})
+        service.command(row["id"],{"action":"resume"})
+    service.tick()
+    state=service.get(row["id"])["state"]
+    assert len(starts)==1 and state["challenge_id"]==starts[0] and state["status"]=="running"
+    assert len(p.workbench.list())==1
+    assert all(method=="GET" for method,_,_ in p.requests)
+
+
+def test_pause_after_attachment_download_prevents_registration_and_agent_start(platform,monkeypatch):
+    from contextlib import contextmanager
+    from test_competition import arena_attachment
+    from agent_adapters import competition
+    p=platform;arena_attachment(p)
+    service,row,_,_=schedule(p,"arena")
+    original=competition._download_attachment
+    @contextmanager
+    def paused(*args,**kwargs):
+        with original(*args,**kwargs) as result:
+            service.pause(row["id"])
+            yield result
+    monkeypatch.setattr(competition,"_download_attachment",paused)
+    starts=[]
+    monkeypatch.setattr(p.workbench.runner,"start",lambda *a,**kw:starts.append(a))
+    service.tick();service.tick()
+    assert not starts and service.get(row["id"])["state"]["status"]=="paused"
+    task,=p.workbench.list();assert not task["attachments"]
 
 
 def test_paused_session_finishes_at_overall_deadline_once_current_task_is_terminal(platform,monkeypatch):

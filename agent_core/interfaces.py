@@ -40,6 +40,24 @@ from agent_core.tool_contracts import (
     ToolSandboxPort, ToolRecorderPort,
     ToolAuthorization,
 )
+from agent_core.stage_contracts import (
+    PlanningExhausted,
+    RoadCandidate,
+    StageConclusionChange,
+    StageFactSelection,
+    StageFactProposal,
+    StageFactBatch,
+    StageFactBatchReview,
+    StageHistoryRead,
+    StagePlanningDecision,
+    StageTurnSnapshot,
+    TurnIntent,
+    TurnPlanningContext,
+    TurnPlanningProposal,
+    TurnPlanningReview,
+)
+from agent_core.handoff_contracts import D8HistoryItem
+from agent_core.conclusion_revision_contracts import D8ChangeDecision
 
 
 class ClockPort(Protocol):
@@ -198,7 +216,51 @@ class EventPort(Protocol):
     """Event publication boundary; subscription and replay rules remain pending."""
 
 
+class TurnPlanningPort(Protocol):
+    """Inner planning through the existing audited model-call pipeline.
+
+    operation_id binds the exact frozen request, role, TaskRun and checkpoint
+    in the existing ledger. A parent proposes only the successor's objective;
+    propose_roads runs in the registered child Turn's own planning session.
+    """
+
+    async def propose_turn(
+        self, context: TurnPlanningContext, operation_id: str,
+        cancellation_token: CancellationToken,
+    ) -> TurnIntent | PlanningExhausted | ModelError: ...
+
+    async def propose_roads(
+        self, context: TurnPlanningContext, operation_id: str,
+        cancellation_token: CancellationToken,
+    ) -> tuple[RoadCandidate, ...] | PlanningExhausted | StageFactSelection | StageHistoryRead | StageConclusionChange | StageFactProposal | StageFactBatch | StagePlanningDecision | ModelError: ...
+
+
+class TurnPlanningReviewPort(Protocol):
+    """Outer reviews a frozen proposal; the trusted controller owns commit."""
+
+    async def review(
+        self, context: TurnPlanningContext, proposal: TurnPlanningProposal | StageFactProposal | StageFactBatch,
+        proposal_operation_id: str, operation_id: str,
+        cancellation_token: CancellationToken,
+    ) -> TurnPlanningReview | StageFactBatchReview | D8ChangeDecision | ModelError: ...
+
+
+class TurnProjectionPort(Protocol):
+    """Read new-framework state and version-bound history within one TaskRun."""
+
+    def load_turn(
+        self, task_run_id: str, turn_id: str,
+    ) -> StageTurnSnapshot | None: ...
+
+    def read_history(
+        self, task_run_id: str, refs: tuple[str, ...],
+    ) -> tuple[D8HistoryItem, ...]: ...
+
+
 __all__ = [
+    "TurnPlanningPort",
+    "TurnPlanningReviewPort",
+    "TurnProjectionPort",
     "IntentToolCallingLoopPort",
     "CancellationToken",
     "AgentApplicationPort",

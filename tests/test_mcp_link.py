@@ -118,6 +118,25 @@ def test_inner_receives_results_and_selects_next_tool(linked, status):
 
 
 @pytest.mark.parametrize("output_case", [22], indirect=True)
+def test_invalid_tool_arguments_stay_correctable_input(linked):
+    """A wrong argument must not read as a policy denial the model cannot fix."""
+    case = linked
+    from agent_adapters.mcp_plan_executor import ToolArgumentError
+    case.tools.status = "rejected"
+    case.tools.error = ToolArgumentError(
+        "download.arguments_invalid: python_package and python_version must be provided together")
+    seen = select_then_inspect(case)
+    asyncio.run(case.app.run(case.token))
+    observations = [m["content"] for m in seen[-1]["messages"] if m["role"] == "tool"]
+    feedback = [o["mcp_tool_result"] for o in observations if "mcp_tool_result" in o]
+    assert feedback and all(r["status"] == "rejected" for r in feedback)
+    assert all(r["category"] == "input" for r in feedback)
+    assert all(r["code"] == "download.arguments_invalid" for r in feedback)
+    # The validator's own words survive, so the retry can fix the same tool.
+    assert all("python_version" in r["detail"] for r in feedback)
+
+
+@pytest.mark.parametrize("output_case", [22], indirect=True)
 def test_unknown_execution_is_not_reissued_on_resume(linked):
     case = linked
     case.tools.error = TimeoutError("not saved to ordinary diagnostics")
@@ -332,7 +351,7 @@ def test_tool_schema_and_review_restrict_before_dispatch(linked, monkeypatch):
 def test_public_real22_wires_mcp_and_closes_same_loop(tmp_path, monkeypatch):
     """Actual public entry, controlled model/MCP/Docker ports; no external calls."""
     from dataclasses import asdict
-    from agent_adapters import deepseek_roles, docker_profile, simulation, task_cli
+    from agent_adapters import deepseek_roles, docker_profile, simulation, task_cli, stage_public
     from agent_adapters.web.simulated_application import _LocalDigestSandbox
     from agent_adapters.run_files import immutable_read
     from test_docker import new_request
@@ -349,7 +368,7 @@ def test_public_real22_wires_mcp_and_closes_same_loop(tmp_path, monkeypatch):
     token = SimpleNamespace(is_cancelled=False)
     class Link(MCPPlanExecutor):
         async def open(self):
-            loop[:] = [asyncio.get_running_loop()]
+            loop[:] = [asyncio.get_running_loop(), asyncio.current_task()]
             if self.manager is None:
                 task = self.app.state.task_run
                 self.manager = Tools(task.task_run_id, task.sandbox_id)
@@ -358,25 +377,30 @@ def test_public_real22_wires_mcp_and_closes_same_loop(tmp_path, monkeypatch):
         async def close(self):
             if loop:
                 assert asyncio.get_running_loop() is loop[0]
+                assert asyncio.current_task() is loop[1]
             await super().close()
     loop = []
-    class Model(simulation.SimulationModel):
+    class Model(stage_public.StageSimulationModel):
         def __init__(self, role, settings):
             super().__init__(role)
             self.settings = settings
         def bind_runtime(self, *args):
             pass
+        def bind_diagnostics(self, evidence):
+            self.evidence = evidence
         def invoke(self, envelope, *args):
-            if getattr(envelope.request, "stage", None) == "inner_plan":
-                seen.append(json.loads(envelope.request.session_context))
+            if getattr(envelope.request, "stage", None) == "stage_action":
+                seen.append(asdict(envelope.request))
                 if len(seen) == 2:
                     token.is_cancelled = True
                 return {"kind": "mcp_call", "tool_name": "shell.run_bash",
                         "arguments": {"script": "printf test"}}
             return super().invoke(envelope, *args)
     monkeypatch.setattr("agent_adapters.mcp_plan_executor.MCPPlanExecutor", Link)
+    monkeypatch.setattr("agent_adapters.stage_application.MCPPlanExecutor", Link)
     monkeypatch.setattr(deepseek_roles, "D8DeepSeekModel", Model)
-    monkeypatch.setattr(simulation, "_Token", lambda directory: token)
+    monkeypatch.setattr(stage_public, "_Token", lambda directory: token)
+    monkeypatch.setattr("agent_adapters.public_web.from_env_file", lambda *args: None)
     def connect(configuration, directory, *, wait_for_ready=False):
         assert wait_for_ready
         sandbox = _LocalDigestSandbox(directory)
@@ -398,7 +422,7 @@ def test_public_real22_wires_mcp_and_closes_same_loop(tmp_path, monkeypatch):
     assert result["verified_facts"] == []
     assert len(links) == 1 and links[0].client is None
     assert len(links[0].manager.calls) == 1 and len(seen) == 2
-    assert any("mcp_tool_result" in m["content"] for m in seen[-1]["messages"] if m["role"] == "tool")
+    assert any(i['identity'] == 'tool_observation_not_fact' for i in seen[-1]['context']['history'])
     directory = args.state_dir / result["task_run_id"]
     declaration = immutable_read(directory / "run.json")
     assert declaration["contract_version"] == 22
@@ -497,3 +521,35 @@ def test_download_preparation_uses_original_ledger_and_feedback(output_case,monk
             assert len(tools.calls)==2
             assert c.app.output_boundary.evidence.read("mcp-download",c.app.mcp.records()[-1].start.operation_id)["reused_from"]
         assert all(o.completion is not None for o in c.app.mcp.records())
+
+
+@pytest.mark.parametrize("path", ["/workspace/input/sample.war", "/workspace/work/sample.war", "/tmp/att/fj/ROOT.war", "sample.war"])
+def test_analysis_planners_use_actual_task_paths_and_writable_jadx_output(path):
+    from MCPs.analysis_common import validate_sandbox_path
+    from MCPs.Jadx_Mcp.server import decompile_android
+    planned = decompile_android(input_path=path, output_dir="/tmp/jadxout", timeout_seconds=240)
+    assert planned["sandbox_command"]["arguments"][-1] == validate_sandbox_path(path)
+    assert planned["sandbox_command"]["arguments"][1] == "/tmp/jadxout"
+    assert decompile_android(input_path=path)["request"]["output_dir"] == "/workspace/work/jadx-output"
+
+
+@pytest.mark.parametrize("path", ["/etc/passwd", "/work/old", "/challenge/old", "/workspace/input-other/file", "../file", "/tmp/../etc/file", "C:\\private\\file"])
+def test_analysis_path_boundary_does_not_expand_to_host_or_old_roots(path):
+    from MCPs.analysis_common import validate_sandbox_path
+    with pytest.raises(ValueError): validate_sandbox_path(path)
+    with pytest.raises(ValueError): validate_sandbox_path("/workspace/input/output", writable=True)
+
+
+def test_completed_mcp_planner_error_cannot_dispatch_a_sandbox_command():
+    from MCPs.Mcp_client.client import MCPManager, MCPCommandPlanError
+    manager = object.__new__(MCPManager)
+    executions = []
+    async def call_tool(*args, **kwargs):
+        return SimpleNamespace(isError=True, content=[SimpleNamespace(type="text", text="PRIVATE server error")])
+    manager.tool_index = {"jadx.decompile_android": SimpleNamespace(server_name="jadx", tool_name="decompile_android")}
+    manager.runtimes = {"jadx": SimpleNamespace(session=SimpleNamespace(call_tool=call_tool))}
+    manager.mcp_call_timeout_seconds = 1
+    manager.sandbox_service = SimpleNamespace(execute=lambda *args: executions.append(args))
+    with pytest.raises(MCPCommandPlanError, match="^mcp.planner_rejected$"):
+        asyncio.run(manager._execute_bound_tool(agent_id="controlled", qualified_name="jadx.decompile_android", arguments={}))
+    assert not executions

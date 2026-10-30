@@ -15,6 +15,7 @@ from agent_core.handoff_contracts import D8HandoffVersion, D8CapacityVersion, D8
 from agent_core.conclusion_revision_contracts import D8RevisionRecord
 from agent_core.session_contracts import D8DecisionRecord
 from agent_core.handoff_storage import D8_CHANGES, D8_OPERATIONS
+from agent_core.stage_contracts import StageStateChange
 from agent_core.web_contracts import (
     D7WebExecutionRecord,
     D7WebPlanRecord,
@@ -575,6 +576,7 @@ StateChange: TypeAlias = (
     | D8TreeRecord
     | D8RevisionRecord
     | D8DecisionRecord
+    | StageStateChange
 )
 
 STATE_CHANGE_TYPES = (
@@ -596,6 +598,7 @@ STATE_CHANGE_TYPES = (
     D8TreeRecord,
     D8RevisionRecord,
     D8DecisionRecord,
+    StageStateChange,
 )
 
 
@@ -775,7 +778,7 @@ CONTROL_OPERATION_RULES: Mapping[str, OperationResultRule] = MappingProxyType(
         ),
         "register_d7_candidate": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
-            allowed_results=frozenset({"awaiting_external_feedback"}),
+            allowed_results=frozenset({"awaiting_external_feedback", "awaiting_confirmation"}),
         ),
         "apply_external_validation_feedback": OperationResultRule(
             event_type=_CONTROL_EVENT_TYPE,
@@ -1074,6 +1077,13 @@ def validate_control_event(
     state_changes: tuple[StateChange, ...],
     event: RuntimeEvent,
 ) -> None:
+    if operation == "apply_stage_state":
+        if (len(state_changes) != 1 or not isinstance(state_changes[0], StageStateChange)
+                or event.type != _CONTROL_EVENT_TYPE or event.status is not TaskRunStatus.RUNNING
+                or dict(event.details) != {"operation": operation,
+                    "entity_ids": [t.turn_id for t in state_changes[0].turns], "result": "applied"}):
+            raise ValueError("stage event must bind its exact typed change")
+        return
     if operation in D8_OPERATIONS:
         records = [c for c in state_changes if isinstance(c, D8_CHANGES)]
         if (len(records) != 1 or event.type != _CONTROL_EVENT_TYPE
@@ -1268,11 +1278,11 @@ def validate_control_event(
         task_change = state_changes[0]
         if operation == "register_d7_candidate":
             if (
-                task_change.status is not TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
-                or event.status is not TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
+                task_change.status not in {TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK, TaskRunStatus.AWAITING_CONFIRMATION}
+                or event.status is not task_change.status
                 or details.get("candidate_id") is None
                 or details.get("evidence_version") is None
-                or details.get("result") != "awaiting_external_feedback"
+                or details.get("result") != task_change.status.value
                 or details.get("entity_ids") != [task_change.task_run_id, details.get("candidate_id")]
             ):
                 raise ValueError("D7 candidate event does not match its waiting transition")
@@ -2165,7 +2175,7 @@ def _state_change_payload(change: StateChange) -> dict[str, object]:
         return {"type": "append_process_fact", **d3_payload(change)}
     if isinstance(change, D8Conclusion):
         return {"type": "append_d8_conclusion", **d3_payload(change)}
-    if isinstance(change, D8_CHANGES):
+    if isinstance(change, (*D8_CHANGES, StageStateChange)):
         return {"type": type(change).__name__, **d3_payload(change)}
     raise TypeError("unsupported state change")
 

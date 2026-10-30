@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from agent_adapters.web.http_adapter import (
     MAX_D7_HTTP_RESPONSE_BYTES,
-    D7HttpError,
+    HttpCapabilityError,
+    HttpProtocolMismatch,
     D7HttpOrigin,
     D7HttpWireResponse,
 )
@@ -26,16 +27,16 @@ class D7SandboxHttpTransport:
         target_network,
     ) -> None:
         if not isinstance(run_config, D7WebRunConfig):
-            raise D7HttpError("d7_http_run_config_invalid")
+            raise HttpCapabilityError("d7_http_run_config_invalid")
         if not isinstance(network_binding, TargetNetworkBinding):
-            raise D7HttpError("d7_http_target_network_binding_invalid")
+            raise HttpCapabilityError("d7_http_target_network_binding_invalid")
         if (
             network_binding.target_url != run_config.endpoint
             or sandbox is None
             or not callable(getattr(sandbox, "execute_d7_http", None))
             or not callable(getattr(target_network, "bind", None))
         ):
-            raise D7HttpError("d7_http_transport_binding_invalid")
+            raise HttpCapabilityError("d7_http_transport_binding_invalid")
         self.sandbox = sandbox
         self.sandbox_id = sandbox_id
         self.run_config = run_config
@@ -59,7 +60,7 @@ class D7SandboxHttpTransport:
             or origin != D7HttpOrigin.parse(self.run_config.endpoint)
             or max_response_bytes != MAX_D7_HTTP_RESPONSE_BYTES
         ):
-            raise D7HttpError("d7_http_transport_origin_or_limit_mismatch")
+            raise HttpCapabilityError("d7_http_transport_origin_or_limit_mismatch")
         try:
             response = self.sandbox.execute_d7_http(
                 self.sandbox_id,
@@ -76,14 +77,21 @@ class D7SandboxHttpTransport:
             )
         except TaskRunSandboxError as exc:
             if exc.outcome == "outcome_unknown":
-                raise D7HttpError("outcome_unknown") from exc
-            raise D7HttpError("d7_http_dispatch_rejected") from exc
+                diagnostic = getattr(exc, "http_diagnostic", None) or {}
+                if (diagnostic.get("worker_phase") == "response_headers"
+                        and diagnostic.get("error_type") == "BadStatusLine"):
+                    # The peer sent a line that is not an HTTP status line. That
+                    # is a known protocol mismatch the planner can route around,
+                    # not an unknown side effect of the request.
+                    raise HttpProtocolMismatch("d22_http_protocol_mismatch") from exc
+                raise HttpCapabilityError("outcome_unknown") from exc
+            raise HttpCapabilityError("d7_http_dispatch_rejected") from exc
         except (TypeError, ValueError) as exc:
-            raise D7HttpError("d7_http_dispatch_rejected") from exc
-        except D7HttpError:
+            raise HttpCapabilityError("d7_http_dispatch_rejected") from exc
+        except HttpCapabilityError:
             raise
         except Exception as exc:
-            raise D7HttpError("outcome_unknown") from exc
+            raise HttpCapabilityError("outcome_unknown") from exc
         return D7HttpWireResponse(
             status=response.status,
             headers=response.headers,

@@ -3,7 +3,7 @@ from dataclasses import asdict
 import json
 import math
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.governance_policy import context, materialize, requires_binding
 from agent_core.turn_modeling import digest
 
@@ -44,7 +44,7 @@ class SelectionBindings:
             return
         raw = asdict(request)
         if digest(raw) != contract['safe_request_sha256']:
-            raise D3RecoveryRequired('s5_safe_request_changed')
+            raise ExecutionRecoveryRequired('s5_safe_request_changed')
         self.output.save('selection-request', contract['model_request_id'], {
             'binding_version': 1, 'contract_version': self.app.config.contract_version, 'task_run_id': contract['task_run_id'],
             'model_request_id': contract['model_request_id'], 'contract_sha256': digest(contract),
@@ -54,7 +54,7 @@ class SelectionBindings:
         try:
             return self._checked_request(identity)
         except (ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
-            raise D3RecoveryRequired('s5_selection_request_changed') from exc
+            raise ExecutionRecoveryRequired('s5_selection_request_changed') from exc
 
     def _checked_request(self, identity):
         record = self.output.read('selection-request', identity)
@@ -70,7 +70,7 @@ class SelectionBindings:
                 or not isinstance(record.get('request'), dict)
                 or digest(record['request']) != contract['safe_request_sha256']
                 or record.get('selection_context_sha256') != digest(context(record['request'], contract['stage']))):
-            raise D3RecoveryRequired('s5_selection_request_changed')
+            raise ExecutionRecoveryRequired('s5_selection_request_changed')
         if contract['model_audit'] is not None:
             snapshot = self.app.sessions.evidence.read('request', identity)
             original = snapshot['request'] if isinstance(snapshot, dict) else None
@@ -81,7 +81,7 @@ class SelectionBindings:
             port = self.app.handoff.evidence if contract['stage'] == 'handoff_summary' else self.app.revisions.evidence
             original = port.read('request', identity)
         if original is None or digest(original) != contract['source_request_sha256']:
-            raise D3RecoveryRequired('s5_original_request_missing_or_changed')
+            raise ExecutionRecoveryRequired('s5_original_request_missing_or_changed')
         return record, contract
 
     def normalize(self, request, wire, clock):
@@ -121,7 +121,7 @@ class SelectionBindings:
                 or op.start.base_checkpoint_sequence != checkpoint or op.start.context_sha256 != source_sha
                 or op.start.budget_policy_ref != self.app.config.d4_budget.budget_policy_ref
                 or binding['finished_at'] < op.start.started_at):
-            raise D3RecoveryRequired('s5_selection_operation_changed')
+            raise ExecutionRecoveryRequired('s5_selection_operation_changed')
         return op
 
     def read(self, identity):
@@ -137,18 +137,18 @@ class SelectionBindings:
                 or binding.get('root_request_id') != contract['root_request_id'] or binding.get('stage') != contract['stage']
                 or binding.get('contract_sha256') != digest(contract) or binding.get('request_sha256') != digest(saved)
                 or type(binding.get('finished_at')) not in {float, int} or not math.isfinite(binding['finished_at'])):
-            raise D3RecoveryRequired('s5_selection_binding_changed')
+            raise ExecutionRecoveryRequired('s5_selection_binding_changed')
         from agent_core.output_contracts import decode_response
         wire, issues, terminal, _ = decode_response(binding['wire_response'], contract['output_contract']['schema'])
         if issues or terminal or not requires_binding(contract['stage'], wire):
-            raise D3RecoveryRequired('s5_selection_wire_changed')
+            raise ExecutionRecoveryRequired('s5_selection_wire_changed')
         try:
             canonical = materialize(context(saved['request'], contract['stage']), contract['stage'], wire)
             validate_value(saved['request'], contract['stage'], canonical)
         except (ValueError, TypeError, KeyError) as exc:
-            raise D3RecoveryRequired('s5_selection_canonical_changed') from exc
+            raise ExecutionRecoveryRequired('s5_selection_canonical_changed') from exc
         if digest(canonical) != digest(binding['canonical_response']):
-            raise D3RecoveryRequired('s5_selection_canonical_changed')
+            raise ExecutionRecoveryRequired('s5_selection_canonical_changed')
         self._operation(saved['request'], contract, binding)
         return binding
 
@@ -172,29 +172,29 @@ class SelectionBindings:
             return
         record = self.read(identity)
         if record is None or digest(record['canonical_response']) != digest(canonical):
-            raise D3RecoveryRequired('s5_selection_binding_missing_or_changed')
+            raise ExecutionRecoveryRequired('s5_selection_binding_missing_or_changed')
         if digest(asdict(request)) not in {contract['source_request_sha256'], contract['safe_request_sha256']}:
-            raise D3RecoveryRequired('s5_selection_source_request_changed')
+            raise ExecutionRecoveryRequired('s5_selection_source_request_changed')
 
     def verify_identity(self, identity, canonical):
         contract = self.output.read('contract', identity)
         if isinstance(contract, dict) and contract.get('stage') in STAGES and requires_binding(contract['stage'], canonical):
             binding = self.read(identity)
             if binding is None or digest(binding['canonical_response']) != digest(canonical):
-                raise D3RecoveryRequired('s5_selection_binding_missing_or_changed')
+                raise ExecutionRecoveryRequired('s5_selection_binding_missing_or_changed')
 
     def check_relation(self, identity, action):
         if action.operation != 'replace_support':
             return
         binding = self.read(identity)
         if binding is None:
-            raise D3RecoveryRequired('s5_selection_binding_missing_or_changed')
+            raise ExecutionRecoveryRequired('s5_selection_binding_missing_or_changed')
         request, contract = self._request(identity)
         ctx = context(request['request'], contract['stage'])
         relation = ctx['relations'][binding['wire_response']['relation_ref']]
         goal, old_ref = self.app.revisions._relation_details(action, self.app.revisions._base())
         if old_ref != relation['old_ref'] or goal != relation['original_goal']:
-            raise D3RecoveryRequired('s5_frozen_relation_changed')
+            raise ExecutionRecoveryRequired('s5_frozen_relation_changed')
 
     def repair_request(self, request):
         identity = request.attempt.model_request_id if hasattr(request, 'attempt') else request.model_request_id
@@ -206,11 +206,11 @@ class SelectionBindings:
         body, native, accepted = self._native(identity, contract)
         if native is not None:
             if accepted and digest(body) != digest(binding['canonical_response']):
-                raise D3RecoveryRequired('s5_selection_native_changed')
+                raise ExecutionRecoveryRequired('s5_selection_native_changed')
             return
         op = self.store.load_d4_operation(identity)
         if op.completion is not None:
-            raise D3RecoveryRequired('s5_native_result_missing_after_completion')
+            raise ExecutionRecoveryRequired('s5_native_result_missing_after_completion')
         raw, finished = binding['canonical_response'], binding['finished_at']
         if contract['model_audit'] is not None:
             from agent_core.dual_llm_modeling import D3ModelEvidence
@@ -245,11 +245,11 @@ class SelectionBindings:
             body, native, accepted = self._native(identity, contract)
             if accepted and requires_binding(contract['stage'], body):
                 if binding is None or digest(body) != digest(binding['canonical_response']):
-                    raise D3RecoveryRequired('s5_selection_binding_missing_or_changed')
+                    raise ExecutionRecoveryRequired('s5_selection_binding_missing_or_changed')
                 if op.completion is not None and (op.completion.result_kind != 'completed'
                         or op.completion.evidence_sha256 != digest(body if contract['stage'] == 'refinement' else native)
                         or op.completion.finished_at != native['finished_at']):
-                    raise D3RecoveryRequired('s5_selection_completion_changed')
+                    raise ExecutionRecoveryRequired('s5_selection_completion_changed')
             if contract['stage'] == 'refinement' and native is not None and native['outcome'] == 'response_unknown':
                 if self.store.is_unknown_refinement_sealed(identity):
                     continue

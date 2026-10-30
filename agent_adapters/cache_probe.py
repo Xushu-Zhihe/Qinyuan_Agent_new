@@ -26,7 +26,7 @@ def _common_prefix(a, b):
     return min(len(a), len(b))
 
 
-def record(*, payload, sent, role):
+def record(*, payload, sent, role, session=None):
     """Observe the exact transport input; diagnostics cannot fail the task."""
     path = os.environ.get("QINYUAN_CACHE_PROBE")
     if not path:
@@ -36,16 +36,21 @@ def record(*, payload, sent, role):
         messages = payload["messages"]
         # Keep the original first-message fields for existing timing reports.
         system = next((m["content"] for m in messages if m["role"] == "system"), "")
+        runtime_system = next((m["content"] for m in reversed(messages) if m["role"] == "system"), "")
         user = next((m["content"] for m in messages if m["role"] == "user"), "")
         serialized = json.dumps(messages, ensure_ascii=False)
         parameters_sha = digest(sent["parameters"])
+        session_key = (session.scope, session.owner_id) if session is not None else None
+        tools = json.dumps(payload.get("tools", []), ensure_ascii=False)
+        tools_sha = hashlib.sha256(tools.encode("utf-8")).hexdigest()
         key = (str(Path(path).resolve()), sent["task_run_id"], sent["role_config_ref"],
-               parameters_sha, sent["stage"])
+               parameters_sha, sent["stage"], session_key)
         wire = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         row = {
             "phase": "provider_attempt", "ts": time.time(), "process_id": os.getpid(),
             "task_run_id": sent["task_run_id"], "request_id": sent["model_request_id"],
             "role": role, "role_config_ref": sent["role_config_ref"], "stage": sent["stage"],
+            "session": session_key,
             "request_sha256": digest(sent), "parameters_sha256": parameters_sha,
             "payload_sha256": hashlib.sha256(wire).hexdigest(),
             "request_utf8_bytes": len(wire),
@@ -59,6 +64,9 @@ def record(*, payload, sent, role):
             "user_utf8_bytes": len(user.encode("utf-8")),
             "system_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(),
             "user_sha256": hashlib.sha256(user.encode("utf-8")).hexdigest(),
+            "tools_sha256": tools_sha, "tools_utf8_bytes": len(tools.encode("utf-8")),
+            "runtime_system_sha256": hashlib.sha256(runtime_system.encode("utf-8")).hexdigest(),
+            "runtime_system_chars": len(runtime_system),
             "markers": {marker: system.find(marker) for marker in MARKERS if marker in system},
         }
         contract_start = row["markers"].get("output_contract=")
@@ -69,9 +77,10 @@ def record(*, payload, sent, role):
             previous = _PREVIOUS.get(key)
             row.update(previous_request_id=None, system_prefix_chars=None, user_prefix_chars=None,
                        user_prefix_follows_identical_system=None, messages_prefix_chars=None,
-                       messages_prefix_utf8_bytes=None, first_changed_message=None)
+                       messages_prefix_utf8_bytes=None, first_changed_message=None,
+                       tools_unchanged=None, runtime_system_prefix_chars=None)
             if previous is not None:
-                identity, prev_system, prev_user, prev_serialized, prev_messages = previous
+                identity, prev_system, prev_user, prev_serialized, prev_messages, prev_tools_sha, prev_runtime = previous
                 prefix = _common_prefix(prev_serialized, serialized)
                 changed = next((i for i, (a, b) in enumerate(zip(prev_messages, messages)) if a != b),
                                min(len(prev_messages), len(messages)) if len(prev_messages) != len(messages) else None)
@@ -81,10 +90,11 @@ def record(*, payload, sent, role):
                            user_prefix_follows_identical_system=prev_system == system,
                            messages_prefix_chars=prefix,
                            messages_prefix_utf8_bytes=len(serialized[:prefix].encode("utf-8")),
-                           first_changed_message=changed)
+                           first_changed_message=changed, tools_unchanged=tools_sha == prev_tools_sha,
+                           runtime_system_prefix_chars=_common_prefix(prev_runtime, runtime_system))
             with open(path, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(row, ensure_ascii=False) + "\n")
-            _PREVIOUS[key] = (sent["model_request_id"], system, user, serialized, json.loads(serialized))
+            _PREVIOUS[key] = (sent["model_request_id"], system, user, serialized, json.loads(serialized), tools_sha, runtime_system)
     except Exception as exc:
         # Opt-in diagnostic I/O is not an execution or recovery decision.
         from qinyuan_core import get_logger

@@ -5,9 +5,9 @@ import json
 
 import pytest
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.modeling import ModelError, ModelErrorKind
-from agent_core.operation_accounting import D4RecoveryRequired
+from agent_core.operation_accounting import OperationRecoveryRequired
 from agent_core.output_contracts import D8ModelResponse
 from test_chain_multi_turn import ProcessLoss
 from test_output import output_case, reopen, run as run_output
@@ -71,7 +71,7 @@ def reject_first_summary(case):
 def assert_paused(case):
     try:
         result = run_output(case)
-    except (D3RecoveryRequired, D4RecoveryRequired):
+    except (ExecutionRecoveryRequired, OperationRecoveryRequired):
         return
     assert result.recovery_required, result
 

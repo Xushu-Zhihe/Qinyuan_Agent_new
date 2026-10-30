@@ -1,6 +1,6 @@
 """Contract16 Plan choices derived from the frozen business request; no I/O."""
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 
 
 def policy_for(request):
@@ -20,13 +20,13 @@ def policy_for(request):
             or context.turn_binding.task_run_id != request.task_run_id
             or len(set(context.prior_plan_ids)) != len(context.prior_plan_ids)
             or len(set(context.reusable_proof_ids)) != len(context.reusable_proof_ids)):
-        raise D3RecoveryRequired('s6_plan_context_invalid')
+        raise ExecutionRecoveryRequired('s6_plan_context_invalid')
     ordinal = len(context.prior_plan_ids) + 1
     import json
     context_packet = json.loads(getattr(request, "history_context", "") or "{}")
     rolling = "completion_facts" in context_packet or "intent_execution" in context_packet
     if ordinal not in {1, 2} and not rolling or ordinal == 1 and context.reusable_proof_ids:
-        raise D3RecoveryRequired('s6_plan_choices_unavailable')
+        raise ExecutionRecoveryRequired('s6_plan_choices_unavailable')
     template = 'size_then_sha256' if ordinal == 1 else 'sha256_only'
     choices = [{'template': template, 'observation_mode': 'new_observation', 'source_proof_id': None}]
     if ordinal == 2 or rolling:
@@ -46,7 +46,7 @@ def plan_schema(request):
 
 
 def validate(request, proposal):
-    from agent_core.dual_llm_modeling import D3ProposalRejected
+    from agent_core.dual_llm_modeling import ExecutionProposalRejected
     value = {key: getattr(proposal, key) for key in ('template', 'observation_mode', 'source_proof_id')}
     if value not in policy_for(request)['allowed_choices']:
-        raise D3ProposalRejected('d3_plan_template_or_source_unavailable')
+        raise ExecutionProposalRejected('d3_plan_template_or_source_unavailable')

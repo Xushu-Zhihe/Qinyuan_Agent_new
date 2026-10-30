@@ -10,10 +10,11 @@ import threading
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from agent_core.dual_llm_contracts import D3RecoveryRequired
+from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.modeling import ModelError, ModelErrorKind
 from agent_core.handoff_contracts import D8Capacity
 from agent_core.turn_modeling import digest
+from agent_core.actions import PUBLIC_REFERENCE_TOOLS
 
 MAX_SECONDS = 30
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -30,7 +31,7 @@ SPECS = [
          input_schema=dict(type='object', properties={
              'url': dict(type='string', minLength=1, maxLength=8192)},
              required=['url'], additionalProperties=False))]
-NAMES = frozenset(s['qualified_name'] for s in SPECS)
+NAMES = PUBLIC_REFERENCE_TOOLS
 
 
 def preview(payload, identity, claim):
@@ -177,10 +178,10 @@ class DeepSeekRetrieval:
         result = transport._invoke_payload(dict(tool=call.tool_name, arguments=dict(call.arguments), target=target),
                                            timeout, token, diagnostic=detail)
         if not detail.get('worker_exit_confirmed'):
-            raise D3RecoveryRequired('retrieval.worker_stop_unconfirmed')
+            raise ExecutionRecoveryRequired('retrieval.worker_stop_unconfirmed')
         if isinstance(result, ModelError):
             if detail.get('transport_end') == 'worker_lost':
-                raise D3RecoveryRequired('retrieval.outcome_unknown')
+                raise ExecutionRecoveryRequired('retrieval.outcome_unknown')
             category = ('cancelled' if result.kind == ModelErrorKind.CANCELLED else
                         'timeout' if result.kind == ModelErrorKind.TIMED_OUT else 'network')
             result = _failure(call.tool_name, 'retrieval.' + category, category)
@@ -228,7 +229,7 @@ class PublicWeb:
             try:
                 return await asyncio.wait_for(asyncio.shield(pending), MODEL_CANCEL_GRACE_SECONDS)
             except asyncio.TimeoutError:
-                raise D3RecoveryRequired('retrieval.worker_stop_unconfirmed') from None
+                raise ExecutionRecoveryRequired('retrieval.worker_stop_unconfirmed') from None
 
 
 def from_env_file(path, model_settings=None):

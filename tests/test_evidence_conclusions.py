@@ -122,8 +122,8 @@ def test_explicit_reuse_and_source_loss_do_not_add_fact(linked,fresh_observation
     source=decisions[0].observation.sources[0]["ref"]
     path=next(p for p in (c.directory/"d8-output").rglob("*"+source+"*.json") if "mcp-result" in p.name)
     path.unlink()
-    from agent_core.dual_llm_contracts import D3RecoveryRequired
-    with pytest.raises(D3RecoveryRequired):c.app.evidence_conclusions.validate_fact(c.app.state.facts[0],c.app.state)
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+    with pytest.raises(ExecutionRecoveryRequired):c.app.evidence_conclusions.validate_fact(c.app.state.facts[0],c.app.state)
 
 @pytest.mark.parametrize("http_case", ["rolling"], indirect=True)
 def test_mixed_http_and_mcp_sources_share_one_review(http_case):
@@ -145,13 +145,13 @@ def test_mixed_http_and_mcp_sources_share_one_review(http_case):
             from dataclasses import replace
             from agent_core.output_contracts import output_schema,shape_issues
             from agent_core.evidence_conclusions import EvidenceCandidate
-            from agent_core.dual_llm_modeling import D3ProposalRejected
+            from agent_core.dual_llm_modeling import ExecutionProposalRejected
             stopped=json.loads(envelope.request.history_context)
             stopped["intent_execution"]["stop_requested"]={"review_id":"controlled-stop"}
             stop_request=replace(envelope.request,history_context=json.dumps(stopped))
             candidate=dict(kind="fact_candidate",content="Claim",reason="Reason",evidence_refs=[packet["evidence_sources"][0]["ref"]],inferred=False)
             assert shape_issues(candidate,output_schema(stop_request,contract_version=22)[1])
-            with pytest.raises(D3ProposalRejected,match="stop_summary_required"):
+            with pytest.raises(ExecutionProposalRejected,match="stop_summary_required"):
                 c.app.evidence_conclusions.validate_candidate(stop_request,EvidenceCandidate.parse(candidate))
             return dict(kind="fact_candidate",content="A local command printed test tool output and the scoped HTTP GET returned 200.",reason="Both independent channel records are visible.",evidence_refs=[s["ref"] for s in packet["evidence_sources"]],inferred=False)
         available=packet["intent_execution"]["facts"]

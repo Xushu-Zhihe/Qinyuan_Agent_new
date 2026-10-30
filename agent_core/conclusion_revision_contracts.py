@@ -1,6 +1,7 @@
 """Narrow, append-only D8-3 conclusion and dependency changes."""
 
 from dataclasses import asdict, dataclass
+from typing import ClassVar
 
 from agent_core.conclusion_contracts import _bounded, _fields, conclusion_digest
 from agent_core.handoff_contracts import D8HistoryItem
@@ -22,6 +23,7 @@ class D8RevisionTarget:
 
 @dataclass(frozen=True, slots=True)
 class D8ConclusionChange:
+    SUPPORT_RELATIONS: ClassVar[frozenset[str]] = frozenset({"parent_support", "intent_dependency"})
     operation: str
     targets: tuple[D8RevisionTarget, ...]
     replacement_ref: str | None
@@ -68,7 +70,7 @@ class D8ConclusionChange:
         elif self.resolution is not None:
             raise ValueError("d8_revision_unexpected_resolution")
         if self.operation == "replace_support":
-            if self.relation_kind not in {"parent_support", "intent_dependency"}:
+            if self.relation_kind not in self.SUPPORT_RELATIONS:
                 raise ValueError("d8_support_relation_invalid")
             _uuid(self.relation_owner_id, "relation_owner_id")
         elif self.relation_kind is not None or self.relation_owner_id is not None:
