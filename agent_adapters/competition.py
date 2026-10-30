@@ -473,6 +473,10 @@ class CompetitionConnections:
                     http_methods=value.get("http_methods",["GET","HEAD","OPTIONS"])))
                 with self.workbench._db() as db:
                     db.execute("INSERT INTO competition_questions VALUES (?,?,?,?,?)",(local["id"],identity,scope,remote,json.dumps(snapshot,ensure_ascii=True)))
+            if target and local["status"]=="draft" and not local["archived"] and local["endpoint"]!=target:
+                local=self.workbench.update(local["id"],dict(title=local["title"],category=local["category"],
+                    description=local["description"],endpoint=target,deadline_minutes=local["deadline_minutes"],
+                    step_timeout_seconds=local["step_timeout_seconds"],http_methods=local["http_methods"]))
             if value.get("default_description_enabled") and local["status"]=="draft" and not local["archived"]:
                 from agent_adapters.workbench import merged_description
                 merged=merged_description(local["description"],value.get("default_description"))

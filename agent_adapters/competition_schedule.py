@@ -10,6 +10,8 @@ from qinyuan_core import get_logger
 
 PLATFORM_POLL_SECONDS=5.0
 FINISHED={"achieved","failed","deadline_exceeded","cancelled","inconclusive"}
+# A live-instance question may arrive before the platform publishes its address.
+ADDRESS_WAIT_SECONDS=30
 
 
 def _default_description(value):
@@ -17,6 +19,16 @@ def _default_description(value):
     if value is None:return ""
     if not isinstance(value,str) or len(value)>16000:raise WorkbenchError("competition_session_invalid")
     return value.strip()
+
+
+def _should_wait_address(item):
+    """Poll for an address while the platform says the attempt is live; never require one."""
+    try:
+        remaining=item.get("remaining_seconds")
+        return bool(item.get("state")=="active" and remaining is not None and remaining>0
+                    and not item.get("addresses"))
+    except AttributeError:
+        return False
 
 
 class CompetitionSchedules:
@@ -415,6 +427,16 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 item=self.read(row,item["remote_ref"])
                 if item is None or item["state"]!="available":return
             target=self.target(row,item);self.live(identity)
+            if target is None and _should_wait_address(item):
+                waited=state.get("address_wait_started")
+                now=self.clock()
+                if waited is None:
+                    self.update(identity,address_wait_started=now,address_wait_reason="competition_waiting_for_address")
+                    get_logger("ctrl").info("competition.address_wait_started",session=identity,remote_ref=item.get("remote_ref"),category="schedule_control")
+                    return
+                if now-waited<ADDRESS_WAIT_SECONDS:return
+                self.update(identity,address_wait_started=None,address_wait_timeout_at=now)
+                get_logger("ctrl").warning("competition.address_wait_timeout",session=identity,remote_ref=item.get("remote_ref"),waited_seconds=round(now-waited,1),category="schedule_control")
             task=self.workbench.competitions.import_question(row["config"]["profile"]["id"],dict(remote_ref=item["remote_ref"],endpoint=target,
                 deadline_minutes=row["config"]["question_seconds"]//60,http_methods=row["config"]["http_methods"],
                 default_description=row["config"].get("default_description",""),
