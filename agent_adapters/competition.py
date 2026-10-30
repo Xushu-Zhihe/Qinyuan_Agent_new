@@ -1,11 +1,14 @@
 """Competition profiles, observed question imports and fixed platform requests."""
 
 import http.client
+import hashlib
 import json
 import socket
 import ssl
+import tempfile
 import time
-from urllib.parse import urlsplit, urlencode
+from contextlib import contextmanager
+from urllib.parse import urlsplit, urlencode, urljoin
 from uuid import UUID, uuid4
 
 from agent_adapters.workbench_contracts import WorkbenchError
@@ -110,7 +113,7 @@ def _exchange(profile, credential, method, path, payload=None):
     parsed = urlsplit(profile["base_url"])
     connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
     connection = connection_type(parsed.hostname, parsed.port, timeout=profile["timeout_seconds"])
-    header = {"Authorization":"Bearer "+credential} if profile["adapter"]=="arena" else {"BENCHMARK_TOKEN":credential}
+    header = _credential_headers(profile, credential)
     body = None if payload is None else json.dumps(payload,ensure_ascii=True,separators=(",",":")).encode()
     try:
         connection.request(method,path,body=body,headers={"Accept":"application/json",**header,
@@ -141,6 +144,106 @@ def _exchange(profile, credential, method, path, payload=None):
     except ssl.SSLError:raise WorkbenchError("competition_tls_failed",502) from None
     except (OSError,http.client.HTTPException):raise WorkbenchError("competition_transport_failed",502) from None
     finally:connection.close()
+
+
+def _credential_headers(profile, credential):
+    return {"Authorization": "Bearer " + credential} if profile["adapter"] == "arena" else {"BENCHMARK_TOKEN": credential}
+
+
+@contextmanager
+def _download_attachment(profile, credential, attachment, check):
+    """Fetch only platform-observed bytes; cross-origin hops never receive credentials."""
+    from agent_adapters.web.request_staging import MAX_V3_REQUEST_BYTES
+    from Sandbox.tool_download_worker import public_addresses, MAX_REDIRECTS
+    limit = MAX_V3_REQUEST_BYTES
+    expected = attachment.get("size")
+    if type(expected) is int and (expected < 0 or expected > limit):
+        raise WorkbenchError("competition_attachment_too_large", 409)
+    url = urljoin(profile["base_url"] + "/", attachment["url"])
+    end = time.monotonic() + profile["timeout_seconds"]
+    authenticated = True
+    with tempfile.TemporaryFile() as output:
+        try:
+            for hop in range(MAX_REDIRECTS + 1):
+                check()
+                value = urlsplit(url)
+                if (len(url) > 8192 or any(ord(c) <= 32 or ord(c) == 127 for c in url) or "\\" in url
+                        or value.fragment or value.username is not None or value.password is not None):
+                    raise WorkbenchError("competition_attachment_url_rejected", 409)
+                try:
+                    same_origin = _target_origin(url) == _target_origin(profile["base_url"])
+                except ValueError:
+                    raise WorkbenchError("competition_attachment_url_rejected", 409) from None
+                authenticated = authenticated and same_origin
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError()
+                connection_type = http.client.HTTPSConnection if value.scheme == "https" else http.client.HTTPConnection
+                connection = connection_type(value.hostname, value.port, timeout=remaining)
+                try:
+                    if not same_origin:
+                        try:
+                            addresses = public_addresses(value.hostname, value.port or (443 if value.scheme == "https" else 80), set())
+                        except ValueError:
+                            raise WorkbenchError("competition_attachment_url_rejected", 409) from None
+                        family, kind, protocol, _, address = addresses[0]
+                        plain = socket.socket(family, kind, protocol)
+                        connection.sock = plain
+                        plain.settimeout(remaining)
+                        plain.connect(address)
+                        if value.scheme == "https":
+                            connection.sock = ssl.create_default_context().wrap_socket(plain, server_hostname=value.hostname)
+                    connection.request("GET", (value.path or "/") + ("?" + value.query if value.query else ""),
+                        headers={"Accept-Encoding": "identity", **(_credential_headers(profile, credential) if authenticated else {})})
+                    response = connection.getresponse()
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = response.getheader("Location")
+                        if not location or hop == MAX_REDIRECTS:
+                            raise WorkbenchError("competition_attachment_redirect_limit", 502)
+                        next_url = urljoin(url, location)
+                        if value.scheme == "https" and urlsplit(next_url).scheme != "https":
+                            raise WorkbenchError("competition_attachment_url_rejected", 409)
+                        url = next_url
+                        continue
+                    if response.status != 200:
+                        raise WorkbenchError("competition_attachment_http_" + str(response.status), 502)
+                    length = response.getheader("Content-Length")
+                    if length is not None and (not length.isdecimal() or int(length) > limit):
+                        raise WorkbenchError("competition_attachment_too_large", 502)
+                    total, digest = 0, hashlib.sha256()
+                    while True:
+                        check()
+                        if time.monotonic() >= end:
+                            raise TimeoutError()
+                        block = response.read(64 * 1024)
+                        if not block:
+                            break
+                        total += len(block)
+                        if total > limit:
+                            raise WorkbenchError("competition_attachment_too_large", 502)
+                        try:
+                            output.write(block)
+                        except OSError:
+                            raise WorkbenchError("competition_attachment_store_failed", 500) from None
+                        digest.update(block)
+                    if length is not None and total != int(length) or type(expected) is int and total != expected:
+                        raise WorkbenchError("competition_attachment_size_mismatch", 502)
+                    break
+                finally:
+                    connection.close()
+            check()
+        except WorkbenchError:
+            raise
+        except (TimeoutError, socket.timeout):
+            raise WorkbenchError("competition_attachment_timeout", 502) from None
+        except ssl.SSLError:
+            raise WorkbenchError("competition_attachment_tls_failed", 502) from None
+        except ValueError:
+            raise WorkbenchError("competition_attachment_url_rejected", 409) from None
+        except (OSError, http.client.HTTPException):
+            raise WorkbenchError("competition_attachment_transport_failed", 502) from None
+        output.seek(0)
+        yield output, total, digest.hexdigest()
 
 
 def _read(profile,credential):
@@ -312,7 +415,7 @@ class CompetitionConnections:
         return {"status": "connected", "profile": public, "preview": preview}
 
 
-    def import_question(self,identity,value):
+    def import_question(self,identity,value,*,check_active=None):
         """Import only platform-observed questions; platform actions remain separate."""
         if not isinstance(value,dict) or set(value)-{"remote_ref","endpoint","deadline_minutes","step_timeout_seconds","http_methods"} or "remote_ref" not in value:
             raise WorkbenchError("competition_import_invalid")
@@ -347,21 +450,78 @@ class CompetitionConnections:
             if any(current[k]!=profile[k] for k in current):raise WorkbenchError("competition_profile_changed",409)
             with self.workbench._db() as db:
                 existing=db.execute("SELECT challenge_id FROM competition_questions WHERE scope_sha256=? AND remote_ref=?",(scope,remote)).fetchone()
-            if existing is not None:return self.workbench.get(existing["challenge_id"])
-            category=item.get("category","").lower()
-            from agent_adapters.workbench import VALID_CATEGORIES
-            if category not in VALID_CATEGORIES:category="misc"
-            minutes=value.get("deadline_minutes",60)
-            description=item["description"]
-            selected=next((raw for raw,match in zip(item["addresses"],matches) if match),None) if target else None
-            if selected:description += "\n\n平台所选入口："+selected
-            local=self.workbench.create(dict(title=item["display_name"][:160],category=category,
-                description=description,endpoint=target,deadline_minutes=minutes,
-                step_timeout_seconds=value.get("step_timeout_seconds",60),
-                http_methods=value.get("http_methods",["GET","HEAD","OPTIONS"])))
-            with self.workbench._db() as db:
-                db.execute("INSERT INTO competition_questions VALUES (?,?,?,?,?)",(local["id"],identity,scope,remote,json.dumps(snapshot,ensure_ascii=True)))
+            if existing is not None:
+                local=self.workbench.get(existing["challenge_id"])
+            else:
+                category=item.get("category","").lower()
+                from agent_adapters.workbench import VALID_CATEGORIES
+                if category not in VALID_CATEGORIES:category="misc"
+                minutes=value.get("deadline_minutes",60)
+                description=item["description"]
+                selected=next((raw for raw,match in zip(item["addresses"],matches) if match),None) if target else None
+                if selected:description += "\n\n平台所选入口："+selected
+                local=self.workbench.create(dict(title=item["display_name"][:160],category=category,
+                    description=description,endpoint=target,deadline_minutes=minutes,
+                    step_timeout_seconds=value.get("step_timeout_seconds",60),
+                    http_methods=value.get("http_methods",["GET","HEAD","OPTIONS"])))
+                with self.workbench._db() as db:
+                    db.execute("INSERT INTO competition_questions VALUES (?,?,?,?,?)",(local["id"],identity,scope,remote,json.dumps(snapshot,ensure_ascii=True)))
+        try:
+            return self._import_attachment(profile,item,local,check_active)
+        except (WorkbenchError,OSError) as error:
+            code=error.code if isinstance(error,WorkbenchError) else "competition_attachment_store_failed"
+            get_logger("store").warning("competition.attachment_failed",challenge=local["id"],code=code,category="attachment_import")
+            if isinstance(error,WorkbenchError):raise
+            raise WorkbenchError(code,500) from None
+
+    def _import_attachment(self,profile,item,local,check_active):
+        attachment=item.get("attachment")
+        if not attachment:
             return local
+        name,url=attachment.get("name"),attachment.get("url")
+        if (not isinstance(name,str) or not name or len(name)>255 or name in {".",".."}
+                or any(c in name for c in ("/","\\","\x00")) or not isinstance(url,str) or not url):
+            raise WorkbenchError("competition_attachment_metadata_invalid",409)
+        def check():
+            if check_active is not None:check_active()
+            self.credential_for(profile)
+        def verify(value):
+            path=self.workbench.uploads/local["id"]/value["id"]
+            if path.is_symlink() or not path.is_file():
+                raise WorkbenchError("competition_attachment_integrity_failed",409)
+            with path.open("rb") as source:
+                if path.stat().st_size!=value["byte_size"] or hashlib.file_digest(source,"sha256").hexdigest()!=value["sha256"]:
+                    raise WorkbenchError("competition_attachment_integrity_failed",409)
+        check()
+        with self.workbench.lock,self.workbench._db() as db:
+            snapshot=json.loads(db.execute("SELECT snapshot_json FROM competition_questions WHERE challenge_id=?",(local["id"],)).fetchone()[0])
+            saved=snapshot["question"].get("attachment") or {}
+            if (saved.get("name"),saved.get("size"))!=(name,attachment.get("size")):
+                raise WorkbenchError("competition_attachment_changed",409)
+            bound=next((v for v in local["attachments"] if v["id"]==snapshot.get("attachment_id")),None)
+            if bound is not None:
+                verify(bound)
+                return local
+        try:
+            with _download_attachment(profile,self.credential_for(profile),attachment,check) as (source,size,digest):
+                with self.workbench.lock:
+                    check()
+                    current=self.workbench.get(local["id"])
+                    existing=next((v for v in current["attachments"] if (v["name"],v["byte_size"],v["sha256"])==(name,size,digest)),None)
+                    if existing is None:
+                        from agent_adapters.web.request_staging import MAX_V3_REQUEST_BYTES
+                        if size+sum(v["byte_size"] for v in current["attachments"])>MAX_V3_REQUEST_BYTES:
+                            raise WorkbenchError("competition_attachment_too_large",409)
+                        current=self.workbench.add_attachment(local["id"],name,source,size)
+                        existing=next(v for v in current["attachments"] if (v["name"],v["byte_size"],v["sha256"])==(name,size,digest))
+                    verify(existing)
+                    snapshot["attachment_id"]=existing["id"]
+                    with self.workbench._db() as db:
+                        db.execute("UPDATE competition_questions SET snapshot_json=? WHERE challenge_id=?",(json.dumps(snapshot,ensure_ascii=True),local["id"]))
+                    get_logger("store").info("competition.attachment_registered",challenge=local["id"],attachment=existing["id"],category="attachment_import")
+                    return current
+        except OSError:
+            raise WorkbenchError("competition_attachment_store_failed",500) from None
 
     def freeze(self,challenge,directory,request,*,schedule=None):
         from agent_adapters.run_files import immutable_write

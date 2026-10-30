@@ -274,7 +274,7 @@ def test_official_full_request_matches_runs112_size_without_sending_output_cap(m
     monkeypatch.setitem(roles.TRANSPORT, "base_url", "https://api.deepseek.com")
     role = replace(roles.role_config("inner_action"), model="deepseek-flash")
     payload = dict(model=role.model, messages=[dict(role="system", content="rule"), dict(role="user", content="{}")],
-                   thinking={"type":"enabled"}, reasoning_effort="max")
+                   thinking={"type":"enabled"}, reasoning_effort="high")
     payload["padding"] = "x" * (244604-len(roles.payload_bytes({**payload,"padding":""})))
     monkeypatch.setattr(roles, "build_payload", lambda *a, **k: payload)
     capacity = roles.EstimatedCapacity(role, role)
@@ -283,6 +283,6 @@ def test_official_full_request_matches_runs112_size_without_sending_output_cap(m
     assert capacity.last_measurement["input_tokens"] is None
     assert capacity.last_measurement["estimated_input_tokens"] == 248700
     assert capacity.last_measurement["output_reserve_tokens"] == 384000
-    assert "max_tokens" not in payload and payload["reasoning_effort"] == "max"
+    assert "max_tokens" not in payload and payload["reasoning_effort"] == "high"
     with pytest.raises(ValueError, match="capacity_binding"):
         capacity.fits(request, roles.SCNET_V41_CAPACITY)

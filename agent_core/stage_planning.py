@@ -324,6 +324,12 @@ def model_contract(request):
             + (EXPLORATION_GUIDANCE + PUBLIC_REFERENCE_GUIDANCE if request.stage in {
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
             + (" Final validation requests must include an exact candidate found in the cited original tool observation. "
+               "If an observed candidate plausibly answers the TaskRun goal, prioritize its supported Fact and truthful Turn/Road closure, "
+               "then request_final_validation from stage_continuation before proposing extra deliverables. "
+               "For a find-the-flag task, do not open a new Turn for source recovery, exploit documentation or external confirmation "
+               "once a grounded flag candidate is ready; use the configured human/external validation handoff. "
+               "The absence of human/platform confirmation is why validation is requested, not a reason for Outer to reject an otherwise supported handoff. "
+               "An unrelated flag-like string is not sufficient; preserve exact original source and current formal support. "
                "Outer approval is not independent validation. Rejected or partial validation feedback returns to this original planning session; "
                "preserve historical stage achievement and improve the proposal using actual evidence. Unknown submission is never resubmitted."
                if request.context.goal_validation is not None else ""),

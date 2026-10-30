@@ -19,6 +19,7 @@ const RunView = (() => {
   const currentFacts = (progress) => (progress.verified_facts || []).filter(f => !f.conflict
     && (!f.source_status || f.source_status === "available") && (!f.current_status || f.current_status === "effective"));
   labels.awaiting_confirmation = "等待人工确认";
+  labels.assumed_achieved = "已结束 · 超时默认确定";
   labels.in_flight = "执行结果待结算";
   labels.unsettled = "未结算";
   Object.assign(labels, { active: "可规划", waiting_child: "等待后继", exhausted: "当前方向耗尽" });
@@ -217,7 +218,7 @@ const RunView = (() => {
     const activeIntent = (progress.turns || []).flatMap(routes).find((item) => item.status === "running");
     let state = "idle";
     let text;
-    if (progress.task_run?.status === "awaiting_confirmation") { state = "warn"; text = "等待人工决定 · 五分钟无决定则未验证结束"; }
+    if (progress.task_run?.status === "awaiting_confirmation") { state = "warn"; text = `等待人工决定 · ${progress.goal_validation?.timeout_action === "assume" ? "五分钟无操作按默认确定结束" : "五分钟无决定则未验证结束"}`; }
     else if (running) { state = "live"; text = `执行中 · ${short(running.operation_id || running.plan_id)}`; }
     else if (live && activeIntent) { state = "live"; text = `${activeIntent.road_id ? "Road" : `Intent ${activeIntent.priority}`} · ${activeIntent.description || "（无描述）"}`; }
     else if (live) { state = "live"; text = "等待下一步规划或审核"; }
@@ -257,6 +258,7 @@ const RunView = (() => {
     }
     renderStages(progress, live);
     renderFocus(progress, run, live);
+    renderConfirmation(progress);
     get("run-stages").hidden = !run;
     get("run-summary").hidden = !run;
     get("run-summary").style.setProperty("--cols", String(metrics.length));
@@ -265,6 +267,35 @@ const RunView = (() => {
     const raw = JSON.stringify({ ...data, challengeId: undefined }, null, 2);
     if (get("run-result").textContent !== raw) get("run-result").textContent = raw;
     draw(progress, live);
+  }
+  function renderConfirmation(progress) {
+    const host = get("run-confirmation");
+    const waiting = progress.goal_validation?.mode === "human" && progress.task_run?.status === "awaiting_confirmation";
+    const assumed = progress.task_run?.status === "assumed_achieved" && progress.task_run?.reason === "human_confirmation_timeout_assumed";
+    host.hidden = !waiting && !assumed;
+    patchRegion("run-confirmation", panel => {
+      if (assumed) {
+        panel.append(node("strong", "已按超时默认确定结束"), node("p", "人工确认窗口内未收到决定；保留默认确定来源，未伪造人工或平台验证。", "run-meta"));
+        return;
+      }
+      if (!waiting) return;
+      panel.append(node("strong", "发现候选答案，请确定或指出错误"));
+      const candidate = (progress.answer_candidates || []).find(item => item.candidate_id === progress.goal_validation.candidate_id);
+      if (!candidate) { panel.append(node("p", "当前快照缺少待确认候选，请刷新；不会对缺失身份发送决定。", "run-meta")); return; }
+      const seconds = Math.max(0, Math.ceil(progress.goal_validation.confirmation_deadline - Date.now() / 1000));
+      panel.append(node("p", `人工决定剩余 ${seconds} 秒；${progress.goal_validation.timeout_action === "assume" ? "无操作按默认确定结束，保留超时来源。" : "此运行按原规则，无决定则未验证结束。"}`, "run-meta"));
+      panel.append(node("p", `候选 ${candidate.candidate_id} · 来源 ${candidate.source_ref || candidate.execution_id}`, "run-ref"));
+      panel.append(node("p", "候选正文通过交互终端 candidate-read 查看并自主提交；普通进度和日志仅展示引用。选择错误后 Agent 返回原规划继续探索。", "run-meta"));
+      const stateDir = current.run?.directory ? `${current.run.directory}/agent-state` : "<state-dir>";
+      panel.append(code("在项目交互终端查看候选", `python -m agent candidate-read --state-dir "${stateDir}" --task-run-id ${progress.task_run_id} --candidate-id ${candidate.candidate_id} --evidence-version ${candidate.evidence_version}`));
+      for (const [action, text] of [["accept", "确定"], ["continue", "错误"]]) {
+        const button = node("button", text, action === "accept" ? "primary-button" : "secondary-button"); button.type = "button";
+        button.dataset.key = `human/${candidate.candidate_id}/${action}`;
+        if (!validationQueries.has(button.dataset.key)) validationQueries.set(button.dataset.key, crypto.randomUUID());
+        button.onclick = event => { event.currentTarget.disabled = true; window.dispatchEvent(new CustomEvent("stage-human-decision", { detail: { challengeId: current.challengeId, selection: { candidate_id: candidate.candidate_id, action, operation_id: validationQueries.get(button.dataset.key) } } })); };
+        panel.append(button);
+      }
+    });
   }
   function setTab(name) {
     activeTab = name;
@@ -694,20 +725,6 @@ const RunView = (() => {
         item.dataset.key = candidate.candidate_id;
         item.append(node("strong", candidate.validation_state === "partial" ? "候选正确 · 整题未完成" : label(candidate.validation_state)), node("p", `候选 ${candidate.candidate_id}\n证据版本 ${candidate.evidence_version}\n来源 ${candidate.source_ref || candidate.execution_id}`, "run-ref"));
         if ([19, 20, 21, 22].includes(progress.contract_version) && candidate.validation_state === 'pending') item.append(node('p', '等待可信验证反馈；候选尚未被确认。', 'run-meta'));
-        if (progress.goal_validation?.mode === "human" && progress.goal_validation.candidate_id === candidate.candidate_id && progress.task_run?.status === "awaiting_confirmation") {
-          const seconds = Math.max(0, Math.ceil(progress.goal_validation.confirmation_deadline - Date.now() / 1000));
-          item.append(node("p", `人工决定剩余 ${seconds} 秒；无决定则未验证结束。`, "run-meta"));
-          item.append(node("p", "候选正文请通过交互终端 candidate-read 查看并自主提交；普通进度和日志仅展示引用。", "run-meta"));
-          const stateDir = current.run?.directory ? `${current.run.directory}/agent-state` : "<state-dir>";
-          item.append(code("在项目交互终端查看候选", `python -m agent candidate-read --state-dir "${stateDir}" --task-run-id ${progress.task_run_id} --candidate-id ${candidate.candidate_id} --evidence-version ${candidate.evidence_version}`));
-          for (const [action, text] of [["accept", "确认成功"], ["continue", "打回继续"], ["end", "结束但未验证"]]) {
-            const button = node("button", text, "secondary-button"); button.type = "button";
-            const key = `human/${candidate.candidate_id}/${action}`;
-            if (!validationQueries.has(key)) validationQueries.set(key, crypto.randomUUID());
-            button.onclick = event => { event.currentTarget.disabled = true; window.dispatchEvent(new CustomEvent("stage-human-decision", { detail: { challengeId: current.challengeId, selection: { candidate_id: candidate.candidate_id, action, operation_id: validationQueries.get(key) } } })); };
-            item.append(button);
-          }
-        }
         if (progress.competition && !live && candidate.validation_state === "pending") {
           const button=node("button","提交此候选到比赛平台","secondary-button");button.type="button";
           button.onclick=event=>{event.currentTarget.disabled=true;window.dispatchEvent(new CustomEvent("competition-submit",{detail:{challengeId:current.challengeId}}));};

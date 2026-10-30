@@ -176,10 +176,24 @@ def execution_policy(config):
         "web_authorization": asdict(config.web_authorization) if config.web_authorization else None,
         "tcp_authorization": asdict(config.tcp_authorization) if config.tcp_authorization else None,
         "capacity": asdict(config.handoff_config),
+        "human_confirmation": "assume_after_300s_v1",
         "review_queue": {"binding": "immutable_proposal_v1", "dispatch": "async_planning_v1"},
         "tool_execution": {"max_in_flight": MAX_IN_FLIGHT_TOOLS, "sandbox_target_in_flight": 1,
                            "max_calls_per_decision": MAX_IN_FLIGHT_TOOLS,
                            "wake": "first_result_before_next_decision_merge_during_generation"}}))
+
+
+def human_confirmation_policy(store, task_id):
+    """Read the frozen timeout rule; historical runs retain their original behavior."""
+    config = require_run(store, task_id)
+    evidence = store.stage_evidence
+    policy = evidence.read("policy", task_id) if evidence is not None else None
+    if not isinstance(policy, dict) or config.execution_policy_ref != "sha256:" + hashlib.sha256(canonical_json(policy).encode("utf-8")).hexdigest():
+        _fail("stage.execution_configuration_changed", Category.UNKNOWN)
+    value = policy.get("human_confirmation")
+    if value not in {None, "assume_after_300s_v1"}:
+        _fail("stage.execution_configuration_changed", Category.POLICY)
+    return value
 
 
 def proposal_digest(value):
@@ -858,9 +872,27 @@ def _validate(store, mutation):
                 return None  # The original D7 validator delegates to validate_goal_mutation below.
             if any(not isinstance(c, UpsertTaskRun) for c in mutation.state_changes):
                 _fail("stage.legacy_domain_write_rejected", Category.POLICY)
-            if any(c.status in {TaskRunStatus.ACHIEVED, TaskRunStatus.ASSUMED_ACHIEVED}
-                   for c in mutation.state_changes):
-                _fail("stage.final_validation_not_connected", Category.POLICY)
+            for after in mutation.state_changes:
+                if after.status is TaskRunStatus.ACHIEVED:
+                    _fail("stage.final_validation_not_connected", Category.POLICY)
+                if after.status is TaskRunStatus.ASSUMED_ACHIEVED:
+                    task = store.load_task_run(mutation.task_run_id)
+                    config = require_run(store, mutation.task_run_id)
+                    now = mutation.event.timestamp
+                    if (mutation.operation != "finish_task_run" or config.goal_validation != "human"
+                            or human_confirmation_policy(store, mutation.task_run_id) != "assume_after_300s_v1"
+                            or task.status is not TaskRunStatus.AWAITING_CONFIRMATION
+                            or task.confirmation_deadline is None or not task.confirmation_deadline <= now < task.deadline_at
+                            or after.failure_reason != "human_confirmation_timeout_assumed"
+                            or after != replace(after, request=task.request, effective_model_backend=task.effective_model_backend,
+                                started_at=task.started_at, deadline_at=task.deadline_at, sandbox_id=task.sandbox_id,
+                                confirmation_deadline=task.confirmation_deadline, finished_at=now,
+                                source_root=task.source_root, target_network=task.target_network)):
+                        _fail("stage.human_timeout_not_ready", Category.POLICY)
+                    candidates = store.list_d7_answer_candidates(mutation.task_run_id)
+                    if not candidates or live_tool_requests(store, mutation.task_run_id) or store.blocking_d4_operations(mutation.task_run_id):
+                        _fail("stage.human_timeout_not_ready", Category.POLICY)
+                    goal_candidate_proof(store, candidates[-1])
         return None
     if len(changes) != 1:
         _fail("stage.change_invalid", Category.INPUT)

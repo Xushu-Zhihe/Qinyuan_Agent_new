@@ -192,7 +192,7 @@ def test_challenge_category_reaches_inner_outer_and_actual_payload(case):
         wire = json.dumps(payload, ensure_ascii=False)
         assert "题型（任务提供）：pwn" in wire and "原始题目描述保持完整。" in wire
         assert "可依据证据修正的分析背景" in wire
-        assert payload["reasoning_effort"] == "max"
+        assert payload["reasoning_effort"] == "high"
 
 
 def test_road_success_does_not_imply_stage_success(case):
@@ -978,13 +978,13 @@ def test_real_provider_payload_keeps_role_and_reasoning_parameters(case):
     projected = build_payload(replace(envelope, request=history), inner)
     assert projected["messages"][1]["role"] == "user"
     assert json.loads(projected["messages"][1]["content"])["history"][0]["content"]["historical_model_result"] == {"kind": "roads"}
-    assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "max"
+    assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "high"
     assert "max_tokens" not in payload and payload["stream"] is True
     with pytest.raises(ValueError, match="model_role_binding_changed"):
         build_payload(envelope, outer)
     request = replace(request, stage="stage_summary", role_config_ref=outer.role_config_ref)
     envelope = replace(envelope, request=request, output_contract={"version": 1, "stage": request.stage, "schema": schema(request)})
-    assert build_payload(envelope, outer)["reasoning_effort"] == "max"
+    assert build_payload(envelope, outer)["reasoning_effort"] == "high"
 
 
 def test_execution_channels_are_frozen_for_inner_outer_and_catalog(case):
@@ -1041,7 +1041,7 @@ def test_generic_exploration_guidance_reaches_provider_without_granting_tools(st
     assert "add no fields or calls" in system
     assert "do not reserve retrieval for a later Road" in system
     assert "their actual contents answer the current question" in system
-    assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "max"
+    assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "high"
     assert "max_tokens" not in payload
     assert len(payload["tools"]) == 1 and payload["tools"][0]["function"]["name"] == OUTPUT_TOOL
     from agent_core.stage_planning import provider_schema
@@ -1146,7 +1146,7 @@ def test_provider_history_segments_stay_identical_while_live_snapshots_change(ca
     assert 'tool_feedback' in json.loads(second['messages'][-1]['content'])['current']
     doc = _stage_input(replace(req, messages=archive))
     assert doc['history'][0]['content']['source'] == json.loads(archive[0]['content'])['source']
-    assert second['tools'] == first['tools'] and second['reasoning_effort'] == 'max'
+    assert second['tools'] == first['tools'] and second['reasoning_effort'] == 'high'
 
 
 def test_continuation_history_omits_only_exact_summary_covered_unneeded_raw():
@@ -1756,7 +1756,7 @@ def test_stage_stop_links_actual_provider_adapter_metadata_without_network(case)
     with pytest.raises(OperationRecoveryRequired) as failure:
         asyncio.run(case.app.models._invoke(model, envelope, 1, case.token, case.app.state.task_run.deadline_at))
     detail = failure.value.context["model_call"]
-    assert len(calls) == 1 and calls[0]["reasoning_effort"] == "max" and "max_tokens" not in calls[0]
+    assert len(calls) == 1 and calls[0]["reasoning_effort"] == "high" and "max_tokens" not in calls[0]
     assert detail["diagnostic_status"] == "bound" and detail["timeout_kind"] == "model_total_timeout"
     assert detail["transport"]["reasoning_chars"] == 12 and detail["transport"]["content_chars"] == 0
     assert detail["provider_result_ref"] == "stage-provider-result/" + request.model_request_id

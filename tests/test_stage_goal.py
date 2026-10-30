@@ -87,20 +87,69 @@ def test_wait_restart_preserves_original_deadline_and_timeout_operation_is_idemp
     operation = str(uuid4())
     case.app.controller.advance_time(operation)
     case.app.controller.advance_time(operation)
-    assert case.app.state.task_run.status is TaskRunStatus.INCONCLUSIVE
+    assert case.app.state.task_run.status is TaskRunStatus.ASSUMED_ACHIEVED
+    assert case.app.state.task_run.failure_reason == "human_confirmation_timeout_assumed"
 
 
-def test_five_minute_timeout_is_inconclusive_without_resetting_wait(case):
+def test_five_minute_timeout_assumes_completion_without_fabricating_feedback(case):
     prepare(case)
     deadline = case.app.state.task_run.confirmation_deadline
     case.now.value += 299
     asyncio.run(case.app.run(case.token))
     assert case.app.state.task_run.confirmation_deadline == deadline
     assert case.app.state.task_run.status is TaskRunStatus.AWAITING_CONFIRMATION
+    from agent_core.stage_storage import StageStateError
+    with pytest.raises(StageStateError, match="human_timeout_not_ready"):
+        case.app.controller._finish_persistent(TaskRunStatus.ASSUMED_ACHIEVED,
+            mutation_id=str(uuid4()), now=case.now.value, failure_reason="human_confirmation_timeout_assumed")
+    assert case.app.state.task_run.status is TaskRunStatus.AWAITING_CONFIRMATION
     case.now.value += 1
+    asyncio.run(case.app.run(case.token))
+    assert case.app.state.task_run.status is TaskRunStatus.ASSUMED_ACHIEVED
+    assert case.app.state.task_run.failure_reason == "human_confirmation_timeout_assumed"
+    candidate, = case.app.store.list_d7_answer_candidates(case.app.task_id)
+    assert not case.app.store.list_d7_validation_feedback(case.app.task_id, candidate.candidate_id, candidate.evidence_version)
+    with pytest.raises(Exception, match="human_confirmation_closed"):
+        case.app.goal.decide(candidate.candidate_id, "continue", str(uuid4()))
+    from agent_adapters.web.task_result import _stage_task_result
+    case.app.controller.cleanup_sandbox()
+    view = _stage_task_result(case.app.directory, dict(task_run_id=case.app.task_id, mode="simulated", goal_validation="human"), case.app.store, case.app.config)
+    assert view["run_exit_code"] == 5 and view["cleanup_status"] == "unconfirmed"
+    from agent_adapters.run_files import immutable_write
+    from agent_adapters.target_network_cleanup import target_network_cleanup_receipt
+    task = case.app.state.task_run
+    immutable_write(case.app.directory / "cleanup.json", dict(status="succeeded", sandbox_id=task.sandbox_id))
+    immutable_write(case.app.directory / "target-network-cleanup.json", target_network_cleanup_receipt(case.app.task_id, task.target_network))
+    view = _stage_task_result(case.app.directory, dict(task_run_id=case.app.task_id, mode="simulated", goal_validation="human"), case.app.store, case.app.config)
+    assert view["run_exit_code"] == 0 and view["goal_evaluation"] == "not_evaluated"
+    assert view["run_outcome"]["reason"] == "assumed_goal_ended"
+    assert view["goal_validation"]["timeout_action"] == "assume"
+
+
+def test_task_deadline_wins_over_default_human_confirmation(case):
+    prepare(case)
+    case.args["sandbox"].interrupt = lambda identity: None
+    case.now.value = case.app.state.task_run.deadline_at
+    asyncio.run(case.app.run(case.token))
+    assert case.app.state.task_run.status is TaskRunStatus.DEADLINE_EXCEEDED
+
+
+def test_historical_human_timeout_policy_stays_unverified_and_readable(case, monkeypatch):
+    from agent_adapters import stage_application
+    original = stage_application.execution_policy
+    def historical(config):
+        policy = original(config)
+        policy.pop("human_confirmation")
+        return policy
+    monkeypatch.setattr(stage_application, "execution_policy", historical)
+    prepare(case)
+    case.now.value += 300
     asyncio.run(case.app.run(case.token))
     assert case.app.state.task_run.status is TaskRunStatus.INCONCLUSIVE
     assert case.app.state.task_run.failure_reason == "human_confirmation_timeout"
+    from agent_adapters.web.task_result import _stage_task_result
+    view = _stage_task_result(case.app.directory, dict(task_run_id=case.app.task_id, mode="simulated", goal_validation="human"), case.app.store, case.app.config)
+    assert view["goal_validation"]["timeout_action"] == "end_unverified"
 
 
 @pytest.mark.parametrize("verdict", ["rejected", "partial", "unknown"])

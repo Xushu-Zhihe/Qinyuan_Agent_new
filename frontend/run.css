@@ -3,6 +3,8 @@
    ========================================================================== */
 
 .run-panel { padding: 26px 0 0; }
+.run-confirmation { margin: 12px 0; padding: 16px; border: 1px solid var(--accent); border-radius: var(--radius); background: var(--panel); }
+.run-confirmation button { margin: 8px 12px 0 0; }
 
 .run-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
 .run-head-main { min-width: 0; }

@@ -247,11 +247,12 @@ def _stage_task_result(directory, declaration, store, expected):
         {"binding": "immutable_proposal_v1", "dispatch": "synchronous_v1"},
         {"binding": "immutable_proposal_v1", "dispatch": "async_fact_v1"},
         {"binding": "immutable_proposal_v1", "dispatch": "async_planning_v1"})
+    supported_confirmation = isinstance(frozen_policy, dict) and frozen_policy.get("human_confirmation") in {None, "assume_after_300s_v1"}
     if (config.outer_role != expected.outer_role or config.inner_role != expected.inner_role
             or config.goal_validation != declaration.get("goal_validation")
-            or config.budget != expected.d4_budget or not isinstance(frozen_policy, dict) or not supported_queue
+            or config.budget != expected.d4_budget or not isinstance(frozen_policy, dict) or not supported_queue or not supported_confirmation
             or config.execution_policy_ref != "sha256:" + digest(frozen_policy)
-            or {k: v for k, v in frozen_policy.items() if k != "review_queue"} != {k: v for k, v in policy.items() if k != "review_queue"}):
+            or {k: v for k, v in frozen_policy.items() if k not in {"review_queue", "human_confirmation"}} != {k: v for k, v in policy.items() if k not in {"review_queue", "human_confirmation"}}):
         raise ValueError("stage.execution_configuration_changed")
     rows = store.load_control_state_rows(task_id)
     if rows is None:
@@ -354,6 +355,7 @@ def _stage_task_result(directory, declaration, store, expected):
         through_event_sequence=checkpoint.watermark_event_sequence)
     result["answer_candidates"] = [{("road_id" if k == "intent_id" else k): v for k, v in item.items()} for item in candidates]
     result["goal_validation"] = dict(mode=config.goal_validation, confirmation_deadline=task.confirmation_deadline,
+        timeout_action="assume" if frozen_policy.get("human_confirmation") == "assume_after_300s_v1" else "end_unverified",
         candidate_id=candidates[-1]["candidate_id"] if candidates else None,
         actions=["accept", "continue", "end"] if task.status.value == "awaiting_confirmation" else [])
     result["goal_evaluation"] = goal

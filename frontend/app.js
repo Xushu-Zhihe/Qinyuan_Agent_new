@@ -225,7 +225,7 @@ async function startRun() {
     options.headers = { "Content-Type": "application/json" };
   }
   try { const run = await request(`/api/challenges/${id}/run`, options); renderRun(run); await loadTasks(); await refreshRun(id); notify("Agent 进程已启动"); }
-  catch (error) { notify(`启动失败：${error.message}`); }
+  catch (error) { notify(`启动失败：${error.message === "competition_schedule_active" ? "当前任务由赛程管理，请回比赛控制继续原赛程。" : error.message}`); }
 }
 async function cancelRun() {
   const id = state.selected; if (!id) return;

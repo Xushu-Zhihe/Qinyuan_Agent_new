@@ -1823,6 +1823,12 @@ class TaskRunController(LegacyTaskRunController):
             and now >= task_run.confirmation_deadline
         ):
             if self._require_persistent().store.load_stage_run_config(task_run.task_run_id) is not None:
+                from agent_core.stage_storage import human_confirmation_policy
+                if human_confirmation_policy(self._require_persistent().store, task_run.task_run_id) == "assume_after_300s_v1":
+                    return self._finish_persistent(
+                        TaskRunStatus.ASSUMED_ACHIEVED, mutation_id=mutation_id, now=now,
+                        failure_reason="human_confirmation_timeout_assumed",
+                    )
                 return self._finish_persistent(
                     TaskRunStatus.INCONCLUSIVE, mutation_id=mutation_id, now=now,
                     failure_reason="human_confirmation_timeout",

@@ -60,7 +60,7 @@ def test_stage_schema_rule_and_role_binding(stage):
     assert deepseek_roles.RULES[stage] in payload["messages"][0]["content"]
     assert payload["stream"] is True
     assert payload["thinking"] == {"type": "enabled"}
-    assert "max_tokens" not in payload and payload["reasoning_effort"] == "max"
+    assert "max_tokens" not in payload and payload["reasoning_effort"] == "high"
     assert "max_tokens" not in dict(role.parameters)
     assert "tools" not in payload and "temperature" not in payload and "top_p" not in payload
     with pytest.raises(ValueError, match="role_binding"):
@@ -465,7 +465,7 @@ def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_p
     result = persisted.read("provider-result", business.review_id)
     assert sent["model_request_id"] == business.review_id and sent["task_run_id"] == business.task_run_id
     assert sent["parameters"] == {"model": role.model, "response_format": {"type": "json_object"},
-        "stream": True, "thinking": {"type": "enabled"}, "reasoning_effort": "max"}
+        "stream": True, "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
     assert sent["timeout_seconds"] == 90 and result["request_sha256"] == digest(sent)
     if failure == "stream":
         assert result["transport"]["stream_error"]["branch"] == "tool_function_field_type"

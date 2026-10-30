@@ -322,8 +322,32 @@ function edgeActivityAcceptance() {
     progress.review_queue.push({ proposal_operation_id: "old-snapshot", state: "pending" });
     RunView.render({ run, progress });
     check(keyed("run-review-queue", "review-proposal/old-snapshot").textContent.includes("归属未提供"), "older metadata not handled explicitly");
+    progress.goal_validation = { mode: "human", candidate_id: "answer", confirmation_deadline: Date.now() / 1000 + 300, timeout_action: "assume" };
+    progress.answer_candidates = [{ candidate_id: "answer", evidence_version: "version", source_ref: "mcp-result/source", validation_state: "pending" }];
+    progress.task_run.status = "awaiting_confirmation";
+    RunView.render({ run, progress });
+    const confirmation = get("run-confirmation");
+    check(!confirmation.hidden && get("run-pane-evidence").hidden, "human controls hidden behind a tab");
+    check(confirmation.textContent.includes("默认确定") && confirmation.textContent.includes("candidate-read"), "timeout rule or candidate reference missing");
+    const buttons = Array.from(confirmation.querySelectorAll("button"));
+    check(buttons.length === 2 && buttons[0].textContent === "确定" && buttons[1].textContent === "错误", "human controls must be determine/error");
+    const commands = [];
+    window.addEventListener("stage-human-decision", event => commands.push(event.detail.selection));
+    buttons[1].click();
+    RunView.render({ run, progress: structuredClone(progress) });
+    check(confirmation.querySelectorAll("button")[1] === buttons[1], "confirmation poll rebuilt button");
+    buttons[1].disabled = false; buttons[1].click();
+    check(commands.length === 2 && commands[0].action === "continue" && commands[0].candidate_id === "answer" && commands[0].operation_id === commands[1].operation_id, "wrong/retry decision identity changed");
+    buttons[0].click(); check(commands.at(-1).action === "accept", "determine not routed to original accept control");
+    progress.goal_validation.mode = "external";
+    RunView.render({ run, progress }); check(confirmation.hidden, "external validation exposed human controls");
+    progress.goal_validation.mode = "human"; progress.goal_validation.timeout_action = "end_unverified";
+    RunView.render({ run, progress }); check(confirmation.textContent.includes("原规则"), "historical timeout falsely shown as assume");
+    progress.task_run.status = "assumed_achieved"; progress.task_run.reason = "human_confirmation_timeout_assumed";
+    RunView.render({ run, progress });
+    check(!confirmation.hidden && !confirmation.querySelector("button") && confirmation.textContent.includes("未伪造"), "default determination lost its provenance");
     get("run-dashboard").scrollIntoView({ block: "start" });
-    return "PASS native Edge: review states, partial claims, branch navigation, scope, DOM/selection preservation, safe text";
+    return "PASS native Edge: review/branch scopes, DOM preservation; prominent human determine/error controls, stable retry IDs, external isolation, timeout provenance";
   }
   let html = fs.readFileSync(path.join(root, "frontend/index.html"), "utf8")
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, "")

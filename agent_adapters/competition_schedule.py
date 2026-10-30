@@ -396,7 +396,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 if item is None or item["state"]!="available":return
             target=self.target(row,item);self.live(identity)
             task=self.workbench.competitions.import_question(row["config"]["profile"]["id"],dict(remote_ref=item["remote_ref"],endpoint=target,
-                deadline_minutes=row["config"]["question_seconds"]//60,http_methods=row["config"]["http_methods"]))
+                deadline_minutes=row["config"]["question_seconds"]//60,http_methods=row["config"]["http_methods"]),check_active=lambda:self.live(identity))
             self.update(identity,challenge_id=task["id"]);row=self.get(identity);state=row["state"];challenge=task["id"]
             if not target and not task["attachments"]:raise WorkbenchError("competition_question_input_required",409)
             self.live(identity)

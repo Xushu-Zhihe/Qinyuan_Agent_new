@@ -448,6 +448,54 @@ def test_waiting_for_attachment_can_extend_budgets_without_inventing_a_taskrun(p
     assert p.workbench.runner.status(challenge) is None
 
 
+@pytest.mark.parametrize("retry",[False,True])
+def test_arena_attachment_is_downloaded_before_scheduled_start_and_failure_can_resume(platform,monkeypatch,retry):
+    from test_competition import arena_attachment
+    p=platform;body=arena_attachment(p)
+    service,row,_,_=schedule(p,"arena")
+    starts=[]
+    def start(identity,**options):
+        task=p.workbench.get(identity);file,=task["attachments"]
+        assert (p.workbench.uploads/identity/file["id"]).read_bytes()==body
+        assert options["competition_control"]["session_id"]==row["id"]
+        starts.append(identity)
+        fake_run(p,service.get(row["id"]))
+    monkeypatch.setattr(p.workbench.runner,"start",start)
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    if retry:
+        p.routes["/archive"]=(403,b"controlled download refusal",{})
+        service.tick();service.tick();state=service.get(row["id"])["state"]
+        assert state["status"]=="paused" and state["reason"]=="competition_attachment_http_403" and not starts
+        task,=p.workbench.list();assert not task["attachments"]
+        p.routes["/archive"]=(200,body,{})
+        service.command(row["id"],{"action":"resume"})
+    service.tick()
+    state=service.get(row["id"])["state"]
+    assert len(starts)==1 and state["challenge_id"]==starts[0] and state["status"]=="running"
+    assert len(p.workbench.list())==1
+    assert all(method=="GET" for method,_,_ in p.requests)
+
+
+def test_pause_after_attachment_download_prevents_registration_and_agent_start(platform,monkeypatch):
+    from contextlib import contextmanager
+    from test_competition import arena_attachment
+    from agent_adapters import competition
+    p=platform;arena_attachment(p)
+    service,row,_,_=schedule(p,"arena")
+    original=competition._download_attachment
+    @contextmanager
+    def paused(*args,**kwargs):
+        with original(*args,**kwargs) as result:
+            service.pause(row["id"])
+            yield result
+    monkeypatch.setattr(competition,"_download_attachment",paused)
+    starts=[]
+    monkeypatch.setattr(p.workbench.runner,"start",lambda *a,**kw:starts.append(a))
+    service.tick();service.tick()
+    assert not starts and service.get(row["id"])["state"]["status"]=="paused"
+    task,=p.workbench.list();assert not task["attachments"]
+
+
 def test_paused_session_finishes_at_overall_deadline_once_current_task_is_terminal(platform,monkeypatch):
     p=platform;p.payload=[benchmark()];service,row,_,_=schedule(p)
     monkeypatch.setattr(p.workbench.runner,"start",lambda *a,**kw:fake_run(p,service.get(row["id"])))

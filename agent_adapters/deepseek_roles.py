@@ -17,7 +17,7 @@ from agent_core.review_contracts import D2ModelFailure
 TRANSPORT = {"version": 1, "base_url": "https://api.deepseek.com",
              "timeout_seconds": DEFAULT_MODEL_TIMEOUT_SECONDS, "response_format": "json_object",
              "max_response_bytes": 2 * 1024 * 1024}
-PARAMETERS = (("thinking", "enabled"), ("reasoning_effort", "max"))
+PARAMETERS = (("thinking", "enabled"), ("reasoning_effort", "high"))
 # User-confirmed deployment limits. Reserve the advertised maximum because
 # the provider default is not observed; this reserve is never sent as a limit.
 SCNET_V41_MAX_OUTPUT = 384_000
