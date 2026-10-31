@@ -100,6 +100,7 @@ RUN rm -rf /var/lib/apt/lists/* \
         gdb-multiarch \
         gdbserver \
         gcc \
+        gcc-mingw-w64-x86-64 \
         libc6-dev \
         libicu72 \
         libssl3 \
@@ -175,6 +176,7 @@ RUN mkdir -p /opt/qinyuan/python \
     && /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir \
         --target /opt/qinyuan/python \
         "pwntools==4.14.1" \
+        "pefile==2024.8.26" \
         "z3-solver==4.15.1.0" \
         "pycryptodome==3.23.0"
 
@@ -244,6 +246,7 @@ RUN mkdir -p /opt/qinyuan/wordlists \
     && command -v one_gadget >/dev/null \
     && command -v pwntools-terminal >/dev/null \
     && command -v qinyuan-exec >/dev/null \
+    && command -v x86_64-w64-mingw32-gcc >/dev/null \
     && command -v checksec >/dev/null \
     && command -v ROPgadget >/dev/null \
     && command -v dirsearch >/dev/null \
@@ -256,7 +259,7 @@ RUN mkdir -p /opt/qinyuan/wordlists \
     && command -v nuclei >/dev/null \
     && command -v pwsh >/dev/null \
     && php -r 'exit(PHP_VERSION_ID >= 80200 ? 0 : 1);' \
-    && /usr/bin/python3 -c "import Crypto, pwn, z3, qinyuan_libcsearcher; assert qinyuan_libcsearcher.find_candidates({'puts': '0x80ed0'})['candidate_count'] >= 1"
+    && /usr/bin/python3 -c "import Crypto, pefile, pwn, z3, qinyuan_libcsearcher; assert qinyuan_libcsearcher.find_candidates({'puts': '0x80ed0'})['candidate_count'] >= 1"
 
 RUN groupadd --gid 10001 sandbox \
     && useradd \

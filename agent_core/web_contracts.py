@@ -22,7 +22,7 @@ D7_WEB_MAX_HEADER_BYTES = 64 * 1024
 D7_WEB_MAX_HEADER_COUNT = 100
 D7_WEB_MAX_HEADER_VALUE_BYTES = 8 * 1024
 D7_WEB_RESPONSE_HEADERS = frozenset({"content-type", "location", "set-cookie"})
-D7_WEB_SANDBOX_IMAGE = "qinyuan/pentest-sandbox:0.3.5"
+D7_WEB_SANDBOX_IMAGE = "qinyuan/pentest-sandbox:0.3.6"
 D7_WEB_FORWARDER_PROFILE = "qinyuan.d7.taskrun-forwarder.v1"
 
 

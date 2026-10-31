@@ -1,6 +1,7 @@
-"""Confirmed D9-3 profile. Never loads dotenv, pulls images or prepares networks."""
+﻿"""Confirmed D9-3 profile. Never loads dotenv, pulls images or prepares networks."""
 
 import json
+import os
 import time
 
 import docker
@@ -11,26 +12,49 @@ from Sandbox.command_sandbox import T6TaskRunSandbox
 from Sandbox.workspace import D8DockerWorkspace
 from Sandbox.docker_runtime import DockerRuntime, DockerRuntimeError
 from Sandbox.settings import SandboxSettings
+from Sandbox.windows_sandbox import WindowsSandboxSettings, WindowsTaskRunSandbox
 
 
 STARTUP_READY_TIMEOUT_SECONDS = 10.0
 
 
-IMAGE_REF = "qinyuan/pentest-sandbox:0.3.5"
-IMAGE_ID = "sha256:3ed5166950edeceb33fe925da6a0d97ccbf864d641a5b8ba85c62b0f84bc9622"
+IMAGE_REF = "qinyuan/pentest-sandbox:0.3.6"
+IMAGE_ID = "sha256:8c7acdea0c13fa5e23d2c8d0d7fc1c10d2541069cebbe5c79d8537d36cac5686"
+
+WINDOWS_IMAGE_REF = "qinyuan/windows-sandbox:0.3.6"
+WINDOWS_IMAGE_ID = "sha256:29bed6bdb9f80a37aaf382fe1a1e908012ff3c55b3a7fbaada2ef21017da6a6b"
+WINDOWS_PROFILE = "windows-wine-v1"
 
 
 def settings():
     return SandboxSettings(image=IMAGE_ID)
 
 
+def windows_settings():
+    return WindowsSandboxSettings(image=WINDOWS_IMAGE_ID)
+
+
+def _active_profile():
+    return os.environ.get("QINYUAN_SANDBOX_PROFILE", "linux").strip().lower()
+
+
 def sandbox_config():
     # Freeze the complete effective container specification, not a hand-written
     # subset that could conceal new default mounts, network or resource limits.
+    if _active_profile() == "windows":
+        return windows_sandbox_config()
     configured = settings()
     profile = T6TaskRunSandbox(SimpleNamespace(settings=configured))
     return {"version": 1, "profile": "d3-fixed-readonly-v2", "image_ref": IMAGE_REF,
             "image_id": IMAGE_ID, "docker_host": configured.docker_host,
+            "spec": profile._spec()}
+
+
+def windows_sandbox_config():
+    configured = windows_settings()
+    profile = WindowsTaskRunSandbox(SimpleNamespace(settings=configured))
+    return {"version": 1, "profile": WINDOWS_PROFILE, "image_ref": WINDOWS_IMAGE_REF,
+            "image_id": WINDOWS_IMAGE_ID, "docker_host": configured.docker_host,
             "spec": profile._spec()}
 
 
@@ -80,15 +104,36 @@ def _wait_ready(configured):
         time.sleep(min(0.25, remaining))
 
 
-def connect(configuration, directory, *, wait_for_ready=False):
-    if json.dumps(configuration, sort_keys=True) != json.dumps(sandbox_config(), sort_keys=True):
+def _connect_profile(expected, configured, sandbox_type, configuration, directory, wait_for_ready):
+    if json.dumps(configuration, sort_keys=True) != json.dumps(expected, sort_keys=True):
         raise ValueError("d9_docker_configuration_mismatch")
-    configured = settings()
-    if wait_for_ready:_wait_ready(configured)
+    if wait_for_ready:
+        _wait_ready(configured)
     runtime = DockerRuntime(configured, prepare_network=False)
-    sandbox = T6TaskRunSandbox(runtime)
+    sandbox = sandbox_type(runtime)
     try:
         return sandbox, D8DockerWorkspace(sandbox, directory)
     except BaseException:
         sandbox.close()
         raise
+
+
+def connect(configuration, directory, *, wait_for_ready=False):
+    if _active_profile() == "windows":
+        return _connect_profile(
+            windows_sandbox_config(),
+            windows_settings(),
+            WindowsTaskRunSandbox,
+            configuration,
+            directory,
+            wait_for_ready,
+        )
+    return _connect_profile(
+        sandbox_config(),
+        settings(),
+        T6TaskRunSandbox,
+        configuration,
+        directory,
+        wait_for_ready,
+    )
+

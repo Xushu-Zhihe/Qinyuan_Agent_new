@@ -1,4 +1,4 @@
-{
+﻿{
   "mcpServers": {
     "nmap": {
       "transport": "stdio",
@@ -102,6 +102,33 @@
       "args": ["server.py"],
       "tags": ["session", "interactive", "debugging", "kernel"],
       "sandboxTools": ["tmux"],
+      "enabled": true
+    },
+    "kernel": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Kernel_Mcp",
+      "args": ["server.py"],
+      "tags": ["kernel", "pwn", "qemu-system", "debugging"],
+      "sandboxTools": ["tmux", "bash"],
+      "enabled": true
+    },
+    "pe": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Pe_Mcp",
+      "args": ["server.py"],
+      "tags": ["windows", "reverse-engineering", "pe", "binary-analysis"],
+      "sandboxTools": ["python3"],
+      "enabled": true
+    },
+    "wine": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Wine_Mcp",
+      "args": ["server.py"],
+      "tags": ["windows", "wine", "dynamic-analysis", "debugging"],
+      "sandboxTools": ["wine", "tmux"],
       "enabled": true
     },
     "curl": {
@@ -240,3 +267,4 @@
     }
   }
 }
+
