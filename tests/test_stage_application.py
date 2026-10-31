@@ -1006,6 +1006,36 @@ def test_execution_channels_are_frozen_for_inner_outer_and_catalog(case):
         assert not req.tools and 'does not prove target behavior' in runtime
 
 
+def test_stage_action_tool_preparation_guidance_requires_declared_download_tool():
+    from agent_adapters.deepseek_roles import role_config
+    from agent_core.stage_planning import model_contract
+    turn = StageTurnSnapshot(str(uuid4()), TurnIntent("inspect the controlled result", "a supported result"),
+        TurnPlanningState.ACTIVE)
+    session = PlanningSession("road_execution", str(uuid4()))
+    context = TurnPlanningContext(str(uuid4()), "find the flag", session, turn, ())
+    role = role_config("inner_action", version=17)
+    local_tool = {"qualified_name": "shell.run_bash", "input_schema": {"type": "object",
+        "properties": {"script": {"type": "string"}}, "required": ["script"], "additionalProperties": False}}
+    download_tool = {"qualified_name": "download.install_tool", "input_schema": {"type": "object",
+        "properties": {}, "required": [], "additionalProperties": False}}
+    request = StageModelRequest(str(uuid4()), context.task_run_id, "stage_action", role.role_config_ref, 1, context,
+        tools=(local_tool, download_tool))
+    rules = model_contract(request)["rules"]
+    assert "Tool preparation is available in this decision" in rules
+    assert "download.install_tool" in rules
+    assert "cannot fetch a new artifact" not in rules
+    assert "512 KiB (524,288 bytes)" in rules
+    assert "64,000 characters" in rules
+    assert "redirect its full output to /workspace/work" in rules
+    branches = schema(request)["anyOf"]
+    assert any(
+        branch.get("properties", {}).get("tool_name", {}).get("const") == "download.install_tool"
+        for branch in branches
+    )
+    without_download = replace(request, tools=(local_tool,))
+    assert "Tool preparation is available in this decision" not in model_contract(without_download)["rules"]
+
+
 @pytest.mark.parametrize("stage", ["stage_roads", "stage_action", "stage_review",
     "stage_completion", "stage_continuation", "stage_supervision"])
 def test_generic_exploration_guidance_reaches_provider_without_granting_tools(stage):

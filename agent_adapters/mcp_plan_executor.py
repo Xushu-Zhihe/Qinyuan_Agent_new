@@ -127,13 +127,24 @@ class MCPPlanExecutor:
                 "sockets or subprocesses. shell/curl/httpx/nuclei planners run inside the sandbox and cannot replace "
                 "this target channel. HTTP evidence is saved per request."
                 if self.experiments.enabled else "No http.run_experiment target channel is enabled in this profile."),
+            "target_tcp": ("The authorized TCP endpoint is reachable from this sandbox only as "
+                "target.qinyuan:<authorized port>; the external host name does not resolve here and there is no "
+                "other egress. A name-resolution or connection failure against the external host name does not "
+                "mean the target is down or that the premise was refuted."
+                if self.app.config.tcp_authorization else "No TCP target channel is enabled in this profile."),
             "public_reference": ("When declared, web.search/web.fetch use an external trusted adapter for public "
                 "references, not target experiments or sandbox networking."
                 if frozen.get("public_web") else "No public-reference adapter is enabled."),
             "tool_preparation": "When declared, download.install_tool prepares allowlisted tool artifacts through "
-                "the trusted installer, not a general target/public-network channel. The execution sandbox stays networkless.",
+                "the trusted installer, not a general target/public-network channel. Use it when a missing local "
+                "executable/module blocks the next check; native sources must be allowlisted and need a verified "
+                "SHA256, or use a pinned Python package. Use the returned path/wrapper. The execution sandbox stays networkless.",
             "boundary": "Only the current tool catalog and authorization permit dispatch. A tool or bridge error "
                 "does not prove target behavior; inspect its category, phase and original request receipts.",
+            "output_limits": "Tool stdout/stderr capture is capped at 512 KiB (524,288 bytes) per stream; "
+                "after UTF-8 decoding the model-visible preview is separately capped at 64,000 characters. "
+                "stdout_bytes/stderr_bytes and truncation flags are reported. For larger output, redirect the "
+                "full command to /workspace/work/<name>.out and page it with grep/sed/wc.",
         }
 
     async def open(self):
@@ -162,6 +173,8 @@ class MCPPlanExecutor:
                 for name, server in registry.servers.items()})
             self.manager = MCPManager(
                 registry, service,
+                output_character_limit=int(os.environ.get(
+                    "QINYUAN_MCP_OUTPUT_CHARACTER_LIMIT", "64000")),
                 required_servers=[s.name for s in registry.servers.values() if s.enabled])
         try:
             await self.manager.start_all()

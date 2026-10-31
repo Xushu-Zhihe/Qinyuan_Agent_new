@@ -76,7 +76,7 @@ def test_workbench_additive_migration_preserves_rows_and_methods(tmp_path):
         db.execute('ALTER TABLE challenges DROP COLUMN http_methods_json')
     current=Workbench(root,protocol_version=3,execution_profile='d8_v20')
     migrated=current.get(challenge['id'])
-    assert migrated['http_methods']==['GET','HEAD','OPTIONS']
+    assert migrated['http_methods']==['GET','HEAD','OPTIONS','POST','PUT','PATCH']
     assert migrated['description']==challenge['description']
     updated=current.update(challenge['id'],_challenge(endpoint=ORIGIN)|{'http_methods':['GET','POST']})
     assert updated['http_methods']==['GET','POST']

@@ -15,6 +15,9 @@ from agent_core.turn_contracts import D1RoleConfig
 D7_WEB_ALLOWED_METHODS = frozenset(
     {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 )
+# Default authorization for a new Web challenge. POST/PUT/PATCH are included so
+# form- and JSON-driven targets are reachable without the operator having to opt in.
+D7_WEB_DEFAULT_METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH")
 D7_WEB_MAX_REQUEST_BODY_BYTES = 64 * 1024
 D7_WEB_MAX_RESPONSE_BODY_BYTES = 2 * 1024 * 1024
 D7_WEB_MAX_MODEL_TEXT_BYTES = 64 * 1024
@@ -22,7 +25,7 @@ D7_WEB_MAX_HEADER_BYTES = 64 * 1024
 D7_WEB_MAX_HEADER_COUNT = 100
 D7_WEB_MAX_HEADER_VALUE_BYTES = 8 * 1024
 D7_WEB_RESPONSE_HEADERS = frozenset({"content-type", "location", "set-cookie"})
-D7_WEB_SANDBOX_IMAGE = "qinyuan/pentest-sandbox:0.3.6"
+D7_WEB_SANDBOX_IMAGE = "qinyuan/pentest-sandbox:0.3.7"
 D7_WEB_FORWARDER_PROFILE = "qinyuan.d7.taskrun-forwarder.v1"
 
 
@@ -512,6 +515,7 @@ class D7WebExecutionRecord:
 
 __all__ = [
     "D7_WEB_ALLOWED_METHODS",
+    "D7_WEB_DEFAULT_METHODS",
     "D7_WEB_FORWARDER_PROFILE",
     "D7_WEB_MAX_HEADER_BYTES",
     "D7_WEB_MAX_HEADER_COUNT",

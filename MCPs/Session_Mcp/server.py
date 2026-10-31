@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from typing import Any
@@ -33,6 +33,9 @@ _PROGRAMS = {
     "nc": "/usr/bin/nc",
     "wine": "/usr/bin/wine",
     "winedbg": "/usr/bin/winedbg",
+    "qy-wine64": "/usr/local/bin/qy-wine64",
+    "qy-wine32": "/usr/local/bin/qy-wine32",
+    "qy-wine-auto": "/usr/local/bin/qy-wine-auto",
 }
 
 _KEYS = frozenset(

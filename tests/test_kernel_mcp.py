@@ -51,6 +51,7 @@ def test_unpack_is_quoted_and_stays_in_work():
     script = plan["sandbox_command"]["arguments"][3]
     assert "cpio -idm --no-absolute-filenames" in script
     assert "/workspace/input/rootfs.cpio.gz" in script
+    assert "zstd -dc" in script and "lz4 -dc" in script and "bzip2 -dc" in script
     with pytest.raises(ValueError):
         kernel_unpack("/workspace/input/rootfs.cpio.gz", "/etc")
 

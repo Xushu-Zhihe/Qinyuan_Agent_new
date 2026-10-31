@@ -12,11 +12,11 @@ from dataclasses import dataclass
 from Sandbox.command_sandbox import T6TaskRunSandbox
 from Sandbox.settings import SandboxSettings
 
-WINDOWS_MEMORY = "2g"
-WINDOWS_CPU = 1_500_000_000
-WINDOWS_PROCESS_LIMIT = 256
-WINDOWS_WORKSPACE = "1g"
-WINDOWS_TEMPORARY = "256m"
+WINDOWS_MEMORY = "4g"
+WINDOWS_CPU = 2_000_000_000
+WINDOWS_PROCESS_LIMIT = 512
+WINDOWS_WORKSPACE = "4g"
+WINDOWS_TEMPORARY = "512m"
 
 
 @dataclass(frozen=True)
@@ -37,9 +37,12 @@ class WindowsTaskRunSandbox(T6TaskRunSandbox):
         environment = dict(spec["environment"])
         environment.update(
             {
-                "WINEPREFIX": "/workspace/work/.wine",
+                "WINEPREFIX": "/workspace/work/.wine64",
+                "WINEPREFIX32": "/workspace/work/.wine32",
                 "WINEARCH": "win64",
                 "WINEDEBUG": "-all",
+                # /tmp is noexec; wineserver32 needs a writable/exec temp dir.
+                "TMPDIR": "/workspace/work/tmp",
             }
         )
         spec["environment"] = environment

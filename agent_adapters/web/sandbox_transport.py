@@ -84,6 +84,12 @@ class D7SandboxHttpTransport:
                     # is a known protocol mismatch the planner can route around,
                     # not an unknown side effect of the request.
                     raise HttpProtocolMismatch("d22_http_protocol_mismatch") from exc
+                if diagnostic.get("worker_phase") == "request_prepare":
+                    # putrequest/putheader run before endheaders(): the worker
+                    # never reached the peer, so the failure is a known input
+                    # rejection (for example http.client.InvalidURL) rather than
+                    # an unknown side effect.
+                    raise HttpCapabilityError("d7_http_dispatch_rejected") from exc
                 raise HttpCapabilityError("outcome_unknown") from exc
             raise HttpCapabilityError("d7_http_dispatch_rejected") from exc
         except (TypeError, ValueError) as exc:

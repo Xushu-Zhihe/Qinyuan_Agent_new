@@ -189,7 +189,7 @@ def kernel_unpack(
     destination: str = "/workspace/work/rootfs",
     timeout_seconds: int = 120,
 ) -> dict[str, Any]:
-    """Extract a gzip/xz/raw cpio initramfs below /workspace/work."""
+    """Extract a gzip/xz/zstd/lz4/bzip2/raw cpio initramfs below /workspace/work."""
 
     source = _readable(archive, "archive")
     target = _writable(destination, "destination")
@@ -200,6 +200,9 @@ def kernel_unpack(
         f"cd -- {shlex.quote(target)}; "
         f"( gzip -dc -- {shlex.quote(source)} 2>/dev/null "
         f"|| xz -dc -- {shlex.quote(source)} 2>/dev/null "
+        f"|| zstd -dc -- {shlex.quote(source)} 2>/dev/null "
+        f"|| lz4 -dc -- {shlex.quote(source)} 2>/dev/null "
+        f"|| bzip2 -dc -- {shlex.quote(source)} 2>/dev/null "
         f"|| cat -- {shlex.quote(source)} ) "
         "| cpio -idm --no-absolute-filenames"
     )

@@ -159,7 +159,7 @@ function renderSavedAttachments(task) {
     const remove = document.createElement("button"); remove.type = "button"; remove.className = "icon-button"; remove.textContent = "×"; remove.title = `删除 ${file.name}`; remove.addEventListener("click", async () => { try { await request(`/api/challenges/${task.id}/attachments/${file.id}`, { method: "DELETE" }); notify("附件已删除"); await loadTasks(); selectTask(task.id); } catch (error) { notify(`删除失败：${error.message}`); } }); row.append(info, remove); $("attachment-list").append(row);
   });
 }
-function setHttpMethods(methods = ["GET", "HEAD", "OPTIONS"]) {
+function setHttpMethods(methods = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"]) {
   document.querySelectorAll('[name="http-method"]').forEach((input) => { input.checked = methods.includes(input.value); input.disabled = !!state.selected && state.tasks.find((task) => task.id === state.selected)?.status !== "draft"; });
 }
 function resetForm() {

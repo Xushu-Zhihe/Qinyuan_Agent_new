@@ -127,7 +127,7 @@
                       <label class="field"><span>整体预算（分钟）</span><input id="competition-overall-minutes" type="number" min="1" value="180" required></label>
                       <label class="field"><span>平台整体截止（可选）</span><input id="competition-platform-end" type="datetime-local"></label>
                     </div>
-                    <label class="field"><span>允许的 HTTP 方法（逗号分隔）</span><input id="competition-methods" value="GET,HEAD,OPTIONS" required></label>
+                    <label class="field"><span>允许的 HTTP 方法（逗号分隔）</span><input id="competition-methods" value="GET,HEAD,OPTIONS,POST,PUT,PATCH" required></label>
                     <label class="field"><span><input id="competition-default-description-enabled" type="checkbox"> 启用默认题目说明</span>
                       <textarea id="competition-default-description" rows="3" placeholder="这段文字会追加到每道题的题目说明末尾（题面为空时直接作为题面）"></textarea></label>
 
@@ -287,17 +287,17 @@
                 <label class="field"><span>总时限（分钟）</span><input id="task-deadline" type="number" min="1" value="60"></label>
                 <label class="field"><span>单步上限（秒）</span><input id="step-timeout" type="number" min="1" max="300" value="60"></label>
                 <label class="field field-wide"><span>远程目标白名单 <em>可选</em></span>
-                  <input id="task-endpoint" type="url" maxlength="2048" placeholder="http://host:24009/">
-                  <small>可在同一运行中使用附件固定观察与单一授权 HTTP／HTTPS 源；其他协议按当前能力明确拒绝。</small>
+                  <input id="task-endpoint" type="text" maxlength="2048" placeholder="host:24009 或 auto://host:24009">
+                  <small>可填 host:port 或 auto://host:port；d8_v22 真实运行先对同一地址做有界协议探测。http(s)://、tcp:// 仅作探测不可达时的回退提示。</small>
                 </label>
                 <fieldset id="http-methods-control" class="field field-wide" hidden>
                   <legend>允许的 HTTP 方法</legend>
                   <label><input type="checkbox" name="http-method" value="GET" checked> GET</label>
                   <label><input type="checkbox" name="http-method" value="HEAD" checked> HEAD</label>
                   <label><input type="checkbox" name="http-method" value="OPTIONS" checked> OPTIONS</label>
-                  <label><input type="checkbox" name="http-method" value="POST"> POST</label>
-                  <label><input type="checkbox" name="http-method" value="PUT"> PUT</label>
-                  <label><input type="checkbox" name="http-method" value="PATCH"> PATCH</label>
+                  <label><input type="checkbox" name="http-method" value="POST" checked> POST</label>
+                  <label><input type="checkbox" name="http-method" value="PUT" checked> PUT</label>
+                  <label><input type="checkbox" name="http-method" value="PATCH" checked> PATCH</label>
                   <label><input type="checkbox" name="http-method" value="DELETE"> DELETE</label>
                   <small>仅对本题授权源生效；修改状态的方法需明确勾选。网页内容不能扩大权限。</small>
                 </fieldset>

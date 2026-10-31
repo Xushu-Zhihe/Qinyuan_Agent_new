@@ -595,8 +595,8 @@ class DockerRuntime:
                     expected=output_stream,
                 )
 
-        stdout_bytes, stdout_truncated = stdout_buffer.render()
-        stderr_bytes, stderr_truncated = stderr_buffer.render()
+        stdout_bytes, stdout_truncated, stdout_total = stdout_buffer.render()
+        stderr_bytes, stderr_truncated, stderr_total = stderr_buffer.render()
 
         return CommandResult(
             sandbox_id=sandbox_id,
@@ -610,6 +610,8 @@ class DockerRuntime:
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
             termination_confirmed=execution_info.get("Running") is False,
+            stdout_bytes=stdout_total,
+            stderr_bytes=stderr_total,
         )
 
     def interrupt(self, sandbox_id: str) -> None:
@@ -915,11 +917,11 @@ class _BoundedByteBuffer:
             if len(self.tail) > self.tail_limit:
                 del self.tail[:-self.tail_limit]
 
-    def render(self) -> tuple[bytes, bool]:
-        """返回最终字节内容以及是否发生过截断。"""
+    def render(self) -> tuple[bytes, bool, int]:
+        """返回最终字节内容、是否截断，以及截断前的总字节数。"""
 
         if self.total_bytes <= self.limit:
-            return bytes(self.head + self.tail), False
+            return bytes(self.head + self.tail), False, self.total_bytes
 
         omitted = (
             self.total_bytes
@@ -931,4 +933,4 @@ class _BoundedByteBuffer:
             f"\n...[{omitted} bytes omitted by Sandbox Runtime]...\n"
         ).encode("utf-8")
 
-        return bytes(self.head) + marker + bytes(self.tail), True
+        return bytes(self.head) + marker + bytes(self.tail), True, self.total_bytes

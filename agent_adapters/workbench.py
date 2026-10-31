@@ -26,6 +26,7 @@ from uuid import UUID, uuid4
 import frontend
 from agent_adapters.workbench_contracts import ACTIVE_RUN_STATUSES, WorkbenchError
 from agent_core.runtime import TERMINAL_STATUSES
+from agent_core.web_contracts import D7_WEB_DEFAULT_METHODS
 
 FRONTEND = Path(frontend.__file__).resolve().parent
 MAX_JSON_BYTES = 64 * 1024
@@ -53,11 +54,20 @@ def endpoint(value: str, *, allow_private_ipv4=False) -> str:
         raise WorkbenchError("endpoint_required")
     from Sandbox.target_address import TargetAddress, TargetAddressError
 
+    raw = value.strip()
+    auto = raw.lower().startswith("auto://") or "://" not in raw
     try:
-        TargetAddress.from_url(value,allow_private_ipv4=allow_private_ipv4)
+        if auto:
+            candidate = raw[7:] if raw.lower().startswith("auto://") else raw
+            target = TargetAddress.from_url("tcp://" + candidate,
+                                            allow_private_ipv4=allow_private_ipv4)
+            host = f"[{target.host}]" if ":" in target.host else target.host
+            return f"auto://{host}:{target.port}"
+        # Explicit HTTP(S)/TCP remains a hint; run start still probes it.
+        TargetAddress.from_url(raw, allow_private_ipv4=allow_private_ipv4)
     except TargetAddressError as exc:
         raise WorkbenchError("invalid_endpoint") from exc
-    return value
+    return raw
 
 
 DEFAULT_DESCRIPTION_MARKER = "\n\n[默认说明]\n"
@@ -182,7 +192,7 @@ class Workbench:
             if "step_timeout_seconds" not in columns:
                 db.execute("ALTER TABLE challenges ADD COLUMN step_timeout_seconds INTEGER NOT NULL DEFAULT 60")
             if 'http_methods_json' not in columns:
-                db.execute("ALTER TABLE challenges ADD COLUMN http_methods_json TEXT NOT NULL DEFAULT '[\"GET\",\"HEAD\",\"OPTIONS\"]'")
+                db.execute("ALTER TABLE challenges ADD COLUMN http_methods_json TEXT NOT NULL DEFAULT '[\"GET\",\"HEAD\",\"OPTIONS\",\"POST\",\"PUT\",\"PATCH\"]'")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
@@ -351,7 +361,7 @@ class Workbench:
 
     def create(self, value):
         title, category, description, target, deadline, step_timeout = challenge_fields(value,allow_private_ipv4=self.protocol_version == 3 and self.execution_profile == "d8_v22")
-        methods = http_methods(value.get('http_methods', ['GET', 'HEAD', 'OPTIONS']))
+        methods = http_methods(value.get('http_methods', list(D7_WEB_DEFAULT_METHODS)))
         if 'http_methods' in value and self.execution_profile not in {'d8_v20','d8_v21','d8_v22'}:
             raise WorkbenchError('http_methods_profile_unsupported')
         challenge_id, timestamp = str(uuid4()), now()
@@ -368,7 +378,7 @@ class Workbench:
         title, category, description, target, deadline, step_timeout = challenge_fields(value,allow_private_ipv4=self.protocol_version == 3 and self.execution_profile == "d8_v22")
         with self.lock, self._db() as db:
             current = self._get(db, challenge_id)
-            methods = http_methods(value.get('http_methods', current.get('http_methods', ['GET', 'HEAD', 'OPTIONS'])))
+            methods = http_methods(value.get('http_methods', current.get('http_methods', list(D7_WEB_DEFAULT_METHODS))))
             if 'http_methods' in value and self.execution_profile not in {'d8_v20','d8_v21','d8_v22'}:
                 raise WorkbenchError('http_methods_profile_unsupported')
             if current["status"] != "draft" or current["archived"]:

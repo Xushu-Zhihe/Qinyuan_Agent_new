@@ -594,3 +594,44 @@ def test_http_exec_failure_diagnostic_distinguishes_parent_branches(branch, stat
             timeout_seconds=3, max_response_bytes=2097152)
     detail = safe_failure_details(caught.value)["http_diagnostic"]
     assert detail["branch"] == branch and "PRIVATE" not in json.dumps(detail)
+
+
+def test_http_worker_rejected_before_send_is_a_known_rejection(monkeypatch):
+    """A URL the worker cannot even prepare is known, never an unknown side effect."""
+    import http.client
+    from agent_adapters.output_evidence import safe_failure_details
+
+    class Connection:
+        def __init__(self, *args, **kwargs): pass
+        def putrequest(self, *args, **kwargs):
+            raise http.client.InvalidURL("URL can't contain control characters")
+        def putheader(self, *args): pass
+        def endheaders(self, body): pass
+        def getresponse(self): raise AssertionError("must not reach the peer")
+        def close(self): pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+    request = dict(scheme="http", host="example.test", port=80, authority="example.test:80", method="GET",
+        path_query="/bad path", headers=[], body_b64="", timeout_seconds=2, max_response_bytes=2097152,
+        max_header_bytes=65536, max_header_count=100, max_header_value_bytes=8192)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode()+b"\n")))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), pytest.raises(SystemExit) as stopped:
+        exec(_HTTP_WORKER, {})
+    assert stopped.value.code == 1
+    failure = json.loads(output.getvalue())
+    assert failure["error_type"] == "InvalidURL"
+    assert failure["code"] == "http.worker.request_prepare_failed"
+
+    task = str(uuid4()); config = _config(task)
+    api = _ExecApi(_frame(1, output.getvalue().encode()))
+    api.exec_inspect = lambda identity: dict(Running=False, ExitCode=1)
+    sandbox, sandbox_id = _sandbox(task, api)
+    transport = D7SandboxHttpTransport(sandbox, sandbox_id=sandbox_id, run_config=config,
+        network_binding=_network_binding(), target_network=_TargetNetwork())
+    with pytest.raises(HttpCapabilityError, match="d7_http_dispatch_rejected") as caught:
+        transport.send(origin=transport_origin(config.endpoint), method="GET", path_query="/bad path",
+            headers=(), body=b"", timeout_seconds=3, max_response_bytes=2097152)
+    detail = safe_failure_details(caught.value, include_chain=True)["http_diagnostic"]
+    assert detail["worker_phase"] == "request_prepare"
+    assert detail["error_type"] == "InvalidURL"

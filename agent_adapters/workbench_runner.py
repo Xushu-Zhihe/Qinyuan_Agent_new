@@ -212,10 +212,16 @@ class Runner:
                     from agent_adapters.workbench import http_methods
                     http_methods(challenge.get('http_methods'))
                     try:
-                        if challenge['endpoint'].startswith('tcp://') and self.workbench.execution_profile == 'd8_v22':
-                            canonical_tcp_endpoint(challenge['endpoint'])
+                        from agent_adapters.target_probe import endpoint_for, parse_endpoint
+                        host, port, explicit, _raw = parse_endpoint(challenge['endpoint'])
+                        if explicit == 'tcp' and self.workbench.execution_profile == 'd8_v22':
+                            canonical_tcp_endpoint(endpoint_for(host, port, 'tcp'))
+                        elif explicit in {'http', 'https'}:
+                            canonical_web_origin(endpoint_for(host, port, explicit))
+                        elif explicit is None:
+                            pass  # protocol_auto; the run-start probe decides.
                         else:
-                            canonical_web_origin(challenge['endpoint'])
+                            raise ValueError("unsupported endpoint scheme")
                     except (TypeError, ValueError):
                         raise WorkbenchError('d20_http_endpoint_invalid', 409) from None
             else:
@@ -325,17 +331,32 @@ class Runner:
                     if mode == "real":
                         from agent_adapters.simulation import real_config
                         from agent_adapters.deepseek_roles import role_config
-                        is_tcp = self.workbench.execution_profile == 'd8_v22' and challenge['endpoint'].startswith('tcp://')
-                        is_http = self.workbench.execution_profile in {'d8_v20','d8_v21','d8_v22'} and bool(challenge['endpoint']) and not is_tcp
+                        endpoint = challenge['endpoint']
+                        if self.workbench.execution_profile == 'd8_v22' and endpoint:
+                            from agent_adapters.target_probe import probe_target
+                            try:
+                                probe = probe_target(endpoint, timeout=min(
+                                    1.5, max(0.4, challenge['step_timeout_seconds'] / 20)))
+                            except ValueError as exc:
+                                raise WorkbenchError(
+                                    "target_protocol_probe_failed", 409) from None
+                            endpoint = probe.endpoint
+                            from qinyuan_core import get_logger
+                            get_logger("ctrl").info(
+                                "target.protocol_probed", challenge=challenge["id"],
+                                protocol=probe.protocol, endpoint=endpoint,
+                                detected=probe.detected)
+                        is_tcp = self.workbench.execution_profile == 'd8_v22' and endpoint.startswith('tcp://')
+                        is_http = self.workbench.execution_profile in {'d8_v20','d8_v21','d8_v22'} and bool(endpoint) and not is_tcp
                         request["d8_config"] = real_config(contract_version=int(self.workbench.execution_profile.removeprefix("d8_v")),
                             http=is_http, http_timeout_seconds=challenge['step_timeout_seconds'])
                         if is_tcp:
-                            endpoint = canonical_tcp_endpoint(challenge['endpoint'])
+                            endpoint = canonical_tcp_endpoint(endpoint)
                             request['task_request']['target']['endpoints'] = [{'url': endpoint}]
                             request['authorization'] = dict(authorization_id=str(uuid4()), allowed_endpoint=endpoint,
                                 allowed_tool='sandbox_tcp', network_allowed=True, attachment_indices=list(range(len(names))))
                         if is_http:
-                            origin = canonical_web_origin(challenge['endpoint'])
+                            origin = canonical_web_origin(endpoint)
                             request['task_request']['target']['endpoints'] = [{'url': origin}]
                             request['authorization'] = dict(authorization_id=str(uuid4()), allowed_origin=origin,
                                 allowed_methods=challenge['http_methods'], allowed_tool='d7_http_request',

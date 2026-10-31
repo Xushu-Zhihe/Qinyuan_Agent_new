@@ -737,3 +737,27 @@ def test_peer_that_does_not_speak_http_is_a_recoverable_rejection(http_case):
     # The rejected request is settled: reconciling neither replays nor reopens it.
     c.app.mcp.reconcile()
     assert c.app.store.load_d4_operation(report['requests'][0]).completion.result_kind=='rejected'
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+def test_request_rejected_before_send_is_a_recoverable_rejection(http_case):
+    """A URL rejected before send must fail this tool, not the whole TaskRun."""
+    c=http_case
+    calls=setup(c,"request('GET','/')\nprint('blocked')")
+    from agent_adapters.web.http_adapter import HttpCapabilityError
+    class RejectingTransport:
+        def send(self,**kwargs):
+            c.sends.append(kwargs)
+            raise HttpCapabilityError('d7_http_dispatch_rejected')
+    c.app.web.transport_factory=lambda _:RejectingTransport()
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required,result
+    report=c.app.mcp.experiments.result(calls[0])
+    assert report['status']=='rejected' and report['code']=='d7_http_dispatch_rejected'
+    assert report['failure']==dict(category='policy',phase='target_request',code='d7_http_dispatch_rejected')
+    assert len(report['requests'])==1 and len(c.sends)==1
+    failure=c.app.mcp.evidence.read('experiment-failure',report['requests'][0])
+    assert failure['code']=='d7_http_dispatch_rejected' and failure['phase']=='http_execute'
+    # The rejected request is settled: reconciling neither replays nor reopens it.
+    c.app.mcp.reconcile()
+    assert c.app.store.load_d4_operation(report['requests'][0]).completion.result_kind=='rejected'

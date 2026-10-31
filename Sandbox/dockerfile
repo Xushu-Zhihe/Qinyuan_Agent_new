@@ -95,34 +95,51 @@ RUN rm -rf /var/lib/apt/lists/* \
         curl \
         file \
         binutils \
+        binwalk \
+        bzip2 \
+        cabextract \
+        e2fsprogs \
         elfutils \
         gdb \
         gdb-multiarch \
         gdbserver \
         gcc \
         gcc-mingw-w64-x86-64 \
+        innoextract \
+        libarchive-tools \
         libc6-dev \
         libicu72 \
         libssl3 \
         ltrace \
+        lz4 \
+        msitools \
         ncurses-term \
         netcat-openbsd \
         nmap \
         openjdk-17-jre-headless \
+        p7zip-full \
         patchelf \
         perl \
         php-cli \
         procps \
         python3 \
+        python3-capstone \
         python3-pip \
         python3-venv \
         qemu-system-x86 \
         qemu-user-static \
         ruby \
         socat \
+        squashfs-tools \
         strace \
         tmux \
+        unrar-free \
+        unzip \
+        xxd \
+        xz-utils \
+        zip \
         zlib1g \
+        zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # yama ptrace_scope=1 plus a non-root uid blocks `gdb -p` on processes started
@@ -133,6 +150,12 @@ COPY Sandbox/qinyuan_exec.c /tmp/qinyuan_exec.c
 RUN gcc -O2 -Wall -Wextra -o /usr/local/bin/qinyuan-exec /tmp/qinyuan_exec.c \
     && rm /tmp/qinyuan_exec.c \
     && chmod 0755 /usr/local/bin/qinyuan-exec
+
+# binwalk 2.3.x needs capstone 4/5; the runtime PYTHONPATH exposes capstone 6.
+# Keep the Debian interpreter path for this one CLI instead of weakening the
+# analysis environment.
+COPY Sandbox/binwalk.sh /usr/local/bin/binwalk
+RUN chmod 0755 /usr/local/bin/binwalk
 
 RUN ln -s /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
 
@@ -243,6 +266,25 @@ RUN mkdir -p /opt/qinyuan/wordlists \
     && command -v qemu-x86_64-static >/dev/null \
     && command -v qemu-system-x86_64 >/dev/null \
     && command -v cpio >/dev/null \
+    && command -v unzip >/dev/null \
+    && command -v zip >/dev/null \
+    && command -v 7z >/dev/null \
+    && command -v bsdtar >/dev/null \
+    && command -v zstd >/dev/null \
+    && command -v xz >/dev/null \
+    && command -v bzip2 >/dev/null \
+    && command -v lz4 >/dev/null \
+    && command -v cabextract >/dev/null \
+    && command -v xxd >/dev/null \
+    && command -v unsquashfs >/dev/null \
+    && command -v binwalk >/dev/null \
+    && binwalk --help >/dev/null 2>&1 \
+    && command -v debugfs >/dev/null \
+    && debugfs -V >/dev/null 2>&1 \
+    && command -v debugfs >/dev/null \
+    && command -v unrar-free >/dev/null \
+    && command -v msiextract >/dev/null \
+    && command -v innoextract >/dev/null \
     && command -v one_gadget >/dev/null \
     && command -v pwntools-terminal >/dev/null \
     && command -v qinyuan-exec >/dev/null \

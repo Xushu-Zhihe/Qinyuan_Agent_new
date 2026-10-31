@@ -1,4 +1,4 @@
-﻿"""Confirmed D9-3 profile. Never loads dotenv, pulls images or prepares networks."""
+"""Confirmed D9-3 profile. Never loads dotenv, pulls images or prepares networks."""
 
 import json
 import os
@@ -18,12 +18,12 @@ from Sandbox.windows_sandbox import WindowsSandboxSettings, WindowsTaskRunSandbo
 STARTUP_READY_TIMEOUT_SECONDS = 10.0
 
 
-IMAGE_REF = "qinyuan/pentest-sandbox:0.3.6"
-IMAGE_ID = "sha256:8c7acdea0c13fa5e23d2c8d0d7fc1c10d2541069cebbe5c79d8537d36cac5686"
+IMAGE_REF = "qinyuan/pentest-sandbox:0.3.7"
+IMAGE_ID = "sha256:f081157d62066f46141597c5ea191136e44e67253ed6c11b5b27e1ce7f46e4af"
 
-WINDOWS_IMAGE_REF = "qinyuan/windows-sandbox:0.3.6"
-WINDOWS_IMAGE_ID = "sha256:29bed6bdb9f80a37aaf382fe1a1e908012ff3c55b3a7fbaada2ef21017da6a6b"
-WINDOWS_PROFILE = "windows-wine-v1"
+WINDOWS_IMAGE_REF = "qinyuan/windows-sandbox:0.3.8"
+WINDOWS_IMAGE_ID = "sha256:3cab772fadaeadfbe3629ada36a4e44c60841bf0da5429e55d63e1944c87118f"
+WINDOWS_PROFILE = "windows-wine-v2"
 
 
 def settings():

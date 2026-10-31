@@ -377,7 +377,8 @@ def shape_issues(value, schema, path="$"):
         extra = [key for key in value if key not in fields]
         additional = schema.get("additionalProperties", False)
         if extra and additional is False:
-            result.append(D8FormatIssue("field_unknown", path + "/<unknown>", "declared_field", "unknown"))
+            names = ",".join(sorted(extra))[:200]
+            result.append(D8FormatIssue("field_unknown", path + "/" + sorted(extra)[0], "declared_field", names))
         elif extra and isinstance(additional, Mapping):
             # Open maps such as HTTP headers declare a value schema instead of a
             # closed field list, so their keys must not be reported as unknown.

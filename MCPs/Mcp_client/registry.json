@@ -1,4 +1,4 @@
-﻿{
+{
   "mcpServers": {
     "nmap": {
       "transport": "stdio",
@@ -128,7 +128,7 @@
       "cwd": "../Wine_Mcp",
       "args": ["server.py"],
       "tags": ["windows", "wine", "dynamic-analysis", "debugging"],
-      "sandboxTools": ["wine", "tmux"],
+      "sandboxTools": ["qy-wine64", "qy-wine32", "qy-wine-auto", "bash", "tmux"],
       "enabled": true
     },
     "curl": {

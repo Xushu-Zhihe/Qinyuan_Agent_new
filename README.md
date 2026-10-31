@@ -99,10 +99,16 @@ if (-not (Test-Path .env)) {
 | `QINYUAN_LLM_CONNECT_TIMEOUT_SECONDS` | 模型建连，默认 `10` 秒 |
 | `QINYUAN_LLM_FIRST_OUTPUT_TIMEOUT_SECONDS` | 连接后首次非空推理／正文增量，默认 `180` 秒 |
 | `QINYUAN_LLM_IDLE_TIMEOUT_SECONDS` | 开始生成后无新增推理／正文，默认 `60` 秒 |
+| `QINYUAN_MCP_OUTPUT_CHARACTER_LIMIT` | MCP 工具结果给模型的单流预览字符数，默认 `64000` |
+| `QINYUAN_SANDBOX_MAX_OUTPUT_BYTES` | 每个 stdout/stderr 在宿主机保留的字节上限，默认 `524288` |
+
+工具输出不是一次性全量进入模型：单流最多保留 `QINYUAN_SANDBOX_MAX_OUTPUT_BYTES` **字节**，解码后预览再按 `QINYUAN_MCP_OUTPUT_CHARACTER_LIMIT` **字符**截断，并在结果中返回 `stdout_bytes`/`stderr_bytes` 与 truncation 标志。默认 `512 KiB = 524,288 bytes` 与 `64,000 characters` 是两个不同层级的独立上限，不是同一个数。逆向等大输出应重定向到 `/workspace/work/<name>.out`，再用 `grep`/`sed`/`wc` 分页读取；13.5MB 级输出不应期望单条消息完整返回。
 
 当前 D8 模型使用 SSE 流式接收，只在完整响应通过原校验后采用决策。心跳不延长生成等待；当前内外层统一thinking=enabled、reasoning_effort=high，不新增默认max_tokens。省略总时限配置才采用600秒；已有 `.env` 显式180仍为180，需要你调整后用于新运行。实际角色/超时策略在运行内冻结，恢复时改变配置会明确拒绝，已有任务不静默改档。诊断保留计数和时间，不保存完整思考；上游未提供 usage 时保持未知。细节见 [上限索引](restrict/explicit_limits_index.md)。
 
 真实运行统一按已核实的模型与端点匹配容量，不再按内部契约版本切换：官方Flash／Pro及已确认的官方Flash别名采用1M上下文、384K输出保守预留，SCNET保留其已确认映射；未知模型／端点明确报配置错误，已移除旧容量策略及兼容回退，旧容量声明不再接受且历史文件不改写。不把预留发送为max_tokens。输入仍按完整序列化字节作保守估算，不冒充精确token。完整请求不足会自动尝试一次有界历史整理，保留原证据和近期对话；局部阻塞且其他分支通过准入探测时技术挂起，任务级阻塞则保留进展并等待有效变化或原deadline。`status`用`capacity_block`说明原因，不增加人工扩容流程。
+
+远程入口可以填 `host:port` 或 `auto://host:port`：`d8_v22` 真实运行会先对同一个 host:port 做一次有界协议探测（先读 banner，再尝试 TLS/HTTP），探测结果决定本轮冻结为 HTTP/HTTPS 还是 raw TCP；`http://`、`https://`、`tcp://` 只作为探测不可达时的显式回退提示，不再是不可更改的协议事实。
 
 新建真实d8_v22运行可用`web.search`／`web.fetch`自主检索公共资料。独立搜索Key可放在同一env文件或进程环境；未配置时，仅主模型为DeepSeek官方端点才复用其Key，无可用凭据不展示工具。检索与主模型分开配置，原文取回受公共地址准入，结果不自动成为Fact或目标观测。长正文先返回明确预览，可按details_ref用现有历史详情接口分页读取，不必再次Fetch。真实账号和检索效果需另验。检索选择按未确认的公开知识缺口及其对下一决策的价值判断，也可选择有判别力的现场验证；不会按版本号、次数或“没搜索”强制触发。
 

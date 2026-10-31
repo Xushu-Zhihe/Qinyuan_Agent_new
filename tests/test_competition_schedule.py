@@ -1,4 +1,4 @@
-"""C01-3 controlled operator/competition tests; no real Docker, model or platform."""
+﻿"""C01-3 controlled operator/competition tests; no real Docker, model or platform."""
 import asyncio
 from uuid import uuid4
 import pytest
@@ -593,7 +593,7 @@ def test_arena_pwn_question_waits_for_the_late_address_instead_of_starting_on_em
     now[0]+=5;service.tick()
     current=service.get(row["id"])["state"];challenge=current["challenge_id"]
     assert challenge is not None and current.get("address_wait_started") is None
-    assert p.workbench.get(challenge)["endpoint"]=="http://10.0.1.5:8080"
+    assert p.workbench.get(challenge)["endpoint"]=="tcp://10.0.1.5:8080"
     assert starts==[challenge] and current["status"]=="running"
 
 
@@ -803,3 +803,21 @@ def test_finish_treats_a_missing_abandon_endpoint_as_unsupported(platform,monkey
     service.command(row["id"],dict(action="finish"))
     state=service.get(row["id"])["state"]
     assert state["status"]=="finished" and state["question_abandoned"]=="unsupported"
+
+
+
+def test_arena_pwn_prefers_tcp_while_other_categories_keep_the_session_scheme():
+    assert module._prefers_tcp({"category":"Pwn"},"arena")
+    assert module._prefers_tcp({"category":"pwn"},"arena")
+    assert not module._prefers_tcp({"category":"Web"},"arena")
+    assert not module._prefers_tcp({"category":"Pwn"},"benchmark")
+    assert not module._prefers_tcp({},"arena")
+
+
+def test_tcp_origin_is_canonical_and_requires_a_port():
+    from agent_adapters.competition import _target_origin
+    assert _target_origin("tcp://10.0.1.5:8080")=="tcp://10.0.1.5:8080"
+    with pytest.raises(ValueError):
+        _target_origin("tcp://10.0.1.5")
+    with pytest.raises(ValueError):
+        _target_origin("tcp://10.0.1.5:8080/path")

@@ -32,6 +32,18 @@ def _default_description(value):
     return value.strip()
 
 
+def _prefers_tcp(item,adapter):
+    """Arena Pwn questions are raw TCP services.
+
+    Web/reverse/crypto/misc keep the session's configured scheme; only the
+    arena adapter maps an explicit ``Pwn`` type to ``tcp://`` so the Workbench
+    builds a TCP authorization instead of an HTTP one.
+    """
+    if adapter!="arena" or not isinstance(item,dict):return False
+    category=item.get("category")
+    return isinstance(category,str) and category.strip().lower()=="pwn"
+
+
 def _should_wait_address(item,adapter):
     """Poll for an address only while a live web/pwn question still has none; never require one."""
     if not isinstance(item,dict) or item.get("addresses"):return False
@@ -352,6 +364,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
     def target(self,row,item):
         from agent_core.turn_modeling import digest
         scope=digest({k:row["config"]["profile"][k] for k in ("id","adapter","base_url")})
+        prefer_tcp=_prefers_tcp(item,row["config"]["profile"]["adapter"])
         with self.workbench._db() as db:
             existing=db.execute("SELECT challenge_id FROM competition_questions WHERE scope_sha256=? AND remote_ref=?",(scope,json.dumps(item["remote_ref"]))).fetchone()
         if existing is not None:
@@ -362,10 +375,19 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 # blocking the platform question for the rest of the session.
                 with self.workbench._db() as db:db.execute("DELETE FROM competition_questions WHERE challenge_id=?",(existing[0],))
                 selected=None
-            if selected and any(_matches_target(raw,selected) for raw in item["addresses"]):return selected
+            if selected and any(_matches_target(raw,selected) for raw in item["addresses"]):
+                # A legacy HTTP binding for a Pwn question is migrated to TCP once
+                # the challenge is draft; otherwise it would keep the HTTP-only
+                # authorization this adapter is fixing.
+                if not (prefer_tcp and not selected.startswith("tcp://")):
+                    return selected
         origins=[]
         for address in item["addresses"]:
-            raw=address if "://" in address else row["config"]["default_scheme"]+"://"+address
+            if "://" in address:
+                raw=address
+            else:
+                scheme="tcp" if prefer_tcp else row["config"]["default_scheme"]
+                raw=scheme+"://"+address
             try:origin=_target_origin(raw)
             except (TypeError,ValueError):raise WorkbenchError("competition_target_protocol_unsupported",409) from None
             if origin not in origins:origins.append(origin)

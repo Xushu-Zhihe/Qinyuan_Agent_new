@@ -88,6 +88,8 @@ class MCPExecutionResult:
     timed_out: bool
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
 
     def to_tool_payload(self) -> dict[str,Any]:
         """生成可以安全返回给 Agent的结果"""
@@ -102,6 +104,8 @@ class MCPExecutionResult:
             "stderr":self.stderr,
             "stdout_truncated":self.stdout_truncated,
             "stderr_truncated": self.stderr_truncated,
+            "stdout_bytes": self.stdout_bytes,
+            "stderr_bytes": self.stderr_bytes,
             "timed_out": self.timed_out,
         }
 
@@ -243,7 +247,7 @@ class MCPManager:
         shutdown_timeout_seconds: float = 10.0,
         sandbox_execution_grace_seconds: float = 10.0,
         sandbox_interrupt_timeout_seconds: float = 10.0,
-        output_character_limit: int = 20_000,
+        output_character_limit: int = 64_000,
         audit_path: str | Path | None = None,
         bootstrap_marker_path: str | Path | None = None,
         required_servers: Iterable[str] | None = None,
@@ -727,6 +731,8 @@ class MCPManager:
             timed_out=result.timed_out,
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
+            stdout_bytes=result.stdout_bytes,
+            stderr_bytes=result.stderr_bytes,
         )
         await self._write_audit(
             {
@@ -738,6 +744,8 @@ class MCPManager:
                 "timed_out": result.timed_out,
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
+                "stdout_bytes": result.stdout_bytes,
+                "stderr_bytes": result.stderr_bytes,
             }
         )
         return execution_result
@@ -1049,7 +1057,7 @@ async def build_mcp_runtime(
             os.environ.get("QINYUAN_SANDBOX_INTERRUPT_TIMEOUT_SECONDS", "10")
         ),
         output_character_limit=int(
-            os.environ.get("QINYUAN_MCP_OUTPUT_CHARACTER_LIMIT", "20000")
+            os.environ.get("QINYUAN_MCP_OUTPUT_CHARACTER_LIMIT", "64000")
         ),
         required_servers=required_servers,
         audit_path=audit_path,

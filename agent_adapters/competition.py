@@ -12,6 +12,7 @@ from urllib.parse import urlsplit, urlencode, urljoin
 from uuid import UUID, uuid4
 
 from agent_adapters.workbench_contracts import WorkbenchError
+from agent_core.web_contracts import D7_WEB_DEFAULT_METHODS
 from qinyuan_core import get_logger
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -40,9 +41,20 @@ def _origin(value):
 
 
 def _target_origin(value):
-    """Explicit HTTP(S) URLs use standard ports; original paths remain question data."""
+    """Canonical HTTP(S) origin, or the exact TCP endpoint for ``tcp://``.
+
+    Arena Pwn questions are raw TCP services; HTTP(S) questions keep the
+    standard-port origin behavior. Both forms are normalized so a stored
+    challenge endpoint and a fresh platform address compare equal.
+    """
+    parsed = urlsplit(value)
+    if parsed.scheme == "tcp":
+        from agent_core.target_contracts import canonical_tcp_endpoint
+        try:
+            return canonical_tcp_endpoint(value)
+        except (TypeError, ValueError):
+            raise ValueError("competition_target_protocol_unsupported") from None
     from agent_core.web_contracts import canonical_web_origin
-    parsed=urlsplit(value)
     if parsed.scheme not in {"http","https"} or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.fragment:
         raise ValueError("competition_target_protocol_unsupported")
     host=parsed.hostname
@@ -493,7 +505,7 @@ class CompetitionConnections:
                 local=self.workbench.create(dict(title=item["display_name"][:160],category=category,
                     description=description,endpoint=target,deadline_minutes=minutes,
                     step_timeout_seconds=value.get("step_timeout_seconds",60),
-                    http_methods=value.get("http_methods",["GET","HEAD","OPTIONS"])))
+                    http_methods=value.get("http_methods",list(D7_WEB_DEFAULT_METHODS))))
                 with self.workbench._db() as db:
                     db.execute("INSERT INTO competition_questions VALUES (?,?,?,?,?)",(local["id"],identity,scope,remote,json.dumps(snapshot,ensure_ascii=True)))
             if target and local["status"]=="draft" and not local["archived"] and local["endpoint"]!=target:

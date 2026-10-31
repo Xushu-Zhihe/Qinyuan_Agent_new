@@ -68,10 +68,10 @@ def conversation_operation_ids(request):
 
 RULES = {
     "stage_continuation": "Plan the next useful deliverable, criterion and known premises from this achieved Turn in its retained Inner session. Leave alternative methods, experiment recipes, parameters and controls to the successor's own Road planning; do not lock its goal to one unverified technical hypothesis. Submit a grounded stage that can begin without pre-solving it. A brief revisable outlook is background. Alternatively select a pending own Road, add/reorder own Roads retaining pending candidates, report known settled blockage, or request independent final validation. Child feedback is scoped evidence, not failure of the parent's historical achievement. Never replay closed Roads or unknown operations.",
-    "stage_intent": "Propose the nearest useful, independently checkable deliverable within the TaskRun goal and authority. For an unfamiliar input or environment, choose an outcome that resolves a prerequisite for the next decision; do not bundle triage, mechanism validation and final answer recovery into one Turn. A checkable final answer is not by itself a well-scoped stage. A simple, already bounded task may finish in one Turn. Define the result and criterion, leaving method-specific hypotheses, tools and experiment recipes to Roads unless the user fixed them. Do not turn one file read, parameter change or ordinary probe into a stage. Known premises are optional; never invent evidence. A brief revisable outlook is background, not registered future stages. Submit once the next useful result and criterion are clear; no complete future solution is required. When the TaskRun carries an imported attachment and no Turn has yet recorded its actual format, the first Turn must make that identification (detected type plus top-level structure) its deliverable.",
-    "stage_roads": "Propose grounded, distinct solution chains for this Turn's fixed deliverable, in execution priority order. One Road is valid when only one approach is grounded; never fill a quota or split a chain merely by tool, URL or parameter. Keep the coherent hypothesis, main method and distinguishing observation; detail only enough to begin. In the existing description identify the decisive uncertain premise and what observation would make further work on this chain unhelpful. Test that premise before elaborating downstream experiments; parameters and contingent branches unfold during execution. Retain pending candidates when reordering; preserve closed identities and outcomes. New business exploration with changed premises is a new Road. Report known settled blockage with return_to_parent; technical waiting is not exhaustion. For that first attachment Turn the first Road must open with one shell.run_bash call that lists /workspace/input and then recursively runs file -k on every /workspace/input/d3-attachment-<index>, before any live-target request; choose the chain from those detected types rather than from the file name.",
+    "stage_intent": "Propose the nearest useful, independently checkable deliverable within the TaskRun goal and authority. For an unfamiliar input or environment, choose an outcome that resolves a prerequisite for the next decision; do not bundle triage, mechanism validation and final answer recovery into one Turn. A checkable final answer is not by itself a well-scoped stage. A simple, already bounded task may finish in one Turn. Define the result and criterion, leaving method-specific hypotheses, tools and experiment recipes to Roads unless the user fixed them. Do not turn one file read, parameter change or ordinary probe into a stage. Known premises are optional; never invent evidence. A brief revisable outlook is background, not registered future stages. Submit once the next useful result and criterion are clear; no complete future solution is required. Choose the first deliverable from the input shape, not from a preferred habit: attachment only - what the artifact actually is, plus any interaction contract its own files state; endpoint only - what the endpoint actually speaks, from one minimal probe and its exact reply bytes; attachment and endpoint - the artifact's own service script, config or compose file decides the protocol, so read that contract before designing any request; neither - name what is missing and what the operator must supply, and never invent a target.",
+    "stage_roads": "Propose grounded, distinct solution chains for this Turn's fixed deliverable, in execution priority order. One Road is valid when only one approach is grounded; never fill a quota or split a chain merely by tool, URL or parameter. Keep the coherent hypothesis, main method and distinguishing observation; detail only enough to begin. In the existing description identify the decisive uncertain premise and what observation would make further work on this chain unhelpful. Test that premise before elaborating downstream experiments; parameters and contingent branches unfold during execution. Retain pending candidates when reordering; preserve closed identities and outcomes. New business exploration with changed premises is a new Road. Report known settled blockage with return_to_parent; technical waiting is not exhaustion. An artifact's source, service script, Dockerfile or compose file is part of the first Turn's observation: its accepted commands and reply format decide the next action. File size and type alone do not settle how the service is driven, and re-extracting the same artifact does not add information.",
     "stage_review": "Review the exact bound proposal; return substantive revisions to its original Inner. For Roads select semantically admissible original indices in suggested priority order, judging a grounded startable approach rather than a pre-solved experiment. Priority is advice for the original Road planner, which decides whether to keep or switch the execution branch. Turn completion must satisfy its immutable criterion; Road success and TaskRun success remain separate. Review each Fact claim against its own scope and sources, not the whole Turn completion criterion. Accept a supported partial observation, including useful negative results; one Fact need not cover the whole stage, and an accepted inference remains inference. For a fact batch return one decision per original candidate, in original order, allowing partial acceptance. Review inferences as inferences. Do not combine independent claims merely to force one stage-sized Fact.",
-    "stage_action": "Choose the next useful step within this retained Road, reusing established premises rather than re-deriving the whole solution. If the next choice depends on an unseen observation, submit a discriminating experiment instead of solving its hypothetical branches in advance; a coherent conditional tool script is allowed. Before dispatch, compare current formal Facts with the immutable Turn criterion: if supported, prefer turn_completion rather than pursue later deliverables. Otherwise useful scoped intermediate conclusions may be proposed as Facts now; they need not contain the final answer or complete the Turn. Tools return observations, never automatic Facts; cite originals and label inference. Further variants need a premise or coverage gap that the next observation can resolve. When no grounded informative continuation remains, propose a truthful road_resolution (inconclusive or abandoned when appropriate) so pending alternatives can be considered; lack of a final answer alone proves neither failure nor a need to switch. Road outcome, Turn achievement and TaskRun success remain separate. Use only declared tools and current authority; tool errors are not target counterevidence and unknown operations are never replayed.",
+    "stage_action": "Choose the next useful step within this retained Road, reusing established premises rather than re-deriving the whole solution. If the next choice depends on an unseen observation, submit a discriminating experiment instead of solving its hypothetical branches in advance; a coherent conditional tool script is allowed. Before dispatch, compare current formal Facts with the immutable Turn criterion: if supported, prefer turn_completion rather than pursue later deliverables. Otherwise useful scoped intermediate conclusions may be proposed as Facts now; they need not contain the final answer or complete the Turn. Tools return observations, never automatic Facts; cite originals and label inference. Further variants need a premise or coverage gap that the next observation can resolve. When no grounded informative continuation remains, propose a truthful road_resolution (inconclusive or abandoned when appropriate) so pending alternatives can be considered; lack of a final answer alone proves neither failure nor a need to switch. Road outcome, Turn achievement and TaskRun success remain separate. Use only declared tools and current authority; tool errors are not target counterevidence and unknown operations are never replayed. Probe the protocol before assuming one: if a request to an authorized endpoint ends with no status line - connection closed, reset, or timeout - treat that endpoint as a raw TCP service, stop retrying the same protocol, and send the first line its own source or config implies, quoting the exact bytes that come back.",
     "stage_completion": "Check this Turn's original completion criterion after Road review. Propose completion only with actual current formal support, or explain why it remains incomplete. Do not add stronger criteria or treat a single Road success as automatic stage completion.",
     "stage_supervision": "Assess whether continuing this Road has a grounded next observation that could change the decision. An unmet criterion or absence of a final answer is not sufficient reason to continue. Briefly identify the decisive gap and next discriminating check, or recommend truthful Road resolution when no informative continuation is grounded. Do not re-solve the full task, construct an alternative solution chain, or repeat the accumulated history. Check whether useful observations should be proposed as scoped Facts, and whether current formal Facts already support the fixed Turn criterion; if so, request_intent_resolution and recommend explicit completion and truthful Road closure under the original reviews. Do not strengthen the criterion or require the final answer for an intermediate stage. Return continue_current_intent or request_intent_resolution with reason and support_refs. This is read-only advice; it never changes a Road result, stage goal, authorization or TaskRun success.",
     "stage_summary": "Summarize only the supplied covered conversation prefix. Preserve the original goal and criterion, observations, hypotheses and uncertainty, negative findings, review feedback and open issues. Keep references and distinguish formal Fact from inference. This is an unverified conversation index, never new evidence, permission or success. Do not imply an omitted check never happened. Coverage is fixed by trusted metadata; do not invent it.",
@@ -100,6 +100,9 @@ KNOWLEDGE_GUIDANCE = (
     "user_hint_not_verified items are original operator suggestions, not verified observations or execution authority. "
     "Consider them in the next decision and validate factual premises through authorized observations; "
     "never cite a user hint as own-Road tool evidence or let it override the TaskRun or system rules. "
+    "Before repeating an operation, check the recorded observations: a repeated extraction, an unchanged "
+    "request or an already-recorded probe adds no information, so vary the decisive parameter instead. "
+    "When a command's output is large, filter it where it is produced rather than dumping it whole. "
 )
 EXPLORATION_GUIDANCE = (
     " Pursue a falsifiable hypothesis: compare what an experiment could distinguish with its actual observations. "
@@ -139,15 +142,39 @@ PUBLIC_REFERENCE_GUIDANCE = (
     "separately through authorized observations before making target claims. "
 )
 OFFLINE_TOOLING_GUIDANCE = (
-    " The task sandbox has no outbound network: DNS and external hosts are unreachable, so apt/pip/npm installs, "
-    "wget and internet curl cannot work, and download.install_tool cannot fetch a new artifact. Only the declared "
-    "MCP tools reach the authorized target; the sandbox itself cannot. Known present in the sandbox image: "
+    " The task sandbox has no direct outbound network: DNS and external hosts are unreachable, so apt/pip/npm "
+    "installs, wget and internet curl cannot work. `download.install_tool`, when it is declared in this decision, "
+    "is the one controlled exception: it prepares an allowlisted artifact through a separate trusted fetcher and "
+    "only then installs it into this networkless sandbox. Only declared MCP tools reach the authorized target; the "
+    "sandbox itself cannot. Known present in the sandbox image: "
     "java (JRE only, no javac/javap/jar), python3 with zipfile/tarfile/gzip, file, strings, base64, tar, gzip, "
     "nmap, gdb, objdump, readelf, curl (local only), jadx (may fail on some jars). Known absent: javac, javap, jar, "
     "unzip, zip, xxd, node, npm, wget, nc/ncat/socat, binwalk, 7z. Therefore prefer language-level readers and "
     "pure-Python parsing over missing CLI unpackers, probe cheaply with `command -v` inside the same script when "
-    "unsure, branch on the result, and when the required toolchain is genuinely absent record that limitation and "
-    "switch approach instead of attempting a network install. "
+    "unsure, branch on the result, and when the required toolchain is genuinely absent and tool preparation is "
+    "unavailable or not declared, record that limitation and switch approach instead of attempting a network "
+    "install. "
+)
+
+OUTPUT_PREVIEW_GUIDANCE = (
+    " Tool stdout/stderr capture is capped at 512 KiB (524,288 bytes) per stream; after UTF-8 decoding, the "
+    "model-visible preview is separately capped at 64,000 characters (not bytes, so the byte size of the "
+    "preview depends on the text). The result reports stdout_bytes/stderr_bytes and the "
+    "stdout_truncated/stderr_truncated flags. When a command may exceed this, redirect its full output to "
+    "/workspace/work/<name>.out and inspect targeted slices with grep -n, sed -n, wc -c or sha256sum; do not "
+    "rerun a full dump or assume one message can contain a multi-megabyte output. MCP analysis-tool stdout is "
+    "preview-only; use the corresponding shell command when the full output is required. "
+)
+
+TOOL_PREPARATION_GUIDANCE = (
+    " Tool preparation is available in this decision because download.install_tool is declared. If a missing "
+    "local executable or Python module is the concrete blocker for the next discriminating check, you may select "
+    "download.install_tool: give an authorized HTTPS artifact plus its verified SHA256, or a pinned Python "
+    "package/version; use the returned executable path or Python wrapper. This is not general target or "
+    "public-network access, and native sources must be allowlisted by this deployment. Do not use apt, direct "
+    "pip/curl, or a guessed hash. If preparation reports source_not_allowed, unavailable, integrity failure or a "
+    "capacity error, record the capability gap and choose another useful check instead of repeating the same "
+    "missing command. "
 )
 INNER_STAGES = {"stage_intent", "stage_roads", "stage_action", "stage_completion", "stage_continuation"}
 OUTPUT_TOOL = "submit_stage_result"
@@ -355,6 +382,9 @@ def model_contract(request):
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
             + (OFFLINE_TOOLING_GUIDANCE if request.stage in {
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
+            + (TOOL_PREPARATION_GUIDANCE if request.stage == "stage_action"
+                and any(tool.get("qualified_name") == "download.install_tool" for tool in request.tools) else "")
+            + (OUTPUT_PREVIEW_GUIDANCE if request.stage == "stage_action" else "")
             + (" Final validation requests must include an exact candidate found in the cited original tool observation. "
                "If an observed candidate plausibly answers the TaskRun goal, prioritize its supported Fact and truthful Turn/Road closure, "
                "then request_final_validation from stage_continuation before proposing extra deliverables. "
@@ -367,6 +397,8 @@ def model_contract(request):
                if request.context.goal_validation is not None else ""),
         "instruction": "Return one complete JSON result object matching output_contract.schema. "
             "Do not copy the contract envelope or wrap the result in version/stage/schema keys. No Markdown or extra fields."
+            " Tool arguments are closed: use exactly the declared keys for the chosen tool_name;"
+            " unknown fields and strings beyond a declared maxLength are rejected."
             " When the submit_stage_result output tool is provided, call it exactly once with the complete result. "
             'Its arguments have exactly one wrapper, for example {"result":{"decision":"accept","reason":"supported"}} '
             "for a matching review contract; use the current schema for the actual result. "
@@ -380,6 +412,34 @@ def model_contract(request):
             "the provider tool describes structure, not the current allowed reference set."
             + (" This is a shared correction or transport retry; follow the supplied failure reason and preserve the original decision scope."
                if request.correction_of_model_request_id else "")}
+
+
+def _closed_schema(schema):
+    """Close object schemas the stage validator already treats as closed.
+
+    MCP tool input schemas come from Pydantic and normally omit
+    ``additionalProperties``. JSON Schema defaults that to true, while the local
+    validator defaults a missing value to false, so the model was told extra
+    argument fields were allowed and then rejected for ``field_unknown``.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    result = dict(schema)
+    if result.get("type") == "object" and "properties" in result and "additionalProperties" not in result:
+        result["additionalProperties"] = False
+    if isinstance(result.get("properties"), dict):
+        result["properties"] = {key: _closed_schema(value) for key, value in result["properties"].items()}
+    if isinstance(result.get("items"), dict):
+        result["items"] = _closed_schema(result["items"])
+    if isinstance(result.get("anyOf"), list):
+        result["anyOf"] = [_closed_schema(value) for value in result["anyOf"]]
+    if isinstance(result.get("oneOf"), list):
+        result["oneOf"] = [_closed_schema(value) for value in result["oneOf"]]
+    if isinstance(result.get("allOf"), list):
+        result["allOf"] = [_closed_schema(value) for value in result["allOf"]]
+    if isinstance(result.get("$defs"), dict):
+        result["$defs"] = {key: _closed_schema(value) for key, value in result["$defs"].items()}
+    return result
 
 
 def schema(request):
@@ -453,8 +513,8 @@ def schema(request):
     by_ref = {item.ref: item for item in request.context.history}
     ready = all(ConclusionRevisions.reliable(by_ref.get(ref)) for ref in request.context.effective_support_refs)
     selections = [obj({"tool_name": {"type": "string", "const": tool["qualified_name"]},
-        "arguments": {"$schema": "https://json-schema.org/draft/2020-12/schema",
-            **tool["input_schema"]}}) for tool in request.tools] if ready else []
+        "arguments": _closed_schema({"$schema": "https://json-schema.org/draft/2020-12/schema",
+            **tool["input_schema"]})}) for tool in request.tools] if ready else []
     calls = [tagged("mcp_call", selection["properties"]) for selection in selections]
     public = sorted(t["qualified_name"] for t in request.tools if t["qualified_name"] in PUBLIC_REFERENCE_TOOLS)
     if selections and public and not request.context.pending_operation_ids:

@@ -27,6 +27,9 @@ DEFAULT_ALLOWED_TOOLS = frozenset(
         "nuclei",
         "tmux",
         "wine",
+        "qy-wine64",
+        "qy-wine32",
+        "qy-wine-auto",
         "pwsh",
     }
 )
@@ -89,7 +92,7 @@ def _default_docker_host() -> str:
 
 @dataclass(frozen=True)
 class SandboxSettings:
-    image: str = "qinyuan/pentest-sandbox:0.3.6"
+    image: str = "qinyuan/pentest-sandbox:0.3.7"
     network: str = "qinyuan_pentest_lab"
     network_internal: bool = True
 
@@ -124,8 +127,9 @@ class SandboxSettings:
     docker_operation_retries: int = 3
     docker_retry_backoff_seconds: float = 0.25
 
-    # 每个 stdout/stderr 最多在宿主机内存中保留 128 KiB。
-    maximum_output_bytes_per_stream: int = 128 * 1024
+    # 每个 stdout/stderr 最多在宿主机内存中保留 512 KiB。MCP 层还会按
+    # 64k Unicode characters 生成模型预览；这两个上限共同决定可一次看到的输出。
+    maximum_output_bytes_per_stream: int = 512 * 1024
 
     allowed_tools: frozenset[str] = field(default_factory=lambda: DEFAULT_ALLOWED_TOOLS)
 
@@ -134,7 +138,7 @@ class SandboxSettings:
         return cls(
             image=os.environ.get(
                 "QINYUAN_SANDBOX_IMAGE",
-                "qinyuan/pentest-sandbox:0.3.6",
+                "qinyuan/pentest-sandbox:0.3.7",
             ).strip(),
             network=os.environ.get(
                 "QINYUAN_SANDBOX_NETWORK",
@@ -175,6 +179,10 @@ class SandboxSettings:
             docker_retry_backoff_seconds=_configured_nonnegative_float(
                 "QINYUAN_DOCKER_RETRY_BACKOFF_SECONDS",
                 0.25,
+            ),
+            maximum_output_bytes_per_stream=_configured_positive_int(
+                "QINYUAN_SANDBOX_MAX_OUTPUT_BYTES",
+                512 * 1024,
             ),
             allowed_tools=_configured_tools(),
         )

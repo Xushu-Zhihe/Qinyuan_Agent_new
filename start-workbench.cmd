@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-
+set "QINYUAN_SANDBOX_PROFILE=windows"
 rem Workbench and its agent/MCP subprocesses share the project interpreter.
 if not exist ".venv\Scripts\python.exe" goto missing_venv
 ".venv\Scripts\python.exe" -m agent_adapters.workbench %*

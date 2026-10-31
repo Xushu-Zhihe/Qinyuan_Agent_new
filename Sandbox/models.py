@@ -78,3 +78,5 @@ class CommandResult:
     stdout_truncated: bool = False
     stderr_truncated: bool = False
     termination_confirmed: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0

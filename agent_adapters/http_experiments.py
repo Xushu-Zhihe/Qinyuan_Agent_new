@@ -20,6 +20,9 @@ from qinyuan_core import get_logger
 
 TOOL = 'http.run_experiment'
 PROTOCOL_MISMATCH = 'd22_http_protocol_mismatch'
+# The worker refused to even prepare the request (for example http.client's
+# InvalidURL): nothing left the sandbox, so this is a known rejection.
+PRE_SEND_REJECTION = 'd7_http_dispatch_rejected'
 SCRIPT_ERRORS = frozenset({'SyntaxError','NameError','TypeError','ValueError','KeyError','IndexError',
     'AttributeError','ZeroDivisionError','AssertionError','ImportError','ModuleNotFoundError','PermissionError',
     'RuntimeError','TimeoutError','MemoryError','RecursionError','OSError'})
@@ -138,7 +141,9 @@ class HttpExperiments:
             # A rejected request produced no response receipt to re-read; its
             # failure evidence is the bound experiment-failure record instead.
             failure = self.evidence.read('experiment-failure', operation.start.operation_id)
-            if (failure is None or failure.get('code') != PROTOCOL_MISMATCH
+            if (failure is None
+                    or failure.get('code') not in {PROTOCOL_MISMATCH, PRE_SEND_REJECTION}
+                    or payload.get('code') != failure.get('code')
                     or failure.get('request_sha256') != digest(claim)):
                 raise ExecutionRecoveryRequired('d22_experiment_source_changed')
             return
@@ -200,8 +205,15 @@ class HttpExperiments:
         code = str(error) if isinstance(error,ExecutionRecoveryRequired) and str(error) in SAFE_MODEL_ERROR_CODES else "d22_experiment_receipt_settlement_failed"
         if phase == "http_execute":
             # A peer that answered with non-HTTP bytes is a known protocol
-            # mismatch; only an unreadable outcome stays genuinely unknown.
-            code = PROTOCOL_MISMATCH if isinstance(error, HttpProtocolMismatch) else "d22_experiment_request_outcome_unknown"
+            # mismatch, and a request rejected before it left the sandbox (for
+            # example an invalid URL) is known too; only a genuinely unreadable
+            # outcome stays unknown.
+            if isinstance(error, HttpProtocolMismatch):
+                code = PROTOCOL_MISMATCH
+            elif isinstance(error, HttpCapabilityError) and getattr(error, "code", None) == PRE_SEND_REJECTION:
+                code = PRE_SEND_REJECTION
+            else:
+                code = "d22_experiment_request_outcome_unknown"
         elif phase == "response_evidence_save":code = "http.response_evidence_save_failed"
         if self.evidence.read("experiment-failure",operation_id) is None:
             self.evidence.save("experiment-failure",operation_id,dict(
@@ -332,20 +344,26 @@ class HttpExperiments:
                     and error.context.get('phase') == 'response_evidence_save'):
                 phase = 'response_evidence_save'
             code = self.record_failure(identity,claim,result if phase=='receipt_apply' else None,phase,error)
-            if isinstance(error, HttpProtocolMismatch):
-                # Known and recoverable: the peer does not speak HTTP. Report a
-                # failed observation so the planner can switch channel, instead
+            known_dispatch = (phase == 'http_execute' and isinstance(error, HttpCapabilityError)
+                and getattr(error, 'code', None) == PRE_SEND_REJECTION)
+            if isinstance(error, HttpProtocolMismatch) or known_dispatch:
+                # Known and recoverable: either the peer does not speak HTTP, or
+                # the request never left the sandbox. Report a failed observation
+                # so the planner can switch channel or correct the path, instead
                 # of ending the TaskRun as an unknown side effect.
                 from agent_core.operation_accounting import D4OperationCompletion
+                category = 'dependency' if isinstance(error, HttpProtocolMismatch) else 'policy'
                 rejected = dict(request_sha256=digest(claim), finished_at=app.clock(),
                     payload=dict(status='rejected', tool=TOOL, code=code, exit_code=1, stdout='', stderr='',
-                        http_request=saved, failure=dict(category='dependency', phase=phase, code=code)))
+                        http_request=saved, failure=dict(category=category, phase=phase, code=code)))
                 self.evidence.save('mcp-result', identity, rejected)
                 app.store.complete_d4_operation(D4OperationCompletion(identity, rejected['finished_at'],
                     'rejected', 'mcp-result/' + identity, digest(rejected)))
-                self.log.warning('experiment.protocol_mismatch',run=claim['task_run_id'],request=parent,
-                    exec=identity,phase=phase,category='dependency',code=code,error_type=type(error).__name__)
-                raise HttpProtocolMismatch(code) from error
+                self.log.warning('experiment.protocol_mismatch' if category == 'dependency'
+                    else 'experiment.request_rejected',
+                    run=claim['task_run_id'],request=parent,exec=identity,phase=phase,
+                    category=category,code=code,error_type=type(error).__name__)
+                raise
             self.log.error('experiment.request_unknown' if phase=='http_execute' else 'experiment.receipt_failed',
                 run=claim['task_run_id'],request=parent,exec=identity,phase=phase,
                 category='unknown' if phase=='http_execute' else 'integrity' if phase=='receipt_apply' else 'persistence',
