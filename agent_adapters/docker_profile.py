@@ -18,11 +18,11 @@ from Sandbox.windows_sandbox import WindowsSandboxSettings, WindowsTaskRunSandbo
 STARTUP_READY_TIMEOUT_SECONDS = 10.0
 
 
-IMAGE_REF = "qinyuan/pentest-sandbox:0.3.7"
-IMAGE_ID = "sha256:f081157d62066f46141597c5ea191136e44e67253ed6c11b5b27e1ce7f46e4af"
+IMAGE_REF = "qinyuan/pentest-sandbox:0.3.8"
+IMAGE_ID = "sha256:7a36cb4066bfd4fb9c369047bd8e359424b8312735710af77e8ce832a173e277"
 
-WINDOWS_IMAGE_REF = "qinyuan/windows-sandbox:0.3.8"
-WINDOWS_IMAGE_ID = "sha256:3cab772fadaeadfbe3629ada36a4e44c60841bf0da5429e55d63e1944c87118f"
+WINDOWS_IMAGE_REF = "qinyuan/windows-sandbox:0.3.9"
+WINDOWS_IMAGE_ID = "sha256:05307f0759008eb08109c0ad73fda078ad4f52a93f7273744ee532a52f86c7a4"
 WINDOWS_PROFILE = "windows-wine-v2"
 
 
@@ -45,7 +45,7 @@ def sandbox_config():
         return windows_sandbox_config()
     configured = settings()
     profile = T6TaskRunSandbox(SimpleNamespace(settings=configured))
-    return {"version": 1, "profile": "d3-fixed-readonly-v2", "image_ref": IMAGE_REF,
+    return {"version": 1, "profile": "d3-fixed-readonly-v3", "image_ref": IMAGE_REF,
             "image_id": IMAGE_ID, "docker_host": configured.docker_host,
             "spec": profile._spec()}
 

@@ -626,3 +626,22 @@ def test_stderr_only_marks_a_failure_when_it_carries_one(tmp_path, stderr, marke
     workbench.runner._watch(run_id)
     codes = [error.get("code") for error in (workbench.runner.status(challenge_id)["result"] or {}).get("errors") or []]
     assert ("agent_process_stderr" in codes) is marked
+
+def test_stage_cleanup_status_confirmed_clears_remote_recovery_projection():
+    row = {
+        "run_id": str(uuid4()),
+        "status": "finished",
+        "exit_code": 0,
+        "cancel_requested": 0,
+        "result_json": json.dumps({
+            "protocol_version": 3,
+            "task_run_id": str(uuid4()),
+            "task_run": {"status": "achieved"},
+            "cleanup": {"status": "succeeded"},
+            "cleanup_status": "confirmed",
+            "exit_code": 0,
+        }),
+    }
+    projected = Workbench._run_dict(row, has_remote_target=True)
+    assert projected["status"] == "finished"
+    assert projected["result"]["cleanup"]["status"] == "succeeded"

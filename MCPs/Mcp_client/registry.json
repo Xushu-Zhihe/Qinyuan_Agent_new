@@ -239,6 +239,15 @@
       "sandboxTools": ["python3"],
       "enabled": true
     },
+    "crypto": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Crypto_Mcp",
+      "args": ["server.py"],
+      "tags": ["crypto", "mathematics", "pari", "sympy", "lattice"],
+      "sandboxTools": ["python3"],
+      "enabled": true
+    },
     "burp": {
       "transport": "stdio",
       "command": "{python}",

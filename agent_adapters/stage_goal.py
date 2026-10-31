@@ -29,11 +29,7 @@ class StageGoal:
         source = app.evidence.read_history(app.task_id, (value.source_ref,))[0]
         operation = app.store.load_d4_operation(source.record_id)
         result = app.evidence.read("mcp-result", source.record_id)
-        claim = app.evidence.read("mcp-call", source.record_id)
-        original = result["payload"].get("stdout", "").encode("utf-8") if result else b""
-        if claim is not None and "experiment_request" in claim:
-            app.web.attach()
-            original = app.web.protected.read(result["payload"]["http_response"]["body_evidence_id"])
+        original = self.grounded_value(value.source_ref)
         if not value.candidate or result is None or value.candidate.encode("utf-8") not in original:
             _fail("stage.candidate_not_in_original_source", Category.POLICY)
         candidate = D7AnswerCandidate(app.task_id, identity, source.turn_id, source.intent_id, None, None,
@@ -46,6 +42,26 @@ class StageGoal:
         app.controller._reload_after_commit()
         app.controller.register_answer_candidate(candidate, identity, manual_confirmation=app.goal_validation == "human")
         return True
+
+    def grounded_value(self, source_ref):
+        """Original text a candidate must appear in; empty when the source is unavailable."""
+        app = self.app
+        try:
+            source = app.evidence.read_history(app.task_id, (source_ref,))[0]
+        except (IndexError, KeyError):
+            return b""
+        result = app.evidence.read("mcp-result", source.record_id)
+        claim = app.evidence.read("mcp-call", source.record_id)
+        if result is None:
+            return b""
+        original = result["payload"].get("stdout", "").encode("utf-8")
+        if claim is not None and "experiment_request" in claim:
+            app.web.attach()
+            original = app.web.protected.read(result["payload"]["http_response"]["body_evidence_id"])
+        return original
+
+    def grounds(self, value):
+        return bool(value.candidate) and value.candidate.encode("utf-8") in self.grounded_value(value.source_ref)
 
     def decide(self, candidate_id, action, operation_id):
         app = self.app

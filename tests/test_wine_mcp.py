@@ -84,7 +84,7 @@ def test_profile_dispatch_by_environment(monkeypatch):
     from agent_adapters import docker_profile
 
     monkeypatch.delenv("QINYUAN_SANDBOX_PROFILE", raising=False)
-    assert docker_profile.sandbox_config()["profile"] == "d3-fixed-readonly-v2"
+    assert docker_profile.sandbox_config()["profile"] == "d3-fixed-readonly-v3"
 
     monkeypatch.setenv("QINYUAN_SANDBOX_PROFILE", "windows")
     assert docker_profile.sandbox_config()["profile"] == "windows-wine-v2"

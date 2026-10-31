@@ -1161,17 +1161,33 @@ def goal_candidate_proof(store, candidate):
     if data is None or data["candidate"] != candidate.to_dict():
         _fail("stage.candidate_binding_changed", Category.UNKNOWN)
     proposal_op = store.load_d4_operation(data["proposal_operation_id"])
-    review_op = store.load_d4_operation(data["review_operation_id"])
-    if (proposal_op is None or review_op is None or proposal_op.application_ref is None
-            or proposal_op.application_ref != review_op.application_ref):
+    if proposal_op is None or proposal_op.application_ref is None:
         _fail("stage.candidate_not_reviewed", Category.POLICY)
-    proposal, review = evidence.read_model_result(proposal_op), evidence.read_model_result(review_op)
+    proposal = evidence.read_model_result(proposal_op)
     value = proposal.result
-    if (not isinstance(value, StagePlanningDecision) or value.kind != "request_final_validation"
-            or review.result.decision != "accept" or review.proposal_operation_id != proposal_op.start.operation_id
-            or review.proposal_sha256 != proposal_digest(value)):
-        _fail("stage.candidate_not_reviewed", Category.POLICY)
-    _sources(store, candidate.task_run_id, value.support_refs, formal=True)
+    direct = proposal_op.application_ref == "stage-direct/" + proposal_op.start.operation_id
+    review = None
+    if direct:
+        # The one direct submission deliberately has no Outer review. It is
+        # authorised only by the frozen runtime marker, the stage-action source
+        # and the absence of any other candidate for this TaskRun.
+        from agent_core.stage_planning import stage_runtime
+        request = evidence.request(proposal_op.start.operation_id)
+        if (not isinstance(value, StagePlanningDecision) or value.kind != "request_final_validation"
+                or request.stage != "stage_action" or not stage_runtime(request).get("direct_submission")
+                or any(item.candidate_id != candidate.candidate_id
+                       for item in store.list_d7_answer_candidates(candidate.task_run_id))):
+            _fail("stage.candidate_not_reviewed", Category.POLICY)
+    else:
+        review_op = store.load_d4_operation(data["review_operation_id"])
+        if review_op is None or proposal_op.application_ref != review_op.application_ref:
+            _fail("stage.candidate_not_reviewed", Category.POLICY)
+        review = evidence.read_model_result(review_op)
+        if (not isinstance(value, StagePlanningDecision) or value.kind != "request_final_validation"
+                or review.result.decision != "accept" or review.proposal_operation_id != proposal_op.start.operation_id
+                or review.proposal_sha256 != proposal_digest(value)):
+            _fail("stage.candidate_not_reviewed", Category.POLICY)
+        _sources(store, candidate.task_run_id, value.support_refs, formal=True)
     source = evidence.read_history(candidate.task_run_id, (value.source_ref,))[0]
     if candidate.source_ref != "mcp-result/" + source.record_id or source.intent_id != candidate.intent_id or source.turn_id != candidate.turn_id:
         _fail("stage.candidate_source_changed", Category.POLICY)

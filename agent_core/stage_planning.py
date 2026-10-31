@@ -127,6 +127,33 @@ TOOL_CONCURRENCY_GUIDANCE = (
     "Waiting is technical scheduling, not failure or exhaustion. "
     "Only the declared tools are currently eligible; a busy tool can be reconsidered after settlement. "
 )
+CRYPTO_TOOL_GUIDANCE = (
+    " For number theory, RSA, elliptic curves, discrete logs or lattice attacks, prefer the declared crypto tools "
+    "over re-implementing the math in an ad-hoc script: crypto.pari('factor(n)'), crypto.pari('ellinit([a4,a6])') "
+    "or crypto.pari('znlog(g, Mod(a,p))') for PARI/GP; crypto.sympy('factorint(n)') for integer and symbolic work; "
+    "crypto.lll([[..],[..]]) for LLL/Coppersmith-style bases. Use shell only for file I/O and glue around their "
+    "results; pass a short expression instead of embedding a whole solver in one bash script. Their output is small "
+    "and directly usable as an observation."
+)
+
+
+def crypto_tool_guidance(request) -> str:
+    if request.stage != "stage_action":
+        return ""
+    tools = getattr(request, "tools", ()) or ()
+    if any(str(tool.get("qualified_name", "")).startswith("crypto.") for tool in tools):
+        return CRYPTO_TOOL_GUIDANCE
+    return ""
+
+
+DIRECT_SUBMISSION_GUIDANCE = (
+    " One direct submission is available for this TaskRun. If a cited original tool observation already contains the exact "
+    "candidate string that answers the TaskRun goal, submit it now with request_final_validation (candidate, source_ref and a "
+    "short reason) before proposing Facts, completion or Road closure. The candidate must appear verbatim in that observation; "
+    "never paraphrase, normalize or invent it, because an ungrounded value cannot be handed off. This path skips review and is "
+    "allowed once per TaskRun: if the platform rejects it, no second direct submission is offered and only the reviewed "
+    "final-validation handoff remains. Do not spend it on a guess."
+)
 PUBLIC_REFERENCE_GUIDANCE = (
     " Prefer web.search for an unresolved public technical question when existing evidence is insufficient and "
     "the answer could change the next decision; use adequate local sources directly and reuse existing retrievals. "
@@ -148,14 +175,13 @@ OFFLINE_TOOLING_GUIDANCE = (
     "installs, wget and internet curl cannot work. `download.install_tool`, when it is declared in this decision, "
     "is the one controlled exception: it prepares an allowlisted artifact through a separate trusted fetcher and "
     "only then installs it into this networkless sandbox. Only declared MCP tools reach the authorized target; the "
-    "sandbox itself cannot. Known present in the sandbox image: "
-    "java (JRE only, no javac/javap/jar), python3 with zipfile/tarfile/gzip, file, strings, base64, tar, gzip, "
-    "nmap, gdb, objdump, readelf, curl (local only), jadx (may fail on some jars). Known absent: javac, javap, jar, "
-    "unzip, zip, xxd, node, npm, wget, nc/ncat/socat, binwalk, 7z. Therefore prefer language-level readers and "
-    "pure-Python parsing over missing CLI unpackers, probe cheaply with `command -v` inside the same script when "
-    "unsure, branch on the result, and when the required toolchain is genuinely absent and tool preparation is "
-    "unavailable or not declared, record that limitation and switch approach instead of attempting a network "
-    "install. "
+    "sandbox itself cannot. The current 0.3.8 image provides: python3 with sympy, gmpy2, fpylll and cypari2 "
+    "(plus zipfile/tarfile/gzip), gp (PARI/GP), java (JRE only), file, strings, base64, tar, gzip, xz, zstd, "
+    "bzip2, lz4, cpio, unzip, zip, 7z, bsdtar, binwalk, xxd, nmap, gdb, objdump, readelf, curl (local only), "
+    "socat, nc, jadx (may fail on some jars). Known absent: javac, javap, jar, node, npm, wget, SageMath, angr. "
+    "Probe with `command -v` inside the same script when unsure; treat the inventory as a hint, not as evidence "
+    "that a tool is missing. When the required toolchain is genuinely absent and tool preparation is unavailable "
+    "or not declared, record that limitation and switch approach instead of attempting a network install. "
 )
 
 OUTPUT_PREVIEW_GUIDANCE = (
@@ -202,6 +228,28 @@ def provider_schema(request):
     return project(schema(request))
 
 
+def _decode_text_or_result_envelope(raw, result_schema):
+    """Accept ordinary text JSON and the native tool's single ``result`` wrapper."""
+    value, issues, terminal, units = decode_response(raw, result_schema)
+    if not issues and not terminal:
+        return value, issues, terminal, units
+    if terminal or any(issue.code not in {"field_missing", "field_unknown"} for issue in issues):
+        return value, issues, terminal, units
+    if isinstance(raw, D8ModelResponse):
+        if raw.finish_reason != "stop":return value, issues, terminal, units
+        content=raw.content
+    else:content=raw
+    try:parsed=json.loads(content) if isinstance(content,str) else content
+    except (TypeError,ValueError,UnicodeError,RecursionError):
+        return value, issues, terminal, units
+    if not isinstance(parsed,dict) or set(parsed)!={"result"}:
+        return value, issues, terminal, units
+    inner_value, inner_issues, inner_terminal, inner_units = decode_response(parsed["result"], result_schema)
+    if inner_issues or inner_terminal:
+        return value, issues, terminal, units
+    return inner_value, inner_issues, inner_terminal, inner_units
+
+
 def decode_stage_response(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAILING_BRACE_POLICY):
     """Keep native bytes/finish reason intact; unwrap only the declared output tool."""
     result_schema = schema(request) if result_schema is None else result_schema
@@ -211,7 +259,7 @@ def decode_stage_response(request, raw, *, result_schema=None, normalization_pol
         # tool_calls finish reason without any call is still a broken response.
         if isinstance(raw, D8ModelResponse) and raw.finish_reason == "tool_calls":
             return None, [D8FormatIssue("native_tool_call_invalid", "$", "one_finished_output_tool", "invalid")], None, None
-        return decode_response(raw, result_schema)
+        return _decode_text_or_result_envelope(raw, result_schema)
     if raw.finish_reason != "tool_calls":
         if raw.finish_reason != "stop":
             return decode_response(raw, result_schema)
@@ -230,6 +278,16 @@ def decode_stage_response(request, raw, *, result_schema=None, normalization_pol
         return None, [D8FormatIssue("native_tool_call_invalid", "$", "nonempty_call_id", "invalid")], None, units
     value, issues, terminal, units = decode_response(calls[0]["function"]["arguments"],
         obj({"result": result_schema}), normalization_policy=normalization_policy, json_error_details=True)
+    if issues or terminal:
+        # Some providers emit the result schema directly in native arguments
+        # instead of the declared {"result": ...} envelope. Validate it exactly
+        # the same way before rejecting the call.
+        if not terminal and all(issue.code in {"field_missing", "field_unknown"} for issue in issues):
+            direct_value, direct_issues, direct_terminal, direct_units = decode_response(
+                calls[0]["function"]["arguments"], result_schema,
+                normalization_policy=normalization_policy, json_error_details=True)
+            if not direct_issues and not direct_terminal:
+                value, issues, terminal, units = {"result": direct_value}, direct_issues, direct_terminal, direct_units
     issues = [D8FormatIssue(i.code, "$/tool_calls/0/function/arguments", i.expected, i.actual)
               if i.code.startswith("json_") or i.code == "output_trailing_markup" else i for i in issues]
     return value["result"] if not issues and not terminal else None, issues, terminal, units
@@ -335,7 +393,7 @@ def stage_output_issues(request, raw, *, normalization_policy=NATIVE_TRAILING_BR
     route_issues = route_order_issues(request, value)
     if route_issues:
         return route_issues
-    fact_issues = fact_source_issues(request, value, native=isinstance(raw, D8ModelResponse) and raw.tool_calls is not None)
+    fact_issues = fact_source_issues(request, value, native=isinstance(raw, D8ModelResponse) and bool(raw.tool_calls))
     if fact_issues:
         return fact_issues
     if kind == "mcp_calls":
@@ -343,10 +401,12 @@ def stage_output_issues(request, raw, *, normalization_policy=NATIVE_TRAILING_BR
         if (isinstance(calls, list) and len(calls) >= 2 and all(isinstance(c, dict)
                 and c.get("tool_name") in {t["qualified_name"] for t in request.tools} for c in calls)
                 and sum(c["tool_name"] not in PUBLIC_REFERENCE_TOOLS for c in calls) > 1):
-            path = "$/result/calls" if isinstance(raw, D8ModelResponse) and raw.tool_calls is not None else "$/calls"
+            path = "$/result/calls" if isinstance(raw, D8ModelResponse) and raw.tool_calls else "$/calls"
             return [D8FormatIssue("stage.tool_batch_resource_conflict", path,
                 "at_most_one_sandbox_or_target_action; public_reference_actions_may_overlap", "two_private_actions")]
-    required = kind in {"turn_completion", "request_final_validation"}
+    direct = (kind == "request_final_validation" and request.stage == "stage_action"
+        and bool(stage_runtime(request).get("direct_submission")))
+    required = kind == "turn_completion" or (kind == "request_final_validation" and not direct)
     if required or kind == "road_resolution" and value.get("outcome") == "succeeded":
         refs = value.get("support_refs")
         eligible = formal_support_refs(request)
@@ -385,6 +445,7 @@ def model_contract(request):
                "neither a branch switch nor old messages restore the environment. Correct or drop unsupported claims rather than asserting them again. "
                if stage_runtime(request).get("review_mode") in {"async_fact_v1", "async_planning_v1"} and request.stage == "stage_action" else "")
             + (TOOL_CONCURRENCY_GUIDANCE if request.stage == "stage_action" else "")
+            + crypto_tool_guidance(request)
             + (EXPLORATION_GUIDANCE + PUBLIC_REFERENCE_GUIDANCE if request.stage in {
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
             + (OFFLINE_TOOLING_GUIDANCE if request.stage in {
@@ -401,7 +462,9 @@ def model_contract(request):
                "An unrelated flag-like string is not sufficient; preserve exact original source and current formal support. "
                "Outer approval is not independent validation. Rejected or partial validation feedback returns to this original planning session; "
                "preserve historical stage achievement and improve the proposal using actual evidence. Unknown submission is never resubmitted."
-               if request.context.goal_validation is not None else ""),
+               if request.context.goal_validation is not None else "")
+            + (DIRECT_SUBMISSION_GUIDANCE if request.stage == "stage_action"
+               and stage_runtime(request).get("direct_submission") else ""),
         "instruction": "Return one complete JSON result object matching output_contract.schema. "
             "Do not copy the contract envelope or wrap the result in version/stage/schema keys. No Markdown or extra fields."
             " Tool arguments are closed: use exactly the declared keys for the chosen tool_name;"
@@ -537,9 +600,16 @@ def schema(request):
         **supported, "support_refs": {**formal_refs, "minItems": 0}}),
         tagged("road_resolution", {"outcome": {"type": "string", "enum": [
             "failed", "inconclusive", "abandoned", "skipped"]}, **supported})]
+    direct = []
+    if stage_runtime(request).get("direct_submission") and request.context.turn is not None:
+        observations = [i.ref for i in request.context.history if i.record_type == "progress"
+            and i.identity == "tool_observation_not_fact" and i.source_status == "available"]
+        if observations:
+            direct.append(tagged("request_final_validation", {"reason": text(), "candidate": text(16384),
+                "source_ref": {"type": "string", "enum": observations}}))
     if request.context.turn is not None and request.context.turn.achievement is not None:
-        return {"anyOf": [*calls, *resolutions, feedback, *knowledge_actions(request)]}
-    return {"anyOf": [*calls, *completions,
+        return {"anyOf": [*direct, *calls, *resolutions, feedback, *knowledge_actions(request)]}
+    return {"anyOf": [*direct, *calls, *completions,
         *resolutions, feedback, *knowledge_actions(request)]}
 
 

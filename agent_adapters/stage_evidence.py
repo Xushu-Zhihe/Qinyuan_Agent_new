@@ -555,12 +555,16 @@ class StageEvidence:
             if binding is None:
                 _fail("stage.candidate_binding_changed", Category.UNKNOWN)
             request = self.request(binding["proposal_operation_id"])
+            owner = owners.get(request.context.session.owner_id)
+            turn_id = owner.turn_id if owner is not None else request.context.session.owner_id
+            intent_id = (request.context.session.owner_id
+                if request.context.session.scope == "road_execution" else None)
             for feedback in self.store.list_d7_validation_feedback(task_id, candidate.candidate_id, candidate.evidence_version):
                 row = self.store._connection.execute("SELECT created_event_sequence FROM d7_validation_feedback WHERE operation_id=?",
                     (feedback.operation_id,)).fetchone()
                 data = feedback.to_dict()
                 item = D8HistoryItem("validation/" + feedback.operation_id, task_id, "progress",
-                    request.context.session.owner_id, None, None, json.dumps(data, ensure_ascii=False),
+                    turn_id, intent_id, None, json.dumps(data, ensure_ascii=False),
                     (candidate.candidate_id, feedback.source_ref), digest(data), row[0],
                     "trusted_validation_feedback_not_fact", "historical", "available")
                 items[item.ref] = item

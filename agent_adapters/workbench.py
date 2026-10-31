@@ -270,7 +270,8 @@ class Workbench:
                 and isinstance(outcome, dict) and outcome.get("protocol_version") in {2, 3}
                 and isinstance(task, dict) and task.get("status") in TERMINAL_STATUSES
                 and isinstance(cleanup, dict) and cleanup.get("status") == "succeeded"
-                and cleanup.get("target_network_confirmed") is not True):
+                and cleanup.get("target_network_confirmed") is not True
+                and outcome.get("cleanup_status") != "confirmed"):
             outcome["cleanup"] = {**cleanup, "status": "not_confirmed"}
             result["status"] = "recovery_required"
         if (result["status"] == "recovery_required" and isinstance(outcome, dict)

@@ -83,6 +83,11 @@ def native_response(value):
         "function": {"name": OUTPUT_TOOL, "arguments": json.dumps({"result": value})}},))
 
 
+def native_direct_response(value):
+    return D8ModelResponse("", "tool_calls", ({"id": "call_" + uuid4().hex, "type": "function",
+        "function": {"name": OUTPUT_TOOL, "arguments": json.dumps(value)}},))
+
+
 class Tools:
     def __init__(self):
         self.calls = []
@@ -306,6 +311,33 @@ def test_empty_native_tool_calls_falls_back_to_text_json(review_request):
     assert parse(request, D8ModelResponse(content, "stop", [])).decision == "accept"
     with pytest.raises(ValueError, match="stage.output_invalid"):
         parse(request, D8ModelResponse(content, "tool_calls", []))
+
+
+def test_text_json_result_envelope_is_unwrapped(review_request):
+    request = replace(review_request, proposal=TurnIntent("supervision-policy", "check one criterion"))
+    content = json.dumps({"result": {"decision": "accept", "reason": "grounded"}})
+    assert parse(request, D8ModelResponse(content, "stop", [])).decision == "accept"
+    supervision = replace(request, stage="stage_supervision")
+    supervision_content = json.dumps({"result": {"decision": "continue_current_intent",
+        "reason": "grounded", "support_refs": []}})
+    assert parse(supervision, D8ModelResponse(supervision_content, "stop", [])).decision == "continue_current_intent"
+
+
+def test_text_json_result_envelope_with_invalid_inner_stays_invalid(review_request):
+    request = replace(review_request, proposal=TurnIntent("supervision-policy", "check one criterion"))
+    content = json.dumps({"result": {"decision": "accept"}})
+    with pytest.raises(ValueError, match="stage.output_invalid"):
+        parse(request, D8ModelResponse(content, "stop", []))
+
+
+def test_native_tool_call_direct_result_is_accepted(review_request):
+    request = replace(review_request, proposal=TurnIntent("supervision-policy", "check one criterion"))
+    value = {"decision": "accept", "reason": "grounded"}
+    assert parse(request, native_direct_response(value)).decision == "accept"
+    assert parse(request, native_response(value)).decision == "accept"
+    supervision = replace(request, stage="stage_supervision")
+    assert parse(supervision, native_direct_response(
+        {"decision": "continue_current_intent", "reason": "grounded", "support_refs": []})).decision == "continue_current_intent"
 
 
 def test_fact_review_scope_and_revision_reason_limit_remain_distinct(review_request):

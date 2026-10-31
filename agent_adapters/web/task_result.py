@@ -33,6 +33,7 @@ def _cleanup(directory: Path, task_run) -> tuple[dict[str, object], str]:
             task_run.task_run_id, task_run.target_network
         ):
             return {"status": "not_confirmed"}, "unconfirmed"
+        return {"status": "succeeded", "target_network_confirmed": True}, "confirmed"
     return {"status": "succeeded"}, "confirmed"
 
 

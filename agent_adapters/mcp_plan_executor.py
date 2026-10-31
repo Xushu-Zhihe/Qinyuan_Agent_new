@@ -12,6 +12,7 @@ from agent_core.actions import MCPCall
 from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
 from agent_core.operation_accounting import D4OperationStart, D4OperationCompletion
 from agent_core.turn_modeling import digest
+from agent_adapters.catalog_order import category_from_goal, order_tools
 from qinyuan_core import get_logger
 
 
@@ -196,6 +197,10 @@ class MCPPlanExecutor:
                 self.tools = [*self.tools, *SPECS]
             if not self.tools:
                 raise ExecutionRecoveryRequired("mcp.no_tools_available")
+            category = category_from_goal(getattr(task.request, "goal", ""))
+            self.tools = order_tools(self.tools, category)
+            self._log.info("mcp.catalog_ordered", run=task.task_run_id,
+                           category=category, tool_count=len(self.tools))
             # Drift is rejected on recovery; no silent replacement of a frozen catalog.
             self.evidence.save("mcp-catalog", task.task_run_id, {"tools": self.tools})
         except BaseException as exc:

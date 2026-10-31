@@ -2,7 +2,7 @@
 # Linux TaskRun: it is selected only through the explicit windows sandbox
 # profile, because Wine needs a larger writable prefix and more memory than the
 # 512 MiB default sandbox.
-FROM qinyuan/pentest-sandbox:0.3.7
+FROM qinyuan/pentest-sandbox:0.3.8
 
 USER root
 

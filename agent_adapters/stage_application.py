@@ -414,6 +414,11 @@ class StageApplication:
                 if entry.state in {"pending", "blocked"}
                 and (self.evidence.request(entry.proposal_operation_id).context.session == session
                     or entry.proposal_operation_id in visible)]}
+        if (self.goal is not None and self.goal_validation == "external"
+                and not self.store.list_d7_answer_candidates(self.task_id)
+                and any(i.record_type == "progress" and i.identity == "tool_observation_not_fact"
+                        and i.source_status == "available" for i in context.history)):
+            runtime["direct_submission"] = "first_flag_v1"
         if stage == "stage_roads":
             advice = stage_plans.route_advice(self.store, self.task_id)
             if advice and self.evidence.request(advice).context.session == session:
@@ -809,6 +814,30 @@ class StageApplication:
                 await self.reviews.stop()
                 await self._stop_tools()
 
+    def _recover_direct_submission(self):
+        """Finish a saved one-shot handoff whose process stopped before registering."""
+        if self.goal is None or self.goal_validation != "external":
+            return None
+        if (self.state.task_run.status is not TaskRunStatus.RUNNING
+                or self.store.list_d7_answer_candidates(self.task_id)):
+            return None
+        for operation in self.store.list_d4_operations(self.task_id):
+            if (operation.start.category != "action"
+                    or not (operation.application_ref or "").startswith("stage-direct/")):
+                continue
+            request = self.evidence.request(operation.start.operation_id)
+            if request is None or request.stage != "stage_action":
+                continue
+            value = self.evidence.read_model_result(operation).result
+            if not (isinstance(value, StagePlanningDecision) and value.kind == "request_final_validation"):
+                continue
+            if self.goal.handoff(SimpleNamespace(proposal_operation_id=operation.start.operation_id,
+                    model_request_id=operation.start.operation_id), value):
+                return StageRunResult(self.task_id,
+                    active_turn(self.store.list_stage_turns(self.task_id)),
+                    "stage.awaiting_" + self.goal_validation + "_validation")
+        return None
+
     def _handoff_result(self):
         for request, review, _ in reversed(self.evidence.applied_reviews(self.task_id)):
             if review.result.decision != "accept":
@@ -882,6 +911,9 @@ class StageApplication:
         await self._prepare_inputs(token)
         self.models.reconcile(self.task_id)
         self.mcp.reconcile()
+        recovered = self._recover_direct_submission()
+        if recovered is not None:
+            return recovered
         root_id = self._id("stage/root")
         while True:
             await self._collect_tools()
@@ -961,6 +993,24 @@ class StageApplication:
                 continue
             if not tool_calls(action) and not fact_candidates(action):
                 await self._collect_tools(drain=True)
+            if (isinstance(action, StagePlanningDecision) and action.kind == "request_final_validation"
+                    and self.goal is not None and stage_runtime(request).get("direct_submission")):
+                if not self.goal.grounds(action):
+                    # The candidate must appear verbatim in the cited original;
+                    # an ungrounded value never consumes the single direct attempt.
+                    self.store.mark_d4_operation_applied(identity, "stage-direct-ungrounded/" + identity)
+                    get_logger("ctrl").warning("stage.direct_candidate_ungrounded", run=self.task_id,
+                        operation=identity, phase="stage_action")
+                    continue
+                # The applied marker is written before the handoff so a restart
+                # can finish the same handoff instead of losing the saved decision.
+                self.store.mark_d4_operation_applied(identity, "stage-direct/" + identity)
+                if self.goal.handoff(SimpleNamespace(proposal_operation_id=identity,
+                        model_request_id=identity), action):
+                    return StageRunResult(self.task_id,
+                        active_turn(self.store.list_stage_turns(self.task_id)),
+                        "stage.awaiting_" + self.goal_validation + "_validation")
+                continue
             if await self._knowledge_action(request, identity, action, token):
                 continue
             if tool_calls(action):

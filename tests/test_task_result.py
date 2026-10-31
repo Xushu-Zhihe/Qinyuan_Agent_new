@@ -254,3 +254,20 @@ def test_state_read_exception_chain_keeps_codes_without_message_or_debug_leak(tm
     assert error["exception_chain"][1]["errno"] == 13
     assert error["error_codes"] == ["d8_handoff_evidence_unavailable"]
     assert "PRIVATE" not in str(result) + capsys.readouterr().err
+
+def test_stage_cleanup_projection_marks_confirmed_target_network(tmp_path):
+    from types import SimpleNamespace
+    from agent_adapters.web.task_result import _cleanup
+    from agent_adapters.target_network_cleanup import target_network_cleanup_receipt
+    from agent_core.control_store import TargetNetworkBinding
+    task_id = str(uuid4())
+    binding = TargetNetworkBinding("a" * 64, "b" * 64, "c" * 64, "d" * 64,
+        "tcp://example.test:24009")
+    task = SimpleNamespace(task_run_id=task_id, sandbox_id="sandbox-1", target_network=binding)
+    immutable_write(tmp_path / "cleanup.json",
+        {"status": "succeeded", "sandbox_id": "sandbox-1"})
+    immutable_write(tmp_path / "target-network-cleanup.json",
+        target_network_cleanup_receipt(task_id, binding))
+    cleanup, status = _cleanup(tmp_path, task)
+    assert status == "confirmed"
+    assert cleanup == {"status": "succeeded", "target_network_confirmed": True}

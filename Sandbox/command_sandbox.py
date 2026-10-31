@@ -60,7 +60,10 @@ class T6TaskRunSandbox(TaskRunSandbox):
         # 覆盖父类的 tmpfs 表，所以必须把 /tmp 一并带回来：根文件系统只读时，
         # 缺了它任何默认写临时目录的工具都会拿到 EROFS。
         spec["environment"] = {
-            "PATH": "/tools/bin:/opt/dirsearch/bin:/opt/qinyuan/python/bin:/opt/microsoft/powershell/7:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            # /opt/dirsearch/bin must come after /usr/bin: its python3 symlink
+            # otherwise shadows the system interpreter, hiding apt-installed
+            # modules (sympy, cypari2, fpylll) from MCP python plans.
+            "PATH": "/tools/bin:/opt/qinyuan/python/bin:/opt/microsoft/powershell/7:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/dirsearch/bin",
             "PYTHONPATH": "/tools/python:/opt/qinyuan/python",
             "QINYUAN_OFFLINE_TOOL_INSTALL": "1",
             "HOME": "/home/sandbox",
