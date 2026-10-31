@@ -141,8 +141,10 @@ def test_stage_http_script_preserves_per_request_evidence_and_read_only_projecti
 
 
 @pytest.mark.parametrize('batched', [False, True])
-def test_http_experiment_overlaps_public_search_and_keeps_each_request_bound(case, batched):
+def test_http_experiment_overlaps_public_search_and_keeps_each_request_bound(case, batched, monkeypatch):
     import threading
+    if batched:
+        monkeypatch.setattr("agent_adapters.stage_application.TOOL_BATCH_WAIT_SECONDS", 0.05)
     first_http, release_http = threading.Event(), threading.Event()
     model_entered, release_model, second_http = threading.Event(), threading.Event(), threading.Event()
     public_started, public_release = asyncio.Event(), asyncio.Event()

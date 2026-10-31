@@ -22,7 +22,7 @@ from agent_core.stage_contracts import PlanningSession, StageStateChange
 from agent_core.stage_contracts import TurnCompletion
 from agent_core.stage_contracts import (TurnIntent, RoadCandidate, RoadResolution, PlanningExhausted,
     StageFactProposal, StagePlanningDecision, TurnPlanningContext)
-from agent_core.stage_planning import StageModelRequest, schema, parse, OUTPUT_TOOL
+from agent_core.stage_planning import StageModelRequest, schema, parse, OUTPUT_TOOL, decode_stage_response
 from agent_core.stage_contracts import StageTurnSnapshot, StageReviewBinding, TurnPlanningState
 from agent_core.stage_storage import StageStateError
 from agent_core.turn_contracts import D1RoleConfig
@@ -298,6 +298,14 @@ def test_non_road_review_never_advertises_or_accepts_road_selection(review_reque
         assert parse(request, D8ModelResponse(json.dumps(raw))).accepted_road_indices == ()
         with pytest.raises(ValueError, match="stage.output_invalid"):
             parse(request, D8ModelResponse(json.dumps({**raw, "accepted_road_indices": [0]})))
+
+
+def test_empty_native_tool_calls_falls_back_to_text_json(review_request):
+    request = replace(review_request, proposal=TurnIntent("supervision-policy", "check one criterion"))
+    content = json.dumps({"decision": "accept", "reason": "grounded"})
+    assert parse(request, D8ModelResponse(content, "stop", [])).decision == "accept"
+    with pytest.raises(ValueError, match="stage.output_invalid"):
+        parse(request, D8ModelResponse(content, "tool_calls", []))
 
 
 def test_fact_review_scope_and_revision_reason_limit_remain_distinct(review_request):
@@ -1889,8 +1897,8 @@ def overlap_case(case):
     asyncio.run(case.app.close())
     case.path = case.path / "overlap"
     case.app = StageApplication(case.path, **case.args)
-    control = SimpleNamespace(started={key: asyncio.Event() for key in "ABC"},
-        release={key: asyncio.Event() for key in "ABC"}, active=set(), maximum=0, calls=[], failure=None,
+    control = SimpleNamespace(started={key: asyncio.Event() for key in "ABCDE"},
+        release={key: asyncio.Event() for key in "ABCDE"}, active=set(), maximum=0, calls=[], failure=None,
         known_failure=None, confirmed_stop=False)
     async def operation(name, arguments):
         label = (arguments.get("query") or arguments.get("url") or arguments["script"]).split()[-1].rsplit("/", 1)[-1]
@@ -1966,9 +1974,10 @@ def test_single_tool_waits_for_result_without_speculative_inner(overlap_case, to
     assert len(actions) == 2 and len(control.calls) == 1
 
 
-def test_results_arriving_during_generation_merge_without_interrupting_inner(overlap_case):
+def test_results_arriving_during_generation_merge_without_interrupting_inner(overlap_case, monkeypatch):
     import threading
     case, control = overlap_case, overlap_case.overlap
+    monkeypatch.setattr("agent_adapters.stage_application.TOOL_BATCH_WAIT_SECONDS", 0.05)
     case.models.inner.native = case.models.outer.native = True
     entered, release_model = threading.Event(), threading.Event()
     actions = []
@@ -1977,6 +1986,7 @@ def test_results_arriving_during_generation_merge_without_interrupting_inner(ove
         if len(actions) == 1:
             return dict(kind="mcp_calls", calls=[dict(tool_name="web.search", arguments={"query": label}) for label in "AB"])
         if len(actions) == 2:
+            assert len(req.context.pending_operation_ids) == 1
             entered.set()
             assert release_model.wait(5)
             return dict(kind="wait_for_tools", reason="await the remaining response")
@@ -2031,8 +2041,35 @@ def test_concurrent_unknown_keeps_other_known_result_and_blocks_restart(overlap_
     assert len(case.models.inner.calls) == count and len(control.calls) == 2
 
 
+def test_four_batch_unknown_keeps_known_results_and_blocks_restart(overlap_case):
+    case, control = overlap_case, overlap_case.overlap
+    def decision(req):
+        return dict(kind="mcp_calls", calls=[dict(tool_name="web.search", arguments={"query": label})
+            for label in "ABCD"])
+    control.decide, control.failure = decision, "A"
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        for label in "ABCD":
+            await asyncio.wait_for(control.started[label].wait(), 5)
+        for label in "ABCD":
+            control.release[label].set()
+        while control.active: await asyncio.sleep(.01)
+        with pytest.raises(Exception, match="retrieval.outcome_unknown"):
+            await asyncio.wait_for(pending, 5)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    records = [op for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == "tool_dispatch"]
+    assert len(records) == 4 and sum(op.completion is not None for op in records) == 3
+    assert case.app.store.blocking_d4_operations(case.app.task_id) and not case.app._tools_in_flight
+    task_id, count = case.app.task_id, len(case.models.inner.calls)
+    asyncio.run(case.app.close())
+    case.app = StageApplication(case.path, **case.args)
+    case.app.bind(task_id)
+    with pytest.raises(OperationRecoveryRequired): asyncio.run(case.app.run(case.token))
+    assert len(case.models.inner.calls) == count and len(control.calls) == 4
+
+
 @pytest.mark.parametrize("known_failure", [None, "B"])
-def test_free_slot_is_reused_but_road_review_waits_for_all_tools(overlap_case, known_failure):
+def test_batch_settled_blocks_extra_action_but_road_review_waits_for_all_tools(overlap_case, known_failure):
     case, control = overlap_case, overlap_case.overlap
     control.known_failure = known_failure
     actions = []
@@ -2049,14 +2086,15 @@ def test_free_slot_is_reused_but_road_review_waits_for_all_tools(overlap_case, k
         try:
             await asyncio.wait_for(control.started["B"].wait(), 5)
             control.release["B"].set()
-            await asyncio.wait_for(control.started["C"].wait(), 5)
-            assert control.active == {"A", "C"} and control.maximum == 2
-            control.release["C"].set()
-            while len(actions) < 3: await asyncio.sleep(0.01)
-            await asyncio.sleep(0.04)
+            await asyncio.sleep(.08)
+            assert len(actions) == 1 and control.active == {"A"}
             assert not any(isinstance(req.proposal, RoadResolution) for req in case.models.outer.calls)
             assert case.app.store.list_stage_turns(case.app.task_id)[0].roads[0].status is IntentStatus.RUNNING
             control.release["A"].set()
+            await asyncio.wait_for(control.started["C"].wait(), 5)
+            assert control.active == {"C"} and control.maximum == 2
+            control.release["C"].set()
+            while len(actions) < 3: await asyncio.sleep(0.01)
             await asyncio.wait_for(pending, 5)
         finally:
             for gate in control.release.values(): gate.set()
@@ -2100,7 +2138,7 @@ def test_cancelled_concurrent_retrievals_keep_confirmed_stop_results(overlap_cas
 @pytest.mark.parametrize('first_tool,second_tool,known_failure', [
     ('web.search', 'web.search', None), ('web.search', 'web.fetch', 'B'),
     ('shell.run_bash', 'web.search', None)])
-def test_one_decision_starts_two_tools_and_first_result_resumes(overlap_case, first_tool, second_tool, known_failure):
+def test_one_decision_starts_two_tools_and_batch_settles_before_next_decision(overlap_case, first_tool, second_tool, known_failure):
     case, control = overlap_case, overlap_case.overlap
     control.known_failure = known_failure
     case.models.inner.native = True
@@ -2113,9 +2151,9 @@ def test_one_decision_starts_two_tools_and_first_result_resumes(overlap_case, fi
                 'https://docs.example/B' if tool == 'web.fetch' else label})
                 for tool, label in [(first_tool, 'A'), (second_tool, 'B')]])
         if len(actions) == 2:
-            assert len(req.context.pending_operation_ids) == 1
-            assert len([i for i in req.context.history if i.record_type == 'progress']) == 1
-            return dict(kind='wait_for_tools', reason='the remaining result is needed')
+            assert not req.context.pending_operation_ids
+            assert len([i for i in req.context.history if i.record_type == 'progress']) == 2
+            return dict(kind='road_resolution', outcome='failed', reason='controlled end', support_refs=[])
         return dict(kind='road_resolution', outcome='failed', reason='controlled end', support_refs=[])
     control.decide = decision
     async def exercise():
@@ -2126,9 +2164,10 @@ def test_one_decision_starts_two_tools_and_first_result_resumes(overlap_case, fi
             with pytest.raises(StageStateError, match='tools_still_running'):
                 case.app._commit(StageStateChange(turns=case.app.store.list_stage_turns(case.app.task_id)))
             control.release['B'].set()
-            while len(actions) < 2: await asyncio.sleep(.01)
-            assert not control.release['A'].is_set()
+            await asyncio.sleep(.08)
+            assert len(actions) == 1 and control.active == {'A'}
             control.release['A'].set()
+            while len(actions) < 2: await asyncio.sleep(.01)
             await asyncio.wait_for(pending, 5)
         finally:
             for gate in control.release.values(): gate.set()
@@ -2139,7 +2178,7 @@ def test_one_decision_starts_two_tools_and_first_result_resumes(overlap_case, fi
     assert len(records) == len({op.start.operation_id for op in records}) == 2
     parents = {case.app.evidence.read('mcp-call', op.start.operation_id)['model_request_id'] for op in records}
     assert parents == {actions[0].model_request_id}
-    assert all(op.completion is not None for op in records) and len(actions) == 3
+    assert all(op.completion is not None for op in records) and len(actions) == 2
     assert not any(req.correction_of_model_request_id for req in actions)
     assert not any(type(req.proposal).__name__ == 'StageToolBatch' for req in case.models.outer.calls)
     before = len(control.calls)
@@ -2175,14 +2214,20 @@ def test_batch_fact_uses_the_original_private_tool_receipt(overlap_case, native)
     assert dict(counts) == {'shell.run_bash': 1, 'web.search': 1}
 
 
-@pytest.mark.parametrize('invalid', ['duplicate', 'two_private', 'three', 'one_pending', 'unknown_tool'])
-def test_invalid_tool_batch_is_corrected_before_any_dispatch(overlap_case, invalid):
+@pytest.mark.parametrize('invalid', ['duplicate', 'two_private', 'three_two_private', 'five', 'one_pending', 'unknown_tool'])
+def test_invalid_tool_batch_is_corrected_before_any_dispatch(overlap_case, invalid, monkeypatch):
     case, control = overlap_case, overlap_case.overlap
     calls = [dict(tool_name='web.search', arguments={'query': label}) for label in 'AB']
     if invalid == 'duplicate': calls[1] = calls[0]
     if invalid == 'two_private': calls = [dict(tool_name='shell.run_bash', arguments={'script': label}) for label in 'AB']
-    if invalid == 'three': calls.append(dict(tool_name='web.search', arguments={'query': 'C'}))
+    if invalid == 'three_two_private':
+        calls = [dict(tool_name='shell.run_bash', arguments={'script': 'A'}),
+                 dict(tool_name='shell.run_bash', arguments={'script': 'B'}),
+                 dict(tool_name='web.search', arguments={'query': 'C'})]
+    if invalid == 'five': calls.extend(dict(tool_name='web.search', arguments={'query': label}) for label in 'CDE')
     if invalid == 'unknown_tool': calls[1]['tool_name'] = 'unknown.tool'
+    if invalid == 'one_pending':
+        monkeypatch.setattr("agent_adapters.stage_application.TOOL_BATCH_WAIT_SECONDS", 0.05)
     actions = []
     def decision(req):
         actions.append(req)
@@ -2200,7 +2245,7 @@ def test_invalid_tool_batch_is_corrected_before_any_dispatch(overlap_case, inval
                 control.release['C'].set()
             while not any(req.correction_of_model_request_id for req in actions): await asyncio.sleep(.01)
             assert control.calls == ([('A', 'web.search'), ('C', 'web.search')] if invalid == 'one_pending' else [])
-            if invalid == 'two_private':
+            if invalid in {'two_private', 'three_two_private'}:
                 feedback = case.app.evidence.contract(actions[-1])["correction"]["issues"]
                 assert feedback[0]["code"] == "stage.tool_batch_resource_conflict"
                 assert feedback[0]["actual"] == "two_private_actions"
@@ -2213,6 +2258,96 @@ def test_invalid_tool_batch_is_corrected_before_any_dispatch(overlap_case, inval
     asyncio.run(asyncio.wait_for(exercise(), 10))
     assert len([req for req in actions if req.correction_of_model_request_id]) == 1
     assert len(control.calls) == (2 if invalid == 'one_pending' else 0)
+
+
+def test_four_public_calls_are_dispatched_in_one_decision(overlap_case):
+    case, control = overlap_case, overlap_case.overlap
+    actions = []
+    def decision(req):
+        actions.append(req)
+        if len(actions) == 1:
+            return dict(kind="mcp_calls", calls=[dict(tool_name="web.search", arguments={"query": label})
+                for label in "ABCD"])
+        assert not req.context.pending_operation_ids
+        assert len([i for i in req.context.history if i.record_type == "progress"]) == 4
+        return dict(kind="road_resolution", outcome="failed", reason="controlled end", support_refs=[])
+    control.decide = decision
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        try:
+            for label in "ABCD":
+                await asyncio.wait_for(control.started[label].wait(), 5)
+            assert control.active == set("ABCD") and control.maximum == 4
+            for label in "ABCD":
+                control.release[label].set()
+            await asyncio.wait_for(pending, 5)
+        finally:
+            for gate in control.release.values(): gate.set()
+            if not pending.done(): pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    assert len(actions) == 2 and len(control.calls) == 4
+    records = [op for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == "tool_dispatch"]
+    assert len(records) == 4 and all(op.completion is not None for op in records)
+
+
+def test_wait_for_tools_waits_every_pending_call(overlap_case, monkeypatch):
+    monkeypatch.setattr("agent_adapters.stage_application.TOOL_BATCH_WAIT_SECONDS", 0.05)
+    case, control = overlap_case, overlap_case.overlap
+    actions = []
+    def decision(req):
+        actions.append(req)
+        if len(actions) == 1:
+            return dict(kind="mcp_calls", calls=[dict(tool_name="web.search", arguments={"query": label})
+                for label in "AB"])
+        if len(actions) == 2:
+            assert len(req.context.pending_operation_ids) == 1
+            return dict(kind="wait_for_tools", reason="need every pending observation")
+        assert not req.context.pending_operation_ids
+        assert len([i for i in req.context.history if i.record_type == "progress"]) == 2
+        return dict(kind="road_resolution", outcome="failed", reason="controlled end", support_refs=[])
+    control.decide = decision
+    async def exercise():
+        pending = asyncio.create_task(case.app.run(case.token))
+        try:
+            await asyncio.wait_for(control.started["B"].wait(), 5)
+            control.release["A"].set()
+            while len(actions) < 2: await asyncio.sleep(.01)
+            await asyncio.sleep(.1)
+            assert len(actions) == 2 and control.active == {"B"}
+            control.release["B"].set()
+            while len(actions) < 3: await asyncio.sleep(.01)
+            await asyncio.wait_for(pending, 5)
+        finally:
+            for gate in control.release.values(): gate.set()
+            if not pending.done(): pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    asyncio.run(asyncio.wait_for(exercise(), 10))
+    assert len(actions) == 3 and len(control.calls) == 2
+
+
+def test_historical_tool_execution_policy_stays_readable_but_is_not_resumed(case, monkeypatch):
+    import agent_adapters.stage_application as application
+    from agent_adapters.web.task_result import _stage_task_result
+    policy = application.execution_policy
+    def historical(config):
+        value = policy(config)
+        value["tool_execution"] = {"max_in_flight": 2, "sandbox_target_in_flight": 1,
+            "max_calls_per_decision": 2,
+            "wake": "first_result_before_next_decision_merge_during_generation"}
+        return value
+    monkeypatch.setattr(application, "execution_policy", historical)
+    other = StageApplication(case.path / "historical-tools", **case.args)
+    try:
+        other.start(case.app.state.task_run.request)
+        result = _stage_task_result(other.directory, dict(task_run_id=other.task_id, mode="controlled", goal_validation=None),
+            other.store, other.config)
+        assert not result["errors"]
+        monkeypatch.setattr(application, "execution_policy", policy)
+        with pytest.raises(StageStateError, match="execution_configuration_changed"):
+            other.bind(other.task_id)
+    finally:
+        asyncio.run(other.close())
 
 
 @pytest.mark.parametrize("size", [1100000, 2200000])

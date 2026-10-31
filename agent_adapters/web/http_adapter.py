@@ -413,42 +413,74 @@ class D7HttpResponseEvidenceStore:
             except WindowsEvidenceProtectionError as exc:
                 raise HttpCapabilityError("d7_http_evidence_protection_failed") from exc
 
+    @staticmethod
+    def _transient_protection_failure(error: WindowsEvidenceProtectionError) -> bool:
+        return getattr(error, "code", None) in {
+            "protected_directory_unavailable",
+            "protected_directory_invalid",
+        }
+
     def read(self, evidence_id: str) -> bytes:
-        """Decrypt one response after verifying TaskRun ownership and both hashes."""
+        """Decrypt one response after verifying TaskRun ownership and both hashes.
+
+        A transient sharing or protection race is retried on the same evidence
+        id; a persistent mismatch still fails closed.
+        """
         _uuid4(evidence_id, "evidence_id")
         with self._lock:
-            try:
-                self.protection.verify_directory(self.directory)
-                self._verify_owner()
-                metadata = self._metadata(evidence_id)
-                ciphertext = self._ciphertext(metadata)
-                entropy = hashlib.sha256(
-                    f"qinyuan-d7-http:{self.task_run_id}:{evidence_id}".encode("ascii")
-                ).digest()
-                envelope = self.protection.unprotect(ciphertext, entropy)
-                value = json.loads(envelope)
-                if (
-                    not isinstance(value, dict)
-                    or set(value) != {"body_sha256", "body"}
-                    or not isinstance(value["body_sha256"], str)
-                    or not isinstance(value["body"], str)
-                ):
-                    raise HttpCapabilityError("d7_http_evidence_integrity_failed")
-                body = bytes.fromhex(value["body"])
-                body_sha = hashlib.sha256(body).hexdigest()
-                if (
-                    len(body) != metadata.byte_size
-                    or body_sha != metadata.body_sha256
-                    or value["body_sha256"] != metadata.body_sha256
-                ):
-                    raise HttpCapabilityError("d7_http_evidence_integrity_failed")
-                return body
-            except WindowsEvidenceProtectionError as exc:
-                raise HttpCapabilityError("d7_http_evidence_protection_failed") from exc
-            except HttpCapabilityError:
-                raise
-            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                raise HttpCapabilityError("d7_http_evidence_integrity_failed") from exc
+            for attempt, delay in enumerate((0.05, 0.1, 0.2, None), 1):
+                try:
+                    self.protection.verify_directory(self.directory)
+                    self._verify_owner()
+                    metadata = self._metadata(evidence_id)
+                    ciphertext = self._ciphertext(metadata)
+                    entropy = hashlib.sha256(
+                        f"qinyuan-d7-http:{self.task_run_id}:{evidence_id}".encode("ascii")
+                    ).digest()
+                    envelope = self.protection.unprotect(ciphertext, entropy)
+                    value = json.loads(envelope)
+                    if (
+                        not isinstance(value, dict)
+                        or set(value) != {"body_sha256", "body"}
+                        or not isinstance(value["body_sha256"], str)
+                        or not isinstance(value["body"], str)
+                    ):
+                        raise HttpCapabilityError("d7_http_evidence_integrity_failed")
+                    body = bytes.fromhex(value["body"])
+                    body_sha = hashlib.sha256(body).hexdigest()
+                    if (
+                        len(body) != metadata.byte_size
+                        or body_sha != metadata.body_sha256
+                        or value["body_sha256"] != metadata.body_sha256
+                    ):
+                        raise HttpCapabilityError("d7_http_evidence_integrity_failed")
+                    if attempt > 1:
+                        get_logger("store").info(
+                            "http.evidence_read_recovered",
+                            run=self.task_run_id,
+                            evidence_ref=evidence_id,
+                            attempts=attempt,
+                        )
+                    return body
+                except WindowsEvidenceProtectionError as exc:
+                    if delay is None or not self._transient_protection_failure(exc):
+                        raise HttpCapabilityError("d7_http_evidence_protection_failed",
+                            protection_code=getattr(exc, "code", None)) from exc
+                    get_logger("store").warning(
+                        "http.evidence_read_retry",
+                        run=self.task_run_id,
+                        evidence_ref=evidence_id,
+                        attempt=attempt,
+                        retry_delay_seconds=delay,
+                        category="dependency",
+                        code="d7_http_evidence_protection_failed",
+                    )
+                    time.sleep(delay)
+                except HttpCapabilityError:
+                    raise
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    raise HttpCapabilityError("d7_http_evidence_integrity_failed") from exc
+        raise AssertionError("bounded evidence read retry did not terminate")
 
     def save(self, operation_id: str, body: bytes) -> D7HttpEvidenceMetadata:
         _uuid4(operation_id, "operation_id")

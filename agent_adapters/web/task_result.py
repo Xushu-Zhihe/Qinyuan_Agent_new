@@ -252,7 +252,7 @@ def _stage_task_result(directory, declaration, store, expected):
             or config.goal_validation != declaration.get("goal_validation")
             or config.budget != expected.d4_budget or not isinstance(frozen_policy, dict) or not supported_queue or not supported_confirmation
             or config.execution_policy_ref != "sha256:" + digest(frozen_policy)
-            or {k: v for k, v in frozen_policy.items() if k not in {"review_queue", "human_confirmation"}} != {k: v for k, v in policy.items() if k not in {"review_queue", "human_confirmation"}}):
+            or {k: v for k, v in frozen_policy.items() if k not in {"review_queue", "human_confirmation", "tool_execution"}} != {k: v for k, v in policy.items() if k not in {"review_queue", "human_confirmation", "tool_execution"}}):
         raise ValueError("stage.execution_configuration_changed")
     rows = store.load_control_state_rows(task_id)
     if rows is None:

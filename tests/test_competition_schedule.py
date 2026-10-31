@@ -1,4 +1,4 @@
-﻿"""C01-3 controlled operator/competition tests; no real Docker, model or platform."""
+"""C01-3 controlled operator/competition tests; no real Docker, model or platform."""
 import asyncio
 from uuid import uuid4
 import pytest
@@ -361,7 +361,7 @@ def test_fixed_platform_operations_use_only_expected_routes_and_safe_fields(monk
     from agent_adapters import competition
     profile=dict(adapter="benchmark",base_url="https://example.test",timeout_seconds=2)
     calls=[]
-    def exchange(profile,key,method,path,payload=None):
+    def exchange(profile,key,method,path,payload=None,**kwargs):
         calls.append((method,path,payload))
         return dict(unique_code="test / code",container_addr=["10.0.1.5:8080"],closed=True,ignored="not forwarded")
     monkeypatch.setattr(competition,"_exchange",exchange)
@@ -402,6 +402,19 @@ def test_platform_success_during_inflight_submission_waits_for_its_receipt(platf
     p.workbench.runner._active.clear()
     fake_run(p,current,"achieved");service.tick()
     assert service.get(row["id"])["state"]["current_ref"] is None
+
+
+def test_arena_solved_platform_finishes_instead_of_needs_attention(platform,monkeypatch):
+    p=platform
+    service,row,_,_=schedule(p,adapter="arena")
+    challenge=str(uuid4())
+    service.update(row["id"],status="needs_attention",reason="operator_task_not_active",
+        challenge_id=challenge,platform={"state":"solved","remaining_seconds":0})
+    monkeypatch.setattr(p.workbench.runner,"status",
+        lambda _: {"status":"finished","result":{"task_run":{"status":"achieved"}}})
+    service.step(service.get(row["id"]))
+    current=service.get(row["id"])["state"]
+    assert current["status"]=="finished" and current["reason"]=="competition_question_solved"
 
 
 def test_overall_can_extend_after_current_terminal_without_reopening_it(platform,monkeypatch):

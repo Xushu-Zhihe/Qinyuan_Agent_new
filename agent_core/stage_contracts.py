@@ -17,7 +17,8 @@ from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.operation_accounting import D4OperationRecord, D8HandoffBudgetPolicy
 from agent_core.turn_contracts import D1RoleConfig
 
-MAX_IN_FLIGHT_TOOLS = 2
+MAX_IN_FLIGHT_TOOLS = 4
+TOOL_BATCH_WAIT_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)

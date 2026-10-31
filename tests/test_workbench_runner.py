@@ -207,6 +207,96 @@ def test_restart_does_not_acknowledge_cancel_without_owned_process(tmp_path):
     assert not (agent_directory / "cancel-request.json").exists()
 
 
+def test_operator_resume_rejects_cancel_marker_without_process(tmp_path):
+    workbench, challenge_id = prepared_workbench(tmp_path)
+    run_id, task_id = str(uuid4()), str(uuid4())
+    directory = workbench.runner.root / run_id
+    agent_directory = directory / "agent-state" / task_id
+    agent_directory.mkdir(parents=True)
+    immutable_write(agent_directory / "run.json", {"task_run_id": task_id})
+    workbench._insert_run(run_id, challenge_id, directory)
+    workbench._started_run(run_id)
+    immutable_write(agent_directory / "cancel-request.json", {"task_run_id": task_id})
+    with patch("agent_adapters.workbench_runner.subprocess.Popen") as popen:
+        with pytest.raises(WorkbenchError, match="operator_task_cancelled"):
+            workbench.runner.operator_control(challenge_id, "resume")
+        assert not popen.called
+
+
+def test_task_resume_unpauses_operator_state_before_cli(tmp_path, monkeypatch):
+    workbench, challenge_id = prepared_workbench(tmp_path)
+    run_id, task_id = str(uuid4()), str(uuid4())
+    directory = workbench.runner.root / run_id
+    agent_directory = directory / "agent-state" / task_id
+    agent_directory.mkdir(parents=True)
+    immutable_write(agent_directory / "run.json",
+        {"task_run_id": task_id, "contract_version": 22, "execution_profile": "d8_v22"})
+    workbench._insert_run(run_id, challenge_id, directory)
+    workbench._started_run(run_id)
+    with workbench._db() as db:
+        db.execute("UPDATE runs SET status='paused', agent_task_run_id=? WHERE run_id=?", (task_id, run_id))
+    class Store:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+    monkeypatch.setattr("agent_core.sqlite_control_store.SqliteControlStore.open",
+        classmethod(lambda cls, *args, **kwargs: Store()))
+    monkeypatch.setattr("agent_core.operator_controls.current", lambda store, task: {"paused": True})
+    submitted = []
+    monkeypatch.setattr("agent_core.controller.TaskRunController.submit_operator_control",
+        lambda *args: submitted.append(args))
+    monkeypatch.setattr("agent_adapters.web.task_result.snapshot_v3_task_result",
+        lambda *args: {"task_run": {"status": "running"}})
+    with patch("agent_adapters.workbench_runner.subprocess.Popen", return_value=FakeProcess()), patch(
+        "agent_adapters.workbench_runner.threading.Thread", NoThread
+    ):
+        workbench.runner.resume(challenge_id)
+    assert len(submitted) == 1 and submitted[0][3] == "resume"
+
+
+def test_pause_on_terminal_run_does_not_leave_marker(tmp_path):
+    workbench, challenge_id = prepared_workbench(tmp_path)
+    run_id = str(uuid4())
+    directory = workbench.runner.root / run_id
+    directory.mkdir()
+    workbench._insert_run(run_id, challenge_id, directory)
+    with workbench._db() as db:
+        db.execute("UPDATE runs SET status='cleanup_confirmed' WHERE run_id=?", (run_id,))
+    with pytest.raises(WorkbenchError, match="operator_task_not_active"):
+        workbench.runner.operator_control(challenge_id, "pause")
+    assert not (directory / "operator-pause-request.json").exists()
+
+
+def test_task_resume_clears_pause_marker_and_rejects_cancel(tmp_path, monkeypatch):
+    workbench, challenge_id = prepared_workbench(tmp_path)
+    run_id, task_id = str(uuid4()), str(uuid4())
+    directory = workbench.runner.root / run_id
+    agent_directory = directory / "agent-state" / task_id
+    agent_directory.mkdir(parents=True)
+    immutable_write(agent_directory / "run.json",
+        {"task_run_id": task_id, "contract_version": 22, "execution_profile": "d8_v22"})
+    workbench._insert_run(run_id, challenge_id, directory)
+    workbench._started_run(run_id)
+    with workbench._db() as db:
+        db.execute("UPDATE runs SET status='paused', agent_task_run_id=? WHERE run_id=?", (task_id, run_id))
+    pause_file = directory / "operator-pause-request.json"
+    immutable_write(pause_file, {"request_id": str(uuid4()), "operation_id": str(uuid4())})
+    monkeypatch.setattr("agent_adapters.web.task_result.snapshot_v3_task_result",
+        lambda *args: {"task_run": {"status": "running"}})
+    with patch("agent_adapters.workbench_runner.subprocess.Popen", return_value=FakeProcess()) as popen, patch(
+        "agent_adapters.workbench_runner.threading.Thread", NoThread
+    ):
+        workbench.runner.resume(challenge_id)
+    assert popen.called and not pause_file.exists()
+
+    immutable_write(agent_directory / "cancel-request.json", {"task_run_id": task_id})
+    with workbench._db() as db:
+        db.execute("UPDATE runs SET status='paused' WHERE run_id=?", (run_id,))
+    with patch("agent_adapters.workbench_runner.subprocess.Popen") as popen:
+        with pytest.raises(WorkbenchError, match="d9_resume_cancelled"):
+            workbench.runner.resume(challenge_id)
+        assert not popen.called
+
+
 def test_no_agent_result_requires_recovery(tmp_path):
     workbench, challenge_id = prepared_workbench(tmp_path)
     run_id = str(uuid4())

@@ -26,6 +26,7 @@ from agent_core.stage_contracts import (
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete,
     StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnPlanningContext, TurnPlanningState, TurnIntent, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
+    TOOL_BATCH_WAIT_SECONDS,
     StageToolBatch, tool_calls, tool_call_key, StageFactBatch, fact_candidates, reviewed_fact, StageBranchFork,
 )
 from agent_core.stage_planning import StageModelRequest, stage_runtime, review_members, formal_support_refs
@@ -636,13 +637,31 @@ class StageApplication:
         return (request.task_run_id == self.task_id and request.stage == "stage_action"
             and request.context.session == PlanningSession("road_execution", road))
 
-    async def _collect_tools(self, *, wait=False, drain=False):
+    async def _collect_tools(self, *, wait=False, drain=False, all_pending=False, timeout=None, ids=None):
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        def targets():
+            return tuple(entry for entry in self._tools_in_flight.values()
+                if ids is None or entry.operation_id in ids)
         while self._tools_in_flight:
-            if wait or drain:
-                while not any(entry.task.done() for entry in self._tools_in_flight.values()):
-                    self._check_dispatch()
-                    await asyncio.wait({entry.task for entry in self._tools_in_flight.values()},
-                        timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+            if wait or drain or all_pending:
+                if all_pending:
+                    while any(not entry.task.done() for entry in targets()):
+                        self._check_dispatch()
+                        remaining = None if deadline is None else deadline - loop.time()
+                        if remaining is not None and remaining <= 0:
+                            pending = [entry.operation_id for entry in targets() if not entry.task.done()]
+                            get_logger("ctrl").info("stage.tools_wait_timeout", run=self.task_id,
+                                phase="tool_dispatch", pending=pending, in_flight=len(self._tools_in_flight))
+                            break
+                        await asyncio.wait({entry.task for entry in targets() if not entry.task.done()},
+                            timeout=0.1 if remaining is None else min(0.1, remaining),
+                            return_when=asyncio.FIRST_COMPLETED)
+                else:
+                    while not any(entry.task.done() for entry in self._tools_in_flight.values()):
+                        self._check_dispatch()
+                        await asyncio.wait({entry.task for entry in self._tools_in_flight.values()},
+                            timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
             completed = []
             for identity, entry in tuple(self._tools_in_flight.items()):
                 if entry.task.done():
@@ -700,14 +719,14 @@ class StageApplication:
         await self._collect_tools()
         if not any(entry.admitted for entry in entries):
             await self.reviews.collect(token, unused=identity)
-            return False
+            return ()
         self.store.mark_d4_operation_applied(identity, identity if isinstance(proposal, StageToolBatch) else operation_id)
         self._commit(StageStateChange())
         get_logger("ctrl").info("stage.tool_dispatched", run=self.task_id, operation=identity,
             phase="tool_dispatch", in_flight=len(self._tools_in_flight), action_count=sum(entry.admitted for entry in entries))
         if self.reviews.dispatch_fence(identity) is not None:
             await self.reviews.collect(token)
-        return True
+        return tuple(entry.operation_id for entry in entries if entry.admitted)
 
     async def _stop_tools(self):
         from agent_core.dual_llm_modeling import MODEL_CANCEL_GRACE_SECONDS
@@ -767,10 +786,15 @@ class StageApplication:
 
     async def run(self, token):
         from agent_adapters.run_files import run_lock
+        from agent_core.operator_controls import OperatorPaused
         with run_lock(self.directory):
             self._tools_stopping = False
             try:
                 return await self._run(token)
+            except OperatorPaused:
+                # Pausing is a normal operator command, not an unknown failure.
+                get_logger("ctrl").info("stage.operator_paused", run=self.task_id, phase="stage_loop")
+                raise
             except Exception as exc:
                 category, code, _ = classify(exc)
                 from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
@@ -929,7 +953,7 @@ class StageApplication:
             self._check_dispatch()
             if isinstance(action, StagePlanningDecision) and action.kind == "wait_for_tools":
                 self._commit(StageStateChange(applications=(identity,)))
-                await self._collect_tools(wait=True)
+                await self._collect_tools(all_pending=True)
                 continue
             if isinstance(action, StagePlanningDecision) and action.kind == "wait_for_review":
                 self._commit(StageStateChange(applications=(identity,)))
@@ -942,9 +966,11 @@ class StageApplication:
             if tool_calls(action):
                 for call in tool_calls(action):
                     self.mcp.validate(SimpleNamespace(history_context=json.dumps({"mcp_tools": list(request.tools)})), call)
-                if not await self._start_tools(identity, running.road_id, action, token):
+                admitted = await self._start_tools(identity, running.road_id, action, token)
+                if not admitted:
                     continue
-                await self._collect_tools(wait=True)
+                await self._collect_tools(all_pending=True, ids=admitted,
+                    timeout=TOOL_BATCH_WAIT_SECONDS if len(admitted) > 1 else None)
                 continue
             try:
                 review_id, review = await self._queued_review(request.context.session, identity, action, token)

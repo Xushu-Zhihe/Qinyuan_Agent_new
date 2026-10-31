@@ -200,7 +200,10 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         if challenge is not None and self.workbench.runner.status(challenge) is not None:
             try:self.workbench.runner.operator_control(challenge,"pause")
             except WorkbenchError as error:
-                self.update(identity,status="needs_attention",reason=error.code)
+                # A terminal run cannot be paused; it is already stopped. Keep
+                # the session pausing so the next tick can settle it normally.
+                if error.code not in {"operator_task_not_active","operator_task_expired_or_terminal"}:
+                    self.update(identity,status="needs_attention",reason=error.code)
         self.wake.set();return self.get(identity)
 
     def pause_profile(self,profile):
@@ -448,9 +451,16 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 row=self.get(identity);state=row["state"]
                 if state.get("pending_control"):return
         active=False
+        run=None
         if challenge is not None:
             run=runner.status(challenge)
             active=run is not None and run["status"] in {"starting","running","cancelling","cleaning"}
+        task_status=((run or {}).get("result") or {}).get("task_run",{}).get("status")
+        if (adapter=="arena" and (state.get("platform") or {}).get("state")=="solved" and not active
+                and ((run or {}).get("status") in {"finished","cleanup_confirmed"} or task_status in FINISHED)):
+            # An Arena attempt is single-question: only finish after the run and
+            # its submission receipt are terminal, never while awaiting feedback.
+            self.update(identity,status="finished",reason="competition_question_solved");return
         if not active and challenge is not None:
             reason=((run or {}).get("result") or {}).get("recovery",{}).get("reason")
             if reason=="competition_end_recovery_required" and not state.get("submission_retry"):
@@ -565,6 +575,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         if active:
             if item is not None and (item.get("is_completed") or item["state"]=="solved"):
                 if runner.inflight_operation(challenge)=="competition-submit":return
+                if adapter=="arena":return
                 self.pause(identity,reason="competition_completion_requires_verification");return
             if item is not None and item["state"] not in {"active","available"} and not item.get("is_completed"):
                 self.pause(identity,reason="competition_target_unavailable")

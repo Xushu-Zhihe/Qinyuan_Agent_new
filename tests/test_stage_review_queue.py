@@ -1076,8 +1076,9 @@ def test_capacity_summary_waits_for_outer_and_survives_the_next_submission_fork(
     assert summaries[0].model_request_id in json.dumps(following.messages)
 
 
-def test_fact_review_and_publication_do_not_wait_for_an_unrelated_inflight_tool(overlap_case):
+def test_fact_review_and_publication_do_not_wait_for_an_unrelated_inflight_tool(overlap_case, monkeypatch):
     case, control = overlap_case, overlap_case.overlap
+    monkeypatch.setattr("agent_adapters.stage_application.TOOL_BATCH_WAIT_SECONDS", 0.05)
     control.release["A"].set()
     actions = []
     def decision(request):

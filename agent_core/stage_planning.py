@@ -114,15 +114,17 @@ EXPLORATION_GUIDANCE = (
     "endorse a direction. Use existing explanations when useful; add no fields or calls just to discuss this. "
 )
 TOOL_CONCURRENCY_GUIDANCE = (
-    " Submit one decision: mcp_call for one tool, or mcp_calls with two useful independent calls when declared. "
-    "Use the batch when both arguments are already known; never guess a dependency on another call's result. "
-    "After dispatch the runtime waits for the first result before requesting another decision. "
-    "Up to two tool actions can be in flight in this Road; "
+    f" Submit one decision: mcp_call for one tool, or mcp_calls with up to {MAX_IN_FLIGHT_TOOLS} useful independent calls when declared. "
+    "Use the batch only when all arguments are already known; never guess a dependency on another call's result. "
+    "After a multi-call batch the runtime waits for the whole batch, or a bounded scheduling timeout, before requesting another decision. "
+    "On timeout the settled observations and pending_tools are returned; unfinished calls are not cancelled. "
+    f"Up to {MAX_IN_FLIGHT_TOOLS} tool actions can be in flight in this Road; "
     "public-reference tools may overlap, while sandbox/target tools share one serial slot. "
     "pending_tools entries and pending_operation_ids identify unfinished work, never observations or Facts. "
     "Use a free slot only for a useful action independent of unfinished results and shared mutable state. "
     "Do not duplicate in-flight work or invent its outcome. If the next useful action depends on a pending result, "
-    "return wait_for_tools with a brief reason. Waiting is technical scheduling, not failure or exhaustion. "
+    "return wait_for_tools with a brief reason; it waits for every pending call to settle, without cancelling them. "
+    "Waiting is technical scheduling, not failure or exhaustion. "
     "Only the declared tools are currently eligible; a busy tool can be reconsidered after settlement. "
 )
 PUBLIC_REFERENCE_GUIDANCE = (
@@ -203,7 +205,12 @@ def provider_schema(request):
 def decode_stage_response(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAILING_BRACE_POLICY):
     """Keep native bytes/finish reason intact; unwrap only the declared output tool."""
     result_schema = schema(request) if result_schema is None else result_schema
-    if not isinstance(raw, D8ModelResponse) or raw.tool_calls is None:
+    if not isinstance(raw, D8ModelResponse) or not raw.tool_calls:
+        # Providers may emit an empty tool_calls list together with ordinary
+        # text JSON. No native call exists, so decode the content as text. A
+        # tool_calls finish reason without any call is still a broken response.
+        if isinstance(raw, D8ModelResponse) and raw.finish_reason == "tool_calls":
+            return None, [D8FormatIssue("native_tool_call_invalid", "$", "one_finished_output_tool", "invalid")], None, None
         return decode_response(raw, result_schema)
     if raw.finish_reason != "tool_calls":
         if raw.finish_reason != "stop":
@@ -333,7 +340,7 @@ def stage_output_issues(request, raw, *, normalization_policy=NATIVE_TRAILING_BR
         return fact_issues
     if kind == "mcp_calls":
         calls = value.get("calls")
-        if (isinstance(calls, list) and len(calls) == 2 and all(isinstance(c, dict)
+        if (isinstance(calls, list) and len(calls) >= 2 and all(isinstance(c, dict)
                 and c.get("tool_name") in {t["qualified_name"] for t in request.tools} for c in calls)
                 and sum(c["tool_name"] not in PUBLIC_REFERENCE_TOOLS for c in calls) > 1):
             path = "$/result/calls" if isinstance(raw, D8ModelResponse) and raw.tool_calls is not None else "$/calls"
@@ -625,6 +632,8 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
         return StageStrategyAdvice(value["decision"], checked(value, "reason"), refs)
     kind = value["kind"]
     if kind == "mcp_calls":
+        if sum(item["tool_name"] not in PUBLIC_REFERENCE_TOOLS for item in value["calls"]) > 1:
+            raise ValueError("stage.tool_batch_resource_conflict")
         return StageToolBatch(tuple(MCPCall(item["tool_name"], item["arguments"]) for item in value["calls"]))
     if kind in {"select_road", "return_to_parent", "request_final_validation", "wait_for_tools", "wait_for_review"}:
         return StagePlanningDecision(kind, checked(value, "reason"), refs, value.get("road_id"), value.get("candidate"), value.get("source_ref"))

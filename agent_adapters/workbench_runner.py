@@ -655,11 +655,17 @@ class Runner:
         with self.workbench.lock:
             run=self._current(challenge_id)
             if run is None:raise WorkbenchError("operator_run_missing",409)
+            if action=="pause" and run["status"] not in {"starting","running","paused","recovery_required"}:
+                raise WorkbenchError("operator_task_not_active",409)
+            if action=="resume" and run["status"] not in {"starting","running","paused","recovery_required"}:
+                raise WorkbenchError("operator_task_not_active",409)
             directory=Path(run["directory"])
             pause_file=directory/"operator-pause-request.json"
+            created_pause=False
             if action=="pause" and not pause_file.exists():
                 binding=immutable_read(directory/"competition-binding.json")
                 immutable_write(pause_file,{"request_id":binding["request_id"],"operation_id":operation_id})
+                created_pause=True
             from agent_adapters.run_files import run_lock
             from agent_core.sqlite_control_store import SqliteControlStore
             from agent_core.operator_controls import current
@@ -671,6 +677,9 @@ class Runner:
             try:
                 with run_lock(controls_dir):
                     agent_dir=self._find_agent_directory(directory);ready=False
+                    if action=="resume" and agent_dir is not None and (
+                            run.get("cancel_requested") or (agent_dir/"cancel-request.json").exists()):
+                        raise WorkbenchError("operator_task_cancelled",409)
                     if agent_dir is not None and (agent_dir/"control.sqlite").is_file():
                         with SqliteControlStore.open_readonly(agent_dir/"control.sqlite") as store:ready=current(store,agent_dir.name) is not None
                     if not ready:
@@ -697,9 +706,29 @@ class Runner:
         except (OSError,ValueError,subprocess.TimeoutExpired):raise WorkbenchError("operator_command_outcome_unknown",503) from None
         if completed.returncode or output.get("exit_code"):
             errors=output.get("errors",[])
+            if action=="pause" and created_pause:
+                self._discard_unpersisted_pause(pause_file,agent_dir,operation_id)
             raise WorkbenchError(errors[0]["code"] if errors else "operator_command_rejected",409)
         if action=="resume":pause_file.unlink(missing_ok=True)
         return output["operator_control"]
+
+    @staticmethod
+    def _discard_unpersisted_pause(pause_file,agent_dir,operation_id):
+        """A rejected pause must not leave a probe that blocks the next resume."""
+        if agent_dir is None:return
+        from agent_core.sqlite_control_store import SqliteControlStore
+        try:
+            with SqliteControlStore.open_readonly(agent_dir/"control.sqlite") as store:
+                persisted=store._connection.execute(
+                    "SELECT 1 FROM task_operator_controls WHERE operation_id=? AND task_run_id=?",
+                    (operation_id,agent_dir.name)).fetchone()
+        except Exception:
+            return
+        if persisted is not None:return
+        try:marker=immutable_read(pause_file)
+        except (OSError,ValueError):return
+        if marker.get("operation_id")==operation_id:
+            pause_file.unlink(missing_ok=True)
 
     def runtime_control(self,challenge_id):
         from agent_core.sqlite_control_store import SqliteControlStore
@@ -807,6 +836,21 @@ class Runner:
             if (not isinstance(declaration, dict) or declaration.get('task_run_id') != agent_dir.name
                     or (declaration.get('contract_version'), declaration.get('execution_profile')) not in {(19,'d8_v19'),(20,'d8_v20'),(21,'d8_v21'),(22,'d8_v22')}):
                 raise WorkbenchError('d9_operation_profile_unsupported', 409)
+            if operation == 'resume':
+                if run.get('cancel_requested') or (agent_dir / 'cancel-request.json').exists():
+                    raise WorkbenchError('d9_resume_cancelled', 409)
+                (directory / 'operator-pause-request.json').unlink(missing_ok=True)
+                from agent_core.sqlite_control_store import SqliteControlStore
+                from agent_core.operator_controls import current as current_operator
+                from agent_core.controller import TaskRunController
+                try:
+                    with SqliteControlStore.open(agent_dir / 'control.sqlite') as store:
+                        state = current_operator(store, agent_dir.name)
+                        if state is not None and state.get('paused'):
+                            TaskRunController.submit_operator_control(
+                                store, agent_dir.name, str(uuid4()), 'resume', {})
+                except ValueError as error:
+                    raise WorkbenchError(str(error), 409) from None
             result = snapshot_v3_task_result(agent_dir, declaration)
             if operation == 'resume' and result.get('task_run', {}).get('status') != 'running':
                 raise WorkbenchError('d9_resume_requires_running_task', 409)

@@ -20,6 +20,7 @@ from agent_core.stage_contracts import (
     StageConclusionChange, StageFactApplication, StageFactProposal, StageFactSelection, StageHistoryRead,
     StageModelEvidence, StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnIntent, TurnPlanningReview, TurnPlanningState, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
+    TOOL_BATCH_WAIT_SECONDS,
     StageToolBatch, tool_calls, tool_call_key, StageFactBatch, StageFactBatchReview,
     fact_candidates, reviewed_fact, fact_verification_ref, StageQueuedReview, StageBranchFork, StageSessionBranch,
 )
@@ -178,9 +179,12 @@ def execution_policy(config):
         "capacity": asdict(config.handoff_config),
         "human_confirmation": "assume_after_300s_v1",
         "review_queue": {"binding": "immutable_proposal_v1", "dispatch": "async_planning_v1"},
-        "tool_execution": {"max_in_flight": MAX_IN_FLIGHT_TOOLS, "sandbox_target_in_flight": 1,
+        "tool_execution": {"schema": "v2", "max_in_flight": MAX_IN_FLIGHT_TOOLS,
+                           "sandbox_target_in_flight": 1,
                            "max_calls_per_decision": MAX_IN_FLIGHT_TOOLS,
-                           "wake": "first_result_before_next_decision_merge_during_generation"}}))
+                           "wake": "batch_settled_or_timeout",
+                           "batch_wait_seconds": TOOL_BATCH_WAIT_SECONDS,
+                           "wait_for_tools": "all_pending"}}))
 
 
 def human_confirmation_policy(store, task_id):

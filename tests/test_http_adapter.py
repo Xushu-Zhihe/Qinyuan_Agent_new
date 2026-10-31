@@ -16,6 +16,7 @@ from agent_adapters.web.http_adapter import (
     D7HttpResponseEvidenceStore,
     D7HttpWireResponse,
 )
+from agent_adapters.windows_evidence_protection import WindowsEvidenceProtectionError
 
 
 class FakeProtection:
@@ -54,6 +55,17 @@ class FakeEvidence:
             len(body),
             1.0,
         )
+
+
+class FlakyProtection(FakeProtection):
+    def __init__(self):
+        self.failures = 0
+        self.code = "protected_directory_unavailable"
+
+    def verify_directory(self, _directory: Path) -> None:
+        if self.failures:
+            self.failures -= 1
+            raise WindowsEvidenceProtectionError(self.code)
 
 
 class FakeTransport:
@@ -174,6 +186,41 @@ def test_response_evidence_lookup_is_idempotent_taskrun_scoped_and_integrity_che
         store.find_by_operation(operation_id)
     with pytest.raises(HttpCapabilityError, match="integrity_failed"):
         store.read(first.evidence_id)
+
+
+def test_response_evidence_read_retries_transient_protection_failure(tmp_path, monkeypatch):
+    from agent_adapters.web import http_adapter
+    task, operation = str(uuid4()), str(uuid4())
+    protection = FlakyProtection()
+    store = D7HttpResponseEvidenceStore(tmp_path, task, protection=protection)
+    metadata = store.save(operation, b"observed")
+    delays = []
+    monkeypatch.setattr(http_adapter.time, "sleep", delays.append)
+    protection.failures, protection.code = 3, "protected_directory_unavailable"
+    assert store.read(metadata.evidence_id) == b"observed"
+    assert delays == [0.05, 0.1, 0.2]
+    protection.failures = 1
+    assert store.read(metadata.evidence_id) == b"observed"
+    assert delays == [0.05, 0.1, 0.2, 0.05]
+
+
+def test_response_evidence_read_retry_is_bounded_and_non_transient_fails_fast(tmp_path, monkeypatch):
+    from agent_adapters.web import http_adapter
+    task, operation = str(uuid4()), str(uuid4())
+    protection = FlakyProtection()
+    store = D7HttpResponseEvidenceStore(tmp_path, task, protection=protection)
+    metadata = store.save(operation, b"observed")
+    delays = []
+    monkeypatch.setattr(http_adapter.time, "sleep", delays.append)
+    protection.failures, protection.code = 4, "protected_directory_unavailable"
+    with pytest.raises(HttpCapabilityError, match="protection_failed"):
+        store.read(metadata.evidence_id)
+    assert delays == [0.05, 0.1, 0.2]
+    delays.clear()
+    protection.failures, protection.code = 1, "protected_data_invalid"
+    with pytest.raises(HttpCapabilityError, match="protection_failed"):
+        store.read(metadata.evidence_id)
+    assert delays == []
 
 
 def test_duplicate_evidence_operation_records_are_a_conflict(tmp_path):

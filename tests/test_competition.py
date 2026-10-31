@@ -308,3 +308,53 @@ def test_benchmark_protocol_has_no_abandon_action():
         competition.platform_action({"adapter":"benchmark"},"controlled","abandon","test-code")
     with pytest.raises(WorkbenchError,match="competition_platform_action_unsupported"):
         competition.platform_action({"adapter":"arena"},"controlled","close","test-code")
+
+
+def test_read_exchange_retries_transient_invalid_then_succeeds(monkeypatch):
+    calls = []
+    def exchange(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            error = WorkbenchError("competition_response_invalid", 502)
+            error.content_type = "application/json"
+            raise error
+        return {"ok": True}
+    monkeypatch.setattr(competition, "_exchange", exchange)
+    monkeypatch.setattr(competition.time, "sleep", lambda _: None)
+    assert competition._read_exchange({"adapter": "arena"}, "token", "/read", operation="read") == {"ok": True}
+    assert len(calls) == 2 and calls[0]["operation"] == "read"
+
+
+def test_read_exchange_stops_after_bounded_invalid(monkeypatch):
+    calls = []
+    def exchange(*args, **kwargs):
+        calls.append(1)
+        error = WorkbenchError("competition_response_invalid", 502)
+        error.content_type = "application/json"
+        raise error
+    monkeypatch.setattr(competition, "_exchange", exchange)
+    monkeypatch.setattr(competition.time, "sleep", lambda _: None)
+    with pytest.raises(WorkbenchError, match="competition_response_invalid"):
+        competition._read_exchange({"adapter": "arena"}, "token", "/read", operation="read")
+    assert len(calls) == len(competition.READ_RETRY_DELAYS) + 1
+
+
+def test_submit_does_not_retry_invalid_response(monkeypatch):
+    calls = []
+    def exchange(*args, **kwargs):
+        calls.append(1)
+        raise WorkbenchError("competition_response_invalid", 502)
+    monkeypatch.setattr(competition, "_exchange", exchange)
+    with pytest.raises(WorkbenchError, match="competition_response_invalid"):
+        competition.submit_candidate({"adapter": "arena"}, "token", 1, "flag")
+    assert len(calls) == 1
+
+
+def test_competition_response_invalid_diagnostic_has_no_body(monkeypatch):
+    captured = []
+    monkeypatch.setattr(competition, "get_logger", lambda _: SimpleNamespace(
+        warning=lambda event, **kwargs: captured.append((event, kwargs))))
+    competition._log_response_invalid(operation="read", path="/read", raw=b"secret platform body", reason="json")
+    assert captured and captured[0][0] == "competition.response_invalid"
+    assert "secret platform body" not in repr(captured[0][1])
+    assert captured[0][1]["response_bytes"] == 20

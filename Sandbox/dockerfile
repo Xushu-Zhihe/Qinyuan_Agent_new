@@ -118,13 +118,18 @@ RUN rm -rf /var/lib/apt/lists/* \
         nmap \
         openjdk-17-jre-headless \
         p7zip-full \
+        pari-gp \
         patchelf \
         perl \
         php-cli \
         procps \
         python3 \
         python3-capstone \
+        python3-cypari2 \
+        python3-fpylll \
+        python3-gmpy2 \
         python3-pip \
+        python3-sympy \
         python3-venv \
         qemu-system-x86 \
         qemu-user-static \
@@ -288,6 +293,8 @@ RUN mkdir -p /opt/qinyuan/wordlists \
     && command -v one_gadget >/dev/null \
     && command -v pwntools-terminal >/dev/null \
     && command -v qinyuan-exec >/dev/null \
+    && command -v gp >/dev/null \
+    && /usr/bin/python3 -c "import sympy, gmpy2, fpylll, cypari2; from cypari2 import Pari; assert Pari()('2+2') == 4" \
     && command -v x86_64-w64-mingw32-gcc >/dev/null \
     && command -v checksec >/dev/null \
     && command -v ROPgadget >/dev/null \
