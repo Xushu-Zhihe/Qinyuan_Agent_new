@@ -553,3 +553,13 @@ def test_completed_mcp_planner_error_cannot_dispatch_a_sandbox_command():
     with pytest.raises(MCPCommandPlanError, match="^mcp.planner_rejected$"):
         asyncio.run(manager._execute_bound_tool(agent_id="controlled", qualified_name="jadx.decompile_android", arguments={}))
     assert not executions
+
+
+def test_registry_reader_tolerates_a_utf8_bom(tmp_path):
+    """An editor-added BOM must not abort the stage loop at mcp.open()."""
+    from pathlib import Path
+    from MCPs.Mcp_client.client import load_registry
+    payload = json.loads(Path(MCPPlanExecutor.registry_path()).read_text(encoding="utf-8-sig"))
+    target = tmp_path / "registry.json"
+    target.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    assert load_registry(target).servers

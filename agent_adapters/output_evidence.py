@@ -95,6 +95,14 @@ def _leading_errno(error):
     return None
 
 
+def trace_frames(error, limit=6):
+    """Bounded frame identities (file:line:function), never exception or payload text."""
+    import traceback
+    from pathlib import Path
+    frames = traceback.extract_tb(getattr(error, "__traceback__", None))[-limit:]
+    return [f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in frames]
+
+
 def safe_failure_details(error, *, include_chain=False):
     """Describe a bounded exception chain without persisting exception text."""
     import os

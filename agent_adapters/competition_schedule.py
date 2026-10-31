@@ -111,8 +111,14 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
     def check_task_operation(self,challenge,operation):
         row=next((r for r in self.rows() if r["state"].get("challenge_id")==challenge and r["state"]["status"]!="finished"),None)
         if row is None or operation=="competition-end":return
-        if self.closed.is_set() or row["state"]["status"]!="running" or self.clock()>=row["state"]["deadline_at"]:
-            raise WorkbenchError("competition_session_not_running",409)
+        state=row["state"]
+        if self.closed.is_set() or state["status"]!="running" or self.clock()>=state["deadline_at"]:
+            # The session cannot make progress until the operator repairs this
+            # question, and the session resume path re-raises the same recovery,
+            # so an explicit per-task resume must stay reachable here.
+            if not (operation=="resume" and state["status"]=="needs_attention"
+                    and state.get("reason")=="competition_task_recovery_required"):
+                raise WorkbenchError("competition_session_not_running",409)
 
     def update(self,identity,**changes):
         with self.workbench.lock,self.workbench._db() as db:

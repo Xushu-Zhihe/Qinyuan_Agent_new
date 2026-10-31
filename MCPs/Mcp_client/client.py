@@ -113,7 +113,9 @@ def load_registry(path: str | Path) -> MCPRegistryConfig:
     """
     
     registry_path = Path(path).resolve()
-    raw = json.loads(registry_path.read_text(encoding="utf-8"))
+    # utf-8-sig tolerates a BOM that an editor or shell may have added; a BOM is
+    # not part of the JSON document and json.loads rejects it outright.
+    raw = json.loads(registry_path.read_text(encoding="utf-8-sig"))
     raw_servers = raw.get("mcpServers")
 
     if not isinstance(raw_servers,dict):

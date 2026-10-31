@@ -9,7 +9,7 @@ from uuid import uuid4
 from agent_adapters.mcp_plan_executor import MCPPlanExecutor
 from agent_adapters.stage_evidence import StageEvidence, StageModelCalls, StageModelTransportFailure, StageModelSuperseded
 from agent_adapters.stage_reviews import StageReviews
-from agent_adapters.output_evidence import safe_failure_details
+from agent_adapters.output_evidence import safe_failure_details, trace_frames
 from agent_core.actions import MCPCall
 from agent_core.control_state_repository import ControlStateRepository
 from agent_core.control_store import ControlMutation
@@ -779,7 +779,7 @@ class StageApplication:
                     code = exc.args[0]
                 get_logger("ctrl").warning("stage.run_stopped", run=self.task_id,
                     category=str(category), code=code, phase="stage_loop",
-                    **safe_failure_details(exc))
+                    trace=trace_frames(exc), **safe_failure_details(exc))
                 raise
             finally:
                 await self.reviews.stop()
