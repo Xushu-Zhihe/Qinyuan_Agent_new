@@ -12,7 +12,7 @@ import pytest
 
 from agent_adapters.run_files import immutable_read, immutable_write
 from agent_adapters.workbench import Workbench, WorkbenchError
-from agent_adapters.workbench_runner import ActiveRun
+from agent_adapters.workbench_runner import ActiveRun, stderr_reports_failure
 
 
 class FakeProcess:
@@ -184,7 +184,7 @@ def test_terminal_recovery_uses_explicit_cleanup_only_before_archive(tmp_path):
     process = workbench.runner._active[run_id].process
     process.result = cleaned
     process.returncode = 5
-    (directory / "agent.stdout.log").write_text(json.dumps(cleaned), encoding="utf-8")
+    (directory / "cleanup.stdout.log").write_text(json.dumps(cleaned), encoding="utf-8")
     workbench.runner._watch(run_id)
     assert workbench.runner.status(challenge_id)["status"] == "cleanup_confirmed"
     assert workbench.archive(challenge_id)["archived"] is True
@@ -352,7 +352,7 @@ def test_recovery_required_v2_can_explicitly_end_and_cleanup(tmp_path, terminal_
     process = workbench.runner._active[run_id].process
     process.result = ended
     process.returncode = 5
-    (directory / "agent.stdout.log").write_text(json.dumps(ended), encoding="utf-8")
+    (directory / "cancel.stdout.log").write_text(json.dumps(ended), encoding="utf-8")
     workbench.runner._watch(run_id)
     finished = workbench.runner.status(challenge_id)
     assert finished["status"] == "cleanup_confirmed"
@@ -441,7 +441,7 @@ def test_historical_remote_cleanup_requires_explicit_network_cleanup(tmp_path):
     process = restarted.runner._active[run_id].process
     process.result = confirmed
     process.returncode = 5
-    (directory / "agent.stdout.log").write_text(json.dumps(confirmed), encoding="utf-8")
+    (directory / "cleanup.stdout.log").write_text(json.dumps(confirmed), encoding="utf-8")
     restarted.runner._watch(run_id)
     assert restarted.runner.status(challenge_id)["status"] == "cleanup_confirmed"
     assert restarted.archive(challenge_id)["archived"] is True
@@ -455,3 +455,84 @@ def test_newer_run_status_is_not_overwritten_by_old_result(tmp_path):
     workbench._insert_run(second, challenge_id, tmp_path / second)
     workbench._finish_run(first, status="cancelled", exit_code=130, result={}, agent_task_run_id=None)
     assert workbench.get(challenge_id)["status"] == "starting"
+
+
+def test_agent_logs_go_to_the_run_directory(tmp_path, monkeypatch):
+    workbench, _ = prepared_workbench(tmp_path)
+    monkeypatch.setenv("QY_LOG_CONSOLE", "1")
+    env = workbench.runner._subprocess_environment(3, tmp_path)
+    # A visible console is the operator's shell choice; children must not turn
+    # their own INFO chatter into stderr that _wait() can read as a failure.
+    assert "QY_LOG_CONSOLE" not in env
+    assert env["QY_LOG_JSONL"] == str(tmp_path / "agent.log.jsonl")
+
+
+@pytest.mark.parametrize(
+    "stderr,failure",
+    [
+        ("10:21:00.525 INFO  store phase.finished run=x\n", False),
+        ("[10/31/26 10:21:28] INFO     Processing request of type server.py:733\n", False),
+        ("10:23:09.668 WARNING ctrl stage.call_rejected code=stage.model_output_unusable\n", False),
+        ("Traceback (most recent call last):\n  File \"x.py\", line 1\n", True),
+        ("12:00:00.001 ERROR   ctrl boom\n", True),
+    ],
+)
+def test_stderr_failure_signature(stderr, failure):
+    assert stderr_reports_failure(stderr) is failure
+
+
+def test_cleanup_operation_keeps_the_run_logs(tmp_path):
+    workbench, challenge_id = prepared_workbench(tmp_path)
+    run_id, task_id = str(uuid4()), str(uuid4())
+    directory = workbench.runner.root / run_id
+    agent_directory = directory / "agent-state" / task_id
+    agent_directory.mkdir(parents=True)
+    immutable_write(agent_directory / "run.json", {"protocol_version": 2, "task_run_id": task_id})
+    workbench._insert_run(run_id, challenge_id, directory)
+    result = {
+        "protocol_version": 2, "task_run_id": task_id,
+        "task_run": {"status": "cancelled"},
+        "cleanup": {"status": "not_confirmed"},
+        "recovery": {"required": True}, "exit_code": 5,
+    }
+    workbench._finish_run(
+        run_id, status="recovery_required", exit_code=5,
+        result=result, agent_task_run_id=task_id,
+    )
+    (directory / "agent.stdout.log").write_text('{"protocol_version": 2}\n', encoding="utf-8")
+    (directory / "agent.stderr.log").write_text("10:14:04.001 INFO  ctrl run started\n", encoding="utf-8")
+    with patch("agent_adapters.workbench_runner.subprocess.Popen", return_value=FakeProcess()) as popen, patch(
+        "agent_adapters.workbench_runner.threading.Thread", NoThread
+    ):
+        workbench.runner.cleanup(challenge_id)
+    assert popen.call_args.kwargs["stdout"].name.endswith("cleanup.stdout.log")
+    assert popen.call_args.kwargs["stderr"].name.endswith("cleanup.stderr.log")
+    # The original run transcript must survive the follow-up operation.
+    assert (directory / "agent.stderr.log").read_text(encoding="utf-8").startswith("10:14:04")
+    assert (directory / "agent.stdout.log").read_text(encoding="utf-8").startswith('{"protocol_version"')
+
+
+@pytest.mark.parametrize(
+    "stderr,marked",
+    [
+        ("10:21:00.525 INFO  store phase.finished run=x\n", False),
+        ("[10/31/26 10:21:28] INFO     Processing request of type server.py:733\n", False),
+        ("Traceback (most recent call last):\n  File \"x.py\", line 1\n", True),
+    ],
+)
+def test_stderr_only_marks_a_failure_when_it_carries_one(tmp_path, stderr, marked):
+    workbench, challenge_id = prepared_workbench(tmp_path)
+    run_id = str(uuid4())
+    directory = workbench.runner.root / run_id
+    directory.mkdir()
+    workbench._insert_run(run_id, challenge_id, directory)
+    workbench._started_run(run_id)
+    result = {"protocol_version": 1, "task_run_id": None, "exit_code": 0, "errors": []}
+    workbench.runner._active[run_id] = ActiveRun(
+        run_id, challenge_id, directory, FakeProcess(result)
+    )
+    (directory / "agent.stdout.log").write_text(json.dumps(result), encoding="utf-8")
+    (directory / "agent.stderr.log").write_text(stderr, encoding="utf-8")
+    workbench.runner._watch(run_id)
+    codes = [error.get("code") for error in (workbench.runner.status(challenge_id)["result"] or {}).get("errors") or []]
+    assert ("agent_process_stderr" in codes) is marked

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import shlex
 from pathlib import PurePosixPath
 from typing import Iterable
 
@@ -9,6 +11,7 @@ MAX_ARGUMENT_BYTES = 16 * 1024
 SANDBOX_INPUT_ROOT = "/workspace/input"
 SANDBOX_WORK_ROOT = "/workspace/work"
 SANDBOX_TEMP_ROOT = "/tmp"
+SANDBOX_STAGE_ROOT = "/workspace/work/.stage"
 SANDBOX_PATH_HELP = "Paths are inside this TaskRun sandbox: /workspace/input is read-only; /workspace/work and /tmp are writable. Relative analysis-tool path arguments resolve below /workspace/work."
 
 
@@ -68,3 +71,53 @@ def validate_commands(values: Iterable[str]) -> list[str]:
 
 def python_command(script: str) -> list[str]:
     return ["-c", validate_script(script)]
+
+
+def needs_stage(path: str) -> bool:
+    """True when an artifact lives on a noexec mount or lacks the exec bit.
+
+    Imported attachments are written as ``0444`` below ``/workspace/input``,
+    which is a ``noexec`` tmpfs. ``/tmp`` is ``noexec`` as well; only
+    ``/workspace/work`` can execute. Anything outside the work tree is copied
+    to a writable, executable staging path first.
+    """
+
+    normalized = PurePosixPath(path)
+    work = PurePosixPath(SANDBOX_WORK_ROOT)
+    return normalized != work and work not in normalized.parents
+
+
+def staged_path(path: str) -> str:
+    """Return a stable, executable path below ``/workspace/work/.stage``."""
+
+    normalized = validate_sandbox_path(path)
+    name = PurePosixPath(normalized).name
+    if not name or name in {".", ".."} or "/" in name:
+        raise ValueError("path must name a file")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"{SANDBOX_STAGE_ROOT}/{digest}-{name}"
+
+
+def stage_shell_prefix(source: str, target: str) -> str:
+    """Bash prefix that copies an artifact to an executable staging path."""
+
+    return (
+        "set -eu; "
+        f"mkdir -p {shlex.quote(SANDBOX_STAGE_ROOT)}; "
+        f"cp -f {shlex.quote(source)} {shlex.quote(target)}; "
+        f"chmod 0755 {shlex.quote(target)}; "
+    )
+
+
+def stage_python_prefix(source: str, target: str) -> str:
+    """Python prefix that copies an artifact and exports ``QINYUAN_BIN``."""
+
+    return (
+        "import os, shutil\n"
+        f"_qy_src = {source!r}\n"
+        f"_qy_dst = {target!r}\n"
+        "os.makedirs(os.path.dirname(_qy_dst), exist_ok=True)\n"
+        "shutil.copyfile(_qy_src, _qy_dst)\n"
+        "os.chmod(_qy_dst, 0o755)\n"
+        "os.environ['QINYUAN_BIN'] = _qy_dst\n"
+    )

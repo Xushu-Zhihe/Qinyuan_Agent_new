@@ -406,6 +406,35 @@ class Workbench:
                     db.execute("UPDATE competition_sessions SET state_json=? WHERE id=?", (json.dumps(state), row["id"]))
             return {"challenge_id": challenge_id, "deleted_runs": removed, "backup": str(backup)}
 
+    def release(self, challenge_id):
+        """Operator ended the session: keep a cleanly paused run as evidence but stop it
+        holding the question, or the same platform question could never be imported again."""
+        with self.lock, self._db() as db:
+            current = self._get(db, challenge_id)
+            run = current.get("run")
+            if run is None or run["status"] != "paused" or current["archived"]:
+                return current
+            timestamp = now()
+            db.execute("UPDATE runs SET status='cancelled',finished_at=COALESCE(finished_at,?),updated_at=? WHERE run_id=?",
+                (timestamp, timestamp, run["run_id"]))
+            db.execute("UPDATE challenges SET status='draft',updated_at=? WHERE id=?", (timestamp, challenge_id))
+            return self._get(db, challenge_id)
+
+    def detach(self, challenge_id, *, reason="competition_question_deleted"):
+        """A deleted question must not stay referenced by any competition session."""
+        with self.lock, self._db() as db:
+            self._detach_sessions(db, challenge_id, reason)
+
+    def _detach_sessions(self, db, challenge_id, reason="competition_question_deleted"):
+        for row in db.execute("SELECT id,state_json FROM competition_sessions").fetchall():
+            state = json.loads(row["state_json"])
+            if state.get("challenge_id") != challenge_id:
+                continue
+            state["challenge_id"] = None
+            if state.get("status") != "finished":
+                state.update(status="paused", reason=reason, retry_operation=None)
+            db.execute("UPDATE competition_sessions SET state_json=? WHERE id=?", (json.dumps(state), row["id"]))
+
     def archive(self, challenge_id):
         with self.lock, self._db() as db:
             current = self._get(db, challenge_id)
@@ -443,6 +472,7 @@ class Workbench:
                     run_directories.append(run_directory)
                 db.execute("DELETE FROM runs WHERE challenge_id=?", (challenge_id,))
                 db.execute("DELETE FROM attachments WHERE challenge_id=?", (challenge_id,))
+                self._detach_sessions(db, challenge_id)
                 db.execute("DELETE FROM challenges WHERE id=?", (challenge_id,))
             for path in attachment_paths:
                 path.unlink(missing_ok=True)

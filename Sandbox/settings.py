@@ -25,6 +25,7 @@ DEFAULT_ALLOWED_TOOLS = frozenset(
         "ffuf",
         "dirsearch",
         "nuclei",
+        "tmux",
         "pwsh",
     }
 )
@@ -87,7 +88,7 @@ def _default_docker_host() -> str:
 
 @dataclass(frozen=True)
 class SandboxSettings:
-    image: str = "qinyuan/pentest-sandbox:0.3.4"
+    image: str = "qinyuan/pentest-sandbox:0.3.5"
     network: str = "qinyuan_pentest_lab"
     network_internal: bool = True
 
@@ -132,7 +133,7 @@ class SandboxSettings:
         return cls(
             image=os.environ.get(
                 "QINYUAN_SANDBOX_IMAGE",
-                "qinyuan/pentest-sandbox:0.3.4",
+                "qinyuan/pentest-sandbox:0.3.5",
             ).strip(),
             network=os.environ.get(
                 "QINYUAN_SANDBOX_NETWORK",

@@ -31,6 +31,25 @@ from agent_core.runtime import TERMINAL_STATUSES
 
 D7_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 D7_ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+_STDERR_ERROR_LEVELS = frozenset({"ERROR", "CRITICAL", "FATAL"})
+
+
+def stderr_reports_failure(stderr: str) -> bool:
+    """Tell a real failure trace apart from ordinary log chatter on stderr.
+
+    The CLI writes INFO logs to stderr only when QY_LOG_CONSOLE is set, and the
+    MCP servers print their own INFO lines there.  Neither means the run failed,
+    so only a traceback header or an ERROR/CRITICAL/FATAL level line counts.
+    """
+    for line in stderr.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith("Traceback (most recent call last)"):
+            return True
+        if _STDERR_ERROR_LEVELS.intersection(text.split()[:4]):
+            return True
+    return False
 
 
 def challenge_goal(challenge):
@@ -49,6 +68,7 @@ class ActiveRun:
     cancel_requested: bool = False
     cleanup_only: bool = False
     operation: str = "run"
+    log_prefix: str = "agent"
 
 
 class Runner:
@@ -74,8 +94,13 @@ class Runner:
         return name
 
     @staticmethod
-    def _subprocess_environment(protocol_version: int):
+    def _subprocess_environment(protocol_version: int, log_directory: Path | None = None):
         env = os.environ.copy()
+        # Child diagnostics belong in the run directory, never on stderr: a
+        # non-empty stderr used to be reported as an agent failure in _wait().
+        env.pop("QY_LOG_CONSOLE", None)
+        if log_directory is not None:
+            env["QY_LOG_JSONL"] = str(Path(log_directory) / "agent.log.jsonl")
         env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent) + os.pathsep + env.get("PYTHONPATH", "")
         if protocol_version == 3:
             for key in (
@@ -382,7 +407,7 @@ class Runner:
                 }
             (directory / "request.json").write_bytes(encode(request))
             events = directory / "events.jsonl"
-            env = self._subprocess_environment(self.workbench.protocol_version)
+            env = self._subprocess_environment(self.workbench.protocol_version, directory)
             # v3 loads its frozen provider settings from the explicit env file;
             # neither simulation nor real mode receives secrets in process env.
             env["QINYUAN_RUNTIME_MODEL_TIMEOUT"] = "180"
@@ -498,9 +523,9 @@ class Runner:
                        agent_dir.name, "--state-dir", str(agent_dir.parent),
                        "--events", str(directory / "events.jsonl")]
             self._append_saved_d7_env_file(command, agent_dir)
-            env = self._subprocess_environment((run.get("result") or {}).get("protocol_version", 2))
+            env = self._subprocess_environment((run.get("result") or {}).get("protocol_version", 2), directory)
             try:
-                with (directory / "agent.stdout.log").open("wb") as stdout, (directory / "agent.stderr.log").open("wb") as stderr:
+                with (directory / "cancel.stdout.log").open("wb") as stdout, (directory / "cancel.stderr.log").open("wb") as stderr:
                     process = subprocess.Popen(command, cwd=directory, env=env,
                                                stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
             except OSError as exc:
@@ -508,7 +533,7 @@ class Runner:
             self.workbench._mark_cancel_requested(run["run_id"])
             with self._lock:
                 self._active[run["run_id"]] = ActiveRun(
-                    run["run_id"], challenge_id, directory, process,
+                    run["run_id"], challenge_id, directory, process, log_prefix="cancel",
                 )
         threading.Thread(target=self._watch, args=(run["run_id"],), daemon=True).start()
         return self.status(challenge_id)
@@ -549,9 +574,9 @@ class Runner:
                 "--events", str(directory / "events.jsonl"),
             ]
             self._append_saved_d7_env_file(command, agent_dir)
-            env = self._subprocess_environment(result.get("protocol_version", 2))
+            env = self._subprocess_environment(result.get("protocol_version", 2), directory)
             try:
-                with (directory / "agent.stdout.log").open("wb") as stdout, (directory / "agent.stderr.log").open("wb") as stderr:
+                with (directory / "cleanup.stdout.log").open("wb") as stdout, (directory / "cleanup.stderr.log").open("wb") as stderr:
                     process = subprocess.Popen(
                         command, cwd=directory, env=env, stdin=subprocess.DEVNULL,
                         stdout=stdout, stderr=stderr,
@@ -561,7 +586,7 @@ class Runner:
             self.workbench._mark_cleanup_started(run["run_id"])
             self._active[run["run_id"]] = ActiveRun(
                 run["run_id"], challenge_id, directory, process,
-                cleanup_only=True,
+                cleanup_only=True, log_prefix="cleanup",
             )
         threading.Thread(target=self._watch, args=(run["run_id"],), daemon=True).start()
         return self.status(challenge_id)
@@ -645,7 +670,7 @@ class Runner:
                      "--task-run-id",agent_dir.name,"--operation-id",operation_id,"--action",action]
             if seconds is not None:command.extend(["--seconds",str(seconds)])
         try:
-            completed=subprocess.run(command,cwd=directory,env=self._subprocess_environment(3),stdin=subprocess.DEVNULL,
+            completed=subprocess.run(command,cwd=directory,env=self._subprocess_environment(3, directory),stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
             output=json.loads(completed.stdout)
         except (OSError,ValueError,subprocess.TimeoutExpired):raise WorkbenchError("operator_command_outcome_unknown",503) from None
@@ -733,7 +758,7 @@ class Runner:
                 "--task-run-id", agent_dir.name, "--candidate-id", selection["candidate_id"],
                 "--operation-id", selection["operation_id"], "--decision", selection["action"]]
         try:
-            completed = subprocess.run(command, cwd=directory, env=self._subprocess_environment(3),
+            completed = subprocess.run(command, cwd=directory, env=self._subprocess_environment(3, directory),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
                 **self._scheduled_process_options(True))
             output = json.loads(completed.stdout)
@@ -782,9 +807,9 @@ class Runner:
                 for key, value in selection.items():
                     command.extend(['--' + key.replace('_', '-'), value])
             try:
-                with (directory / 'agent.stdout.log').open('wb') as stdout, (directory / 'agent.stderr.log').open('wb') as stderr:
+                with (directory / f'{operation}.stdout.log').open('wb') as stdout, (directory / f'{operation}.stderr.log').open('wb') as stderr:
                     process = subprocess.Popen(command, cwd=directory,
-                        env=self._subprocess_environment(3), stdin=subprocess.PIPE if secret is not None else subprocess.DEVNULL,
+                        env=self._subprocess_environment(3, directory), stdin=subprocess.PIPE if secret is not None else subprocess.DEVNULL,
                         stdout=stdout, stderr=stderr,
                         **self._scheduled_process_options(self.workbench.schedules.owns(challenge_id)))
                     if secret is not None:
@@ -793,7 +818,7 @@ class Runner:
                         finally:process.stdin=None;secret=None
             except OSError as exc:
                 raise WorkbenchError('d9_operation_start_failed', 503) from exc
-            self._active[run['run_id']] = ActiveRun(run['run_id'], challenge_id, directory, process,operation=operation)
+            self._active[run['run_id']] = ActiveRun(run['run_id'], challenge_id, directory, process,operation=operation,log_prefix=operation)
             self.workbench._started_run(run['run_id'])
         threading.Thread(target=self._watch, args=(run['run_id'],), daemon=True).start()
         return self.status(challenge_id)
@@ -910,6 +935,7 @@ class Runner:
                     pass
 
             # Delete from database
+            self.workbench.detach(challenge_id)
             with self.workbench._db() as db:
                 db.execute("DELETE FROM runs WHERE challenge_id=?", (challenge_id,))
                 db.execute("DELETE FROM attachments WHERE challenge_id=?", (challenge_id,))
@@ -1040,8 +1066,8 @@ class Runner:
             stdout = ""
         if stderr is None:
             stderr = ""
-        stdout_file = active.directory / "agent.stdout.log"
-        stderr_file = active.directory / "agent.stderr.log"
+        stdout_file = active.directory / f"{active.log_prefix}.stdout.log"
+        stderr_file = active.directory / f"{active.log_prefix}.stderr.log"
         if stdout_file.exists():
             stdout = stdout_file.read_text(encoding="utf-8", errors="replace")
         if stderr_file.exists():
@@ -1062,7 +1088,8 @@ class Runner:
                 "errors": [{"code": "agent_process_no_result"}],
                 "exit_code": process.returncode if process.returncode is not None else 4,
             }
-        if stderr and not result.get("errors"):
+        if stderr.strip() and not result.get("errors") and (
+                process.returncode not in (0, None) or stderr_reports_failure(stderr)):
             result["errors"] = [{"code": "agent_process_stderr"}]
         known = self._current(active.challenge_id)
         if (known and known['run_id'] == run_id and known.get('agent_task_run_id')

@@ -1,17 +1,28 @@
 """Serial competition orchestration. Agent decisions and TaskRun state stay in the CLI."""
 import json
 import math
+import os
 import threading
 import time
 from uuid import UUID,uuid4
-from agent_adapters.competition import read_question,platform_action,_target_origin,_matches_target
-from agent_adapters.workbench_contracts import WorkbenchError
+from agent_adapters.competition import read_question,platform_action,_target_origin,_matches_target,supports_action
+from agent_adapters.workbench_contracts import ACTIVE_RUN_STATUSES,WorkbenchError
 from qinyuan_core import get_logger
 
 PLATFORM_POLL_SECONDS=5.0
 FINISHED={"achieved","failed","deadline_exceeded","cancelled","inconclusive"}
-# A live-instance question may arrive before the platform publishes its address.
-ADDRESS_WAIT_SECONDS=30
+# A live target-bearing question may arrive before the platform publishes its address.
+ADDRESS_WAIT_CATEGORIES=("web","pwn")
+
+
+def _address_wait_seconds():
+    """Operator-tunable wait window; invalid or out-of-range values keep 30 seconds."""
+    try:value=float(os.environ.get("QINYUAN_COMPETITION_ADDRESS_WAIT_SECONDS",""))
+    except (TypeError,ValueError):return 30.0
+    return value if math.isfinite(value) and 0<=value<=900 else 30.0
+
+
+ADDRESS_WAIT_SECONDS=_address_wait_seconds()
 
 
 def _default_description(value):
@@ -21,14 +32,18 @@ def _default_description(value):
     return value.strip()
 
 
-def _should_wait_address(item):
-    """Poll for an address while the platform says the attempt is live; never require one."""
-    try:
-        remaining=item.get("remaining_seconds")
-        return bool(item.get("state")=="active" and remaining is not None and remaining>0
-                    and not item.get("addresses"))
-    except AttributeError:
-        return False
+def _should_wait_address(item,adapter):
+    """Poll for an address only while a live web/pwn question still has none; never require one."""
+    if not isinstance(item,dict) or item.get("addresses"):return False
+    remaining=item.get("remaining_seconds")
+    if remaining is not None and remaining<=0:return False
+    if item.get("state")!=("available" if adapter=="benchmark" else "active"):return False
+    category=item.get("category") or ""
+    if not isinstance(category,str):return False
+    # Benchmark items carry no platform type; a container reported available
+    # without an address is still waiting for its port.
+    return adapter=="benchmark" if not category.strip() else any(
+        name in category.strip().lower() for name in ADDRESS_WAIT_CATEGORIES)
 
 
 class CompetitionSchedules:
@@ -57,6 +72,17 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
             if challenge is not None and workbench.runner.status(challenge) is not None:
                 try:workbench.runner.operator_control(challenge,"pause")
                 except WorkbenchError as error:self.update(identity,status="needs_attention",reason=error.code)
+        # A finished session must not keep its last question paused, and a deleted
+        # question must not stay referenced: both block every following session.
+        for row in self.rows():
+            challenge=row["state"].get("challenge_id")
+            if challenge is None:continue
+            try:workbench.get(challenge)
+            except WorkbenchError as error:
+                if error.code!="challenge_not_found":raise
+                self.update(row["id"],challenge_id=None)
+                continue
+            if row["state"]["status"]=="finished":workbench.release(challenge)
 
 
     def rows(self):
@@ -181,7 +207,13 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 run=self.workbench.runner.status(challenge)
                 if run is not None and run["status"] in {"starting","running","cancelling","cleaning"}:
                     raise WorkbenchError("competition_finish_requires_pause",409)
-            self.update(identity,status="finished",reason="operator_finished",pending_control=None,retry_operation=None)
+            abandoned=self._abandon(row,state)
+            if challenge is not None:
+                try:self.workbench.release(challenge)
+                except WorkbenchError as error:
+                    if error.code!="challenge_not_found":raise
+            self.update(identity,status="finished",reason="operator_finished",pending_control=None,retry_operation=None,
+                address_wait_started=None,address_wait_reason=None,question_abandoned=abandoned)
             self.wake.set();return self.get(identity)
         if action=="stop_after_current" and set(value)=={"action","enabled"} and type(value["enabled"]) is bool:
             self.update(identity,stop_after_current=value["enabled"]);self.wake.set();return self.get(identity)
@@ -202,7 +234,8 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 if runtime and runtime["status"] not in FINISHED and self.clock()<runtime["deadline_at"]:self.workbench.runner.operator_control(challenge,"resume")
             with self.workbench._db() as db:
                 blocked=db.execute("SELECT operation_id FROM competition_platform_operations WHERE session_id=? AND receipt_json LIKE '%blocked%' ORDER BY rowid DESC LIMIT 1",(identity,)).fetchone()
-            self.update(identity,status="running",reason=None,retry_operation=blocked[0] if blocked else None,submission_retry=True)
+            self.update(identity,status="running",reason=None,retry_operation=blocked[0] if blocked else None,submission_retry=True,
+                address_wait_started=None,address_wait_reason=None)
             self.launch();return self.get(identity)
         if action in {"extend_question","extend_overall"} and set(value)=={"action","seconds","operation_id"}:
             seconds=value["seconds"];operation=value["operation_id"]
@@ -299,8 +332,12 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         profile=row["config"]["profile"]
         try:receipt=platform_action(profile,self.workbench.competitions.credential_for(profile),action,remote)
         except WorkbenchError as error:
-            known=error.code in {"competition_credential_missing","competition_auth_failed","competition_invalid_state","competition_rate_limited","competition_request_rejected"}
+            # A business refusal is a definite "no", not an unknown outcome; the
+            # operator can retry it explicitly with 继续原赛程.
+            known=error.code in {"competition_credential_missing","competition_auth_failed","competition_invalid_state",
+                "competition_rate_limited","competition_request_rejected","competition_business_error"}
             receipt={"state":"blocked" if known else "unknown","code":error.code}
+            if getattr(error,"platform_code",None) is not None:receipt["platform_code"]=error.platform_code
         with self.workbench._db() as db:db.execute("UPDATE competition_platform_operations SET receipt_json=? WHERE operation_id=?",(json.dumps(receipt),operation))
         get_logger("ctrl").info("competition.platform_operation",session=identity,operation=operation,action=action,category="platform_control",result=receipt.get("state","known"))
         if "state" in receipt:raise WorkbenchError(receipt["code"] if receipt["state"]=="blocked" else "competition_platform_operation_unknown",409)
@@ -312,7 +349,13 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         with self.workbench._db() as db:
             existing=db.execute("SELECT challenge_id FROM competition_questions WHERE scope_sha256=? AND remote_ref=?",(scope,json.dumps(item["remote_ref"]))).fetchone()
         if existing is not None:
-            selected=self.workbench.get(existing[0])["endpoint"]
+            try:selected=self.workbench.get(existing[0])["endpoint"]
+            except WorkbenchError as error:
+                if error.code!="challenge_not_found":raise
+                # The local question was deleted; drop the stale binding instead of
+                # blocking the platform question for the rest of the session.
+                with self.workbench._db() as db:db.execute("DELETE FROM competition_questions WHERE challenge_id=?",(existing[0],))
+                selected=None
             if selected and any(_matches_target(raw,selected) for raw in item["addresses"]):return selected
         origins=[]
         for address in item["addresses"]:
@@ -326,7 +369,8 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
     def advance(self,row,*,resume=False):
         with self.workbench.lock:
             state=self.get(row["id"])["state"]
-            changes=dict(index=state["index"]+1,current_ref=None,challenge_id=None,platform=None,last_platform_check=0,question_seconds=None)
+            changes=dict(index=state["index"]+1,current_ref=None,challenge_id=None,platform=None,last_platform_check=0,question_seconds=None,
+                address_wait_started=None,address_wait_reason=None,address_wait_timeout_at=None)
             if state["stop_after_current"]:changes.update(status="finished",reason="competition_stopped_after_current",stop_after_current=False)
             elif resume and state["reason"]=="competition_platform_question_ended":changes.update(status="running",reason=None)
             return self.update(row["id"],**changes)
@@ -334,6 +378,23 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
     def finish_question(self,row):
         self.update(row["id"],submission_retry=False)
         return self.workbench.runner.competition_end(row["state"]["challenge_id"])
+
+    def _abandon(self,row,state):
+        """Give the live attempt back when the platform protocol defines that action, so
+        a later token or account is not blocked by a question this round never finished."""
+        profile=row["config"]["profile"];remote=state.get("current_ref")
+        if remote is None or not supports_action(profile["adapter"],"abandon"):return None
+        known=(state.get("platform") or {}).get("state")
+        if known is not None and known!="active":return None
+        try:
+            platform_action(profile,self.workbench.competitions.credential_for(profile),"abandon",remote)
+            result="abandoned"
+        except WorkbenchError as error:
+            # A platform without the endpoint is not a failure of this round.
+            result="unsupported" if getattr(error,"http_status",None) in {404,405} else error.code
+        get_logger("ctrl").info("competition.attempt_abandon",session=row["id"],remote_ref=remote,
+            result=result,category="platform_control")
+        return result
 
     def tick(self):
         if not self.tick_lock.acquire(blocking=False):return
@@ -349,6 +410,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
 
     def step(self,row):
         state=row["state"];identity=row["id"];runner=self.workbench.runner;challenge=state["challenge_id"]
+        adapter=row["config"]["profile"]["adapter"]
         if state.get("pending_control"):
             with self.workbench._db() as db:
                 pending=db.execute("SELECT action,receipt_json FROM competition_platform_operations WHERE operation_id=?",(state["pending_control"],)).fetchone()
@@ -400,9 +462,16 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
             return
         if state["current_ref"] is None:
             if state["stop_after_current"]:self.update(identity,status="finished",reason="competition_stopped_after_current");return
-            if row["config"]["profile"]["adapter"]=="arena":
+            if adapter=="arena":
                 item=self.read(row)
-                if item is None or item["state"]!="active":item=self.perform(row,"next",None)["item"]
+                if item is None or item["state"]!="active":
+                    try:item=self.perform(row,"next",None)["item"]
+                    except WorkbenchError as error:
+                        if error.code!="competition_business_error":raise
+                        # The platform may still hold an unended attempt; re-read once
+                        # so a refusal does not strand the session on a stale answer.
+                        item=self.read(row)
+                        if item is None or item["state"]!="active":raise
             else:
                 queue=row["config"]["queue"]
                 if state["index"]>=len(queue):self.update(identity,status="finished",reason="competition_queue_completed");return
@@ -416,27 +485,40 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                     self.update(identity,status="finished",reason="competition_stopped_after_current");return
                 self.update(identity,current_ref=item["remote_ref"])
             row=self.get(identity);state=row["state"]
-        else:item=self.read(row,state["current_ref"]) if challenge is None or self.clock()-state["last_platform_check"]>=PLATFORM_POLL_SECONDS or not active else None
+        waiting=state.get("address_wait_started") is not None
+        due=self.clock()-state.get("last_platform_check",0)>=PLATFORM_POLL_SECONDS
+        throttled=waiting and not due and challenge is None
+        if challenge is None:
+            item=None if throttled else self.read(row,state["current_ref"])
+        else:
+            item=self.read(row,state["current_ref"]) if due or not active else None
         if item is not None:
             self.update(identity,last_platform_check=self.clock(),platform={k:item[k] for k in ("state","correct_flag_count","flag_count","wrong_count","max_wrong_count","remaining_seconds") if k in item})
         if challenge is None or runner.status(challenge) is None:
-            if item is None:raise WorkbenchError("competition_question_not_found",404)
-            if row["config"]["profile"]["adapter"]=="benchmark" and item["state"]=="stop_pending":return
-            if row["config"]["profile"]["adapter"]=="benchmark" and item["state"]!="available":
+            if item is None:
+                if throttled:return
+                raise WorkbenchError("competition_question_not_found",404)
+            if adapter=="benchmark" and item["state"]=="stop_pending":return
+            if adapter=="benchmark" and item["state"]!="available":
                 receipt=self.perform(row,"start",item["remote_ref"])
                 item=self.read(row,item["remote_ref"])
                 if item is None or item["state"]!="available":return
             target=self.target(row,item);self.live(identity)
-            if target is None and _should_wait_address(item):
+            # target() returns "" (not None) when the platform published no address.
+            if not target and _should_wait_address(item,adapter):
                 waited=state.get("address_wait_started")
                 now=self.clock()
                 if waited is None:
                     self.update(identity,address_wait_started=now,address_wait_reason="competition_waiting_for_address")
-                    get_logger("ctrl").info("competition.address_wait_started",session=identity,remote_ref=item.get("remote_ref"),category="schedule_control")
+                    get_logger("ctrl").info("competition.address_wait_started",session=identity,remote_ref=item.get("remote_ref"),
+                        question_category=item.get("category"),category="schedule_control")
                     return
                 if now-waited<ADDRESS_WAIT_SECONDS:return
-                self.update(identity,address_wait_started=None,address_wait_timeout_at=now)
-                get_logger("ctrl").warning("competition.address_wait_timeout",session=identity,remote_ref=item.get("remote_ref"),waited_seconds=round(now-waited,1),category="schedule_control")
+                self.update(identity,address_wait_started=None,address_wait_reason=None,address_wait_timeout_at=now)
+                get_logger("ctrl").warning("competition.address_wait_timeout",session=identity,remote_ref=item.get("remote_ref"),
+                    waited_seconds=round(now-waited,1),category="schedule_control")
+            elif state.get("address_wait_started") is not None:
+                self.update(identity,address_wait_started=None,address_wait_reason=None)
             task=self.workbench.competitions.import_question(row["config"]["profile"]["id"],dict(remote_ref=item["remote_ref"],endpoint=target,
                 deadline_minutes=row["config"]["question_seconds"]//60,http_methods=row["config"]["http_methods"],
                 default_description=row["config"].get("default_description",""),
@@ -445,7 +527,9 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
             if not target and not task["attachments"]:raise WorkbenchError("competition_question_input_required",409)
             self.live(identity)
             run=runner.status(challenge)
-            if run is not None:raise WorkbenchError("competition_existing_task_requires_recovery",409)
+            # A terminal run (finished/failed/cancelled/...) is history, not a live
+            # claim; only an unresolved run blocks a fresh import of the same question.
+            if run is not None and run["status"] in ACTIVE_RUN_STATUSES:raise WorkbenchError("competition_existing_task_requires_recovery",409)
             runner.start(challenge,mode=row["config"]["mode"],competition_control={"session_id":identity,"question_seconds":state.get("question_seconds") or row["config"]["question_seconds"],"overall_deadline_at":state["deadline_at"],"overall_ceiling_at":row["config"]["platform_deadline_at"]})
             return
         if item is not None and item["state"] in {"failed","expired","abandoned"}:

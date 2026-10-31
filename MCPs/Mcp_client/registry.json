@@ -95,6 +95,15 @@
       "sandboxTools": ["bash", "pwsh"],
       "enabled": true
     },
+    "session": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Session_Mcp",
+      "args": ["server.py"],
+      "tags": ["session", "interactive", "debugging", "kernel"],
+      "sandboxTools": ["tmux"],
+      "enabled": true
+    },
     "curl": {
       "transport": "stdio",
       "command": "{python}",
@@ -173,7 +182,7 @@
       "cwd": "../Gdb_Mcp",
       "args": ["server.py"],
       "tags": ["reverse-engineering", "debugging", "pwn"],
-      "sandboxTools": ["gdb"],
+      "sandboxTools": ["gdb", "bash"],
       "enabled": true
     },
     "pwntools": {

@@ -28,7 +28,7 @@ from agent_core.stage_contracts import (
     TurnAchievement, TurnCompletion, TurnPlanningContext, TurnPlanningState, TurnIntent, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
     StageToolBatch, tool_calls, tool_call_key, StageFactBatch, fact_candidates, reviewed_fact, StageBranchFork,
 )
-from agent_core.stage_planning import StageModelRequest, stage_runtime, review_members
+from agent_core.stage_planning import StageModelRequest, stage_runtime, review_members, formal_support_refs
 from agent_core.stage_storage import StageRecoveryRequired, StageStateError, active_turn, _just_registered_roads, execution_policy, load_branch, branch_prefix, duplicate_fact
 from agent_core import stage_plans
 from agent_core.turn_modeling import digest, stable_id
@@ -40,6 +40,18 @@ class StageRunResult:
     task_run_id: str
     turn: StageTurnSnapshot | None
     reason: str
+
+
+def catalog_with_completion_support(catalog, eligible_refs):
+    """Mark which catalogued facts may support turn_completion.
+
+    ``history_catalog`` is deliberately wider than the live context window, so a
+    readable ref can still be ineligible for completion.  Keeping the marker on
+    the entry tells the model which of them to drop instead of letting it cite
+    an ineligible ref and then receive an opaque ``allowed_choice`` rejection.
+    """
+    eligible = set(eligible_refs)
+    return tuple({**entry, "completion_eligible": entry["ref"] in eligible} for entry in catalog)
 
 
 class StageApplication:
@@ -405,11 +417,13 @@ class StageApplication:
             advice = stage_plans.route_advice(self.store, self.task_id)
             if advice and self.evidence.request(advice).context.session == session:
                 runtime["route_advice"] = advice
-        return StageModelRequest(identity, self.task_id, stage, role.role_config_ref,
+        request = StageModelRequest(identity, self.task_id, stage, role.role_config_ref,
             state.latest_checkpoint.sequence, context, messages,
             self._available_tools() if stage == "stage_action" else (), proposal_id, proposal,
             history_catalog=tuple(i.visible(include_content=False) for i in all_history),
             execution_context={**self.mcp.execution_context(), "stage_runtime": runtime})
+        return replace(request, history_catalog=catalog_with_completion_support(
+            request.history_catalog, formal_support_refs(request)))
 
     async def _review(self, request, token):
         decision = await self.reviews.action(request, token)

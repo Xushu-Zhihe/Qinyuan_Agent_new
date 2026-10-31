@@ -16,8 +16,8 @@ from Sandbox.settings import SandboxSettings
 STARTUP_READY_TIMEOUT_SECONDS = 10.0
 
 
-IMAGE_REF = "qinyuan/pentest-sandbox:0.3.4"
-IMAGE_ID = "sha256:e38c60b0111ce3f9a478f9b1b09e67fa5f07f15e0ff018b62dfcfee789a26581"
+IMAGE_REF = "qinyuan/pentest-sandbox:0.3.5"
+IMAGE_ID = "sha256:3ed5166950edeceb33fe925da6a0d97ccbf864d641a5b8ba85c62b0f84bc9622"
 
 
 def settings():
@@ -29,7 +29,7 @@ def sandbox_config():
     # subset that could conceal new default mounts, network or resource limits.
     configured = settings()
     profile = T6TaskRunSandbox(SimpleNamespace(settings=configured))
-    return {"version": 1, "profile": "d3-fixed-readonly-v1", "image_ref": IMAGE_REF,
+    return {"version": 1, "profile": "d3-fixed-readonly-v2", "image_ref": IMAGE_REF,
             "image_id": IMAGE_ID, "docker_host": configured.docker_host,
             "spec": profile._spec()}
 

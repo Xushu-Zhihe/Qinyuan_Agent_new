@@ -1122,6 +1122,46 @@ def test_cache_projection_keeps_exact_evidence_status_and_local_reference_gate()
     assert request.context.history == (item,) and item.content.startswith('literal source: \\n')
 
 
+def test_review_proposal_stays_verbatim_when_history_already_holds_an_equal_array():
+    """The reviewer must read the stored proposal, never a reference to an equal copy.
+
+    Regression for a live revise loop: a re-submitted closure repeated the support
+    array of an earlier select_facts result, so request assembly replaced
+    proposal.support_refs with a pointer. The reviewer kept answering "write a
+    literal array", which the Inner had already done, because the pointer made a
+    declared array look like an object.
+    """
+    from agent_adapters.deepseek_roles import build_payload, role_config, _stage_input
+    from agent_core.handoff_contracts import D8HistoryItem
+    from agent_core.output_contracts import D8OutputRequest
+    from agent_core.stage_planning import model_contract
+    uid = lambda: str(uuid4())
+    task, turn_id, road_id = uid(), uid(), uid()
+    refs = ["verified_fact:" + uid() + ":" + "a" * 64 for _ in range(5)]
+    item = D8HistoryItem(uid(), task, "progress", turn_id, road_id, None,
+        "the binary was inspected and each observation was registered", (),
+        "a" * 64, 1, "verified_fact", "current", "available")
+    turn = StageTurnSnapshot(turn_id, TurnIntent("triage the attachment", "supported triage"), TurnPlanningState.ACTIVE)
+    context = TurnPlanningContext(task, "triage the authorized attachment and record every supported observation " * 3,
+        PlanningSession("road_execution", road_id), turn, (item,))
+    role = role_config("outer_planning", version=17)
+    proposal = RoadResolution(IntentStatus.SUCCEEDED, "the closure cites the five effective Facts", tuple(refs))
+    request = StageModelRequest(uid(), task, "stage_review", role.role_config_ref, 1, context,
+        messages=({"role": "user", "content": json.dumps({"stage": "stage_action", "context": asdict(context)})},
+                  {"role": "assistant", "content": json.dumps({"kind": "select_facts", "support_refs": refs})}),
+        proposal_operation_id=uid(), proposal=proposal)
+    document = _stage_input(request)
+    assert document["current"]["proposal"]["support_refs"] == refs
+    # Unchanged sharing still applies outside the reviewed proposal.
+    assert document["current"]["context"] == {"$input_ref": "#/history/0/content/context"}
+    contract = model_contract(request)
+    payload = build_payload(D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": schema(request)},
+        contract["instruction"], None), role)
+    current = json.loads(payload["messages"][-1]["content"])["current"]
+    assert current["proposal"]["support_refs"] == refs
+    assert proposal.support_refs == tuple(refs)
+
+
 def test_provider_history_segments_stay_identical_while_live_snapshots_change(case):
     from agent_adapters.deepseek_roles import build_payload, role_config, _stage_input
     from agent_core.output_contracts import D8OutputRequest

@@ -5,6 +5,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from Sandbox.task_run_sandbox import TaskRunSandbox
+from Sandbox.seccomp_profile import analysis_seccomp_profile
 
 REAPER_SCRIPT = """import os,time
 while True:
@@ -42,6 +43,13 @@ class T6TaskRunSandbox(TaskRunSandbox):
                 raise ValueError("t6_private_network_conflict")
             self.private_network = name
 
+    def _security_opt(self) -> list[str]:
+        # The stock Docker profile denies personality(ADDR_NO_RANDOMIZE), so gdb
+        # cannot disable ASLR. Add only that rule (see Sandbox/seccomp/README.md)
+        # and keep the rest of the default profile, no-new-privileges, cap_drop
+        # ALL, read-only rootfs and the empty network.
+        return [*super()._security_opt(), f"seccomp={analysis_seccomp_profile()}"]
+
     def _spec(self) -> dict[str, object]:
         spec = super()._spec()
         # Timeout cleanup kills orphaned model processes too. PID 1 must reap
@@ -52,9 +60,14 @@ class T6TaskRunSandbox(TaskRunSandbox):
         # 覆盖父类的 tmpfs 表，所以必须把 /tmp 一并带回来：根文件系统只读时，
         # 缺了它任何默认写临时目录的工具都会拿到 EROFS。
         spec["environment"] = {
-            "PATH": "/tools/bin:/opt/dirsearch/bin:/opt/microsoft/powershell/7:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PATH": "/tools/bin:/opt/dirsearch/bin:/opt/qinyuan/python/bin:/opt/microsoft/powershell/7:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "PYTHONPATH": "/tools/python:/opt/qinyuan/python",
             "QINYUAN_OFFLINE_TOOL_INSTALL": "1",
+            "HOME": "/home/sandbox",
+            "TERM": "xterm-256color",
+            "SHELL": "/bin/bash",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
         }
         spec["tmpfs"] = {
             "/tools": "rw,exec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700",
@@ -65,6 +78,11 @@ class T6TaskRunSandbox(TaskRunSandbox):
             "/workspace/work": (
                 f"rw,exec,nosuid,nodev,size={self._settings.workspace_size},"
                 "uid=10001,gid=10001,mode=0700"
+            ),
+            # tools such as nuclei/subfinder/amass write their config below
+            # $HOME; the image home is on the read-only rootfs.
+            "/home/sandbox": (
+                "rw,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700"
             ),
             "/tmp": (
                 f"rw,noexec,nosuid,nodev,size={self._settings.temporary_size},"

@@ -281,11 +281,22 @@ def _shared_supervision(context, request):
     return _shared_input(ordered)
 
 
-def _shared_input(document, *, reference_key="$ref"):
-    """Share identical included values by backwards JSON Pointer, never by external lookup."""
+def _shared_input(document, *, reference_key="$ref", verbatim=()):
+    """Share identical included values by backwards JSON Pointer, never by external lookup.
+
+    Paths listed in `verbatim` are always written out: a value the reader has to
+    judge for itself must arrive as its stored JSON. Replacing the reviewed
+    proposal with a reference to an equal value elsewhere turns a field whose
+    contract requires an array into an object the reviewer must reject.
+
+    The exemption holds only while no ancestor is shared as a whole, so keep
+    these paths directly under a section that can never duplicate history.
+    """
     seen = {}
+    def written_out(path):
+        return any(path == root or path.startswith(root + "/") for root in verbatim)
     def share(value, path):
-        if isinstance(value, (dict, list, tuple, str)) and not (isinstance(value, dict) and set(value) == {reference_key}):
+        if not written_out(path) and isinstance(value, (dict, list, tuple, str)) and not (isinstance(value, dict) and set(value) == {reference_key}):
             key = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
             if len(key.encode("utf-8")) >= 128:
                 if key in seen:
@@ -322,7 +333,11 @@ def _stage_input(request):
         # Role labels are archived data inside a user message, never live calls.
         history.append({"role": "user" if message["role"] == "assistant" else message["role"],
             "content": {"historical_model_result": content} if message["role"] == "assistant" else content})
-    return _shared_input({"history": history, "current": context}, reference_key="$input_ref")
+    return _shared_input({"history": history, "current": context}, reference_key="$input_ref",
+        # The reviewed proposal is the object of the call: it must stay readable
+        # as the stored JSON array instead of becoming a reference to an earlier
+        # equal copy (a reviewer then rejects a field it cannot type-check).
+        verbatim=("#/current/proposal",))
 
 
 def build_payload(envelope, role, *, context_loader=None):

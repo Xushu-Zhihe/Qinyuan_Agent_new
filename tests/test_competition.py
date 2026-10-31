@@ -30,7 +30,7 @@ def platform(tmp_path):
             state.requests.append((self.command,self.path,dict(self.headers)))
             if not hasattr(state,"post_payload"):self.send_error(405);return
             length=int(self.headers.get("Content-Length","0"))
-            state.bodies.append(json.loads(self.rfile.read(length)))
+            state.bodies.append(json.loads(self.rfile.read(length)) if length else None)
             body=json.dumps(state.post_payload).encode()
             self.send_response(getattr(state,"post_status",200));self.send_header("Content-Length",str(len(body)))
             self.end_headers();self.wfile.write(body)
@@ -291,3 +291,20 @@ def test_changed_registered_attachment_is_not_silently_downloaded_over(platform)
     before=len([r for r in p.requests if r[1]=="/archive"])
     with pytest.raises(WorkbenchError,match="competition_attachment_integrity_failed"):import_attachment(p,profile)
     assert len([r for r in p.requests if r[1]=="/archive"])==before and path.read_bytes()==b"changed"
+
+def test_arena_abandon_posts_to_the_attempt_and_accepts_an_empty_reply(monkeypatch):
+    calls=[]
+    def exchange(*args,**kwargs):
+        calls.append((args,kwargs));return {}
+    monkeypatch.setattr(competition,"_exchange",exchange)
+    receipt=competition.platform_action({"adapter":"arena"},"controlled","abandon",12041)
+    assert receipt["abandoned"] is True
+    args,kwargs=calls[0]
+    assert args[2]=="POST" and args[3]=="/api/skill/agent/arena/attempt/12041/abandon/"
+    assert kwargs.get("empty_ok") is True
+
+def test_benchmark_protocol_has_no_abandon_action():
+    with pytest.raises(WorkbenchError,match="competition_platform_action_unsupported"):
+        competition.platform_action({"adapter":"benchmark"},"controlled","abandon","test-code")
+    with pytest.raises(WorkbenchError,match="competition_platform_action_unsupported"):
+        competition.platform_action({"adapter":"arena"},"controlled","close","test-code")

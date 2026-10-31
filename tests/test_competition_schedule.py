@@ -368,7 +368,7 @@ def test_fixed_platform_operations_use_only_expected_routes_and_safe_fields(monk
     assert competition.platform_action(profile,"unused","start","test / code")==dict(addresses=["10.0.1.5:8080"],owned=True)
     assert competition.platform_action(profile,"unused","close","test / code")==dict(closed=True)
     assert calls==[("POST","/openapi/v1/challenges/start?unique_code=test+%2F+code",None),("POST","/openapi/v1/challenges/close?unique_code=test+%2F+code",None)]
-    with pytest.raises(WorkbenchError,match="competition_platform_action_invalid"):
+    with pytest.raises(WorkbenchError,match="competition_platform_action_unsupported"):
         competition.platform_action(profile,"unused","hint","test / code")
 
 
@@ -434,9 +434,11 @@ def test_workbench_shutdown_pauses_scheduled_child_without_cancel_or_kill(platfo
 def test_waiting_for_attachment_can_extend_budgets_without_inventing_a_taskrun(platform,monkeypatch):
     p=platform;p.payload=[benchmark()];p.payload[0]["container_addr"]=[]
     service,row,_,_=schedule(p)
+    # This case covers the no-TaskRun window, not the address poll itself.
+    monkeypatch.setattr(module,"ADDRESS_WAIT_SECONDS",0)
     def start_result(*args):return dict(owned=True,addresses=[])
     monkeypatch.setattr(module,"platform_action",start_result)
-    service.tick();service.tick();current=service.get(row["id"])
+    service.tick();service.update(row["id"],last_platform_check=0);service.tick();current=service.get(row["id"])
     challenge=current["state"]["challenge_id"]
     assert challenge is not None and p.workbench.runner.status(challenge) is None
     global_command=dict(action="extend_overall",seconds=60,operation_id=str(uuid4()))
@@ -561,3 +563,243 @@ def test_restart_requests_pause_before_any_explicit_continuation(platform,monkey
     assert (Path(run["directory"])/"operator-pause-request.json").is_file()
     assert restarted.schedules.get(row["id"])["state"]["status"]=="paused"
     assert restarted.schedules.thread is None and len(p.requests)==before
+
+
+def test_address_wait_only_covers_live_web_or_pwn_questions_without_addresses():
+    web=dict(state="active",addresses=[],remaining_seconds=600,category="Web")
+    assert module._should_wait_address(web,"arena") and module._should_wait_address({**web,"category":"Pwn"},"arena")
+    assert not module._should_wait_address({**web,"category":"Reverse"},"arena")
+    assert not module._should_wait_address({**web,"addresses":["10.0.1.5:8080"]},"arena")
+    assert not module._should_wait_address({**web,"remaining_seconds":0},"arena")
+    assert not module._should_wait_address({**web,"state":"solved"},"arena")
+    assert module._should_wait_address(dict(state="available",addresses=[],remaining_seconds=None),"benchmark")
+    assert not module._should_wait_address(dict(state="pending",addresses=[],remaining_seconds=None),"benchmark")
+
+
+def test_arena_pwn_question_waits_for_the_late_address_instead_of_starting_on_empty_target(platform,monkeypatch):
+    p=platform;now=[1000.0];starts=[]
+    p.payload={"code":200,"data":{"agent":{},"attempt":{"id":11939,"state_label":"active","wrong_count":0,
+        "max_wrong_count":20,"remaining_seconds":600,
+        "problem":{"type_label":"Pwn","content":"controlled","container":None}}}}
+    service,row,_,_=schedule(p,"arena")
+    service.clock=lambda:now[0]
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:starts.append(challenge))
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    service.tick();state=service.get(row["id"])["state"]
+    assert state["address_wait_started"]==1000.0 and state["challenge_id"] is None and not starts and not p.workbench.list()
+    now[0]+=10;service.tick()
+    assert service.get(row["id"])["state"]["address_wait_started"]==1000.0 and not starts
+    p.payload["data"]["attempt"]["problem"]["container"]={"url":["10.0.1.5:8080"]}
+    now[0]+=5;service.tick()
+    current=service.get(row["id"])["state"];challenge=current["challenge_id"]
+    assert challenge is not None and current.get("address_wait_started") is None
+    assert p.workbench.get(challenge)["endpoint"]=="http://10.0.1.5:8080"
+    assert starts==[challenge] and current["status"]=="running"
+
+
+def test_address_wait_times_out_on_the_existing_no_target_path(platform,monkeypatch):
+    p=platform;p.payload=[benchmark()];p.payload[0]["container_addr"]=[]
+    service,row,_,_=schedule(p);now=[1000.0];service.clock=lambda:now[0]
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    service.tick();state=service.get(row["id"])["state"]
+    assert state["address_wait_started"]==1000.0 and state["challenge_id"] is None
+    now[0]+=31;service.tick();service.tick()
+    state=service.get(row["id"])["state"]
+    assert state["address_wait_timeout_at"]==now[0] and state["status"]=="paused"
+    assert state["reason"]=="competition_question_input_required"
+
+
+def reopen(platform,row):
+    value=dict(profile_id=row["config"]["profile"]["id"],default_scheme="http",question_minutes=10,
+        overall_minutes=30,queue=["test-code"],http_methods=["GET","HEAD","OPTIONS"],mode="real")
+    code,second=call(platform.port,"POST","/api/competition/sessions",value)
+    assert code==201,second
+    return platform.workbench.schedules,second
+
+
+def test_finish_releases_the_paused_question_so_the_same_platform_question_can_run_again(platform,monkeypatch):
+    p=platform;p.payload=[benchmark()]
+    service,row,_,_=schedule(p)
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:fake_run(p,service.get(row["id"])))
+    service.tick();challenge=service.get(row["id"])["state"]["challenge_id"]
+    assert challenge is not None and p.workbench.get(challenge)["status"]=="paused"
+    service.command(row["id"],dict(action="finish"))
+    assert service.get(row["id"])["state"]["status"]=="finished"
+    released=p.workbench.get(challenge)
+    assert released["status"]=="draft" and released["run"]["status"]=="cancelled" and released["run"]["started_at"]
+    again,second=reopen(p,row);starts=[]
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:starts.append(challenge))
+    again.tick()
+    state=again.get(second["id"])["state"]
+    assert starts==[challenge] and state["status"]=="running" and state["challenge_id"]==challenge
+
+
+def test_deleted_local_question_does_not_pin_the_platform_question(platform,monkeypatch):
+    import sqlite3
+    p=platform;p.payload=[benchmark()]
+    service,row,_,_=schedule(p)
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:fake_run(p,service.get(row["id"])))
+    service.tick();challenge=service.get(row["id"])["state"]["challenge_id"]
+    service.command(row["id"],dict(action="finish"))
+    # Deleting the question without a cascade leaves the platform binding behind.
+    con=sqlite3.connect(p.workbench.database)
+    try:
+        con.execute("PRAGMA foreign_keys=OFF")
+        con.execute("DELETE FROM runs WHERE challenge_id=?",(challenge,))
+        con.execute("DELETE FROM challenges WHERE id=?",(challenge,))
+        con.commit()
+    finally:con.close()
+    again,second=reopen(p,row);starts=[]
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:starts.append(challenge))
+    again.tick()
+    state=again.get(second["id"])["state"]
+    assert state["status"]=="running" and state["challenge_id"] not in (None,challenge)
+    assert starts==[state["challenge_id"]] and p.workbench.get(state["challenge_id"])["endpoint"]=="http://10.0.1.5:8080"
+
+
+def test_restart_releases_the_question_left_paused_by_an_already_finished_session(platform,monkeypatch):
+    import sqlite3
+    from agent_adapters.workbench import Workbench
+    p=platform;p.payload=[benchmark()]
+    service,row,_,_=schedule(p)
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:fake_run(p,service.get(row["id"])))
+    service.tick();challenge=service.get(row["id"])["state"]["challenge_id"]
+    # Older builds only flipped the session to finished and left the question paused.
+    service.update(row["id"],status="finished",reason="operator_finished")
+    assert p.workbench.get(challenge)["status"]=="paused"
+    restarted=Workbench(p.workbench.root,protocol_version=3,execution_profile="d8_v22")
+    released=restarted.get(challenge)
+    assert released["status"]=="draft" and released["run"]["status"]=="cancelled"
+
+
+def test_purging_the_question_detaches_it_from_every_session(platform,monkeypatch):
+    p=platform;p.payload=[benchmark()];p.payload[0]["container_addr"]=[]
+    service,row,_,_=schedule(p)
+    monkeypatch.setattr(module,"ADDRESS_WAIT_SECONDS",0)
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    service.tick();service.update(row["id"],last_platform_check=0);service.tick()
+    challenge=service.get(row["id"])["state"]["challenge_id"]
+    assert challenge is not None and service.get(row["id"])["state"]["status"]=="pausing"
+    p.workbench.archive(challenge)
+    p.workbench.purge(challenge,"test-code")
+    state=service.get(row["id"])["state"]
+    assert state["challenge_id"] is None and state["status"]=="paused"
+    assert state["reason"]=="competition_question_deleted" and all(t["id"]!=challenge for t in p.workbench.list())
+
+
+def test_restart_drops_a_session_reference_to_a_deleted_question(platform,monkeypatch):
+    from agent_adapters.workbench import Workbench
+    p=platform;p.payload=[benchmark()]
+    service,row,_,_=schedule(p)
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:fake_run(p,service.get(row["id"])))
+    service.tick();challenge=service.get(row["id"])["state"]["challenge_id"]
+    service.update(row["id"],status="finished",reason="operator_finished")
+    with p.workbench._db() as db:
+        db.execute("DELETE FROM runs WHERE challenge_id=?",(challenge,))
+        db.execute("DELETE FROM challenges WHERE id=?",(challenge,))
+    assert service.get(row["id"])["state"]["challenge_id"]==challenge
+    restarted=Workbench(p.workbench.root,protocol_version=3,execution_profile="d8_v22")
+    assert restarted.schedules.get(row["id"])["state"]["challenge_id"] is None
+
+
+def test_arena_business_refusal_is_blocked_retryable_and_keeps_the_platform_code(platform,monkeypatch):
+    p=platform;p.bodies=[]
+    p.payload={"code":200,"data":{"agent":{},"attempt":None}}
+    p.post_payload={"code":400,"message":"controlled refusal"}
+    service,row,_,_=schedule(p,"arena")
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    service.tick();service.tick()
+    state=service.get(row["id"])["state"]
+    assert state["status"]=="paused" and state["reason"]=="competition_business_error"
+    with p.workbench._db() as db:
+        receipt=json.loads(db.execute("SELECT receipt_json FROM competition_platform_operations "
+            "WHERE action='next' ORDER BY rowid DESC LIMIT 1").fetchone()[0])
+    assert receipt=={"state":"blocked","code":"competition_business_error","platform_code":400}
+    before=[r for r in p.requests if r[1]=="/api/skill/agent/arena/next/"]
+    service.command(row["id"],dict(action="resume"));service.tick();service.tick()
+    after=[r for r in p.requests if r[1]=="/api/skill/agent/arena/next/"]
+    assert len(after)==len(before)+1
+    assert service.get(row["id"])["state"]["reason"]=="competition_business_error"
+
+
+def test_arena_next_refusal_falls_back_to_the_attempt_current_reports(platform,monkeypatch):
+    p=platform;p.bodies=[]
+    attempt={"id":12099,"state_label":"active","wrong_count":0,"max_wrong_count":20,"remaining_seconds":600,
+        "problem":{"type_label":"Web","content":"controlled","container":{"url":["10.0.1.5:8080"]}}}
+    p.payload={"code":200,"data":{"agent":{},"attempt":attempt}}
+    p.post_payload={"code":400,"message":"controlled refusal"}
+    service,row,_,_=schedule(p,"arena")
+    real_read=module.read_question;calls=[]
+    def first_empty(profile,credential,remote=None):
+        calls.append(remote)
+        return None if len(calls)==1 else real_read(profile,credential,remote)
+    monkeypatch.setattr(module,"read_question",first_empty)
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    starts=[]
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:starts.append(challenge))
+    service.tick()
+    state=service.get(row["id"])["state"]
+    assert state["status"]=="running" and starts==[state["challenge_id"]]
+    assert p.workbench.get(state["challenge_id"])["endpoint"]=="http://10.0.1.5:8080"
+
+
+def test_finish_abandons_the_open_arena_attempt_before_ending(platform,monkeypatch):
+    p=platform;p.bodies=[]
+    p.payload={"code":200,"data":{"agent":{},"attempt":{"id":12041,"state_label":"active","wrong_count":0,
+        "max_wrong_count":20,"remaining_seconds":600,
+        "problem":{"type_label":"Pwn","content":"controlled","container":{"url":["10.0.1.5:8080"]}}}}}
+    p.post_payload={"code":200,"data":{"attempt":{"id":12041,"state_label":"abandoned"}}}
+    service,row,_,_=schedule(p,"arena")
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:fake_run(p,service.get(row["id"])))
+    service.tick();challenge=service.get(row["id"])["state"]["challenge_id"]
+    assert challenge is not None and p.workbench.get(challenge)["status"]=="paused"
+    service.command(row["id"],dict(action="finish"))
+    assert ("POST","/api/skill/agent/arena/attempt/12041/abandon/") in [(m,path) for m,path,_ in p.requests]
+    state=service.get(row["id"])["state"]
+    assert state["status"]=="finished" and state["question_abandoned"]=="abandoned"
+    assert p.workbench.get(challenge)["run"]["status"]=="cancelled"
+
+
+def test_finish_still_ends_the_session_when_the_platform_refuses_to_abandon(platform,monkeypatch):
+    p=platform;p.bodies=[]
+    p.payload={"code":200,"data":{"agent":{},"attempt":{"id":12041,"state_label":"active","wrong_count":0,
+        "max_wrong_count":20,"remaining_seconds":600,
+        "problem":{"type_label":"Pwn","content":"controlled","container":{"url":["10.0.1.5:8080"]}}}}}
+    p.post_payload={"code":400,"message":"controlled refusal"}
+    service,row,_,_=schedule(p,"arena")
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:fake_run(p,service.get(row["id"])))
+    service.tick()
+    service.command(row["id"],dict(action="finish"))
+    state=service.get(row["id"])["state"]
+    assert state["status"]=="finished" and state["question_abandoned"]=="competition_business_error"
+
+
+def test_benchmark_finish_never_calls_the_arena_abandon_endpoint(platform,monkeypatch):
+    p=platform;p.payload=[benchmark()]
+    service,row,_,_=schedule(p)
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:fake_run(p,service.get(row["id"])))
+    service.tick();service.command(row["id"],dict(action="finish"))
+    state=service.get(row["id"])["state"]
+    assert state["status"]=="finished" and state["question_abandoned"] is None
+    assert all("abandon" not in path for _,path,_ in p.requests)
+
+def test_finish_treats_a_missing_abandon_endpoint_as_unsupported(platform,monkeypatch):
+    p=platform;p.bodies=[]
+    p.payload={"code":200,"data":{"agent":{},"attempt":{"id":12041,"state_label":"active","wrong_count":0,
+        "max_wrong_count":20,"remaining_seconds":600,
+        "problem":{"type_label":"Pwn","content":"controlled","container":{"url":["10.0.1.5:8080"]}}}}}
+    p.post_payload={"error":"not found"};p.post_status=404
+    service,row,_,_=schedule(p,"arena")
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:fake_run(p,service.get(row["id"])))
+    service.tick()
+    service.command(row["id"],dict(action="finish"))
+    state=service.get(row["id"])["state"]
+    assert state["status"]=="finished" and state["question_abandoned"]=="unsupported"

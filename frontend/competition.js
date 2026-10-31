@@ -12,6 +12,10 @@ const CompetitionPage = (() => {
     competition_submission_requires_attention: "提交被拒绝或结果未知，请先核对回执、凭据及平台状态。",
     competition_task_recovery_required: "当前 Agent 需要核验恢复，已保留进展。",
     competition_workbench_restarted: "工作台已重启；补充同源凭据后显式继续。",
+    competition_finish_requires_pause: "当前题目还在停止中；等它变为已暂停再结束赛程。",
+    competition_still_pausing: "赛程正在暂停；等当前题目停止后再继续或结束。",
+    competition_existing_task_requires_recovery: "这道题已有未收尾的运行；先结束或取消该运行，再开始新赛程。",
+    competition_session_scope_invalid: "赛程与当前题目不匹配；请从比赛控制继续原赛程，不要从单题页启动。",
     operator_task_initializing: "TaskRun 正在登记，请稍后用同一操作再次确认。",
     operator_command_outcome_unknown: "控制命令结果待确认；请用原按钮再次确认，不重复增加预算。",
     operator_unknown_operation: "有未核验的执行结果，暂不能继续。",
@@ -22,6 +26,7 @@ const CompetitionPage = (() => {
     competition_target_address_not_supported: "目标需为公网地址或明确的 RFC1918 私网 IPv4；回环、链路本地等特殊地址不支持。",
     competition_import_invalid: "导入参数不正确。",
     competition_question_not_found: "平台当前未返回这道题，请刷新。",
+    challenge_not_found: "这道题已在任务页删除；赛程与平台记录仍保留，可以直接新建赛程。",
     competition_question_not_active: "平台题目已结束或有效期已过。",
     competition_target_selection_required: "请选择明确的 HTTP(S) 入口；无协议地址需要你指定。",
     competition_target_protocol_unsupported: "当前启动入口支持 HTTP(S)；其他协议需要单独接入。",
@@ -52,7 +57,7 @@ const CompetitionPage = (() => {
     competition_resource_unavailable: "平台资源暂时不可用。",
     competition_request_rejected: "平台拒绝读取请求，请检查所选协议。",
     competition_http_error: "平台返回 HTTP 错误。",
-    competition_business_error: "平台返回业务失败，未将其当作认证成功。",
+    competition_business_error: "平台拒绝了这次操作（常见：上一道题在平台还没结束，或账号额度/冷却限制）。请先在平台结束上一题，再点继续原赛程重试。",
     competition_origin_invalid: "地址应为 http(s) 平台根地址，不含账号、路径、查询或片段。",
     competition_credential_invalid: "凭据格式不正确；Benchmark 需要 UUID，Agent Token 不含 Bearer 前缀。",
     competition_profile_invalid: "配置字段不正确，请检查名称、协议和 1–60 秒读取超时。",
@@ -241,16 +246,18 @@ const CompetitionPage = (() => {
     el("run-settings").querySelector("summary").textContent=active ? "赛程参数 · 已冻结" : "新赛程参数";
     if(active) el("frozen-settings").replaceChildren(...[["无协议入口",session.config.default_scheme?.toUpperCase() || "未提供"],["初始单题预算",`${session.config.question_seconds/60} 分钟`],["允许的 HTTP 方法",session.config.http_methods?.join(", ") || "未提供"]].map(([label,value])=> {const row=node("div");row.append(node("dt",label),node("dd",value));return row;}));
     el("schedule-status").closest(".c-command").dataset.status=state?.status || "idle";
-    el("schedule-status").textContent=state ? `${sessionLabels[state.status] || state.status}${state.reason ? ` · ${errorText(state.reason) || state.reason}` : ""}${state.pending_control ? " · 加时待应用" : ""}` : "尚未创建赛程";
+    el("schedule-status").textContent=state ? `${sessionLabels[state.status] || state.status}${state.reason ? ` · ${errorText(state.reason) || state.reason}` : ""}${state.address_wait_started ? " · 等待平台下发实例地址" : ""}${state.pending_control ? " · 加时待应用" : ""}` : "尚未创建赛程";
     el("bound-source").textContent=session ? `${session.config.profile.adapter.toUpperCase()} · ${session.config.profile.base_url}` : "尚未绑定赛程";
     el("overall-clock").textContent=clock(state?.deadline_at);
     el("question-clock").textContent=runtime ? clock(runtime.deadline_at) : state?.current_ref!==null && state?.current_ref!==undefined ? "尚未计时" : "—";
     const platform=state?.platform;
+    const waiting=state?.address_wait_started ? Math.max(0,Math.round(Date.now()/1000-state.address_wait_started)) : null;
+    const abandoned=state?.question_abandoned;
     el("flag-score").textContent=platform?.flag_count!==undefined ? `${platform.correct_flag_count} / ${platform.flag_count}` : "—";
     const limits=[["本地整体截止",state?.deadline_at],["本题有效截止",runtime?.deadline_at],["本地单题截止",control?.question_deadline_at],["平台题目截止",control?.platform_deadline_at],["平台整体截止",session?.config.platform_deadline_at]];
     el("deadlines").replaceChildren(...limits.map(([label,value])=> {const row=node("div");row.append(node("dt",label),node("dd",date(value)));return row;}));
     if (platform?.wrong_count!==null && platform?.wrong_count!==undefined) {const row=node("div");row.append(node("dt","平台错误次数"),node("dd",`${platform.wrong_count} / ${platform.max_wrong_count ?? "上限未提供"}`));el("deadlines").append(row);}
-    const reason=runtime?.unknown ? "存在未核验操作，不能自动重放。" : session?.runtime_error ? "本题状态读取失败；当前无法确认执行状态。" : state?.status==="pausing" ? "新操作已停止准入；在途调用尚未确认全部结束。" : state && state.deadline_at<=Date.now()/1000 && state.status!=="finished" ? "截止已到，等待可信端核验与结算。" : "本地加时不改变平台期限；有效截止取各层最小值。";
+    const reason=waiting!==null ? `等待平台下发实例地址（已等待 ${waiting} 秒，超时后按附件/原流程继续）。` : abandoned==="unsupported" ? "当前平台协议没有“放弃题目”，本轮只结束了本地赛程；平台上的题目仍按平台规则处理。" : abandoned && abandoned!=="abandoned" ? `结束赛程时平台未确认放弃本题（${errorText(abandoned) || abandoned}）；可在平台手动结束上一题。` : runtime?.unknown ? "存在未核验操作，不能自动重放。" : session?.runtime_error ? "本题状态读取失败；当前无法确认执行状态。" : state?.status==="pausing" ? "新操作已停止准入；在途调用尚未确认全部结束。" : state && state.deadline_at<=Date.now()/1000 && state.status!=="finished" ? "截止已到，等待可信端核验与结算。" : "本地加时不改变平台期限；有效截止取各层最小值。";
     el("schedule-progress").textContent=reason;
     const identity=session?.id || null;
     if (dashboardOwner!==identity) {dashboardOwner=identity;el("preview-details").open=!state || state.status==="finished";}
@@ -305,7 +312,15 @@ const CompetitionPage = (() => {
       el("current-question").replaceChildren(node("p",session ? "等待领取 / 准备当前题目。" : "配置来源并读取题目后开始。","c-empty"));
       el("agent-state").textContent="尚未运行";el("agent-metrics").replaceChildren();el("agent-frontier").replaceChildren();el("recovery").textContent="";el("feedback").textContent="平台提交回执尚未产生。";el("candidates").textContent="尚无受保护候选。";records=[];renderRecords();return;
     }
-    const [task,data]=await Promise.all([request(`/api/challenges/${encodeURIComponent(challenge)}`),request(`/api/challenges/${encodeURIComponent(challenge)}/progress`)]);
+    let task,data;
+    try {[task,data]=await Promise.all([request(`/api/challenges/${encodeURIComponent(challenge)}`),request(`/api/challenges/${encodeURIComponent(challenge)}/progress`)]);}
+    catch (error) {
+      if (error.message!=="challenge_not_found") throw error;
+      el("current-question").replaceChildren(node("p","这道题已在任务页删除；赛程与平台记录保留。","c-empty"));
+      el("agent-state").textContent="题目已删除";el("agent-metrics").replaceChildren();el("agent-frontier").replaceChildren();
+      el("recovery").textContent="";el("feedback").textContent="平台提交回执尚未产生。";el("candidates").textContent="尚无受保护候选。";
+      records=[];renderRecords();return;
+    }
     if(captured!==revision || session?.id!==owner || session?.state.challenge_id!==challenge) return;
     const progress=data.progress, intents=(progress?.turns || []).flatMap(turn=>turn.intents || []);
     el("current-question").replaceChildren(node("h3",task.title),node("p",task.description || "平台未提供题面。"),node("pre",task.endpoint || "附件任务 · 无网络入口"));
@@ -374,11 +389,11 @@ const CompetitionPage = (() => {
     el("fill-queue").addEventListener("click",()=> {el("queue").value = current?.adapter === "benchmark" ? previewItems.filter(x=>!x.is_completed).map(x=>x.remote_ref).join("\n") : "";renderQueue();});
     el("pause").addEventListener("click",()=>scheduleCommand({action:"pause"}));
     el("resume").addEventListener("click",()=>scheduleCommand({action:"resume"}));
-    el("finish").addEventListener("click",()=>{ if (confirm("结束当前赛程？结束后本轮不可继续，但题目与证据会保留。")) scheduleCommand({action:"finish"}); });
+    el("finish").addEventListener("click",()=>{ const arena=session?.config.profile.adapter==="arena"; if (confirm(arena ? "结束当前赛程？会先按平台规则放弃当前题目（Arena abandon），再结束本轮；题目与证据会保留。" : "结束当前赛程？当前平台协议没有“放弃题目”，只会结束本地赛程；题目与证据会保留。")) scheduleCommand({action:"finish"}); });
     el("stop-after").addEventListener("change",()=>scheduleCommand({action:"stop_after_current",enabled:el("stop-after").checked}));
     el("extend-question").addEventListener("click",()=>extend("extend_question"));
     el("extend-overall").addEventListener("click",()=>extend("extend_overall"));
-    el("open-task").addEventListener("click",async()=> {if(session?.state.challenge_id){await loadTasks();selectTask(session.state.challenge_id,false);showView("detail");}});
+    el("open-task").addEventListener("click",async()=> {const id=session?.state.challenge_id;if(!id)return;await loadTasks();if(!state.tasks.some(task=>task.id===id)){el("schedule-error").textContent=errors.challenge_not_found;return;}selectTask(id,false);showView("detail");});
     setInterval(()=> {if (!document.getElementById("competition-view").hidden) refreshSession();},2000);
     sessionControls();
     el("form").addEventListener("submit", save);

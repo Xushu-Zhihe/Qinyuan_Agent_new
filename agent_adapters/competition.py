@@ -16,6 +16,13 @@ from qinyuan_core import get_logger
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 READ_PATHS = {"arena": "/api/skill/agent/arena/current/", "benchmark": "/openapi/v1/challenges"}
+# Actions each platform protocol really defines. Ending a round must never assume a
+# capability the protocol does not have (for example benchmark has no abandon).
+PLATFORM_ACTIONS = {"arena": frozenset({"next", "abandon"}), "benchmark": frozenset({"start", "close"})}
+
+
+def supports_action(adapter, action):
+    return action in PLATFORM_ACTIONS.get(adapter, frozenset())
 
 
 def _origin(value):
@@ -109,7 +116,7 @@ def _redact(value, credential):
     return value
 
 
-def _exchange(profile, credential, method, path, payload=None):
+def _exchange(profile, credential, method, path, payload=None, *, empty_ok=False):
     parsed = urlsplit(profile["base_url"])
     connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
     connection = connection_type(parsed.hostname, parsed.port, timeout=profile["timeout_seconds"])
@@ -119,13 +126,16 @@ def _exchange(profile, credential, method, path, payload=None):
         connection.request(method,path,body=body,headers={"Accept":"application/json",**header,
             **({"Content-Type":"application/json"} if body is not None else {})})
         response=connection.getresponse(); status=response.status
+        def http_error():
+            error=WorkbenchError("competition_http_error",502);error.http_status=status;return error
         if 300<=status<400:raise WorkbenchError("competition_redirect_blocked",502)
         if status in {401,403}:raise WorkbenchError("competition_auth_failed",502)
         errors={429:"competition_rate_limited",422:"competition_request_rejected",503:"competition_resource_unavailable"}
         if status in errors:raise WorkbenchError(errors[status],502)
-        if status>=500:raise WorkbenchError("competition_http_error",502)
+        if status>=500:raise http_error()
         raw=response.read(MAX_RESPONSE_BYTES+1)
         if len(raw)>MAX_RESPONSE_BYTES:raise WorkbenchError("competition_response_too_large",502)
+        if empty_ok and status in {200,204} and not raw.strip():return {}
         try:value=json.loads(raw)
         except (ValueError,UnicodeError,RecursionError):raise WorkbenchError("competition_response_invalid",502) from None
         code=value.get("code") if isinstance(value,dict) else None
@@ -135,10 +145,15 @@ def _exchange(profile, credential, method, path, payload=None):
         if code=="invalid_state":raise WorkbenchError("competition_invalid_state",502)
         if method=="POST" and profile["adapter"]=="benchmark" and status==409 and code=="duplicate":
             return {"duplicate":True}
-        if status!=200:raise WorkbenchError("competition_http_error",502)
+        if status!=200:raise http_error()
         if profile["adapter"]=="arena":
             if type(code) is not int:raise WorkbenchError("competition_response_invalid",502)
-            if code!=200:raise WorkbenchError("competition_business_error",502)
+            if code!=200:
+                # A business refusal is a definite platform answer; keep only the
+                # numeric code (never the message) so operators can see why.
+                error=WorkbenchError("competition_business_error",502)
+                error.platform_code=code
+                raise error
         return value
     except (TimeoutError,socket.timeout):raise WorkbenchError("competition_timeout",502) from None
     except ssl.SSLError:raise WorkbenchError("competition_tls_failed",502) from None
@@ -306,6 +321,8 @@ def read_question(profile,credential,remote_ref=None):
 
 
 def platform_action(profile,credential,action,remote_ref):
+    if not supports_action(profile["adapter"],action):
+        raise WorkbenchError("competition_platform_action_unsupported")
     if profile["adapter"]=="arena" and action=="next":
         value=_exchange(profile,credential,"POST","/api/skill/agent/arena/next/")
         try:
@@ -314,7 +331,13 @@ def platform_action(profile,credential,action,remote_ref):
             if len(items)!=1 or items[0]["state"]!="active":raise ValueError()
             return {"item":items[0],"reused":value["data"]["reused"]}
         except (ValueError,KeyError,TypeError):raise WorkbenchError("competition_response_invalid",502) from None
-    if profile["adapter"]!="benchmark" or action not in {"start","close"} or not isinstance(remote_ref,str) or not remote_ref:
+    if profile["adapter"]=="arena" and action=="abandon":
+        # Give the attempt back before the token/account moves on; otherwise the
+        # platform keeps it open and refuses to hand out the next question.
+        path=f"/api/skill/agent/arena/attempt/{_integer(remote_ref,minimum=1)}/abandon/"
+        value=_exchange(profile,credential,"POST",path,empty_ok=True)
+        return {"abandoned":True,"platform_state":(value.get("data") or {}).get("attempt",{}).get("state_label")}
+    if profile["adapter"]!="benchmark" or not isinstance(remote_ref,str) or not remote_ref:
         raise WorkbenchError("competition_platform_action_invalid")
     path=f"/openapi/v1/challenges/{action}?"+urlencode({"unique_code":remote_ref})
     value=_exchange(profile,credential,"POST",path)

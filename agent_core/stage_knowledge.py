@@ -11,6 +11,12 @@ from agent_core.stage_storage import _fail
 from agent_core.turn_modeling import digest, stable_id
 from qinyuan_core import Category
 
+# The planning schema allows at most eight support refs on one decision, so the
+# live window carries the same number of facts.  A narrower window could hide a
+# fact that is still eligible for turn_completion, which is what made the model
+# cite an invisible ref and then fail the whole stage.
+LIVE_FACT_WINDOW = 8
+
 
 class StageKnowledge(ConclusionRevisions):
     """Reuse revision projection; stage ownership and IO stay in their own boundary."""
@@ -143,7 +149,7 @@ class StageKnowledge(ConclusionRevisions):
                 refs.update(candidate.candidate.support_refs)
                 refs.update(self.effective_premises(turn, candidate))
         local = [i for i in items if i.turn_id == turn.turn_id]
-        refs.update(i.ref for i in [i for i in local if i.record_type in {"verified_fact", "reviewed_inference"}][-4:])
+        refs.update(i.ref for i in [i for i in local if i.record_type in {"verified_fact", "reviewed_inference"}][-LIVE_FACT_WINDOW:])
         refs.update(i.ref for i in [i for i in local if i.record_type == "progress"
                                   and not i.record_id.startswith("revision/")][-4:])
         feedback = [i for i in items if i.record_id.startswith("feedback/")

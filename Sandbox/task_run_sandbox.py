@@ -93,6 +93,11 @@ class TaskRunSandbox:
             "qinyuan.task_run_id": task_run_id,
         }
 
+    def _security_opt(self) -> list[str]:
+        """Container security options; subclasses may add a narrowed profile."""
+
+        return ["no-new-privileges:true"]
+
     def _spec(self) -> dict[str, object]:
         s = self._settings
         return {
@@ -106,7 +111,7 @@ class TaskRunSandbox:
                 "/tmp": f"rw,noexec,nosuid,nodev,size={s.temporary_size},mode=1777",
             },
             "cap_drop": ["ALL"],
-            "security_opt": ["no-new-privileges:true"],
+            "security_opt": self._security_opt(),
             "mem_limit": s.memory_limit,
             "memswap_limit": s.memory_swap_limit,
             "nano_cpus": s.cpu_limit,
@@ -147,7 +152,7 @@ class TaskRunSandbox:
             "Privileged": False,
             "AutoRemove": False,
             "CapDrop": ["ALL"],
-            "SecurityOpt": ["no-new-privileges:true"],
+            "SecurityOpt": self._security_opt(),
             "Tmpfs": self._spec()["tmpfs"],
             "Memory": parse_bytes(self._settings.memory_limit),
             "MemorySwap": parse_bytes(self._settings.memory_swap_limit),

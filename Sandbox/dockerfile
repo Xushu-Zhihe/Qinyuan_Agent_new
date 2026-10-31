@@ -73,8 +73,10 @@ COPY --from=powershell-tool /opt/microsoft/powershell/7 /opt/microsoft/powershel
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false \
-    PATH="/opt/dirsearch/bin:${PATH}" \
+    PATH="/opt/dirsearch/bin:/opt/qinyuan/python/bin:${PATH}" \
     PYTHONPATH="/opt/qinyuan/python" \
+    TERM=xterm-256color \
+    SHELL=/bin/bash \
     NUCLEI_TEMPLATES_DIR=/opt/nuclei-templates \
     PS_INSTALL_FOLDER=/opt/microsoft/powershell/7 \
     PSModuleAnalysisCachePath=/tmp/qinyuan-cache/powershell/ModuleAnalysisCache \
@@ -89,21 +91,47 @@ RUN rm -rf /var/lib/apt/lists/* \
     && apt-get install --no-install-recommends -y \
         ca-certificates \
         coreutils \
+        cpio \
         curl \
         file \
         binutils \
+        elfutils \
         gdb \
+        gdb-multiarch \
+        gdbserver \
+        gcc \
+        libc6-dev \
         libicu72 \
         libssl3 \
+        ltrace \
+        ncurses-term \
+        netcat-openbsd \
         nmap \
         openjdk-17-jre-headless \
+        patchelf \
         perl \
         php-cli \
+        procps \
         python3 \
         python3-pip \
         python3-venv \
+        qemu-system-x86 \
+        qemu-user-static \
+        ruby \
+        socat \
+        strace \
+        tmux \
         zlib1g \
     && rm -rf /var/lib/apt/lists/*
+
+# yama ptrace_scope=1 plus a non-root uid blocks `gdb -p` on processes started
+# by another tool call. This launcher only sets PR_SET_PTRACER_ANY (the same
+# permission pwntools sets on process() tubes); it grants no capability and
+# stays inside the caller's uid/PID namespace.
+COPY Sandbox/qinyuan_exec.c /tmp/qinyuan_exec.c
+RUN gcc -O2 -Wall -Wextra -o /usr/local/bin/qinyuan-exec /tmp/qinyuan_exec.c \
+    && rm /tmp/qinyuan_exec.c \
+    && chmod 0755 /usr/local/bin/qinyuan-exec
 
 RUN ln -s /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
 
@@ -127,14 +155,18 @@ RUN /usr/bin/python3 -m venv --without-pip /opt/dirsearch \
         "$(/opt/dirsearch/bin/python3 -c \
             'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
         "pip==25.3" \
+        "setuptools==80.9.0" \
     && (/opt/dirsearch/bin/python3 -m pip install --no-cache-dir \
             "cffi==1.17.1" \
             "chardet==5.2.0" \
             "dirsearch==0.4.3.post1" \
+            "setuptools==80.9.0" \
         || /opt/dirsearch/bin/python3 -m pip install --no-cache-dir \
             "cffi==1.17.1" \
             "chardet==5.2.0" \
-            "dirsearch==0.4.3.post1")
+            "dirsearch==0.4.3.post1" \
+            "setuptools==80.9.0") \
+    && /opt/dirsearch/bin/dirsearch --version >/dev/null
 
 # Keep CTF analysis packages in a dedicated target directory. The runtime is
 # read-only and non-root, so MCPs use PYTHONPATH instead of installing packages
@@ -151,6 +183,25 @@ RUN mkdir -p /opt/qinyuan/python \
 # only; the image does not contain the Ubuntu libc package corpus.
 COPY MCPs/LibcSearcher_Mcp/runtime.py /opt/qinyuan/python/qinyuan_libcsearcher.py
 COPY MCPs/LibcSearcher_Mcp/database.json /opt/qinyuan/python/qinyuan_libcsearcher_index.json
+
+# GEF is vendored as a single file so the build stays offline-reproducible.
+# Debian's gdb reads /etc/gdb/gdbinit unless it is started with --nx; the Gdb
+# MCP no longer passes --nx, so both the MCP and pwntools' gdb.debug() get
+# vmmap/heap/checksec without an extra command.
+COPY Sandbox/gef/gef.py /opt/qinyuan/gef/gef.py
+RUN printf '%s\n' 'source /opt/qinyuan/gef/gef.py' > /etc/gdb/gdbinit \
+    && chmod a=rX /opt/qinyuan/gef /opt/qinyuan/gef/gef.py \
+    && gdb --batch -nx -ex 'source /opt/qinyuan/gef/gef.py' -ex 'pi print("gef-ok")' >/dev/null
+
+# one_gadget is a Ruby gem; keep it in the image so pwn analysis does not need
+# runtime network access.
+RUN gem install --no-document one_gadget
+
+# pwntools prefers a `pwntools-terminal` helper over tmux/xterm. The sandbox
+# has no display and mounts /tmp noexec, so the helper allocates a pty with
+# script(1) and runs generated launcher scripts through python3.
+COPY Sandbox/pwntools_terminal.sh /usr/local/bin/pwntools-terminal
+RUN chmod 0755 /usr/local/bin/pwntools-terminal
 
 # 内置小型字典用于开发和集成测试；生产环境可在后续镜像版本中替换。
 RUN mkdir -p /opt/qinyuan/wordlists \
@@ -179,6 +230,24 @@ RUN mkdir -p /opt/qinyuan/wordlists \
     && command -v nm >/dev/null \
     && command -v strings >/dev/null \
     && command -v gdb >/dev/null \
+    && command -v gdbserver >/dev/null \
+    && command -v gdb-multiarch >/dev/null \
+    && command -v tmux >/dev/null \
+    && command -v patchelf >/dev/null \
+    && command -v strace >/dev/null \
+    && command -v ltrace >/dev/null \
+    && command -v socat >/dev/null \
+    && command -v nc >/dev/null \
+    && command -v qemu-x86_64-static >/dev/null \
+    && command -v qemu-system-x86_64 >/dev/null \
+    && command -v cpio >/dev/null \
+    && command -v one_gadget >/dev/null \
+    && command -v pwntools-terminal >/dev/null \
+    && command -v qinyuan-exec >/dev/null \
+    && command -v checksec >/dev/null \
+    && command -v ROPgadget >/dev/null \
+    && command -v dirsearch >/dev/null \
+    && dirsearch --version >/dev/null \
     && command -v subfinder >/dev/null \
     && command -v amass >/dev/null \
     && command -v httpx >/dev/null \

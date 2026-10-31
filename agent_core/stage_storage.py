@@ -1443,6 +1443,9 @@ def save(store, mutation, change):
         return
     task_id = mutation.task_run_id
     from agent_core import stage_plans
+    # Bound once at function scope: the settlement loop below may run with an
+    # empty change.reviews, so an import inside that loop left it unbound.
+    from agent_core.stage_planning import review_members
     plan_rows = stage_plans.submissions(store, task_id, change) if change.config is None else ()
     discarded = _validate_branches(store, mutation, change)
     discarded.update((binding.proposal_operation_id, binding.review_operation_id) for binding in change.discarded_decisions)
@@ -1488,7 +1491,6 @@ def save(store, mutation, change):
             continue
         request = store.stage_evidence.request(binding.review_operation_id) if store._connection.execute(
             "SELECT 1 FROM stage_review_queue WHERE proposal_operation_id=?", (binding.proposal_operation_id,)).fetchone() else None
-        from agent_core.stage_planning import review_members
         members = review_members(request) if request is not None else (binding.proposal_operation_id,)
         for op_id in (*members, binding.review_operation_id):
             store._mark_d4_operation_applied(op_id, mutation.mutation_id)

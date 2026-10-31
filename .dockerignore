@@ -1,0 +1,22 @@
+# The sandbox image only copies vendored analysis assets from the build
+# context. Keep the context small so image builds do not ship run data,
+# virtualenvs, test fixtures, or frontend dependencies to the daemon.
+.venv/
+.uv-cache/
+.test/
+.runs/
+workbench_data/
+dist/
+frontend/
+tests/
+Plan/
+agent_adapters/
+agent_core/
+qinyuan_core/
+Challenge/
+Control/
+restrict/
+scripts/
+**/__pycache__/
+*.pyc
+.git/
