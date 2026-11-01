@@ -308,3 +308,103 @@ def test_legacy_file_program_remains_evidence_only():
     )
     assert policy.validate_recorded_command(r, legacy).allowed
     assert not policy.validate_command(r, legacy).allowed
+
+
+# ---- transport diagnostics: a failed connect must say where it failed ----
+
+class _DiagnosticPipe:
+    def __init__(self):
+        self.values = []
+
+    def send(self, value):
+        self.values.append(value)
+
+    def close(self):
+        pass
+
+
+class _PeerSock:
+    def getpeername(self):
+        return ("112.28.173.74", 443)
+
+    def settimeout(self, timeout):
+        pass
+
+
+def _run_worker(monkeypatch, *, sock, connect, status=500, request_error=None):
+    class FakeHTTP:
+        def __init__(self, host, timeout):
+            self.sock = sock
+
+        def connect(self):
+            connect(self)
+
+        def request(self, method, path, **kwargs):
+            assert method == "POST"
+            if request_error is not None:
+                raise request_error
+
+        def getresponse(self):
+            return type("Response", (), {"status": status})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(deepseek_model.http.client, "HTTPSConnection", FakeHTTP)
+    monkeypatch.setattr(deepseek_model.signal, "signal", lambda *args: None)
+    pipe = _DiagnosticPipe()
+    settings = DeepSeekSettings("deepseek-v4-flash", "secret-value")
+    deepseek_model._http_worker(pipe, settings, build_payload(request(), settings), 10,
+                               deepseek_model.MAX_T6_RESPONSE_BYTES, True)
+    merged = {}
+    for value in pipe.values:
+        merged.update(value.get("diagnostic") or {})
+    return pipe.values, merged
+
+
+def test_connect_that_never_reached_tcp_is_labelled_connect(monkeypatch):
+    def connect(client):
+        raise TimeoutError("timed out")
+
+    values, merged = _run_worker(monkeypatch, sock=None, connect=connect)
+    assert merged["phase"] == "connect"
+    assert merged["exception_type"] == "TimeoutError"
+    assert merged["transport_end"] == "timeout"
+    assert {"error": "timed_out", "reason": "http_timeout"} in values
+
+
+def test_connect_that_stalled_in_the_handshake_is_labelled_tls(monkeypatch):
+    peer = _PeerSock()
+
+    def connect(client):
+        client.sock = peer
+        raise TimeoutError("_ssl.c:1015: The handshake operation timed out")
+
+    _, merged = _run_worker(monkeypatch, sock=None, connect=connect)
+    assert merged["phase"] == "tls" and merged["exception_type"] == "TimeoutError"
+
+
+def test_connected_peer_is_reported_without_leaking_anything_else(monkeypatch):
+    peer = _PeerSock()
+
+    def connect(client):
+        client.sock = peer
+
+    values, merged = _run_worker(monkeypatch, sock=peer, connect=connect, status=503)
+    assert merged["peer"] == "112.28.173.74"
+    assert {"diagnostic": {"peer": "112.28.173.74"}} in values
+    assert "secret-value" not in json.dumps(values)
+
+
+def test_failure_after_connect_is_labelled_stream(monkeypatch):
+    peer = _PeerSock()
+
+    def connect(client):
+        client.sock = peer
+
+    _, merged = _run_worker(monkeypatch, sock=peer, connect=connect,
+                            request_error=ConnectionResetError("reset"))
+    assert merged["phase"] == "stream"
+    assert merged["exception_type"] == "ConnectionResetError"
+    assert merged["transport_end"] == "transport_error"
+    assert merged["peer"] == "112.28.173.74"

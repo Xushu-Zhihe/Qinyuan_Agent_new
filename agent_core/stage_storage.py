@@ -715,6 +715,49 @@ def _shape(turn):
             _fail("stage.achievement_support_required", Category.INPUT)
 
 
+def _withdrawn_by_review(store, mutation, change):
+    """Proposals this very commit's review withdrew before they were dispatched.
+
+    A review can return while a decision is still unapplied; the runtime then
+    records that decision in ``discarded_decisions`` instead of dispatching it.
+    Without honouring that record the pending check rejects the runtime's own
+    withdrawal, so the rejected mutation is replayed identically on every
+    restart and the run never advances.
+
+    The binding is trusted only when the commit itself settles that review, the
+    proposal is a completed unapplied Inner decision of this TaskRun, it was
+    never executed, and it sits inside the review's own interruption set -- the
+    same predicate the dispatcher used to withdraw it. Anything else stays
+    pending, so a discard can never be asserted on its own.
+    """
+    if not change.discarded_decisions:
+        return set()
+    from agent_core.stage_planning import conversation_operation_ids
+    settled = {binding.review_operation_id for binding in change.reviews}
+    withdrawn = set()
+    for binding in change.discarded_decisions:
+        if binding.review_operation_id not in settled:
+            continue
+        operation = store.load_d4_operation(binding.proposal_operation_id)
+        if (operation is None or operation.start.task_run_id != mutation.task_run_id
+                or operation.start.role != "inner_action" or operation.completion is None
+                or operation.completion.result_kind != "completed"
+                or operation.application_ref is not None):
+            continue
+        # An already executed action keeps its recorded outcome; only a decision
+        # that never reached a dispatcher can be withdrawn here.
+        if any(child.start.category == "tool_dispatch"
+               and binding.proposal_operation_id in child.start.resource_ref.split("/")
+               for child in store.list_d4_operations(mutation.task_run_id)):
+            continue
+        request = store.stage_evidence.request(binding.proposal_operation_id)
+        interruptions = store.stage_evidence.review_interruptions(binding.review_operation_id)
+        if not set(interruptions).intersection(conversation_operation_ids(request)):
+            continue
+        withdrawn.add(binding.proposal_operation_id)
+    return withdrawn
+
+
 def _reviewed(store, mutation, change, discarded=()):
     config = require_run(store, mutation.task_run_id)
     queue = {entry.proposal_operation_id: entry for entry in list_reviews(store, mutation.task_run_id)}
@@ -846,12 +889,13 @@ def _reviewed(store, mutation, change, discarded=()):
         if decision.decision == "accept":
             accepted.append((binding, proposal.session, value, decision))
     known_queue = _queued_known_operations(store, mutation.task_run_id, tuple(queue.values()))
+    withdrawn = _withdrawn_by_review(store, mutation, change)
     pending = {r.start.operation_id for r in store.list_d4_operations(mutation.task_run_id)
                if (r.completion is None or r.completion.result_kind == "completed" and r.application_ref is None)
                and not (r.start.category == "tool_dispatch"
                         and getattr(store, "live_tool_operation", lambda identity: False)(r.start.operation_id))
                and not getattr(store, "live_stage_review_operation", lambda identity: False)(r.start.operation_id)
-               } - used - set(change.applications) - known_queue - set(change.review_submissions) - set(discarded)
+               } - used - set(change.applications) - known_queue - set(change.review_submissions) - set(discarded) - withdrawn
     if pending:
         _fail("stage.pending_operations", Category.UNKNOWN)
     return accepted

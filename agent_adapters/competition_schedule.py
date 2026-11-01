@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import re
 import threading
 import time
 from uuid import UUID,uuid4
@@ -13,6 +14,16 @@ PLATFORM_POLL_SECONDS=5.0
 FINISHED={"achieved","failed","deadline_exceeded","cancelled","inconclusive"}
 # A live target-bearing question may arrive before the platform publishes its address.
 ADDRESS_WAIT_CATEGORIES=("web","pwn")
+# Platform failures that say nothing about the question itself: the TaskRun keeps
+# its own frozen deadline and sandbox, so a read or an ambiguous action is retried
+# with backoff instead of stopping the run. Definitive answers (auth, business
+# refusal) still pause, because continuing cannot succeed.
+PLATFORM_RETRY_CODES=frozenset({
+    "competition_resource_unavailable","competition_http_error","competition_rate_limited",
+    "competition_response_invalid","competition_platform_operation_unknown",
+    "competition_timeout","competition_tls_failed","competition_transport_failed",
+})
+PLATFORM_RETRY_BACKOFF_SECONDS=(5.0,15.0,60.0)
 
 
 def _address_wait_seconds():
@@ -30,6 +41,21 @@ def _default_description(value):
     if value is None:return ""
     if not isinstance(value,str) or len(value)>16000:raise WorkbenchError("competition_session_invalid")
     return value.strip()
+
+
+# Prefill only: the operator can override or clear the field. Arena is NSSCTF;
+# benchmark flags are platform-defined, so "flag" is an editable convention.
+DEFAULT_FLAG_HEADS={"arena":"NSSCTF","benchmark":"flag"}
+
+
+def _flag_head(value,adapter):
+    """Submission head sent to the agent; absent uses the adapter default, empty disables substitution."""
+    if value is None:return DEFAULT_FLAG_HEADS.get(adapter,"")
+    if not isinstance(value,str) or len(value)>32:raise WorkbenchError("competition_session_invalid")
+    value=value.strip()
+    if value and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*",value):
+        raise WorkbenchError("competition_session_invalid")
+    return value
 
 
 def _prefers_tcp(item,adapter):
@@ -63,6 +89,7 @@ class CompetitionSchedules:
         self.workbench=workbench;self.clock=clock
         self.wake=threading.Event();self.closed=threading.Event();self.tick_lock=threading.Lock()
         self.thread=None;self.automatic=True;self.commands_lock=threading.Lock()
+        self.platform_failures={};self.retry_at={}
         restarted=[]
         with workbench._db() as db:
             db.executescript("""
@@ -141,7 +168,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
     def start(self,value):
         from agent_adapters.workbench import http_methods
         required={"profile_id","default_scheme","question_minutes","overall_minutes","queue","http_methods","mode"}
-        if not isinstance(value,dict) or set(value)-{"platform_deadline_at","default_description","default_description_enabled"}!=required:raise WorkbenchError("competition_session_invalid")
+        if not isinstance(value,dict) or set(value)-{"platform_deadline_at","default_description","default_description_enabled","flag_head"}!=required:raise WorkbenchError("competition_session_invalid")
         if self.workbench.protocol_version!=3 or self.workbench.execution_profile!="d8_v22":raise WorkbenchError("competition_requires_contract22",409)
         if self.workbench.d7_mode=="simulated":raise WorkbenchError("mode_configuration_mismatch",409)
         if value["mode"]!="real" or value["default_scheme"] not in {"http","https"}:raise WorkbenchError("competition_session_invalid")
@@ -149,6 +176,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         methods=http_methods(value["http_methods"])
         profile=self.workbench.competitions._get(value["profile_id"])
         self.workbench.competitions.credential_for(profile)
+        flag_head=_flag_head(value.get("flag_head"),profile["adapter"])
         queue=value["queue"]
         if not isinstance(queue,list) or any(not isinstance(ref,str) or not ref for ref in queue) or len(set(queue))!=len(queue):raise WorkbenchError("competition_queue_invalid")
         if profile["adapter"]=="benchmark" and not queue or profile["adapter"]=="arena" and queue:raise WorkbenchError("competition_queue_invalid")
@@ -160,7 +188,8 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         config=dict(profile=profile,queue=queue,default_scheme=value["default_scheme"],mode=value["mode"],
                     question_seconds=value["question_minutes"]*60,http_methods=methods,platform_deadline_at=ceiling,
                     default_description=_default_description(value.get("default_description")),
-                    default_description_enabled=bool(value.get("default_description_enabled")))
+                    default_description_enabled=bool(value.get("default_description_enabled")),
+                    flag_head=flag_head)
         state=dict(status="running",reason=None,index=0,current_ref=None,challenge_id=None,deadline_at=end,
                    stop_after_current=False,last_platform_check=0,platform=None,retry_operation=None)
         identity=str(uuid4())
@@ -195,6 +224,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
     def pause(self,identity,*,reason="operator_paused"):
         row=self.get(identity)
         if row["state"]["status"]=="finished":return row
+        self.platform_failures.pop(identity,None);self.retry_at.pop(identity,None)
         self.update(identity,status="pausing",reason=reason)
         challenge=row["state"]["challenge_id"]
         if challenge is not None and self.workbench.runner.status(challenge) is not None:
@@ -257,6 +287,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 blocked=db.execute("SELECT operation_id FROM competition_platform_operations WHERE session_id=? AND receipt_json LIKE '%blocked%' ORDER BY rowid DESC LIMIT 1",(identity,)).fetchone()
             self.update(identity,status="running",reason=None,retry_operation=blocked[0] if blocked else None,submission_retry=True,
                 address_wait_started=None,address_wait_reason=None)
+            self.platform_failures.pop(identity,None);self.retry_at.pop(identity,None)
             self.launch();return self.get(identity)
         if action in {"extend_question","extend_overall"} and set(value)=={"action","seconds","operation_id"}:
             seconds=value["seconds"];operation=value["operation_id"]
@@ -432,12 +463,35 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         try:
             for row in self.rows():
                 if row["state"]["status"]=="finished":continue
+                identity=row["id"]
+                if self.clock()<self.retry_at.get(identity,0):continue
                 try:self.step(row)
                 except WorkbenchError as error:
                     if error.code=="competition_session_not_running":continue
-                    self.pause(row["id"],reason=error.code)
+                    if error.code in PLATFORM_RETRY_CODES:
+                        self.platform_retry(identity,error)
+                        break
+                    self.pause(identity,reason=error.code)
+                else:
+                    self.platform_failures.pop(identity,None);self.retry_at.pop(identity,None)
                 break
         finally:self.tick_lock.release()
+
+    def platform_retry(self,identity,error):
+        """Back off from a platform-side failure without stopping the TaskRun.
+
+        The platform is advisory for progress: the run carries its own frozen
+        question deadline and its sandbox, so a 503 or an ambiguous platform
+        action says nothing about the work being done. Pausing here used to turn
+        a transient outage into an in-flight model cancellation and then into a
+        recovery_required stop, so the tick is retried with backoff instead.
+        """
+        failures=self.platform_failures.get(identity,0)+1
+        self.platform_failures[identity]=failures
+        delay=PLATFORM_RETRY_BACKOFF_SECONDS[min(failures,len(PLATFORM_RETRY_BACKOFF_SECONDS))-1]
+        self.retry_at[identity]=self.clock()+delay
+        get_logger("ctrl").warning("competition.platform_retry",session=identity,code=error.code,
+            attempt=failures,retry_in=delay,category="platform_control")
 
     def step(self,row):
         state=row["state"];identity=row["id"];runner=self.workbench.runner;challenge=state["challenge_id"]
@@ -560,7 +614,8 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
             task=self.workbench.competitions.import_question(row["config"]["profile"]["id"],dict(remote_ref=item["remote_ref"],endpoint=target,
                 deadline_minutes=row["config"]["question_seconds"]//60,http_methods=row["config"]["http_methods"],
                 default_description=row["config"].get("default_description",""),
-                default_description_enabled=bool(row["config"].get("default_description_enabled"))),check_active=lambda:self.live(identity))
+                default_description_enabled=bool(row["config"].get("default_description_enabled")),
+                flag_head=row["config"].get("flag_head","")),check_active=lambda:self.live(identity))
             self.update(identity,challenge_id=task["id"]);row=self.get(identity);state=row["state"];challenge=task["id"]
             if not target and not task["attachments"]:raise WorkbenchError("competition_question_input_required",409)
             self.live(identity)

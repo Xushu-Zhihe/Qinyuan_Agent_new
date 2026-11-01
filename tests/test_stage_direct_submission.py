@@ -41,23 +41,46 @@ def test_direct_schema_requires_the_runtime_marker_and_an_original_observation()
     assert direct_branches(request_for({"direct_submission": "first_flag_v1"}, with_observation=False)) == []
 
 
-def test_grounds_requires_the_exact_candidate_in_the_original_output():
+def test_grounds_allows_only_the_declared_submission_head_substitution():
     from agent_adapters.stage_goal import StageGoal
-    result = {"payload": {"stdout": "pt_repr b'CCTF{x}' candidate NSSCTF{x}"}}
-    app = SimpleNamespace(task_id="task", web=None,
-        evidence=SimpleNamespace(
-            read_history=lambda task, refs: (SimpleNamespace(record_id="op"),),
-            read=lambda kind, identity: result if kind == "mcp-result" else {}),
-        store=SimpleNamespace())
-    goal = StageGoal(app)
-    assert goal.grounds(SimpleNamespace(candidate="NSSCTF{x}", source_ref="op"))
-    assert not goal.grounds(SimpleNamespace(candidate="NSSCTF{y}", source_ref="op"))
-    assert not goal.grounds(SimpleNamespace(candidate="", source_ref="op"))
+    def goal_for(stdout, head=""):
+        goal = f"controlled challenge\n\n提交 flag 头：{head}" if head else "controlled challenge"
+        result = {"payload": {"stdout": stdout}}
+        app = SimpleNamespace(task_id="task", web=None,
+            state=SimpleNamespace(task_run=SimpleNamespace(request=SimpleNamespace(goal=goal))),
+            evidence=SimpleNamespace(
+                read_history=lambda task, refs: (SimpleNamespace(record_id="op"),),
+                read=lambda kind, identity: result if kind == "mcp-result" else {}),
+            store=SimpleNamespace())
+        return StageGoal(app)
+    converted = goal_for("msg    D1  b'wectf{th1s_1s_we_b64}'", "NSSCTF")
+    assert converted.grounds(SimpleNamespace(candidate="NSSCTF{th1s_1s_we_b64}", source_ref="op"))
+    assert not converted.grounds(SimpleNamespace(candidate="NSSCTF{th1s_1s_we_b6}", source_ref="op"))
+    assert not converted.grounds(SimpleNamespace(candidate="FLAG{th1s_1s_we_b64}", source_ref="op"))
+    # A model that appends its derivation to candidate still submits only the token.
+    assert converted.grounds(SimpleNamespace(
+        candidate="NSSCTF{th1s_1s_we_b64}\n\nDerivation: decoded from the custom alphabet", source_ref="op"))
+    numeric = goal_for("123{th1s_1s_we_b64}", "NSSCTF")
+    assert not numeric.grounds(SimpleNamespace(candidate="NSSCTF{th1s_1s_we_b64}", source_ref="op"))
+    exact = goal_for("candidate NSSCTF{abc}", "NSSCTF")
+    assert exact.grounds(SimpleNamespace(candidate="NSSCTF{abc}", source_ref="op"))
+    assert not exact.grounds(SimpleNamespace(candidate="NSSCTF{abd}", source_ref="op"))
+    assert not exact.grounds(SimpleNamespace(candidate="", source_ref="op"))
+    custom = goal_for("msg b'CTF{custom_body}'", "flag")
+    assert custom.grounds(SimpleNamespace(candidate="flag{custom_body}", source_ref="op"))
+    assert not custom.grounds(SimpleNamespace(candidate="NSSCTF{custom_body}", source_ref="op"))
+    # Empty field disables head substitution; exact source text still works.
+    plain = goal_for("msg b'wectf{plain_body}'")
+    assert not plain.grounds(SimpleNamespace(candidate="NSSCTF{plain_body}", source_ref="op"))
+    assert plain.grounds(SimpleNamespace(candidate="wectf{plain_body}", source_ref="op"))
 
 
-def external_app(case):
+def external_app(case, head=""):
+    from dataclasses import replace
     from agent_adapters.stage_application import StageApplication
     task = case.app.state.task_run.request
+    if head:
+        task = replace(task, goal=task.goal + f"\n\n提交 flag 头：{head}")
     app = StageApplication(case.path / "direct-task", **case.args, goal_validation="external")
     app.start(task)
     asyncio.run(case.app.close())
@@ -109,3 +132,24 @@ def test_first_grounded_flag_is_handed_off_without_review_and_consumes_the_shot(
     after = app._request("stage_action", PlanningSession("road_execution", road.road_id))
     assert "direct_submission" not in stage_runtime(after)
     assert direct_branches(after) == []
+
+
+def test_direct_handoff_accepts_task_required_head_substitution(case):
+    from MCPs.Mcp_client.client import MCPExecutionResult
+    app = external_app(case, "NSSCTF")
+    original = case.tools.call_tool
+    async def call(name, arguments):
+        result = await original(name, arguments)
+        return MCPExecutionResult(result.agent_id, result.sandbox_id, name, result.executable,
+            result.arguments, "completed", 0, "msg b'wectf{observed}'", "", False)
+    case.tools.call_tool = call
+    direct_transform(case, candidate="NSSCTF{observed}\n\nDerivation: decoded from the artifact")
+    result = asyncio.run(app.run(case.token))
+    assert result.reason == "stage.awaiting_external_validation"
+    assert app.state.task_run.status is TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
+    candidate, = app.store.list_d7_answer_candidates(app.task_id)
+    from agent_adapters.web.candidate_evidence import D7CandidateEvidenceService
+    protected = D7CandidateEvidenceService(app.directory, app.task_id,
+        trusted_adapter_ids=("competition",), create=False)
+    # The submitted value is the clean token, never the model's derivation.
+    assert protected.read_port("competition").read(candidate.candidate_id) == "NSSCTF{observed}"

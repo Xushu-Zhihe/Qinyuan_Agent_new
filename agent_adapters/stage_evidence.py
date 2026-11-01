@@ -21,7 +21,7 @@ from agent_core.stage_contracts import (
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, StagePlanningDecision,
     StageFactBatch, StageFactBatchReview, fact_candidates, reviewed_fact, fact_review_parts,
 )
-from agent_core.stage_planning import BUSINESS_ISSUE_CODES, INNER_STAGES, MAX_STAGE_CORRECTIONS, STAGE_CALL_POLICY, StageModelRequest, model_contract, stage_output_issues, parse, request_from_dict, review_members, conversation_operation_ids
+from agent_core.stage_planning import BUSINESS_ISSUE_CODES, INNER_STAGES, MAX_STAGE_CORRECTIONS, STAGE_CALL_POLICY, StageModelRequest, correction_hint, model_contract, stage_output_issues, parse, request_from_dict, review_members, conversation_operation_ids
 from agent_core.stage_storage import StageRecoveryRequired, StageStateError, proposal_digest, fact_scope_failure, _fail
 from agent_core.turn_modeling import digest, stable_id
 from qinyuan_core import Category, Layer, get_logger
@@ -147,7 +147,7 @@ class StageEvidence:
 
     def contract(self, request):
         self.correction_depth(request)
-        feedback = None
+        feedback, hint = None, ""
         source_id = request.correction_of_model_request_id
         if source_id is not None:
             source = self.request(source_id)
@@ -171,11 +171,17 @@ class StageEvidence:
                 feedback.update(reason="output_business_invalid" if any(i.code in BUSINESS_ISSUE_CODES for i in issues) else "output_format_invalid",
                     issues=[asdict(i) for i in issues]
                         or [{"code": "stage_value_invalid", "path": "$", "expected": "valid_stage_value", "actual": "invalid"}])
+                # The issue list alone names a code at a JSON path; the admissible
+                # set for that path is what the retry has to satisfy.
+                hint = correction_hint(source, issues)
             elif result["outcome"] == "model_error" and self.transport_failure(source, result) is not None:
                 feedback.update(reason="previous_model_transport_failed_no_usable_decision", issues=[])
             else:
                 _fail("stage.correction_binding_changed", Category.UNKNOWN)
-        return {**model_contract(request), "correction": feedback}
+        contract = model_contract(request)
+        if hint:
+            contract = {**contract, "instruction": contract["instruction"] + hint}
+        return {**contract, "correction": feedback}
 
     def correction_depth(self, request):
         """Count persisted parent links, never a process-local retry counter."""

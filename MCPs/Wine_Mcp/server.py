@@ -10,11 +10,18 @@ from MCPs.Session_Mcp.server import session_capture, session_send, session_stop,
 mcp = FastMCP(
     "qinyuan-wine-command-planner",
     instructions=(
-        "Prepare Wine plans for the dedicated Windows profile. `wine_init` "
-        "creates both the 64-bit (.wine64) and 32-bit (.wine32) prefixes; "
-        "`wine_run` auto-selects the loader from the PE header unless `arch` is "
-        "32/64; `wine_debug` starts winedbg in a tmux session so breakpoints "
-        "survive across tool calls. This server never executes Wine itself."
+        "Wine plans for the dedicated Windows profile (user-mode PE only; no "
+        "kernel drivers, .NET Framework or anti-cheat). Workflow: "
+        "1) wine_init once per TaskRun (creates .wine64 and .wine32, ~1.9GB, "
+        "1-2 minutes). "
+        "2) wine_run for one-shot execution; arch='auto' reads the PE header. "
+        "3) wine_debug for breakpoints: it starts `winedbg --gdb Z:\\...`, so "
+        "the tmux pane is a GNU gdb prompt; arch must be '32' or '64' "
+        "(default 64; check with file or Pe_Mcp.inspect_pe). "
+        "4) Drive the session with wine_send/wine_capture; set breakpoints "
+        "before 'c'; wine_stop when done. PEs may live in /workspace/input "
+        "(read-only) or /workspace/work; Wine maps them through Z:, so no "
+        "staging copy is needed. This server never executes Wine itself."
     ),
     json_response=True,
 )
@@ -48,7 +55,12 @@ def _arguments(values: list[str] | None) -> list[str]:
 
 @mcp.tool(title="Initialize Wine Prefixes")
 def wine_init(timeout_seconds: int = 300, arch: str = "both") -> dict[str, Any]:
-    """Create/update the 64-bit and 32-bit prefixes below /workspace/work."""
+    """Call once per TaskRun before wine_run/wine_debug.
+
+    Creates the 64-bit `.wine64` and 32-bit `.wine32` prefixes under
+    /workspace/work (about 1.9GB, 1-2 minutes). `arch='both'` by default; use
+    '32' or '64' only when you need a single prefix.
+    """
 
     timeout = validate_timeout(timeout_seconds)
     if arch not in {"both", "32", "64"}:
@@ -81,7 +93,12 @@ def wine_run(
     arch: str = "auto",
     timeout_seconds: int = 120,
 ) -> dict[str, Any]:
-    """Run one PE and capture its console output."""
+    """Run one PE and return its console output/exit code.
+
+    `arch='auto'` picks the loader from the PE header; use '32'/'64' to force.
+    Use this for non-interactive/crackme runs; for breakpoints or stepping use
+    wine_debug instead.
+    """
 
     target = _target(executable)
     wrapper = _WRAPPERS[_arch(arch)]
@@ -101,23 +118,32 @@ def wine_run(
     }
 
 
-@mcp.tool(title="Debug PE With winedbg")
+@mcp.tool(title="Debug PE With winedbg --gdb")
 def wine_debug(
     executable: str,
     arguments: list[str] | None = None,
-    arch: str = "auto",
+    arch: str = "64",
     name: str = "wine",
     timeout_seconds: int = 20,
 ) -> dict[str, Any]:
-    """Start winedbg in an interactive tmux session."""
+    """Start an interactive GNU gdb session for a PE via `winedbg --gdb`.
+
+    The tmux pane is a gdb prompt: send `b main` or `b *0x...`, press Enter,
+    then `c`; read output with wine_capture. `arch` must be '32' or '64'
+    (default 64; check with file or Pe_Mcp.inspect_pe). The session survives
+    across tool calls; call wine_stop when done.
+    """
 
     target = _target(executable)
-    wrapper = _WRAPPERS[_arch(arch)]
+    if arch not in {"32", "64"}:
+        raise ValueError("arch must be 32 or 64 (check the PE with file/Pe_Mcp)")
+    wrapper = _WRAPPERS[arch]
     values = _arguments(arguments)
+    windows_target = "Z:" + target.replace("/", "\\")
     return session_start(
         name=name,
         program=wrapper,
-        arguments=["winedbg", target, *values],
+        arguments=["winedbg", "--gdb", windows_target, *values],
         timeout_seconds=timeout_seconds,
     )
 
@@ -129,6 +155,12 @@ def wine_send(
     name: str = "wine",
     timeout_seconds: int = 10,
 ) -> dict[str, Any]:
+    """Send input to the `wine` session: text or one named key.
+
+    Use `text` for a gdb command and then `key='Enter'`; use `key` alone for
+    Enter, C-c, Up/Down, etc. Provide exactly one of text or key.
+    """
+
     return session_send(name=name, text=text, key=key, timeout_seconds=timeout_seconds)
 
 
@@ -138,11 +170,18 @@ def wine_capture(
     name: str = "wine",
     timeout_seconds: int = 15,
 ) -> dict[str, Any]:
+    """Read the last `lines` (10-400) of the `wine` session pane.
+
+    Call after wine_send to see the gdb prompt/output or program messages.
+    """
+
     return session_capture(name=name, lines=lines, timeout_seconds=timeout_seconds)
 
 
 @mcp.tool(title="Stop Wine Session")
 def wine_stop(name: str = "wine", timeout_seconds: int = 10) -> dict[str, Any]:
+    """Stop the `wine` session; Wine prefixes remain for the next run."""
+
     return session_stop(name=name, timeout_seconds=timeout_seconds)
 
 

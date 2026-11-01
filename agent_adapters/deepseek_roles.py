@@ -17,6 +17,12 @@ from agent_core.review_contracts import D2ModelFailure
 TRANSPORT = {"version": 1, "base_url": "https://api.deepseek.com",
              "timeout_seconds": DEFAULT_MODEL_TIMEOUT_SECONDS, "response_format": "json_object",
              "max_response_bytes": 2 * 1024 * 1024}
+# A connect that never completed sent no bytes, so re-dispatching it cannot
+# duplicate work. Every failure on 2026-11-01 reported connected=None and
+# arrived in 60-70s windows; without a re-dispatch, three of them inside one
+# decision exhausted the correction budget and stopped the run.
+CONNECT_RETRY_REASONS = frozenset({"model_connect_timeout", "http_transport_failure"})
+MAX_CONNECT_ATTEMPTS = 3
 PARAMETERS = (("thinking", "enabled"), ("reasoning_effort", "high"))
 # User-confirmed deployment limits. Reserve the advertised maximum because
 # the provider default is not observed; this reserve is never sent as a limit.
@@ -985,6 +991,25 @@ def _raw_http_worker(connection, settings, payload, timeout):
     _http_worker(connection, settings, payload, timeout, TRANSPORT["max_response_bytes"], True)
 
 
+def _invoke_with_connect_retry(transport, payload, timeout_seconds, token, diagnostic):
+    """Re-dispatch only a connection that never came up; return (raw, attempts).
+
+    Any other failure keeps the single attempt: a connected-but-failed call may
+    already have reached the provider, and re-dispatching it could duplicate a
+    generation or bill twice. ``worker_exit_confirmed`` must be true as well, so
+    a child whose state is unknown is never re-dispatched.
+    """
+    raw = transport._invoke_payload(payload, timeout_seconds, token, diagnostic=diagnostic)
+    attempts = 1
+    while (isinstance(raw, ModelError) and raw.short_reason in CONNECT_RETRY_REASONS
+            and diagnostic.get("connected_seconds") is None
+            and diagnostic.get("worker_exit_confirmed") is True
+            and attempts < MAX_CONNECT_ATTEMPTS):
+        attempts += 1
+        raw = transport._invoke_payload(payload, timeout_seconds, token, diagnostic=diagnostic)
+    return raw, attempts
+
+
 class D8DeepSeekModel:
     def __init__(self, role, settings, *, transport=None):
         validate_role(role)
@@ -1046,7 +1071,14 @@ class D8DeepSeekModel:
                 from agent_adapters.cache_probe import record as cache_probe
                 cache_probe(payload=payload, sent=sent, role=self.role_config.role,
                     session=getattr(getattr(request, "context", None), "session", None))
-                raw = self.transport._invoke_payload(payload, timeout_seconds, token, diagnostic=transport)
+                raw, attempts = _invoke_with_connect_retry(
+                    self.transport, payload, timeout_seconds, token, transport)
+                if attempts > 1:
+                    from qinyuan_core import get_logger
+                    transport["connect_attempts"] = attempts
+                    get_logger("model").warning("model.connect_retried", run=sent["task_run_id"],
+                        request=identity, phase=sent["stage"], category="dependency", attempts=attempts,
+                        outcome=(raw.short_reason if isinstance(raw, ModelError) else "connected"))
         except Exception as exc:
             save_result(safe_failure_details(exc, include_chain=True))
             raise

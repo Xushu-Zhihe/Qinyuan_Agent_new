@@ -33,6 +33,10 @@ MAX_RESPONSE_BYTES = 64 * 1024
 MAX_T6_RESPONSE_BYTES = 2 * 1024 * 1024
 DEFAULT_T6_OUTPUT_TOKENS = 8192
 DEFAULT_T6_STEP_TIMEOUT_SECONDS = 60
+# Measured over 949 successful calls on four days: connect+TLS takes 0.5s
+# median and 1.66s at worst, so 10s already leaves a ~6x margin. Raising it only
+# lengthens a dropped-SYN attempt: on 2026-11-01 every 30s attempt failed
+# exactly as the 10s ones did, at its own deadline.
 CONNECT_TIMEOUT_SECONDS = 10.0
 
 
@@ -286,6 +290,15 @@ def _trace_provider_response(data, choice, message, finish, content, requested_m
           file=sys.stderr, flush=True)
 
 
+def _peer_address(client):
+    """Peer IP of the connected socket, or None; never a hostname or error text."""
+    try:
+        address = client.sock.getpeername()[0]
+    except (AttributeError, IndexError, OSError, TypeError):
+        return None
+    return address if isinstance(address, str) else None
+
+
 def _http_worker(
     connection, settings, payload, timeout,
     max_response_bytes=MAX_RESPONSE_BYTES,
@@ -294,6 +307,7 @@ def _http_worker(
     """Never print or transmit raw errors/credentials through the result channel."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     client = None
+    phase_reported = False
     def report(**detail):
         if preserve_content:
             connection.send({"diagnostic": detail})
@@ -309,7 +323,17 @@ def _http_worker(
                 parsed.hostname, port=parsed.port, timeout=min(settings.connect_timeout_seconds, timeout)
             )
         started = time.monotonic()
-        client.connect()
+        try:
+            client.connect()
+        except OSError as error:
+            # http.client assigns .sock only once TCP has connected, so this
+            # separates a dead TCP path from a stalled TLS handshake without
+            # parsing exception text. Only the class name leaves the worker.
+            report(phase="tls" if client.sock is not None else "connect",
+                   exception_type=type(error).__name__)
+            phase_reported = True
+            raise
+        report(peer=_peer_address(client))
         connection.send({"connected": True})
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0:
@@ -449,15 +473,18 @@ def _http_worker(
             return
         connection.send({"payload": result})
     except http.client.IncompleteRead as exc:
-        report(transport_end="incomplete_response")
+        report(transport_end="incomplete_response", exception_type=type(exc).__name__,
+               **({} if phase_reported else {"phase": "stream"}))
         if exc.partial and payload.get("stream") is not True:
             report(response_utf8_bytes=len(exc.partial))
         connection.send({"error": "provider_failure", "reason": "http_transport_failure"})
-    except TimeoutError:
-        report(transport_end="timeout")
+    except TimeoutError as exc:
+        report(transport_end="timeout", exception_type=type(exc).__name__,
+               **({} if phase_reported else {"phase": "stream"}))
         connection.send({"error": "timed_out", "reason": "http_timeout"})
-    except Exception:  # noqa: BLE001 -- process boundary must not leak raw HTTP errors
-        report(transport_end="transport_error")
+    except Exception as exc:  # noqa: BLE001 -- process boundary must not leak raw HTTP errors
+        report(transport_end="transport_error", exception_type=type(exc).__name__,
+               **({} if phase_reported else {"phase": "stream"}))
         connection.send(
             {"error": "provider_failure", "reason": "http_transport_failure"}
         )

@@ -834,3 +834,59 @@ def test_tcp_origin_is_canonical_and_requires_a_port():
         _target_origin("tcp://10.0.1.5")
     with pytest.raises(ValueError):
         _target_origin("tcp://10.0.1.5:8080/path")
+
+
+def test_transient_platform_failure_retries_instead_of_pausing_the_session(platform,monkeypatch):
+    p=platform;p.payload=[benchmark()]
+    service,row,_,_=schedule(p);identity=row["id"]
+    monkeypatch.setattr(p.workbench.runner,"start",lambda *a,**kw:fake_run(p,service.get(identity)))
+    p.status=503;p.post_status=503
+    service.tick()
+    state=service.get(identity)["state"]
+    assert state["status"]=="running" and state.get("reason") is None
+    assert service.platform_failures[identity]==1 and service.retry_at[identity]>service.clock()
+    # Repeated failures keep backing off; they never pause the run.
+    service.retry_at[identity]=0
+    service.tick()
+    assert service.get(identity)["state"]["status"]=="running"
+    assert service.platform_failures[identity]==2
+    assert service.retry_at[identity]-service.clock()>5
+    # A recovered platform clears the backoff and the run proceeds.
+    p.status=200;p.post_status=200
+    service.retry_at[identity]=0
+    service.tick()
+    assert identity not in service.platform_failures and identity not in service.retry_at
+
+
+def test_definitive_platform_answer_still_pauses(platform):
+    p=platform;p.payload=[benchmark()]
+    service,row,_,_=schedule(p);identity=row["id"]
+    p.status=401;p.post_status=401
+    service.tick()
+    assert service.get(identity)["state"]["status"]=="pausing"
+    assert identity not in service.platform_failures
+
+
+@pytest.mark.parametrize("code",sorted(module.PLATFORM_RETRY_CODES))
+def test_every_transient_platform_code_retries_without_pausing(platform,code):
+    p=platform;p.payload=[benchmark()]
+    service,row,_,_=schedule(p);identity=row["id"]
+    def boom(_row):raise WorkbenchError(code,502)
+    service.step=boom
+    service.tick()
+    state=service.get(identity)["state"]
+    assert state["status"]=="running" and state.get("reason") is None
+    assert service.platform_failures[identity]==1 and identity in service.retry_at
+
+
+@pytest.mark.parametrize("code",["competition_auth_failed","competition_business_error",
+    "competition_question_not_found","competition_redirect_blocked","competition_response_too_large",
+    "competition_task_recovery_required"])
+def test_definitive_platform_codes_still_pause(platform,code):
+    p=platform;p.payload=[benchmark()]
+    service,row,_,_=schedule(p);identity=row["id"]
+    def boom(_row):raise WorkbenchError(code,409)
+    service.step=boom
+    service.tick()
+    assert service.get(identity)["state"]["status"]=="pausing"
+    assert identity not in service.platform_failures

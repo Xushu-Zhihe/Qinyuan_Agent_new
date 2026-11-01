@@ -53,10 +53,15 @@ def stderr_reports_failure(stderr: str) -> bool:
 
 
 def challenge_goal(challenge):
-    """Carry the saved classification through the existing task context."""
-    return (f"题型（任务提供）：{challenge['category']}\n"
+    """Carry the saved classification and declared submission head into the run."""
+    head = (challenge.get("flag_head") or "").strip()
+    parts = [f"题型（任务提供）：{challenge['category']}\n"
         "将题型作为可依据证据修正的分析背景，用于规划、工具选择与监督；"
-        "它不扩大工具、文件或网络访问授权。\n\n题目描述（原文）：\n" + challenge["description"])
+        "它不扩大工具、文件或网络访问授权。"]
+    if head:
+        parts.append(f"提交 flag 头：{head}")
+    parts.append("题目描述（原文）：\n" + challenge["description"])
+    return "\n\n".join(parts)
 
 
 @dataclass

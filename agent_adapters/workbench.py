@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -84,9 +85,9 @@ def merged_description(base: object, default: object) -> str:
     return (DEFAULT_DESCRIPTION_MARKER.lstrip("\n") + text)[:16000]
 
 
-def challenge_fields(value: object, *, allow_private_ipv4=False) -> tuple[str, str, str, str, int, int]:
+def challenge_fields(value: object, *, allow_private_ipv4=False) -> tuple[str, str, str, str, int, int, str]:
     required = {"title", "category", "description", "deadline_minutes", "step_timeout_seconds"}
-    if not isinstance(value, dict) or not required <= value.keys() or value.keys() - required - {"endpoint", "http_methods"}:
+    if not isinstance(value, dict) or not required <= value.keys() or value.keys() - required - {"endpoint", "http_methods", "flag_head"}:
         raise WorkbenchError("invalid_challenge_fields")
     title, category, description = (value[key] for key in ("title", "category", "description"))
     if not isinstance(title, str) or not title.strip() or len(title) > 160:
@@ -105,7 +106,13 @@ def challenge_fields(value: object, *, allow_private_ipv4=False) -> tuple[str, s
         raise WorkbenchError("invalid_deadline")
     if type(step_timeout) is not int or not 1 <= step_timeout <= min(300, deadline * 60):
         raise WorkbenchError("invalid_step_timeout")
-    return title.strip(), category, description, target, deadline, step_timeout
+    flag_head = value.get("flag_head", "")
+    if not isinstance(flag_head, str):
+        raise WorkbenchError("invalid_flag_head")
+    flag_head = flag_head.strip()
+    if flag_head and (len(flag_head) > 32 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", flag_head)):
+        raise WorkbenchError("invalid_flag_head")
+    return title.strip(), category, description, target, deadline, step_timeout, flag_head
 
 
 def http_methods(value):
@@ -168,6 +175,7 @@ class Workbench:
                     title TEXT NOT NULL,
                     category TEXT NOT NULL,
                     description TEXT NOT NULL,
+                    flag_head TEXT NOT NULL DEFAULT '',
                     endpoint TEXT NOT NULL,
                     deadline_minutes INTEGER NOT NULL DEFAULT 60,
                     step_timeout_seconds INTEGER NOT NULL DEFAULT 60,
@@ -187,6 +195,8 @@ class Workbench:
                 CREATE INDEX IF NOT EXISTS attachments_challenge ON attachments(challenge_id);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(challenges)")}
+            if "flag_head" not in columns:
+                db.execute("ALTER TABLE challenges ADD COLUMN flag_head TEXT NOT NULL DEFAULT ''")
             if "deadline_minutes" not in columns:
                 db.execute("ALTER TABLE challenges ADD COLUMN deadline_minutes INTEGER NOT NULL DEFAULT 60")
             if "step_timeout_seconds" not in columns:
@@ -361,22 +371,22 @@ class Workbench:
             return self._get(db, challenge_id)
 
     def create(self, value):
-        title, category, description, target, deadline, step_timeout = challenge_fields(value,allow_private_ipv4=self.protocol_version == 3 and self.execution_profile == "d8_v22")
+        title, category, description, target, deadline, step_timeout, flag_head = challenge_fields(value,allow_private_ipv4=self.protocol_version == 3 and self.execution_profile == "d8_v22")
         methods = http_methods(value.get('http_methods', list(D7_WEB_DEFAULT_METHODS)))
         if 'http_methods' in value and self.execution_profile not in {'d8_v20','d8_v21','d8_v22'}:
             raise WorkbenchError('http_methods_profile_unsupported')
         challenge_id, timestamp = str(uuid4()), now()
         with self.lock, self._db() as db:
             db.execute(
-                "INSERT INTO challenges(id,title,category,description,endpoint,deadline_minutes,step_timeout_seconds,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (challenge_id, title, category, description, target, deadline, step_timeout, timestamp, timestamp),
+                "INSERT INTO challenges(id,title,category,description,flag_head,endpoint,deadline_minutes,step_timeout_seconds,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (challenge_id, title, category, description, flag_head, target, deadline, step_timeout, timestamp, timestamp),
             )
             if self.execution_profile in {'d8_v20','d8_v21','d8_v22'}:
                 db.execute('UPDATE challenges SET http_methods_json=? WHERE id=?', (json.dumps(methods), challenge_id))
             return self._get(db, challenge_id)
 
     def update(self, challenge_id, value):
-        title, category, description, target, deadline, step_timeout = challenge_fields(value,allow_private_ipv4=self.protocol_version == 3 and self.execution_profile == "d8_v22")
+        title, category, description, target, deadline, step_timeout, flag_head = challenge_fields(value,allow_private_ipv4=self.protocol_version == 3 and self.execution_profile == "d8_v22")
         with self.lock, self._db() as db:
             current = self._get(db, challenge_id)
             methods = http_methods(value.get('http_methods', current.get('http_methods', list(D7_WEB_DEFAULT_METHODS))))
@@ -385,8 +395,8 @@ class Workbench:
             if current["status"] != "draft" or current["archived"]:
                 raise WorkbenchError("challenge_not_editable", HTTPStatus.CONFLICT)
             db.execute(
-                "UPDATE challenges SET title=?,category=?,description=?,endpoint=?,deadline_minutes=?,step_timeout_seconds=?,updated_at=? WHERE id=?",
-                (title, category, description, target, deadline, step_timeout, now(), challenge_id),
+                "UPDATE challenges SET title=?,category=?,description=?,flag_head=?,endpoint=?,deadline_minutes=?,step_timeout_seconds=?,updated_at=? WHERE id=?",
+                (title, category, description, flag_head, target, deadline, step_timeout, now(), challenge_id),
             )
             if self.execution_profile in {'d8_v20','d8_v21','d8_v22'}:
                 db.execute('UPDATE challenges SET http_methods_json=? WHERE id=?', (json.dumps(methods), challenge_id))

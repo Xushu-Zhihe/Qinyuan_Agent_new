@@ -90,6 +90,7 @@ const CompetitionPage = (() => {
     el("name").value = profile?.name || "";
     el("adapter").value = profile?.adapter || "arena";
     el("url").value = profile?.base_url || "https://www.nssctf.cn";
+    const flagHeadInput = el("flag-head"); if (flagHeadInput) flagHeadInput.value = el("adapter").value === "arena" ? "NSSCTF" : "flag";
     el("timeout").value = profile?.timeout_seconds || 10;
     el("credential").value = "";
     dirty = !profile;
@@ -244,7 +245,7 @@ const CompetitionPage = (() => {
     const active=state && state.status!=="finished";
     el("schedule-form").hidden=Boolean(active);el("frozen-settings").hidden=!active;
     el("run-settings").querySelector("summary").textContent=active ? "赛程参数 · 已冻结" : "新赛程参数";
-    if(active) el("frozen-settings").replaceChildren(...[["无协议入口",session.config.default_scheme?.toUpperCase() || "未提供"],["初始单题预算",`${session.config.question_seconds/60} 分钟`],["允许的 HTTP 方法",session.config.http_methods?.join(", ") || "未提供"]].map(([label,value])=> {const row=node("div");row.append(node("dt",label),node("dd",value));return row;}));
+    if(active) el("frozen-settings").replaceChildren(...[["无协议入口",session.config.default_scheme?.toUpperCase() || "未提供"],["初始单题预算",`${session.config.question_seconds/60} 分钟`],["允许的 HTTP 方法",session.config.http_methods?.join(", ") || "未提供"],["提交 flag 头",session.config.flag_head || "未设置（仅精确匹配）"]].map(([label,value])=> {const row=node("div");row.append(node("dt",label),node("dd",value));return row;}));
     el("schedule-status").closest(".c-command").dataset.status=state?.status || "idle";
     el("schedule-status").textContent=state ? `${sessionLabels[state.status] || state.status}${state.reason ? ` · ${errorText(state.reason) || state.reason}` : ""}${state.address_wait_started ? " · 等待平台下发实例地址" : ""}${state.pending_control ? " · 加时待应用" : ""}` : "尚未创建赛程";
     el("bound-source").textContent=session ? `${session.config.profile.adapter.toUpperCase()} · ${session.config.profile.base_url}` : "尚未绑定赛程";
@@ -363,11 +364,13 @@ const CompetitionPage = (() => {
     event.preventDefault(); if (!current || sessionBusy) return;
     revision += 1; sessionBusy = true; sessionControls();
     try {
+      const flagHeadInput = el("flag-head");
       const value = {profile_id:current.id,default_scheme:el("scheme").value,question_minutes:Number(el("question-minutes").value),
         overall_minutes:Number(el("overall-minutes").value),queue:el("queue").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean),
         http_methods:el("methods").value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean),mode:"real",
         default_description:el("default-description").value,
-        default_description_enabled:el("default-description-enabled").checked};
+        default_description_enabled:el("default-description-enabled").checked,
+        flag_head:flagHeadInput ? flagHeadInput.value.trim() : ""};
       if (el("platform-end").value) value.platform_deadline_at = new Date(el("platform-end").value).getTime()/1000;
       session = await request("/api/competition/sessions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(value)});
     } catch(e) {el("schedule-error").textContent = errors[e.message] || `创建失败：${e.message}`;return;}
@@ -400,7 +403,7 @@ const CompetitionPage = (() => {
     el("profile").addEventListener("change", () => select(profiles.find(p => p.id === el("profile").value) || null));
     el("new").addEventListener("click", () => select(null));
     el("form").addEventListener("input", () => { dirty = true; resetPreview(); credentialLabel(); controls(); status("配置尚未保存；保存后再测试连接。"); });
-    el("adapter").addEventListener("change", () => { el("url").value = el("adapter").value === "arena" ? "https://www.nssctf.cn" : ""; credentialLabel(); });
+    el("adapter").addEventListener("change", () => { el("url").value = el("adapter").value === "arena" ? "https://www.nssctf.cn" : ""; const flagHeadInput = el("flag-head"); if (flagHeadInput) flagHeadInput.value = el("adapter").value === "arena" ? "NSSCTF" : "flag"; credentialLabel(); });
     el("check").addEventListener("click", check); el("clear").addEventListener("click", clear);
   });
   return {load};

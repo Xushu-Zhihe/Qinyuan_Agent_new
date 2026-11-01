@@ -64,13 +64,23 @@ def test_wine_run_selects_the_loader_from_the_pe_header():
         wine_run("/workspace/work/a.exe", ["x" * 4096])
 
 
-def test_wine_debug_uses_a_tmux_session():
+def test_wine_debug_uses_winedbg_gdb_with_a_windows_path():
     plan = wine_debug("/workspace/work/hello.exe", name="wine")
     args = plan["sandbox_command"]["arguments"]
     assert plan["sandbox_command"]["tool"] == "tmux"
     assert args[:4] == ["new-session", "-d", "-s", "qy-wine"]
-    assert "/usr/local/bin/qy-wine-auto" in args
-    assert "winedbg" in args
+    assert "/usr/local/bin/qy-wine64" in args
+    assert args[args.index("winedbg") : args.index("winedbg") + 3] == [
+        "winedbg",
+        "--gdb",
+        "Z:\\workspace\\work\\hello.exe",
+    ]
+
+    plan32 = wine_debug("/workspace/work/hello32.exe", arch="32")
+    args32 = plan32["sandbox_command"]["arguments"]
+    assert "/usr/local/bin/qy-wine32" in args32
+    with pytest.raises(ValueError):
+        wine_debug("/workspace/work/hello.exe", arch="auto")
 
 
 def test_wine_session_helpers_are_bounded():

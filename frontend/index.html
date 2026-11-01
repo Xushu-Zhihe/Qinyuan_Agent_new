@@ -128,6 +128,7 @@
                       <label class="field"><span>平台整体截止（可选）</span><input id="competition-platform-end" type="datetime-local"></label>
                     </div>
                     <label class="field"><span>允许的 HTTP 方法（逗号分隔）</span><input id="competition-methods" value="GET,HEAD,OPTIONS,POST,PUT,PATCH" required></label>
+                    <label class="field"><span>提交 flag 头</span><input id="competition-flag-head" maxlength="32" placeholder="如 NSSCTF、flag；留空=只接受原文精确匹配"></label>
                     <label class="field"><span><input id="competition-default-description-enabled" type="checkbox"> 启用默认题目说明</span>
                       <textarea id="competition-default-description" rows="3" placeholder="这段文字会追加到每道题的题目说明末尾（题面为空时直接作为题面）"></textarea></label>
 
@@ -303,6 +304,10 @@
                 </fieldset>
                 <label class="field field-wide"><span>题目说明</span>
                   <textarea id="task-description" rows="5" maxlength="16000" placeholder="粘贴题面、已知限制和 Flag 提示。不要填写 API Key。"></textarea>
+                </label>
+                <label class="field field-wide"><span>提交 flag 头（可选）</span>
+                  <input id="task-flag-head" maxlength="32" placeholder="如 NSSCTF、flag；留空=只接受原始观察中的精确候选">
+                  <small>只影响提交时的头部；body 仍必须来自原始观察，不能编造。</small>
                 </label>
               </div>
 

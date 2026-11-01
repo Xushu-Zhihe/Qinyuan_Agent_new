@@ -493,7 +493,7 @@ class CompetitionConnections:
 
     def import_question(self,identity,value,*,check_active=None):
         """Import only platform-observed questions; platform actions remain separate."""
-        if not isinstance(value,dict) or set(value)-{"remote_ref","endpoint","deadline_minutes","step_timeout_seconds","http_methods","default_description","default_description_enabled"} or "remote_ref" not in value:
+        if not isinstance(value,dict) or set(value)-{"remote_ref","endpoint","deadline_minutes","step_timeout_seconds","http_methods","default_description","default_description_enabled","flag_head"} or "remote_ref" not in value:
             raise WorkbenchError("competition_import_invalid")
         if self.workbench.execution_profile != "d8_v22":raise WorkbenchError("competition_requires_contract22",409)
         observed_at=time.time()
@@ -545,7 +545,7 @@ class CompetitionConnections:
                     description=merged_description(description,value.get("default_description"))
                 local=self.workbench.create(dict(title=item["display_name"][:160],category=category,
                     description=description,endpoint=target,deadline_minutes=minutes,
-                    step_timeout_seconds=value.get("step_timeout_seconds",60),
+                    step_timeout_seconds=value.get("step_timeout_seconds",60),flag_head=value.get("flag_head",""),
                     http_methods=value.get("http_methods",list(D7_WEB_DEFAULT_METHODS))))
                 with self.workbench._db() as db:
                     db.execute("INSERT INTO competition_questions VALUES (?,?,?,?,?)",(local["id"],identity,scope,remote,json.dumps(snapshot,ensure_ascii=True)))
