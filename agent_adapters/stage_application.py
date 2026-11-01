@@ -392,6 +392,11 @@ class StageApplication:
         inner = stage != "stage_review" and stage != "stage_supervision"
         role = self.config.inner_role if inner else self.config.outer_role
         messages = self._conversation(session, sources)
+        if stage == "stage_review" and isinstance(proposal, (StageFactProposal, StageFactBatch, StageConclusionChange)):
+            # A Fact judgement reads the claim and its own frozen evidence, not
+            # the author's argument for it. User turns (review feedback, tool
+            # observations) stay; only the author's own prose is withheld.
+            messages = tuple(message for message in messages if message.get("role") == "user")
         if stage == "stage_action" and self._tools_in_flight:
             messages += ({"role": "user", "content": json.dumps({"pending_tools": [
                 {"operation_id": entry.operation_id, **asdict(entry.call)} for entry in self._tools_in_flight.values()]},
@@ -423,6 +428,12 @@ class StageApplication:
             advice = stage_plans.route_advice(self.store, self.task_id)
             if advice and self.evidence.request(advice).context.session == session:
                 runtime["route_advice"] = advice
+        if stage == "stage_action" and session.scope == "road_execution":
+            # The original planner decides whether to close this Road; the
+            # suggestion only says which available sibling would start next.
+            suggestion = stage_plans.road_suggestion(self.store, self.task_id, turn, session.owner_id)
+            if suggestion is not None:
+                runtime["road_suggestion"] = suggestion
         request = StageModelRequest(identity, self.task_id, stage, role.role_config_ref,
             state.latest_checkpoint.sequence, context, messages,
             self._available_tools() if stage == "stage_action" else (), proposal_id, proposal,
@@ -957,7 +968,15 @@ class StageApplication:
             if turn.planning_state is TurnPlanningState.EXHAUSTED:
                 return StageRunResult(self.task_id, turn, "stage.exhausted")
             if running is None:
-                pending = next((r for r in turn.roads if r.status in {IntentStatus.PENDING, IntentStatus.SUSPENDED}), None)
+                # An accepted suggestion only chooses which available sibling starts;
+                # the Inner still decided to close the Road that just ended.
+                suggestion = (stage_plans.road_suggestion(self.store, self.task_id, turn, None)
+                              if turn.achievement is None else None)
+                pending = next((r for r in turn.roads if suggestion is not None
+                                and r.road_id == suggestion["road_id"]
+                                and r.status in {IntentStatus.PENDING, IntentStatus.SUSPENDED}), None)
+                pending = pending or next((r for r in turn.roads
+                                           if r.status in {IntentStatus.PENDING, IntentStatus.SUSPENDED}), None)
                 if pending is not None:
                     self._commit(StageStateChange(turns=(replace(turn, roads=tuple(
                         replace(r, status=IntentStatus.RUNNING) if r.road_id == pending.road_id else r for r in turn.roads)),)))

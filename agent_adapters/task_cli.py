@@ -114,11 +114,15 @@ def _dispatch_v3_run_task(args, raw):
         result["exit_code"] = _v3_run_operation_exit(result)
         return result
 
-    # Current D3 simulator can bind at most two attachments and each staged
-    # item is capped at 16 MiB.  Preserve the complete request receipt, then
-    # remove staged payload bytes on a capability rejection.
+    # The D3 simulator can bind at most two attachments and each staged item is
+    # capped at 16 MiB.  A real D8 run mounts the staged bytes in its own sandbox,
+    # so its binding limit is the 64 MiB the stager has already accepted; capping
+    # it again here rejected storable inputs before any TaskRun existed.  Preserve
+    # the complete request receipt, then remove staged payload bytes on rejection.
+    from agent_adapters.web.request_staging import MAX_V3_REQUEST_BYTES
+    attachment_limit = MAX_V3_REQUEST_BYTES if d8_real else 16 * 1024 * 1024
     unsupported = len(request.attachments) not in (0, 1, 2) or any(
-        item.byte_size > 16 * 1024 * 1024 for item in receipt.attachments
+        item.byte_size > attachment_limit for item in receipt.attachments
     )
     if unsupported:
         receipt = stager.record_outcome(

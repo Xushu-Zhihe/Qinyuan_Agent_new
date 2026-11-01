@@ -467,6 +467,9 @@ def test_waiting_for_attachment_can_extend_budgets_without_inventing_a_taskrun(p
 def test_arena_attachment_is_downloaded_before_scheduled_start_and_failure_can_resume(platform,monkeypatch,retry):
     from test_competition import arena_attachment
     p=platform;body=arena_attachment(p)
+    # This fixture is about attachment ordering; give the question its address so
+    # the (now category-independent) address wait does not gate the first tick.
+    p.payload["data"]["attempt"]["problem"]["container"]={"url":["10.0.1.5:8080"]}
     service,row,_,_=schedule(p,"arena")
     starts=[]
     def start(identity,**options):
@@ -496,6 +499,7 @@ def test_pause_after_attachment_download_prevents_registration_and_agent_start(p
     from test_competition import arena_attachment
     from agent_adapters import competition
     p=platform;arena_attachment(p)
+    p.payload["data"]["attempt"]["problem"]["container"]={"url":["10.0.1.5:8080"]}
     service,row,_,_=schedule(p,"arena")
     original=competition._download_attachment
     @contextmanager
@@ -578,13 +582,13 @@ def test_restart_requests_pause_before_any_explicit_continuation(platform,monkey
     assert restarted.schedules.thread is None and len(p.requests)==before
 
 
-def test_address_wait_only_covers_live_web_or_pwn_questions_without_addresses():
+def test_address_wait_covers_every_live_question_without_an_address():
     web=dict(state="active",addresses=[],remaining_seconds=600,category="Web")
-    assert module._should_wait_address(web,"arena") and module._should_wait_address({**web,"category":"Pwn"},"arena")
-    assert not module._should_wait_address({**web,"category":"Reverse"},"arena")
-    assert not module._should_wait_address({**web,"addresses":["10.0.1.5:8080"]},"arena")
-    assert not module._should_wait_address({**web,"remaining_seconds":0},"arena")
-    assert not module._should_wait_address({**web,"state":"solved"},"arena")
+    for category in ("Web","Pwn","Reverse","Crypto","Misc",""):
+        assert module._should_wait_address({**web,"category":category},"arena")
+    assert not module._should_wait_address({**web,"category":"Web","addresses":["10.0.1.5:8080"]},"arena")
+    assert not module._should_wait_address({**web,"category":"Web","remaining_seconds":0},"arena")
+    assert not module._should_wait_address({**web,"category":"Web","state":"solved"},"arena")
     assert module._should_wait_address(dict(state="available",addresses=[],remaining_seconds=None),"benchmark")
     assert not module._should_wait_address(dict(state="pending",addresses=[],remaining_seconds=None),"benchmark")
 

@@ -9,7 +9,7 @@ from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8Revisio
 from agent_core.output_contracts import D8ModelResponse, D8FormatIssue, array, obj, tagged, text, decode_response, NATIVE_TRAILING_BRACE_POLICY
 from agent_core.stage_contracts import (
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot,
-    StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete, StageSessionSummary, StageStrategyAdvice, StageTurnSnapshot, TurnAchievement, TurnCompletion, TurnIntent,
+    StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete, StageSessionSummary, StageStrategyAdvice, StageRoadSuggestion, StageTurnSnapshot, TurnAchievement, TurnCompletion, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, TurnPlanningState, StagePlanningDecision,
     StageToolBatch, MAX_IN_FLIGHT_TOOLS, StageFactBatch, StageFactBatchReview,
 )
@@ -70,7 +70,7 @@ RULES = {
     "stage_continuation": "Plan the next useful deliverable, criterion and known premises from this achieved Turn in its retained Inner session. Leave alternative methods, experiment recipes, parameters and controls to the successor's own Road planning; do not lock its goal to one unverified technical hypothesis. Submit a grounded stage that can begin without pre-solving it. A brief revisable outlook is background. Alternatively select a pending own Road, add/reorder own Roads retaining pending candidates, report known settled blockage, or request independent final validation. Child feedback is scoped evidence, not failure of the parent's historical achievement. Never replay closed Roads or unknown operations.",
     "stage_intent": "Propose the nearest useful, independently checkable deliverable within the TaskRun goal and authority. For an unfamiliar input or environment, choose an outcome that resolves a prerequisite for the next decision; do not bundle triage, mechanism validation and final answer recovery into one Turn. A checkable final answer is not by itself a well-scoped stage. A simple, already bounded task may finish in one Turn. Define the result and criterion, leaving method-specific hypotheses, tools and experiment recipes to Roads unless the user fixed them. Do not turn one file read, parameter change or ordinary probe into a stage. Known premises are optional; never invent evidence. A brief revisable outlook is background, not registered future stages. Submit once the next useful result and criterion are clear; no complete future solution is required. Choose the first deliverable from the input shape, not from a preferred habit: attachment only - what the artifact actually is, plus any interaction contract its own files state; endpoint only - what the endpoint actually speaks, from one minimal probe and its exact reply bytes; attachment and endpoint - the artifact's own service script, config or compose file decides the protocol, so read that contract before designing any request; neither - name what is missing and what the operator must supply, and never invent a target.",
     "stage_roads": "Propose grounded, distinct solution chains for this Turn's fixed deliverable, in execution priority order. One Road is valid when only one approach is grounded; never fill a quota or split a chain merely by tool, URL or parameter. Keep the coherent hypothesis, main method and distinguishing observation; detail only enough to begin. In the existing description identify the decisive uncertain premise and what observation would make further work on this chain unhelpful. Test that premise before elaborating downstream experiments; parameters and contingent branches unfold during execution. Retain pending candidates when reordering; preserve closed identities and outcomes. New business exploration with changed premises is a new Road. Report known settled blockage with return_to_parent; technical waiting is not exhaustion. An artifact's source, service script, Dockerfile or compose file is part of the first Turn's observation: its accepted commands and reply format decide the next action. File size and type alone do not settle how the service is driven, and re-extracting the same artifact does not add information.",
-    "stage_review": "Review the exact bound proposal; return substantive revisions to its original Inner. For Roads select semantically admissible original indices in suggested priority order, judging a grounded startable approach rather than a pre-solved experiment. Priority is advice for the original Road planner, which decides whether to keep or switch the execution branch. Turn completion must satisfy its immutable criterion; Road success and TaskRun success remain separate. Review each Fact claim against its own scope and sources, not the whole Turn completion criterion. Accept a supported partial observation, including useful negative results; one Fact need not cover the whole stage, and an accepted inference remains inference. For a fact batch return one decision per original candidate, in original order, allowing partial acceptance. Review inferences as inferences. Do not combine independent claims merely to force one stage-sized Fact.",
+    "stage_review": "Review the exact bound proposal; return substantive revisions to its original Inner. For Roads select semantically admissible original indices in suggested priority order, judging a grounded startable approach rather than a pre-solved experiment. Priority is advice for the original Road planner, which decides whether to keep or switch the execution branch. Turn completion must satisfy its immutable criterion; Road success and TaskRun success remain separate. Review each Fact claim against its own scope and sources, not the whole Turn completion criterion. Accept a supported partial observation, including useful negative results; one Fact need not cover the whole stage, and an accepted inference remains inference. For a fact batch return one decision per original candidate, in original order, allowing partial acceptance. Review inferences as inferences. Do not combine independent claims merely to force one stage-sized Fact. Accept binds this exact proposal with no added obligation: a condition, caveat or follow-up written only in the reason has no effect, because nothing downstream executes or later re-checks it. If the proposal is acceptable only provided something else first happens, return revise and state that requirement in the proposal or its criterion instead. Approve only against sources you name in support_refs: an approval that cites nothing is recorded as unsupported, so name the recorded source each accept rests on.",
     "stage_action": "Choose the next useful step within this retained Road, reusing established premises rather than re-deriving the whole solution. If the next choice depends on an unseen observation, submit a discriminating experiment instead of solving its hypothetical branches in advance; a coherent conditional tool script is allowed. Before dispatch, compare current formal Facts with the immutable Turn criterion: if supported, prefer turn_completion rather than pursue later deliverables. Otherwise useful scoped intermediate conclusions may be proposed as Facts now; they need not contain the final answer or complete the Turn. Tools return observations, never automatic Facts; cite originals and label inference. Further variants need a premise or coverage gap that the next observation can resolve. When no grounded informative continuation remains, propose a truthful road_resolution (inconclusive or abandoned when appropriate) so pending alternatives can be considered; lack of a final answer alone proves neither failure nor a need to switch. Road outcome, Turn achievement and TaskRun success remain separate. Use only declared tools and current authority; tool errors are not target counterevidence and unknown operations are never replayed. Probe the protocol before assuming one: if a request to an authorized endpoint ends with no status line - connection closed, reset, or timeout - treat that endpoint as a raw TCP service, stop retrying the same protocol, and send the first line its own source or config implies, quoting the exact bytes that come back.",
     "stage_completion": "Check this Turn's original completion criterion after Road review. Propose completion only with actual current formal support, or explain why it remains incomplete. Do not add stronger criteria or treat a single Road success as automatic stage completion.",
     "stage_supervision": "Assess whether continuing this Road has a grounded next observation that could change the decision. An unmet criterion or absence of a final answer is not sufficient reason to continue. Briefly identify the decisive gap and next discriminating check, or recommend truthful Road resolution when no informative continuation is grounded. Do not re-solve the full task, construct an alternative solution chain, or repeat the accumulated history. Check whether useful observations should be proposed as scoped Facts, and whether current formal Facts already support the fixed Turn criterion; if so, request_intent_resolution and recommend explicit completion and truthful Road closure under the original reviews. Do not strengthen the criterion or require the final answer for an intermediate stage. Return continue_current_intent or request_intent_resolution with reason and support_refs. This is read-only advice; it never changes a Road result, stage goal, authorization or TaskRun success.",
@@ -148,6 +148,20 @@ def crypto_tool_guidance(request) -> str:
     if any(str(tool.get("qualified_name", "")).startswith("crypto.") for tool in tools):
         return CRYPTO_TOOL_GUIDANCE
     return ""
+
+
+def road_suggestion_guidance(request):
+    """Surface Outer's optional alternative; it never becomes an instruction."""
+    suggestion = stage_runtime(request).get("road_suggestion")
+    if not suggestion:
+        return ""
+    return (" An optional alternative was suggested by the reviewer: "
+        + str(suggestion.get("description", "")) + " - reason: " + str(suggestion.get("reason", ""))
+        + "; uncertainty: " + str(suggestion.get("uncertainty", ""))
+        + "; value of staying: " + str(suggestion.get("current_direction_value", ""))
+        + ". This is advice, not an instruction and not evidence: keep this Road while it still has a grounded "
+        "next check, and never treat the suggestion as a Fact. If you instead close this Road with a truthful "
+        "road_resolution, that alternative starts next.")
 
 
 DIRECT_SUBMISSION_GUIDANCE = (
@@ -581,6 +595,7 @@ def model_contract(request):
             + (TOOL_PREPARATION_GUIDANCE if request.stage == "stage_action"
                 and any(tool.get("qualified_name") == "download.install_tool" for tool in request.tools) else "")
             + (OUTPUT_PREVIEW_GUIDANCE if request.stage == "stage_action" else "")
+            + road_suggestion_guidance(request)
             + (" Final validation requests must include a candidate grounded in the cited original tool observation. "
                "If the task declares a '提交 flag 头：X' line, the body inside the braces must appear verbatim and only that "
                "X head may replace the source's own head (for example source wectf{body} becomes X{body}); otherwise submit "
@@ -707,7 +722,20 @@ def schema(request):
     if request.stage == "stage_completion":
         return {"anyOf": [*completions, tagged("incomplete", supported)]}
     if request.stage == "stage_supervision":
-        return obj({"decision": {"type": "string", "enum": ["continue_current_intent", "request_intent_resolution"]}, **supported})
+        roads = request.context.turn.roads if request.context.turn is not None else ()
+        targets = [r.road_id for r in roads if r.status in {IntentStatus.PENDING, IntentStatus.SUSPENDED}
+                   and r.road_id != request.context.session.owner_id]
+        properties = {"decision": {"type": "string", "enum": ["continue_current_intent", "request_intent_resolution"]},
+                      **supported}
+        optional = ()
+        if targets:
+            # Outer may name one comparable alternative; the original planner decides.
+            properties["suggestion"] = {"anyOf": [{"type": "null"}, obj({
+                "road_id": {"type": "string", "enum": targets}, "reason": text(512),
+                "uncertainty": text(512), "current_direction_value": text(512),
+                "evidence_refs": {**array({**ref, "enum": visible}, 1, 8), "uniqueItems": True}})]}
+            optional = ("suggestion",)
+        return obj(properties, optional)
     if request.stage != "stage_action":
         raise ValueError("stage.model_stage_invalid")
     from agent_core.conclusion_revisions import ConclusionRevisions
@@ -803,6 +831,29 @@ def frozen_history(request):
     return tuple(result.values())
 
 
+def _road_suggestion(request, raw):
+    """Validate Outer's optional alternative without granting it any authority."""
+    if raw is None:
+        return None
+    if (not isinstance(raw, dict) or set(raw) != {"road_id", "reason", "uncertainty",
+            "current_direction_value", "evidence_refs"}):
+        raise ValueError("stage.supervision_suggestion_invalid")
+    roads = request.context.turn.roads if request.context.turn is not None else ()
+    if (raw["road_id"] not in {r.road_id for r in roads if r.status in {IntentStatus.PENDING, IntentStatus.SUSPENDED}}
+            or raw["road_id"] == request.context.session.owner_id):
+        raise ValueError("stage.supervision_suggestion_target_invalid")
+    for field in ("reason", "uncertainty", "current_direction_value"):
+        if not isinstance(raw[field], str) or not raw[field].strip() or "\x00" in raw[field]:
+            raise ValueError("stage.supervision_suggestion_text_invalid")
+    refs = raw["evidence_refs"]
+    visible = {item.ref for item in request.context.history}
+    if (not isinstance(refs, list) or not 1 <= len(refs) <= 8 or len(set(refs)) != len(refs)
+            or any(not isinstance(r, str) or r not in visible for r in refs)):
+        raise ValueError("stage.supervision_suggestion_refs_invalid")
+    return StageRoadSuggestion(raw["road_id"], raw["reason"], raw["uncertainty"],
+                               raw["current_direction_value"], tuple(refs))
+
+
 def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAILING_BRACE_POLICY, diagnostics=None):
     value, issues, terminal, units = decode_stage_response(request, raw, result_schema=result_schema,
         normalization_policy=normalization_policy)
@@ -834,7 +885,8 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
             raise ValueError("stage.road_selection_invalid")
         return TurnPlanningReview(value["decision"], checked(value, "reason"), refs, indices)
     if request.stage == "stage_supervision":
-        return StageStrategyAdvice(value["decision"], checked(value, "reason"), refs)
+        return StageStrategyAdvice(value["decision"], checked(value, "reason"), refs,
+                                   _road_suggestion(request, value.get("suggestion")))
     kind = value["kind"]
     if kind == "mcp_calls":
         if sum(item["tool_name"] not in PUBLIC_REFERENCE_TOOLS for item in value["calls"]) > 1:

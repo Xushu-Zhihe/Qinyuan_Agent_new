@@ -24,7 +24,12 @@ from Sandbox.task_run_sandbox import TaskRunSandboxError
 
 
 # Neither this program nor its arguments originate in model-generated code.
+# The sandbox side must accept exactly what the host already accepted: the
+# request staging cap is 64 MiB, so a smaller limit here rejected the stream
+# mid-transfer and surfaced as an unexplained broken pipe.
+MAX_WORKSPACE_BYTES = 64 * 1024 * 1024
 WORKSPACE_SCRIPT = r'''import hashlib,json,os,stat,sys,uuid
+LIMIT=__LIMIT__
 mode,source,target,size=sys.argv[1:];size=int(size)
 fds=[];temporary=None;parent=None
 def open_parent(path,create=False):
@@ -46,7 +51,7 @@ def observe(path):
         block=os.read(fd,65536)
         if not block: break
         length+=len(block)
-        if length>16777216: raise ValueError('size')
+        if length>LIMIT: raise ValueError('size')
         digest.update(block)
     return {'status':'present','byte_size':length,'sha256':digest.hexdigest()}
 try:
@@ -56,7 +61,7 @@ try:
         fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent);fds.append(fd)
         if mode=='import':
             left=size
-            if not 0<=left<=16777216: raise ValueError('size')
+            if not 0<=left<=LIMIT: raise ValueError('size')
             def read():
                 global left
                 block=sys.stdin.buffer.read(min(left,65536)) if left else b''
@@ -73,7 +78,7 @@ try:
             block=read()
             if not block: break
             length+=len(block)
-            if length>16777216: raise ValueError('size')
+            if length>LIMIT: raise ValueError('size')
             view=memoryview(block)
             while view:
                 count=os.write(fd,view)
@@ -96,7 +101,7 @@ finally:
         try: os.unlink(temporary,dir_fd=parent)
         except OSError: pass
     for fd in reversed(fds): os.close(fd)
-'''
+'''.replace("__LIMIT__", str(MAX_WORKSPACE_BYTES))
 
 
 def _path(path, *, input_only=False, artifact_only=False):

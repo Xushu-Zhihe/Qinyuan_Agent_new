@@ -150,6 +150,50 @@ def feedback_turns(store, task_id, review_id):
     return tuple(changed)
 
 
+def road_suggestion(store, task_id, turn, running_road_id):
+    """Outer's still-live alternative for the running Road; the planner decides.
+
+    Only the latest applied supervision is considered, it must target the Road
+    that is actually running, and the named Road must still be available.  The
+    suggestion never changes a Road by itself: closing the running Road stays
+    the Inner's own reviewed decision.
+    """
+    if turn is None:
+        return None
+    evidence = store.stage_evidence
+    available = {road.road_id for road in turn.roads if road.status in {IntentStatus.PENDING, IntentStatus.SUSPENDED}}
+    for operation in reversed(store.list_d4_operations(task_id)):
+        start = operation.start
+        if (start.category != "review" or start.role != "outer_planning"
+                or operation.application_ref is None or operation.completion is None):
+            continue
+        if evidence.read("request", start.operation_id) is None:
+            continue
+        request = evidence.request(start.operation_id)
+        if request.stage != "stage_supervision":
+            continue
+        supervised = request.context.session.owner_id
+        if running_road_id is not None:
+            if supervised != running_road_id:
+                continue
+        elif not any(road.road_id == supervised for road in turn.roads):
+            continue
+        if request.context.turn is None:
+            continue
+        result = evidence.read_model_result(operation).result
+        suggestion = getattr(result, "suggestion", None)
+        if suggestion is None or suggestion.road_id not in available:
+            return None
+        road = next(road for road in turn.roads if road.road_id == suggestion.road_id)
+        return {"review_id": start.operation_id, "road_id": suggestion.road_id,
+                "description": road.candidate.description, "reason": suggestion.reason,
+                "uncertainty": suggestion.uncertainty,
+                "current_direction_value": suggestion.current_direction_value,
+                "evidence_refs": list(suggestion.evidence_refs),
+                "identity": "optional_alternative_not_instruction_or_fact"}
+    return None
+
+
 def route_advice(store, task_id):
     """A different Outer priority is answered by the original Road planner."""
     evidence = store.stage_evidence

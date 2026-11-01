@@ -12,7 +12,10 @@ from agent_core.file_inspection import validate_inspection_path
 from agent_core.modeling import CancellationToken
 
 
-MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024
+# One attachment, one import: the same 64 MiB the task request has already
+# staged.  Keeping a smaller limit here rejected an input that had been accepted
+# by staging, so the run failed at configuration read before it ever started.
+MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
 
 
 class AttachmentImportConflict(RuntimeError):

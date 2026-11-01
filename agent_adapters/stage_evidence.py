@@ -174,6 +174,13 @@ class StageEvidence:
                 # The issue list alone names a code at a JSON path; the admissible
                 # set for that path is what the retry has to satisfy.
                 hint = correction_hint(source, issues)
+                if result.get("finish_reason") == "length":
+                    # A retry with the same text and the same budget repeats the
+                    # truncation; ask for the smallest admissible answer instead.
+                    feedback["reason"] = "output_budget_exhausted"
+                    hint = (" The previous attempt stopped because its whole output budget was spent before the "
+                            "result object was complete. Return only the single required JSON result now, with no "
+                            "extended deliberation and no intermediate working.")
             elif result["outcome"] == "model_error" and self.transport_failure(source, result) is not None:
                 feedback.update(reason="previous_model_transport_failed_no_usable_decision", issues=[])
             else:
@@ -1007,8 +1014,15 @@ class StageModelCalls:
                     operation=identity, phase=request.stage, code="stage.model_output_unusable",
                     category="input" if result["outcome"] == "invalid" else "dependency")
                 _fail("stage.model_output_unusable", Category.INPUT if result["outcome"] == "invalid" else Category.DEPENDENCY)
+            # A review that failed twice is retried once with the frozen snapshot
+            # only, and any truncation is retried without the conversation tail:
+            # the same proposal and history, a smaller input.  The correction
+            # binding excludes messages, so this is still the same decision.
+            narrow = (request.stage == "stage_review" and depth + 1 >= MAX_STAGE_CORRECTIONS
+                      or result.get("finish_reason") == "length")
             request = replace(request, model_request_id=stable_id(request.task_run_id, "stage/correction/" + identity),
-                correction_of_model_request_id=identity, frozen_contract_ref=None)
+                correction_of_model_request_id=identity, frozen_contract_ref=None,
+                messages=() if narrow else request.messages)
         raise AssertionError("bounded correction did not terminate")
 
     def prepare(self, request):

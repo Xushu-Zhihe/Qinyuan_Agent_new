@@ -278,10 +278,26 @@ class StageIncomplete:
 
 
 @dataclass(frozen=True, slots=True)
+class StageRoadSuggestion:
+    """Outer names one pending sibling; the original planner still decides.
+
+    Mirrors the D22 strategy suggestion: a comparable alternative with its own
+    uncertainty and the value of the current direction, never an instruction.
+    """
+
+    road_id: str
+    reason: str
+    uncertainty: str
+    current_direction_value: str
+    evidence_refs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class StageStrategyAdvice:
     decision: Literal["continue_current_intent", "request_intent_resolution"]
     reason: str
     support_refs: tuple[str, ...]
+    suggestion: StageRoadSuggestion | None = None
 
 
 @dataclass(frozen=True, slots=True)

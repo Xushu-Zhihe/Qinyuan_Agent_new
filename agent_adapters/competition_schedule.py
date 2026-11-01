@@ -12,8 +12,8 @@ from qinyuan_core import get_logger
 
 PLATFORM_POLL_SECONDS=5.0
 FINISHED={"achieved","failed","deadline_exceeded","cancelled","inconclusive"}
-# A live target-bearing question may arrive before the platform publishes its address.
-ADDRESS_WAIT_CATEGORIES=("web","pwn")
+# A live question may arrive before the platform publishes its address, in any
+# category: crypto and misc questions are regularly served by a remote process.
 # Platform failures that say nothing about the question itself: the TaskRun keeps
 # its own frozen deadline and sandbox, so a read or an ambiguous action is retried
 # with backoff instead of stopping the run. Definitive answers (auth, business
@@ -71,17 +71,19 @@ def _prefers_tcp(item,adapter):
 
 
 def _should_wait_address(item,adapter):
-    """Poll for an address only while a live web/pwn question still has none; never require one."""
+    """Poll for an address whenever a live question still has none; never require one.
+
+    No category is exempt: the platform allocates the container after handing the
+    question out, and a category label does not say whether this particular
+    question is served remotely.  A question that stays without an address simply
+    falls through to the existing no-target path when the wait expires.
+    """
     if not isinstance(item,dict) or item.get("addresses"):return False
     remaining=item.get("remaining_seconds")
     if remaining is not None and remaining<=0:return False
-    if item.get("state")!=("available" if adapter=="benchmark" else "active"):return False
-    category=item.get("category") or ""
-    if not isinstance(category,str):return False
     # Benchmark items carry no platform type; a container reported available
     # without an address is still waiting for its port.
-    return adapter=="benchmark" if not category.strip() else any(
-        name in category.strip().lower() for name in ADDRESS_WAIT_CATEGORIES)
+    return item.get("state")==("available" if adapter=="benchmark" else "active")
 
 
 class CompetitionSchedules:
