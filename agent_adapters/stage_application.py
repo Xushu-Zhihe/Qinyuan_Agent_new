@@ -31,9 +31,25 @@ from agent_core.stage_contracts import (
 )
 from agent_core.stage_planning import StageModelRequest, stage_runtime, review_members, formal_support_refs
 from agent_core.stage_storage import StageRecoveryRequired, StageStateError, active_turn, _just_registered_roads, execution_policy, load_branch, branch_prefix, duplicate_fact
-from agent_core import stage_plans
+from agent_core import stage_plans, stage_storage
 from agent_core.turn_modeling import digest, stable_id
 from qinyuan_core import Category, Layer, classify, get_logger
+
+# A recovered request keeps this many newest history entries inline; the rest
+# stay addressable by ref, so recovery can shrink below the bound that failed.
+HISTORY_AFTER_RECOVERY = 8
+
+
+def _compact_context(context):
+    """A past decision's snapshot without a second copy of every observation.
+
+    The refs stay, and ``history_details`` resolves them to the original text,
+    so nothing becomes unreachable; only the duplicated payload goes away.
+    """
+    value = asdict(context)
+    value.pop("history", None)
+    value["history_refs"] = [item.ref for item in context.history]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +164,15 @@ class StageApplication:
         self.task_id = task_id
         self._freeze_models()
         self.controller.attach(task_id)
+        # Calls that completed without their application commit are invisible to
+        # the conversation while still counting as pending for every later commit.
+        # Detection only: reconciliation is deliberately not automatic here, since
+        # the restart path already resumes some of these operations itself.
+        orphans = stage_storage.orphaned_operations(self.store, task_id)
+        if orphans:
+            get_logger("ctrl").warning("stage.orphan_operations_detected", category="recovery",
+                operations=[record.start.operation_id for record in orphans],
+                categories=[record.start.category for record in orphans])
 
     def _freeze_models(self):
         configured = [model for model in (self.models.inner, self.models.outer) if hasattr(model, "settings")]
@@ -239,8 +264,15 @@ class StageApplication:
         return sources
 
     def _render_conversation(self, sources):
+        # Each past decision used to carry that moment's whole history, so the
+        # body grew with every turn.  Only the two most recent decisions keep the
+        # full snapshot; older ones cite their refs, which history_details can
+        # still resolve to the original observation.
+        contextual = [index for index, (_, request, _) in enumerate(sources)
+                      if request.stage not in {"stage_review", "stage_supervision"}]
+        keep = set(contextual[-2:])
         messages = []
-        for op, request, result in sources:
+        for index, (op, request, result) in enumerate(sources):
             content = result["content"]
             if "tool_calls" in result:
                 from agent_core.stage_planning import decode_stage_response
@@ -256,7 +288,8 @@ class StageApplication:
                 messages.append({"role": "user", "content": json.dumps(feedback, ensure_ascii=False)})
             else:
                 messages.extend([{"role": "user", "content": handoff_json({"source_operation_id": op.start.operation_id,
-                    "stage": request.stage, "context": asdict(request.context)})},
+                    "stage": request.stage,
+                    "context": asdict(request.context) if index in keep else _compact_context(request.context)})},
                     {"role": "assistant", "content": content if isinstance(content, str)
                      else json.dumps(content, ensure_ascii=False)}])
                 if isinstance(self.evidence.read_model_result(op).result, StageHistoryRead):
@@ -338,8 +371,14 @@ class StageApplication:
         messages = self._conversation(request.context.session)
         self.evidence.save("capacity-recovery", request.model_request_id, {
             "source_request_sha256": digest(asdict(request)), "summary_operation_id": summary_id})
+        # The recovered request has to be able to shrink past the bound that
+        # triggered it.  Conversation is already summarized; the live history is
+        # the remaining fixed cost, so keep its newest entries and leave the rest
+        # readable by ref through history_catalog / history_details.
+        history = request.context.history[-HISTORY_AFTER_RECOVERY:]
         return replace(request, model_request_id=self._id("stage/capacity/" + request.model_request_id + "/" + summary_id),
-            messages=messages, capacity_recovery_of=request.model_request_id)
+            messages=messages, capacity_recovery_of=request.model_request_id,
+            context=replace(request.context, history=history))
 
     def _request(self, stage, session, *, proposal_id=None, proposal=None):
         # Only synchronous stages resume an outstanding proposal directly.

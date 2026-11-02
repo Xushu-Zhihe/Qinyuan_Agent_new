@@ -626,6 +626,26 @@ def test_address_wait_times_out_on_the_existing_no_target_path(platform,monkeypa
     assert state["reason"]=="competition_question_input_required"
 
 
+def test_arena_question_without_address_or_attachment_still_starts(platform,monkeypatch):
+    """A description-only arena question is a real case, not a missing input."""
+    p=platform
+    p.payload={"code":200,"data":{"agent":{},"attempt":{"id":12226,"state_label":"active","wrong_count":0,
+        "max_wrong_count":20,"remaining_seconds":600,
+        "problem":{"type_label":"Misc","content":"answer from the description","container":None}}}}
+    service,row,_,_=schedule(p,"arena")
+    now=[1000.0];service.clock=lambda:now[0]
+    starts=[]
+    monkeypatch.setattr(module,"ADDRESS_WAIT_SECONDS",0)
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**options:starts.append(challenge))
+    monkeypatch.setattr(p.workbench.runner,"runtime_control",lambda _:None)
+    service.tick()
+    now[0]+=31;service.tick();service.tick()
+    state=service.get(row["id"])["state"]
+    assert state["challenge_id"] is not None and starts==[state["challenge_id"]]
+    task=p.workbench.get(state["challenge_id"])
+    assert task["endpoint"]=="" and task["attachments"]==[]
+
+
 def reopen(platform,row):
     value=dict(profile_id=row["config"]["profile"]["id"],default_scheme="http",question_minutes=10,
         overall_minutes=30,queue=["test-code"],http_methods=["GET","HEAD","OPTIONS"],mode="real")

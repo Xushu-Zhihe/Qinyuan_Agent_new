@@ -340,8 +340,11 @@ class Runner:
                         if self.workbench.execution_profile == 'd8_v22' and endpoint:
                             from agent_adapters.target_probe import probe_target
                             try:
+                                # The late look exists for raw services that stay
+                                # silent for seconds before printing a banner, so the
+                                # budget must exceed a single short handshake.
                                 probe = probe_target(endpoint, timeout=min(
-                                    1.5, max(0.4, challenge['step_timeout_seconds'] / 20)))
+                                    6.0, max(2.5, challenge['step_timeout_seconds'] / 20)))
                             except ValueError as exc:
                                 raise WorkbenchError(
                                     "target_protocol_probe_failed", 409) from None

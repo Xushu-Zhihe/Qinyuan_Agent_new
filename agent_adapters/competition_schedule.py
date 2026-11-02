@@ -619,7 +619,13 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 default_description_enabled=bool(row["config"].get("default_description_enabled")),
                 flag_head=row["config"].get("flag_head","")),check_active=lambda:self.live(identity))
             self.update(identity,challenge_id=task["id"]);row=self.get(identity);state=row["state"];challenge=task["id"]
-            if not target and not task["attachments"]:raise WorkbenchError("competition_question_input_required",409)
+            # A question may legitimately carry neither an address nor an
+            # attachment: the answer then comes from the description alone.  Only
+            # the arena adapter can say that; a benchmark question without either
+            # is still waiting for its container, and an arena question that
+            # published an attachment is still waiting for that file.
+            if not target and not task["attachments"] and (adapter != "arena" or item.get("attachment")):
+                raise WorkbenchError("competition_question_input_required",409)
             self.live(identity)
             run=runner.status(challenge)
             # A terminal run (finished/failed/cancelled/...) is history, not a live

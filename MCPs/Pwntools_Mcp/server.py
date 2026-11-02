@@ -13,6 +13,11 @@ from MCPs.analysis_common import (
 )
 from MCPs.fastmcp_compat import FastMCP
 
+# A sandbox step cannot usefully exceed this: the executor already caps by
+# MAX_ACTION_TIMEOUT and the remaining TaskRun deadline, and a longer script
+# mostly buffers output that a 512 MiB container may never get to print.
+MAX_PWNTOOLS_TIMEOUT_SECONDS = 120
+
 
 mcp = FastMCP(
     "qinyuan-pwntools-command-planner",
@@ -44,8 +49,16 @@ def run_pwntools(
     timeout_seconds: int = 120,
     executable: str | None = None,
 ) -> dict[str, Any]:
+    """Run a Python/pwntools script inside the sandbox.
+
+    timeout_seconds is capped at 120 seconds.  Print progress while the script
+    runs (flush=True) instead of collecting it for the end: a timeout or a
+    killed process keeps only what was already printed.
+    """
     normalized_script = validate_script(script)
-    timeout = validate_timeout(timeout_seconds)
+    # Server-side clamp: the model may ask for more time than the sandbox step
+    # can ever grant, and a killed process must not look like a policy failure.
+    timeout = min(validate_timeout(timeout_seconds), MAX_PWNTOOLS_TIMEOUT_SECONDS)
     staged: str | None = None
     prefix = ""
     if executable is not None:

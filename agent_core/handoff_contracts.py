@@ -50,17 +50,25 @@ class D8CapacityPolicy:
     measurement_unit: str
     total_units: int
     output_reserve_units: int
+    bytes_per_token: float = 1.0
 
     def __post_init__(self):
         _text(self.policy_name, "policy_name")
         _text(self.measurement_unit, "measurement_unit")
         if (type(self.total_units) is not int or type(self.output_reserve_units) is not int
-                or not 0 < self.output_reserve_units < self.total_units):
+                or not 0 < self.output_reserve_units < self.total_units
+                or type(self.bytes_per_token) not in (int, float)
+                or not 0.5 <= self.bytes_per_token <= 8):
             raise ValueError("d8_model_capacity_invalid")
 
     @property
     def policy_ref(self):
-        return "sha256:" + conclusion_digest(asdict(self))
+        value = asdict(self)
+        # A policy that still measures bytes as tokens keeps its historical
+        # identity, so runs frozen before the coefficient existed stay readable.
+        if value.get("bytes_per_token") == 1.0:
+            value.pop("bytes_per_token", None)
+        return "sha256:" + conclusion_digest(value)
 
 
 class D8CapacityPort(Protocol):

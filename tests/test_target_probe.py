@@ -1,6 +1,7 @@
 """Protocol preflight keeps host:port fixed and discovers the application layer."""
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from agent_adapters.target_probe import (
@@ -26,7 +27,7 @@ def _http_server():
     return server, thread
 
 
-def _banner_server(payload):
+def _banner_server(payload, delay=0.0):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
@@ -35,6 +36,8 @@ def _banner_server(payload):
     def serve():
         connection, _ = listener.accept()
         with connection:
+            if delay:
+                time.sleep(delay)
             connection.sendall(payload)
         listener.close()
 
@@ -75,6 +78,22 @@ def test_raw_tcp_banner_is_not_misread_as_http():
     assert probe.protocol == "tcp"
     assert probe.endpoint == f"tcp://127.0.0.1:{port}"
     assert "HELLO FROM RAW SERVICE" in probe.evidence
+
+
+def test_slow_banner_on_a_declared_http_endpoint_is_detected_as_tcp():
+    """A crypto service entered as http://host:port may answer only after seconds.
+
+    Arena question 12261 declared http://node4.anna.nssnode.cn:24208 but the
+    service printed its sumcheck banner ~3s after connect.  The preflight must
+    wait for that banner instead of trusting the declared scheme, otherwise the
+    run is frozen as HTTP and can never talk to a raw TCP service.
+    """
+    thread, port = _banner_server(b"HELLO LATE SERVICE\n", delay=0.9)
+    probe = probe_target(f"http://127.0.0.1:{port}", timeout=2.0)
+    thread.join(timeout=3)
+    assert probe.protocol == "tcp" and probe.detected
+    assert probe.endpoint == f"tcp://127.0.0.1:{port}"
+    assert "HELLO LATE SERVICE" in probe.evidence
 
 
 def test_silent_raw_tcp_is_not_forced_to_http():

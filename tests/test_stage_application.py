@@ -282,6 +282,89 @@ def test_known_tool_result_before_checkpoint_is_not_dispatched_again(case, monke
     assert result.turn.achievement is not None and len(case.tools.calls) == 1
 
 
+def _orphan_operation(case):
+    """Fabricate a completed call whose application commit never happened."""
+    from agent_core.operation_accounting import D4OperationCompletion, D4OperationStart
+    store = case.app.store
+    template = next(record for record in store.list_d4_operations(case.app.task_id)
+                    if record.start.category == "action")
+    operation_id = str(uuid4())
+    started = store._now()
+    store.begin_d4_operation(D4OperationStart(operation_id=operation_id,
+        task_run_id=case.app.task_id, category="action", started_at=started,
+        base_checkpoint_sequence=case.app.state.latest_checkpoint.sequence,
+        context_sha256="0" * 64, resource_ref="tool:controlled-orphan",
+        budget_policy_ref=template.start.budget_policy_ref, role="inner_action",
+        role_config_ref=template.start.role_config_ref))
+    store.complete_d4_operation(D4OperationCompletion(operation_id=operation_id,
+        finished_at=started, result_kind="completed",
+        evidence_ref="mcp-result/" + operation_id, evidence_sha256="0" * 64))
+    return operation_id
+
+
+def test_completed_operation_without_application_does_not_block_the_run(case, monkeypatch):
+    """Production shape of runs 8b06a1c8 / 904083b4, after the invariant fix.
+
+    A call completes in evidence while the commit that would have applied it never
+    happens.  Such a record used to count as pending and blocked every later
+    commit forever; it is durable and may be applied later, so the run now keeps
+    going and the record stays visible through orphaned_operations().
+    """
+    prepare_capacity_episode(case)
+    commit = case.app._commit
+    orphan = []
+    def interrupted(change, **kwargs):
+        if case.tools.calls and not orphan:
+            orphan.append(_orphan_operation(case))
+        return commit(change, **kwargs)
+    monkeypatch.setattr(case.app, "_commit", interrupted)
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.achievement is not None
+    record = case.app.store.load_d4_operation(orphan[0])
+    assert record.completion.result_kind == "completed" and record.application_ref is None
+
+
+def test_orphaned_operations_lists_only_completed_unapplied_calls(case):
+    from agent_core.stage_storage import orphaned_operations
+    asyncio.run(case.app.run(case.token))
+    assert orphaned_operations(case.app.store, case.app.task_id) == ()
+    operation_id = _orphan_operation(case)
+    assert [record.start.operation_id for record in orphaned_operations(case.app.store, case.app.task_id)] == [operation_id]
+    case.app.store.mark_d4_operation_applied(operation_id, "reconciled/" + operation_id)
+    assert orphaned_operations(case.app.store, case.app.task_id) == ()
+
+
+def test_bind_reports_orphaned_operations_without_changing_them(case, caplog):
+    asyncio.run(case.app.run(case.token))
+    operation_id = _orphan_operation(case)
+    task_id = case.app.task_id
+    asyncio.run(case.app.close())
+    case.app = StageApplication(case.path, **case.args)
+    with caplog.at_level("WARNING"):
+        case.app.bind(task_id)
+    assert any(record.getMessage() == "stage.orphan_operations_detected" for record in caplog.records)
+    record = case.app.store.load_d4_operation(operation_id)
+    assert record.application_ref is None
+
+
+def test_two_completed_unapplied_operations_do_not_block_each_other(case):
+    """The deadlock shape of run 8b06a1c8: two finished calls, neither applied.
+
+    Applying one used to leave the other in the pending set and vice versa, so no
+    commit could ever succeed.  Both are durable results now, so a commit passes
+    and either can be applied by a later change.
+    """
+    asyncio.run(case.app.run(case.token))
+    first = _orphan_operation(case)
+    second = _orphan_operation(case)
+    case.app._commit(StageStateChange())
+    for operation_id in (first, second):
+        assert case.app.store.load_d4_operation(operation_id).application_ref is None
+    case.app.store.mark_d4_operation_applied(first, "reconciled/" + first)
+    case.app.store.mark_d4_operation_applied(second, "reconciled/" + second)
+    assert case.app.store.load_d4_operation(first).application_ref == "reconciled/" + first
+
+
 @pytest.fixture
 def review_request():
     context = TurnPlanningContext("task", "goal", PlanningSession("turn_planning", "turn"), None, ())
@@ -1381,7 +1464,10 @@ def prepare_capacity_episode(case, *, block_summary=False, block_rebuilt=False):
             return not block_summary
         if request.capacity_recovery_of:
             return not block_rebuilt
-        if request.stage == "stage_action" and len(request.messages) >= 12 and not blocked:
+        # Fire after the six scripted actions rather than at a message count: the
+        # conversation now also carries one review message per decision, so a
+        # fixed message number no longer maps to a fixed action number.
+        if request.stage == "stage_action" and len(counter) >= 6 and not blocked:
             blocked.append(request)
             return False
         return True
@@ -2399,22 +2485,31 @@ def test_storage_capacity_stops_before_dispatch_with_safe_metadata(case, size):
     assert bool(saved) == (size < 2 * 1024 * 1024)
 
 
-def test_storage_capacity_triggers_bounded_summary_before_model_admission(case):
+def test_storage_capacity_triggers_bounded_summary_before_model_admission(case, monkeypatch):
     prepare_capacity_episode(case)
     case.app.models.capacity_port = SimpleNamespace(fits=lambda envelope, policy: True)
-    original = case.tools.call_tool
-    async def large_observation(name, arguments):
-        return replace(await original(name, arguments), stdout="observed " + "x" * 50000)
-    case.tools.call_tool = large_observation
+    # Fail one admission record deterministically instead of inflating the
+    # conversation until a record happens to exceed the production bound.
+    # Recovery needs more than four applied decisions, which this episode has
+    # reached by the twelfth action.
+    from agent_core.command_contracts import T6EvidenceCapacityError
+    recorder = type(case.app.models.evidence.records)
+    original_encode = recorder.encode
+    seen = {"actions": 0, "fired": None}
+    def encode(self, kind, reference, value, *, limit=None):
+        request = (value or {}).get("request") or {}
+        if kind == "stage-request" and request.get("stage") == "stage_action":
+            seen["actions"] += 1
+            if seen["fired"] is None and seen["actions"] >= 12:
+                seen["fired"] = reference
+                raise T6EvidenceCapacityError(kind, reference, (limit or 1024 * 1024) + 1, limit)
+        return original_encode(self, kind, reference, value, limit=limit)
+    monkeypatch.setattr(recorder, "encode", encode)
     result = asyncio.run(case.app.run(case.token))
     summaries = [r for r in case.models.outer.calls if r.stage == "stage_summary"]
-    assert result.turn.achievement is not None and summaries
+    assert seen["fired"] is not None and result.turn.achievement is not None and summaries
     for summary in summaries:
         source = case.app.evidence.request(summary.capacity_recovery_of)
-        data = {"request": asdict(source), "proposal_kind": type(source.proposal).__name__}
-        from agent_core.command_contracts import T6EvidenceCapacityError
-        with pytest.raises(T6EvidenceCapacityError):
-            case.app.evidence.records.encode("stage-request", source.model_request_id, data, limit=1024 * 1024)
         assert case.app.store.load_d4_operation(source.model_request_id) is None
         assert source.model_request_id not in {r.model_request_id for r in case.models.inner.calls}
     for summary in summaries:

@@ -99,17 +99,24 @@ def _recv_http(host: str, port: int, timeout: float, *, tls: bool) -> str | None
     return None
 
 
+def _banner(host: str, port: int, window: float) -> bytes:
+    """Whatever the endpoint says first, without sending anything."""
+    with socket.create_connection((host, port), timeout=window) as raw:
+        raw.settimeout(window)
+        try:
+            return raw.recv(4096)
+        except socket.timeout:
+            return b""
+
+
 def probe_target(value: object, *, timeout: float = 1.5) -> TargetProbe:
     host, port, explicit, original = parse_endpoint(value)
-    timeout = max(0.2, min(float(timeout), 3.0))
-    banner = b""
+    timeout = max(0.2, min(float(timeout), 8.0))
+    # One silent connection first.  Raw services often print their banner only
+    # after a few seconds of initialisation, and sending HTTP bytes at one can
+    # leave a single-threaded service waiting on a connection we already closed.
     try:
-        with socket.create_connection((host, port), timeout=timeout) as raw:
-            raw.settimeout(min(0.6, timeout))
-            try:
-                banner = raw.recv(4096)
-            except socket.timeout:
-                banner = b""
+        banner = _banner(host, port, timeout)
     except OSError:
         if explicit in _PROTOCOLS:
             return TargetProbe(explicit, host, port, endpoint_for(host, port, explicit),
@@ -123,12 +130,13 @@ def probe_target(value: object, *, timeout: float = 1.5) -> TargetProbe:
         return TargetProbe("tcp", host, port, endpoint_for(host, port, "tcp"),
                            "banner=" + banner[:64].decode("latin-1", errors="replace"))
 
-    # No server banner: distinguish HTTPS, HTTP, and client-first raw TCP.
-    tls_http = _recv_http(host, port, timeout, tls=True)
+    # Silent endpoint: distinguish HTTPS, HTTP, and client-first raw TCP.
+    window = min(2.0, timeout)
+    tls_http = _recv_http(host, port, window, tls=True)
     if tls_http is not None:
         return TargetProbe("https", host, port, endpoint_for(host, port, "https"),
                            "tls_http=" + tls_http)
-    plain_http = _recv_http(host, port, timeout, tls=False)
+    plain_http = _recv_http(host, port, window, tls=False)
     if plain_http is not None:
         return TargetProbe("http", host, port, endpoint_for(host, port, "http"),
                            "http=" + plain_http)

@@ -626,7 +626,12 @@ class CompetitionConnections:
             self.credential_for(snapshot["profile"])
             if challenge["endpoint"] and not any(_matches_target(raw,challenge["endpoint"]) for raw in snapshot["question"]["addresses"]):
                 raise WorkbenchError("competition_target_not_in_question",409)
-            if not challenge["endpoint"] and not challenge["attachments"]:
+            # A question may legitimately have neither an address nor an attachment:
+            # the answer then comes from the description alone.  Only the arena
+            # adapter can say that; elsewhere an empty target is still "not ready".
+            adapter = (snapshot.get("profile") or {}).get("adapter")
+            if (not challenge["endpoint"] and not challenge["attachments"]
+                    and (adapter != "arena" or snapshot["question"].get("attachment"))):
                 raise WorkbenchError("competition_question_input_required",409)
             if request.get("execution_profile")!="d8_v22":raise WorkbenchError("competition_requires_contract22",409)
             deadline=snapshot["platform_deadline_at"]

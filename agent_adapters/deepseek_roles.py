@@ -1,6 +1,7 @@
 """Frozen D9-2 DeepSeek roles; D8 owns content parsing and all business gates."""
 
 import json
+import math
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -31,8 +32,14 @@ SCNET_V41_CAPACITY = D8CapacityPolicy(
     "scnet-v4.1-flash-conservative-bytes-v1", "estimated_token_units", 1_000_000, SCNET_V41_MAX_OUTPUT)
 
 
+# Measured over 151 stored requests with both cl100k and o200k: the lowest
+# observed density was 2.34 UTF-8 bytes per token.  2.2 stays below that floor,
+# so an admitted request cannot exceed the real token budget, while the same
+# 1M window stops rejecting payloads that were only ~1/4 of the real limit.
+OFFICIAL_BYTES_PER_TOKEN = 2.2
 OFFICIAL_V4_CAPACITY = D8CapacityPolicy(
-    "deepseek-v4-conservative-bytes-v1", "estimated_token_units", 1_000_000, SCNET_V41_MAX_OUTPUT)
+    "deepseek-v4-conservative-bytes-v1", "estimated_token_units", 1_000_000, SCNET_V41_MAX_OUTPUT,
+    OFFICIAL_BYTES_PER_TOKEN)
 OFFICIAL_V4_MODELS = frozenset({"deepseek-flash", "deepseek-v4-flash",
                                 "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"})
 
@@ -924,6 +931,11 @@ class EstimatedCapacity:
                 or not 0 < requested_output <= policy.output_reserve_units):
             raise ValueError("d22_model_capacity_binding_mismatch")
         business = request.request
+        # The calibrated bytes-per-token coefficient applies to the current stage
+        # runtime only.  Legacy D8/D22 requests keep the byte-for-unit arithmetic
+        # their frozen runs and evidence were measured with.
+        from agent_core.stage_planning import StageModelRequest
+        ratio = policy.bytes_per_token if isinstance(business, StageModelRequest) else 1.0
         identity = getattr(business, "model_request_id", None) or getattr(business, "review_id", None)
         if identity is None and getattr(business, "attempt", None) is not None:
             identity = business.attempt.model_request_id
@@ -934,17 +946,20 @@ class EstimatedCapacity:
             "sections_utf8_bytes": {k: len(json.dumps(v, ensure_ascii=False).encode("utf-8"))
                                     for k, v in json.loads(payload["messages"][1]["content"]).items()},
             "messages_utf8_bytes": [len(m["content"].encode("utf-8")) for m in payload["messages"]]}
+        units = size if ratio == 1.0 else math.ceil(size / ratio)
         self.last_measurement.update(
-            counting_method="conservative_utf8_bytes_plus_margin",
-            estimated_input_tokens=size + 4096,
+            counting_method="conservative_utf8_bytes_plus_margin" if ratio == 1.0
+                else "measured_utf8_bytes_per_token_%.1f_plus_margin" % ratio,
+            bytes_per_token=ratio,
+            estimated_input_tokens=units + 4096,
             context_window_tokens=policy.total_units,
             requested_output_tokens=payload.get("max_tokens"),
             output_reserve_tokens=policy.output_reserve_units,
             model_max_output_tokens=policy.output_reserve_units)
         limit = policy.total_units - policy.output_reserve_units - 4096
-        if size > limit:
-            _trace_capacity(stage, size, limit, payload)
-        return size + 4096 + policy.output_reserve_units <= policy.total_units
+        if units > limit:
+            _trace_capacity(stage, units, limit, payload)
+        return units + 4096 + policy.output_reserve_units <= policy.total_units
 
 
 def _trace_capacity(stage, size, limit, payload):

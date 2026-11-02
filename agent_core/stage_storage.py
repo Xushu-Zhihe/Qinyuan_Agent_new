@@ -890,8 +890,14 @@ def _reviewed(store, mutation, change, discarded=()):
             accepted.append((binding, proposal.session, value, decision))
     known_queue = _queued_known_operations(store, mutation.task_run_id, tuple(queue.values()))
     withdrawn = _withdrawn_by_review(store, mutation, change)
+    # Only an unknown outcome blocks a commit.  A completed result is durable and
+    # any later commit may still apply it, so counting "completed but not yet
+    # applied" as pending let two finished operations block each other forever
+    # (runs 8b06a1c8 / 904083b4: a planning call and an action call each waited
+    # for the other's application commit).  Such records stay visible through
+    # orphaned_operations() as a health signal instead.
     pending = {r.start.operation_id for r in store.list_d4_operations(mutation.task_run_id)
-               if (r.completion is None or r.completion.result_kind == "completed" and r.application_ref is None)
+               if r.completion is None
                and not (r.start.category == "tool_dispatch"
                         and getattr(store, "live_tool_operation", lambda identity: False)(r.start.operation_id))
                and not getattr(store, "live_stage_review_operation", lambda identity: False)(r.start.operation_id)
@@ -899,6 +905,24 @@ def _reviewed(store, mutation, change, discarded=()):
     if pending:
         _fail("stage.pending_operations", Category.UNKNOWN)
     return accepted
+
+
+def orphaned_operations(store, task_run_id):
+    """Completed calls that no state change ever applied.
+
+    The result is durable, so it no longer blocks later commits, but the record is
+    invisible to the conversation (only applied or queued operations are rendered)
+    and any later change may still apply it.  Identification is read-only: the
+    caller decides whether to apply, discard or just report it.
+    """
+    live_tool = getattr(store, "live_tool_operation", lambda identity: False)
+    live_review = getattr(store, "live_stage_review_operation", lambda identity: False)
+    return tuple(record for record in store.list_d4_operations(task_run_id)
+                 if record.completion is not None
+                 and record.completion.result_kind == "completed"
+                 and record.application_ref is None
+                 and not live_tool(record.start.operation_id)
+                 and not live_review(record.start.operation_id))
 
 
 def validate(store, mutation):
