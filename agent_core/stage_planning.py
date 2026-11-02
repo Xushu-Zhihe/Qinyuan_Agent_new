@@ -120,6 +120,8 @@ EXPLORATION_GUIDANCE = (
 TOOL_CONCURRENCY_GUIDANCE = (
     f" Submit one decision: mcp_call for one tool, or mcp_calls with up to {MAX_IN_FLIGHT_TOOLS} useful independent calls when declared. "
     "Use the batch only when all arguments are already known; never guess a dependency on another call's result. "
+    "A batch carries public-reference calls only, plus at most one sandbox or target call: two private actions in one batch "
+    "are rejected as a resource conflict, so fold them into one script or submit them as two separate decisions. "
     "After a multi-call batch the runtime waits for the whole batch, or a bounded scheduling timeout, before requesting another decision. "
     "On timeout the settled observations and pending_tools are returned; unfinished calls are not cancelled. "
     f"Up to {MAX_IN_FLIGHT_TOOLS} tool actions can be in flight in this Road; "
