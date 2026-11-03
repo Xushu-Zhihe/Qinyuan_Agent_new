@@ -74,8 +74,9 @@ class T6TaskRunSandbox(TaskRunSandbox):
         }
         spec["tmpfs"] = {
             "/tools": "rw,exec,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700",
+            # 输入区只放 root 导入的只读附件（总量上限 64 MiB）。
             "/workspace": (
-                f"rw,noexec,nosuid,nodev,size={self._settings.workspace_size},"
+                f"rw,noexec,nosuid,nodev,size={self._settings.input_size},"
                 "uid=0,gid=0,mode=0755"
             ),
             "/workspace/work": (

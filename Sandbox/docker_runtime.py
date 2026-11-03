@@ -10,6 +10,7 @@ from typing import Callable, TypeVar
 import docker
 import requests
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
+from docker.utils import parse_bytes
 
 from Sandbox.models import CommandRequest, CommandResult, SandboxMounts
 from Sandbox.settings import SandboxSettings
@@ -37,6 +38,31 @@ def _connection_failure_message(error: BaseException) -> str:
 def _compact_error(error: BaseException) -> str:
     detail = " ".join(str(error).split())
     return detail[:300] + ("..." if len(detail) > 300 else "")
+
+
+def _parse_oom_counters(text: str) -> tuple[int, int | None]:
+    """Read OOM evidence from cgroup v2 (`memory.events`, `memory.peak`) or v1.
+
+    Docker Desktop may run either cgroup version, so the caller concatenates
+    both file sets and this parser takes whatever is present. Bare numbers are
+    v2 `memory.peak` / v1 `memory.max_usage_in_bytes`; v1 `memory.failcnt` is a
+    small count, so anything below 1 MiB is ignored instead of reported as a
+    peak.
+    """
+
+    oom_kill = 0
+    peak = None
+    for line in text.splitlines():
+        parts = line.strip().split(None, 1)
+        if not parts:
+            continue
+        if len(parts) == 2 and parts[0] == "oom_kill" and parts[1].isdigit():
+            oom_kill = max(oom_kill, int(parts[1]))
+        elif len(parts) == 1 and parts[0].isdigit():
+            value = int(parts[0])
+            if value >= 1024 * 1024:
+                peak = value if peak is None else max(peak, value)
+    return oom_kill, peak
 
 
 class DockerRuntime:
@@ -86,6 +112,9 @@ class DockerRuntime:
             self._stream_client_lock = Lock()
             self._active_output_streams: dict[str, object] = {}
             self._active_output_streams_lock = Lock()
+            # Cumulative oom_kill counters seen per sandbox, used to attribute a
+            # later exit 137 to a new kill instead of an older one.
+            self._oom_seen: dict[str, int] = {}
             if prepare_network:
                 self._ensure_network()
 
@@ -598,6 +627,8 @@ class DockerRuntime:
         stdout_bytes, stdout_truncated, stdout_total = stdout_buffer.render()
         stderr_bytes, stderr_truncated, stderr_total = stderr_buffer.render()
 
+        self._log_oom_if_any(sandbox_id, container, exit_code)
+
         return CommandResult(
             sandbox_id=sandbox_id,
             exit_code=exit_code,
@@ -612,6 +643,51 @@ class DockerRuntime:
             termination_confirmed=execution_info.get("Running") is False,
             stdout_bytes=stdout_total,
             stderr_bytes=stderr_total,
+        )
+
+    def _log_oom_if_any(self, sandbox_id: str, container, exit_code: int) -> None:
+        """Attribute an exit 137 to a new cgroup OOM kill; never affects the result.
+
+        `State.OOMKilled` is unreliable here because PID 1 is the reaper and the
+        killed process is usually a child, so the counters are read from inside
+        the container. Docker Desktop may run cgroup v1 or v2; missing files only
+        produce stderr, which is dropped, and the rest of the output is parsed.
+        """
+
+        if exit_code != 137:
+            return
+        try:
+            output = container.exec_run(
+                [
+                    "cat",
+                    "/sys/fs/cgroup/memory.events",
+                    "/sys/fs/cgroup/memory.peak",
+                    "/sys/fs/cgroup/memory/memory.oom_control",
+                    "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+                ],
+                stdout=True,
+                stderr=False,
+                user="10001:10001",
+                demux=False,
+            ).output
+        except Exception:
+            return
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        total, peak = _parse_oom_counters(output or "")
+        previous = self._oom_seen.get(sandbox_id, 0)
+        self._oom_seen[sandbox_id] = max(previous, total)
+        if total <= previous:
+            return
+        from qinyuan_core import get_logger
+
+        get_logger("exec").warning(
+            "exec.oom_killed",
+            code="sandbox_oom_killed",
+            category="environment",
+            error_type="OOMKilled",
+            actual_bytes=peak,
+            limit_bytes=parse_bytes(self.settings.memory_limit),
         )
 
     def interrupt(self, sandbox_id: str) -> None:

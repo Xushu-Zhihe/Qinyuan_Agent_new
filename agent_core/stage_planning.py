@@ -144,6 +144,25 @@ CRYPTO_TOOL_GUIDANCE = (
     "results; pass a short expression instead of embedding a whole solver in one bash script. Their output is small "
     "and directly usable as an observation."
 )
+WEB_EFFECT_GUIDANCE = (
+    " Before a target action that might consume limited state (a one-shot render, upload or submit, an attempt or "
+    "wrong-flag quota, a one-time token), decide from the challenge's own code, description or rules whether that "
+    "action is repeatable; read-only requests and searches remain ordinary exploration. For a genuinely "
+    "irreversible use, do not spend it on a probe: spend it on a reusable primitive (for example a new route or a "
+    "written marker) or on the decisive final read, or make it non-consuming (for example abort before the one-shot "
+    "state is committed). Probe first only while the action stays repeatable. Verify an effect with a discriminating "
+    "signal (a new route or status, a unique marker, a changed body hash), not a fixed echoed body or a bare 200; "
+    "identical responses on a repeated request are not evidence that state changed and must not be reported as new "
+    "progress."
+)
+ANCHOR_SEARCH_GUIDANCE = (
+    " When a concrete constraint is already grounded (a length, magic value, prefix, checksum, field width or "
+    "version from the artifact's own format/code or from the task), use it as a search anchor before guessing "
+    "the surrounding structure: locate the matching immediate or constant in strings, imports, hex or "
+    "disassembly, then start from the code or data that references it. A value assumed from another challenge "
+    "is a hypothesis, never evidence; if the anchor does not locate the check or does not survive verification, "
+    "fall back to normal recon instead of scanning blindly. "
+)
 
 
 def crypto_tool_guidance(request) -> str:
@@ -153,6 +172,21 @@ def crypto_tool_guidance(request) -> str:
     if any(str(tool.get("qualified_name", "")).startswith("crypto.") for tool in tools):
         return CRYPTO_TOOL_GUIDANCE
     return ""
+
+
+def web_effect_guidance(request) -> str:
+    """One-shot or quota-limited target effects are not ordinary probes."""
+    if request.stage != "stage_action":
+        return ""
+    tools = getattr(request, "tools", ()) or ()
+    if any(tool.get("qualified_name") == "http.run_experiment" for tool in tools):
+        return WEB_EFFECT_GUIDANCE
+    return ""
+
+
+def anchor_search_guidance(request) -> str:
+    """A grounded constraint is a search anchor; a guessed one is not."""
+    return ANCHOR_SEARCH_GUIDANCE if request.stage in {"stage_roads", "stage_action"} else ""
 
 
 def road_suggestion_guidance(request):
@@ -228,7 +262,9 @@ TOOL_PREPARATION_GUIDANCE = (
     " Tool preparation is available in this decision because download.install_tool is declared. If a missing "
     "local executable or Python module is the concrete blocker for the next discriminating check, you may select "
     "download.install_tool: give an authorized HTTPS artifact plus its verified SHA256, or a pinned Python "
-    "package/version; use the returned executable path or Python wrapper. This is not general target or "
+    "package/version; use the returned executable path or Python wrapper. When a specialized tool is missing, "
+    "consult download.list_catalog (when declared) for supported recipes; install only a listed recipe, and "
+    "treat an entry listed as unsupported as a capability gap rather than retrying network installs. This is not general target or "
     "public-network access, and native sources must be allowlisted by this deployment. Do not use apt, direct "
     "pip/curl, or a guessed hash. If preparation reports source_not_allowed, unavailable, integrity failure or a "
     "capacity error, record the capability gap and choose another useful check instead of repeating the same "
@@ -593,8 +629,10 @@ def model_contract(request):
                if stage_runtime(request).get("review_mode") in {"async_fact_v1", "async_planning_v1"} and request.stage == "stage_action" else "")
             + (TOOL_CONCURRENCY_GUIDANCE if request.stage == "stage_action" else "")
             + crypto_tool_guidance(request)
+            + web_effect_guidance(request)
             + (EXPLORATION_GUIDANCE + PUBLIC_REFERENCE_GUIDANCE if request.stage in {
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
+            + anchor_search_guidance(request)
             + (OFFLINE_TOOLING_GUIDANCE if request.stage in {
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
             + (TOOL_PREPARATION_GUIDANCE if request.stage == "stage_action"

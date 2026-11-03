@@ -52,18 +52,49 @@ gzip/xz/zstd/lz4/bzip2/raw。
 `sympy`（符号计算/因式分解）、`lll`（fpylll 格基约简）。同时修正了 T6 的
 PATH 顺序：`/opt/dirsearch/bin` 必须排在 `/usr/bin` 之后，否则它的 python3
 符号链接会遮住系统解释器，导致 MCP 的 `python3` 看不到 apt 安装的
-sympy/cypari2/fpylll。Linux profile 因此升为 `d3-fixed-readonly-v3`。
+sympy/cypari2/fpylll。Linux profile 因此升为 `d3-fixed-readonly-v3`；
+资源档位调整后标签再次升为 v4，见下。
+
+## 资源档位（2026-11-03）
+
+镜像 ID 不变，只改容器资源上限；`QINYUAN_SANDBOX_PROFILE` 一次只选一档，
+默认 `linux`：
+
+| profile | 标签 | 内存/swap | CPU | pids | 输入 `/workspace` | work `/workspace/work` | `/tmp` |
+|---|---|---|---|---|---|---|---|
+| linux（默认） | `d3-fixed-readonly-v4` | 2 GiB / 2 GiB | 1.0 | 256 | 128m | 512m | 256m |
+| linux-heavy | `linux-heavy-v1` | 4 GiB / 4 GiB | 2.0 | 512 | 128m | 1g | 512m |
+| windows | `windows-wine-v3` | 8 GiB / 8 GiB | 2.0 | 512 | 128m | 4g | 512m |
+
+`/tools` 256 MiB、`/home/sandbox` 64 MiB 三档一致。swap 与内存等额，即关闭
+swap：命中上限直接 exit 137，不让宿主抖动。tmpfs 页计入容器 memcg，所以
+linux 档各项上限合计 1216 MiB < 2048 MiB、heavy 档 1984 MiB < 4096 MiB、
+windows 档 5056 MiB < 8192 MiB；旧配置 640 MiB > 512 MiB 是 OOM 的一个来源，
+本次一并修正。输入区独立成 `input_size`，因为 T6 附件导入总量上限只有
+64 MiB。
+
+windows 档内存从 4 GiB 提到 8 GiB 的依据是 2026-11-03 的真实 OOM 记录
+（run `882d0fb1`）：那次容器是 4 GiB，两个 Wine prefix 已建在 work 里
+（约 1.9 GB，计入 memcg），再叠 gdb+pwntools 的堆遍历就把 4 GiB 顶穿，
+工具结果是 exit 137 + 空输出。所以 windows 档的 4 GiB 对“Wine + 量堆”
+这个组合不够，不是 linux 档 512 MiB 的问题。
+
+`Sandbox/settings.py` 的 `SandboxSettings` 是 linux 档，`LinuxHeavySandboxSettings`
+是 heavy 档；`Sandbox/windows_sandbox.py` 的 `WindowsSandboxSettings` 是
+Windows 档。`agent_adapters/docker_profile.py` 用一张 profile 表把标签、镜像
+ID 和 settings/sandbox 类绑在一起；档位或数值变化时标签必须一起改，旧运行的
+冻结配置会以 `configuration_mismatch` 显式失配，不会静默复用新上限。
 
 Windows profile 只在显式选择时启用：
 
   QINYUAN_SANDBOX_PROFILE=windows
 
-它使用 `qinyuan/windows-sandbox:0.3.9`（基于 Linux 0.3.8）、4 GiB 内存、
+它使用 `qinyuan/windows-sandbox:0.3.9`（基于 Linux 0.3.8）、8 GiB 内存、
 2 CPU、4 GiB `/workspace/work`、512 MiB `/tmp`，并设置
 `WINEPREFIX=/workspace/work/.wine64`、`WINEPREFIX32=/workspace/work/.wine32`、
-`TMPDIR=/workspace/work/tmp`。默认 Linux profile（512 MiB / 128 MiB work）
-和其安全边界完全不变。当前是部署级开关（整个 workbench 进程生效）；按任务
-选择需要新增请求字段。
+`TMPDIR=/workspace/work/tmp`。4 GiB work 是上限不是承诺：tmpfs 同样计入
+8 GiB 内存，真要写满仍会被 kill。当前是部署级开关（整个 workbench 进程
+生效）；按任务选择需要新增请求字段。
 
 Windows 0.3.8 增加 32 位 PE 支持：启用 i386 multiarch，安装
 `wine64`、`wine32` 和 `gcc-mingw-w64-i686`（旧的 0.3.7 只有 wine64，32 位

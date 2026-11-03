@@ -15,7 +15,7 @@ from MCPs.fastmcp_compat import FastMCP
 
 # A sandbox step cannot usefully exceed this: the executor already caps by
 # MAX_ACTION_TIMEOUT and the remaining TaskRun deadline, and a longer script
-# mostly buffers output that a 512 MiB container may never get to print.
+# mostly buffers output that the 2 GiB default container may never get to print.
 MAX_PWNTOOLS_TIMEOUT_SECONDS = 120
 
 

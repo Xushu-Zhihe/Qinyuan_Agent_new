@@ -1,7 +1,7 @@
 # Dedicated Windows user-mode profile. This image is NOT used by the default
 # Linux TaskRun: it is selected only through the explicit windows sandbox
 # profile, because Wine needs a larger writable prefix and more memory than the
-# 512 MiB default sandbox.
+# 2 GiB default sandbox.
 FROM qinyuan/pentest-sandbox:0.3.8
 
 USER root

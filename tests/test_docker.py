@@ -46,8 +46,10 @@ def test_new18_and_old17_have_separate_frozen_backends(tmp_path):
     assert policy["image_id"] == docker_profile.IMAGE_ID
     spec = policy["spec"]
     assert spec["network_mode"] == "none" and spec["read_only"] is True
-    assert spec["mem_limit"] == spec["memswap_limit"] == "512m"
-    assert spec["nano_cpus"] == 500_000_000 and spec["pids_limit"] == 128
+    assert spec["mem_limit"] == spec["memswap_limit"] == "2g"
+    assert spec["nano_cpus"] == 1_000_000_000 and spec["pids_limit"] == 256
+    assert "size=128m" in spec["tmpfs"]["/workspace"]
+    assert "size=512m" in spec["tmpfs"]["/workspace/work"]
     assert not {"volumes", "ports", "privileged"} & set(spec)
     raw["execution_profile"], raw["d8_config"] = "d8_v17", real_config()
     for name, role in (("outer", "outer_planning"), ("inner", "inner_action")):
@@ -67,6 +69,51 @@ def test_changed_resource_policy_rejected_before_connection(tmp_path, monkeypatc
         parse_request(raw)
 
 
+def test_linux_heavy_profile_raises_only_resources(monkeypatch):
+    monkeypatch.setenv("QINYUAN_SANDBOX_PROFILE", "linux-heavy")
+    policy = docker_profile.sandbox_config()
+    spec = policy["spec"]
+    assert policy["profile"] == "linux-heavy-v1" and policy["image_id"] == docker_profile.IMAGE_ID
+    assert spec["mem_limit"] == spec["memswap_limit"] == "4g"
+    assert spec["nano_cpus"] == 2_000_000_000 and spec["pids_limit"] == 512
+    assert "size=1g" in spec["tmpfs"]["/workspace/work"] and "size=512m" in spec["tmpfs"]["/tmp"]
+    assert spec["read_only"] is True and spec["network_mode"] == "none"
+    assert spec["cap_drop"] == ["ALL"] and "no-new-privileges:true" in spec["security_opt"]
+
+
+def test_oom_counters_cover_both_cgroup_layouts():
+    from Sandbox.docker_runtime import _parse_oom_counters
+
+    # cgroup v2: memory.events lines plus the bare memory.peak value.
+    assert _parse_oom_counters("low 0\nhigh 0\nmax 0\noom 0\noom_kill 2\n1073741824\n") == (
+        2,
+        1073741824,
+    )
+    # cgroup v1: oom_control lines plus the bare max_usage_in_bytes value.
+    assert _parse_oom_counters(
+        "oom_kill_disable 0\nunder_oom 0\noom_kill 1\n536870912\n"
+    ) == (1, 536870912)
+    assert _parse_oom_counters("") == (0, None)
+    # A missing file must not turn its stderr into counters or a peak.
+    assert _parse_oom_counters(
+        "cat: /sys/fs/cgroup/memory.peak: No such file or directory"
+    ) == (0, None)
+
+
+def test_unknown_sandbox_profile_is_rejected(monkeypatch):
+    monkeypatch.setenv("QINYUAN_SANDBOX_PROFILE", "lunix")
+    with pytest.raises(ValueError, match="unknown QINYUAN_SANDBOX_PROFILE"):
+        docker_profile.sandbox_config()
+
+
+def test_docker_host_environment_override_reaches_the_frozen_profile(monkeypatch):
+    from Sandbox.settings import SandboxSettings
+
+    monkeypatch.setenv("QINYUAN_DOCKER_HOST", "npipe:////./pipe/docker_engine")
+    assert SandboxSettings().docker_host == "npipe:////./pipe/docker_engine"
+    assert docker_profile.sandbox_config()["docker_host"] == "npipe:////./pipe/docker_engine"
+
+
 def test_new18_public_simulation_uses_all_existing_gates(tmp_path, monkeypatch):
     result, args = start(tmp_path, monkeypatch, new_request(tmp_path))
     assert result["errors"] == [] and not result["recovery"]["required"], result
@@ -82,6 +129,8 @@ def test_real18_public_assembly_cancel_without_model_key_and_status_without_dock
     class Model(SimulationModel):
         def __init__(self, role, settings):
             super().__init__(role)
+            # freeze_timeout_policy reads model.settings, like D8DeepSeekModel does.
+            self.settings = settings
         def bind_runtime(self, *args):
             pass
     connections = []
@@ -262,6 +311,28 @@ def test_daemon_readiness_does_not_retry_permissions_or_configuration(monkeypatc
     monkeypatch.setattr(docker_profile.docker,"DockerClient",connect)
     monkeypatch.setattr(docker_profile.time,"sleep",lambda _:pytest.fail("permanent error was retried"))
     with pytest.raises(type(failure)):docker_profile._wait_ready(docker_profile.settings())
+
+
+@pytest.mark.parametrize("message", [
+    "(2, 'CreateFile', 'The system cannot find the file specified.')",
+    "(2, 'CreateFile', '系统找不到指定的文件。')",
+])
+def test_daemon_readiness_retries_unrecognized_engine_pipe_errors(monkeypatch, message):
+    # A stopped or still-booting Docker Desktop surfaces a localized pywin32
+    # error; it must count as a cold start instead of a permanent failure.
+    from docker.errors import DockerException
+    from Sandbox.docker_runtime import DockerRuntimeError
+
+    now, attempts = [0.0], []
+    monkeypatch.setattr(docker_profile.time,"monotonic",lambda:now[0])
+    monkeypatch.setattr(docker_profile.time,"sleep",lambda seconds:now.__setitem__(0,now[0]+seconds))
+    def connect(**kwargs):
+        attempts.append(kwargs)
+        raise DockerException("Error while fetching server API version: " + message)
+    monkeypatch.setattr(docker_profile.docker,"DockerClient",connect)
+    with pytest.raises(DockerRuntimeError, match="docker_startup_not_ready"):
+        docker_profile._wait_ready(docker_profile.settings())
+    assert len(attempts) > 1
 
 
 def test_daemon_readiness_obeys_one_deadline_for_all_probes(monkeypatch):

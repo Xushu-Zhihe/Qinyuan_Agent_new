@@ -1184,7 +1184,7 @@ def test_generic_exploration_guidance_reaches_provider_without_granting_tools(st
     system = payload["messages"][-2]["content"]
     assert "answer could change the next decision" in system
     assert "use adequate local sources directly and reuse existing retrievals" in system
-    assert "Do not search merely because a version, error or attempt count exists" in system
+    assert "Do not search merely because a version, error or bare attempt count exists" in system
     assert "cannot distinguish success from failure leaves that hypothesis unresolved" in system
     assert "Separate tool or measurement failure from target counterevidence" in system
     assert "Supervision should challenge unsupported premises" in system
@@ -1496,6 +1496,21 @@ def test_automatic_capacity_summary_keeps_recent_four_and_original_sources(case,
     for identity, _ in summary.summary_coverage:
         assert case.app.evidence.read("request", identity) and case.app.evidence.read("result", identity)
     assert all(i.record_type != "summary" for i in case.app.evidence.history(case.app.task_id))
+
+
+def test_capacity_recovery_refreezes_contract_after_history_trim(case, monkeypatch):
+    # The trim below is what the real run hit: recovery keeps only the newest
+    # history entries, so the rebuilt request has a different contract than the
+    # one it was derived from. It must therefore be frozen again, not inherit
+    # the source's frozen hash.
+    monkeypatch.setattr("agent_adapters.stage_application.HISTORY_AFTER_RECOVERY", 1)
+    blocked = prepare_capacity_episode(case)
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.achievement is not None
+    rebuilt = next(r for r in case.models.inner.calls if r.capacity_recovery_of == blocked[0].model_request_id)
+    assert len(blocked[0].context.history) > 1 and len(rebuilt.context.history) == 1
+    assert rebuilt.frozen_contract_ref is not None
+    assert rebuilt.frozen_contract_ref != blocked[0].frozen_contract_ref
 
 
 def test_capacity_replacement_recovers_known_output_without_new_summary_or_tool(case, monkeypatch):

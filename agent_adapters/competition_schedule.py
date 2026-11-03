@@ -514,8 +514,13 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         task_status=((run or {}).get("result") or {}).get("task_run",{}).get("status")
         if (adapter=="arena" and (state.get("platform") or {}).get("state")=="solved" and not active
                 and ((run or {}).get("status") in {"finished","cleanup_confirmed"} or task_status in FINISHED)):
-            # An Arena attempt is single-question: only finish after the run and
-            # its submission receipt are terminal, never while awaiting feedback.
+            # Only leave the attempt after the run and its submission receipt are
+            # terminal, never while awaiting feedback. A running session then takes
+            # the next attempt; pausing/needs_attention settle as finished so an
+            # interrupted session cannot silently reopen itself.
+            if (state["status"]=="running" and not state["stop_after_current"]
+                    and self.clock()<state["deadline_at"]):
+                self.advance(row);return
             self.update(identity,status="finished",reason="competition_question_solved");return
         if not active and challenge is not None:
             reason=((run or {}).get("result") or {}).get("recovery",{}).get("reason")

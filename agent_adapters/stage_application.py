@@ -376,9 +376,12 @@ class StageApplication:
         # the remaining fixed cost, so keep its newest entries and leave the rest
         # readable by ref through history_catalog / history_details.
         history = request.context.history[-HISTORY_AFTER_RECOVERY:]
+        # The trimmed history is part of the output schema, so this request has a
+        # different contract than its source. Clear the inherited hash exactly as
+        # the summary and correction paths do; call() freezes the new contract.
         return replace(request, model_request_id=self._id("stage/capacity/" + request.model_request_id + "/" + summary_id),
             messages=messages, capacity_recovery_of=request.model_request_id,
-            context=replace(request.context, history=history))
+            context=replace(request.context, history=history), frozen_contract_ref=None)
 
     def _request(self, stage, session, *, proposal_id=None, proposal=None):
         # Only synchronous stages resume an outstanding proposal directly.

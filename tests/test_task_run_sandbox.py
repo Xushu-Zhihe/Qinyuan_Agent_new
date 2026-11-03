@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 from docker.errors import NotFound
+from docker.utils import parse_bytes
 
 from Sandbox.models import CommandRequest, CommandResult
 from Sandbox.settings import SandboxSettings
@@ -97,8 +98,8 @@ class FakeContainer:
                 "CapDrop": spec["cap_drop"],
                 "SecurityOpt": spec["security_opt"],
                 "Tmpfs": spec["tmpfs"],
-                "Memory": 536870912,
-                "MemorySwap": 536870912,
+                "Memory": parse_bytes(spec["mem_limit"]),
+                "MemorySwap": parse_bytes(spec["memswap_limit"]),
                 "NanoCpus": spec["nano_cpus"],
                 "PidsLimit": spec["pids_limit"],
                 "Binds": None,

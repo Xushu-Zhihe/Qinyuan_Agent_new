@@ -22,8 +22,8 @@ class RuntimeStub:
 def test_windows_profile_has_bigger_resources_and_wine_prefix():
     spec = WindowsTaskRunSandbox(RuntimeStub(WindowsSandboxSettings()))._spec()
 
-    assert spec["mem_limit"] == "4g"
-    assert spec["memswap_limit"] == "4g"
+    assert spec["mem_limit"] == "8g"
+    assert spec["memswap_limit"] == "8g"
     assert spec["nano_cpus"] == 2_000_000_000
     assert spec["pids_limit"] == 512
     assert "size=4g" in spec["tmpfs"]["/workspace/work"]
@@ -33,7 +33,7 @@ def test_windows_profile_has_bigger_resources_and_wine_prefix():
     assert spec["environment"]["TMPDIR"] == "/workspace/work/tmp"
     # the default profile is untouched
     default = T6TaskRunSandbox(RuntimeStub(SandboxSettings()))._spec()
-    assert default["mem_limit"] == "512m"
+    assert default["mem_limit"] == "2g"
     assert "WINEPREFIX" not in default["environment"]
 
 
@@ -94,7 +94,7 @@ def test_profile_dispatch_by_environment(monkeypatch):
     from agent_adapters import docker_profile
 
     monkeypatch.delenv("QINYUAN_SANDBOX_PROFILE", raising=False)
-    assert docker_profile.sandbox_config()["profile"] == "d3-fixed-readonly-v3"
+    assert docker_profile.sandbox_config()["profile"] == "d3-fixed-readonly-v4"
 
     monkeypatch.setenv("QINYUAN_SANDBOX_PROFILE", "windows")
-    assert docker_profile.sandbox_config()["profile"] == "windows-wine-v2"
+    assert docker_profile.sandbox_config()["profile"] == "windows-wine-v3"

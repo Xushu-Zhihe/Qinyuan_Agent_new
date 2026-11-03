@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 from docker.errors import NotFound
 from Sandbox.tool_download_worker import MAX_DOWNLOAD_BYTES
+from Sandbox.env_settings import configured as configured_operational
 
 DOWNLOAD_STOP_GRACE_SECONDS = 5.0
 DOWNLOAD_TAR_OVERHEAD_BYTES = 1024 * 1024
@@ -40,7 +41,7 @@ def host_allowed(host, allowed_hosts):
 
 
 def _configured_allowed_hosts():
-    raw = os.environ.get(DOWNLOAD_ALLOWED_HOSTS_ENV, "")
+    raw = configured_operational(DOWNLOAD_ALLOWED_HOSTS_ENV) or ""
     return frozenset(
         item.strip().lower().rstrip(".")
         for item in raw.split(",")
@@ -131,7 +132,7 @@ class ToolDownload:
 
     def record(self, **values):
         self.lease.update(values)
-        self.evidence.save("mcp-download", self.operation_id, dict(self.lease))
+        self.evidence.save_lease("mcp-download", self.operation_id, dict(self.lease))
 
     def owned(self, container, component):
         container.reload()

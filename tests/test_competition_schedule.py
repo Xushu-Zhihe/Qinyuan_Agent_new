@@ -417,6 +417,31 @@ def test_arena_solved_platform_finishes_instead_of_needs_attention(platform,monk
     assert current["status"]=="finished" and current["reason"]=="competition_question_solved"
 
 
+def test_arena_running_session_takes_the_next_attempt_after_solved(platform,monkeypatch):
+    p=platform
+    service,row,_,_=schedule(p,adapter="arena")
+    service.update(row["id"],status="running",challenge_id=str(uuid4()),current_ref=12306,
+        platform={"state":"solved","remaining_seconds":0})
+    monkeypatch.setattr(p.workbench.runner,"status",
+        lambda _: {"status":"finished","result":{"task_run":{"status":"achieved"}}})
+    service.step(service.get(row["id"]))
+    current=service.get(row["id"])["state"]
+    assert current["status"]=="running"
+    assert current["current_ref"] is None and current["challenge_id"] is None and current["index"]==1
+
+
+def test_arena_stop_after_current_still_finishes_after_solved(platform,monkeypatch):
+    p=platform
+    service,row,_,_=schedule(p,adapter="arena")
+    service.update(row["id"],status="running",challenge_id=str(uuid4()),current_ref=12306,
+        stop_after_current=True,platform={"state":"solved","remaining_seconds":0})
+    monkeypatch.setattr(p.workbench.runner,"status",
+        lambda _: {"status":"finished","result":{"task_run":{"status":"achieved"}}})
+    service.step(service.get(row["id"]))
+    current=service.get(row["id"])["state"]
+    assert current["status"]=="finished"
+
+
 def test_overall_can_extend_after_current_terminal_without_reopening_it(platform,monkeypatch):
     p=platform;p.payload=[benchmark()];service,row,_,_=schedule(p)
     monkeypatch.setattr(p.workbench.runner,"start",lambda *a,**kw:fake_run(p,service.get(row["id"])))

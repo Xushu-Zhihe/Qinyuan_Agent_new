@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from typing import Any
@@ -16,7 +17,10 @@ mcp = FastMCP(
         "the current Agent sandbox. Boot a kernel into a tmux session, attach "
         "gdb-multiarch to the QEMU gdbstub, and drive the guest console with "
         "session_send/session_capture. KVM is never used; everything runs under "
-        "TCG with no capabilities. This server never executes QEMU itself."
+        "TCG with no capabilities. Guest RAM is capped by the active sandbox "
+        "profile (1024 MB on linux, 2048 MB on linux-heavy/windows) because it "
+        "shares the container limit with QEMU, gdb and work files. This server "
+        "never executes QEMU itself."
     ),
     json_response=True,
 )
@@ -26,6 +30,16 @@ GDB = "/usr/bin/gdb-multiarch"
 SESSION_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 APPEND = re.compile(r"[\x20-\x7e]{0,512}")
 DEFAULT_APPEND = "console=ttyS0 nokaslr"
+
+# Guest RAM competes with QEMU's own overhead, gdb-multiarch and the tmpfs work
+# tree inside one container limit, so leave roughly half of each profile.
+QEMU_MEMORY_LIMIT_MB = {"linux": 1024, "linux-heavy": 2048, "windows": 2048}
+DEFAULT_QEMU_MEMORY_LIMIT_MB = 1024
+
+
+def _qemu_memory_limit() -> tuple[str, int]:
+    profile = os.environ.get("QINYUAN_SANDBOX_PROFILE", "linux").strip().lower() or "linux"
+    return profile, QEMU_MEMORY_LIMIT_MB.get(profile, DEFAULT_QEMU_MEMORY_LIMIT_MB)
 
 
 def _session(value: str) -> str:
@@ -72,8 +86,16 @@ def kernel_boot(
     initrd_path = _readable(initramfs, "initramfs") if initramfs is not None else None
     if not isinstance(append, str) or APPEND.fullmatch(append) is None:
         raise ValueError("append must be printable ASCII, at most 512 characters")
-    if isinstance(memory_mb, bool) or not isinstance(memory_mb, int) or not 128 <= memory_mb <= 384:
-        raise ValueError("memory_mb must be between 128 and 384 (512 MiB cgroup)")
+    profile, memory_limit = _qemu_memory_limit()
+    if (
+        isinstance(memory_mb, bool)
+        or not isinstance(memory_mb, int)
+        or not 128 <= memory_mb <= memory_limit
+    ):
+        raise ValueError(
+            f"memory_mb must be between 128 and {memory_limit} "
+            f"(sandbox profile {profile})"
+        )
     port = _port(gdb_port)
     timeout = validate_timeout(timeout_seconds)
     arguments = [

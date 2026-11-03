@@ -90,6 +90,19 @@ class StageEvidence:
                 _fail("stage.evidence_io_failed", Category.DEPENDENCY)
             raise
 
+    def save_lease(self, kind, identity, value):
+        """Replace the operational lease for one identity in place.
+
+        Download/install leases advance through states (creating -> ready ->
+        prepared); unlike audit evidence they are one mutable snapshot, so the
+        latest state replaces the previous one atomically.
+        """
+        try:
+            self.records.save_mutable("stage-" + kind, identity,
+                json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False)))
+        except T6EvidenceCapacityError as error:
+            self.capacity_error(error)
+
     def capacity_error(self, error):
         operation = self.store.load_d4_operation(error.record_id)
         failure = StageStateError("stage.evidence_capacity_exceeded", code="stage.evidence_capacity_exceeded")

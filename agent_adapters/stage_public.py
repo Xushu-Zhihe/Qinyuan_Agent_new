@@ -15,6 +15,54 @@ from agent_adapters.web.simulated_application import _LocalDigestSandbox, _Token
 from agent_core.runtime import TaskRunStatus, TERMINAL_STATUSES
 
 
+async def _close_mcp_best_effort(app, phase: str) -> None:
+    """Teardown must not turn a finished TaskRun into an execution failure.
+
+    MCP sidecars get a fixed shutdown deadline; missing it is a host-resource
+    warning, not a change to the run result. ``MCPManager.close()`` clears its
+    runtimes before raising, so the later ``app.close()`` retry is a no-op.
+    """
+    from MCPs.Mcp_client.client import MCPClientError
+    from agent_adapters.output_evidence import safe_failure_details
+    from qinyuan_core import get_logger
+
+    try:
+        await app.mcp.close()
+    except MCPClientError as error:
+        get_logger("ctrl").warning(
+            "stage.mcp_close_failed",
+            phase=phase,
+            **safe_failure_details(error, include_chain=True),
+        )
+
+
+async def _close_application(app):
+    """Close the application; MCP sidecar teardown stays best-effort.
+
+    ``StageApplication.close()`` already logs a failed ``mcp`` phase. Re-raising
+    it from the public finally replaced a finished run result (with a pending
+    answer candidate) with ``task.real.execution_failed`` whenever the TaskRun
+    was awaiting external feedback rather than terminal. Only non-MCP teardown
+    defects remain fatal, so return the error worth collecting.
+    """
+    from MCPs.Mcp_client.client import MCPClientError
+    from agent_adapters.output_evidence import safe_failure_details
+    from qinyuan_core import get_logger
+
+    try:
+        await app.close()
+    except MCPClientError as error:
+        get_logger("ctrl").warning(
+            "stage.mcp_close_failed",
+            phase="application",
+            **safe_failure_details(error, include_chain=True),
+        )
+        return None
+    except BaseException as error:
+        return error
+    return None
+
+
 class StageSimulationModel:
     """Fixed local control exercise, never a real target or model capability claim."""
     def __init__(self, role):
@@ -229,7 +277,7 @@ async def _run_stage_task(directory, declaration, *, operation, finalize_export,
                 task = app.state.task_run
                 if task.status is TaskRunStatus.AWAITING_CONFIRMATION:
                     # The worker remains available; short locked ticks leave manual commands independent.
-                    await app.mcp.close()
+                    await _close_mcp_best_effort(app, "confirmation")
                     while app.state.task_run.status is TaskRunStatus.AWAITING_CONFIRMATION:
                         try:
                             with run_lock(directory):
@@ -268,7 +316,7 @@ async def _run_stage_task(directory, declaration, *, operation, finalize_export,
                 else:
                     raise ValueError("stage.public_operation_invalid")
         if app.state.task_run.status in TERMINAL_STATUSES:
-            await app.mcp.close()
+            await _close_mcp_best_effort(app, "terminal")
             from agent_adapters.web.task_result import _cleanup
             with run_lock(directory):
                 app.controller._reload_after_commit()
@@ -282,10 +330,9 @@ async def _run_stage_task(directory, declaration, *, operation, finalize_export,
                 finalize_export()
         except BaseException as error:
             cleanup_errors.append(("export", error))
-        try:
-            await app.close()
-        except BaseException as error:
-            cleanup_errors.append(("application", error))
+        application_error = await _close_application(app)
+        if application_error is not None:
+            cleanup_errors.append(("application", application_error))
         try:
             if resources is not None:
                 resources.close()

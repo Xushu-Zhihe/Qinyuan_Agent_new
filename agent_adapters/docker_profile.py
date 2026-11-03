@@ -1,17 +1,18 @@
-"""Confirmed D9-3 profile. Never loads dotenv, pulls images or prepares networks."""
+"""Confirmed D9-3 profiles. Never loads dotenv, pulls images or prepares networks."""
 
 import json
 import os
 import time
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 import docker
 from docker.errors import DockerException
-from types import SimpleNamespace
 
 from Sandbox.command_sandbox import T6TaskRunSandbox
 from Sandbox.workspace import D8DockerWorkspace
 from Sandbox.docker_runtime import DockerRuntime, DockerRuntimeError
-from Sandbox.settings import SandboxSettings
+from Sandbox.settings import LinuxHeavySandboxSettings, SandboxSettings
 from Sandbox.windows_sandbox import WindowsSandboxSettings, WindowsTaskRunSandbox
 
 
@@ -19,43 +20,90 @@ STARTUP_READY_TIMEOUT_SECONDS = 10.0
 
 
 IMAGE_REF = "qinyuan/pentest-sandbox:0.3.8"
-IMAGE_ID = "sha256:7a36cb4066bfd4fb9c369047bd8e359424b8312735710af77e8ce832a173e277"
+IMAGE_ID = "sha256:bb71169cd4dc94a43f9d5b2609113da1dcaa49ad94fab410378c03d6407aa164"
 
 WINDOWS_IMAGE_REF = "qinyuan/windows-sandbox:0.3.9"
-WINDOWS_IMAGE_ID = "sha256:05307f0759008eb08109c0ad73fda078ad4f52a93f7273744ee532a52f86c7a4"
-WINDOWS_PROFILE = "windows-wine-v2"
+WINDOWS_IMAGE_ID = "sha256:141d9534ad0459238b9b0223abf45772a8ae547eb027bcfddc08c8eeb66893b7"
 
 
-def settings():
-    return SandboxSettings(image=IMAGE_ID)
+@dataclass(frozen=True)
+class _Profile:
+    label: str
+    image_ref: str
+    image_id: str
+    settings: type[SandboxSettings]
+    sandbox: type
 
 
-def windows_settings():
-    return WindowsSandboxSettings(image=WINDOWS_IMAGE_ID)
+# One table, one lookup: resource numbers live in the settings classes and the
+# frozen label changes whenever any of them does (an old run then fails with
+# configuration_mismatch instead of silently reusing different limits).
+_PROFILES = {
+    "linux": _Profile(
+        "d3-fixed-readonly-v4",
+        IMAGE_REF,
+        IMAGE_ID,
+        SandboxSettings,
+        T6TaskRunSandbox,
+    ),
+    "linux-heavy": _Profile(
+        "linux-heavy-v1",
+        IMAGE_REF,
+        IMAGE_ID,
+        LinuxHeavySandboxSettings,
+        T6TaskRunSandbox,
+    ),
+    "windows": _Profile(
+        "windows-wine-v3",
+        WINDOWS_IMAGE_REF,
+        WINDOWS_IMAGE_ID,
+        WindowsSandboxSettings,
+        WindowsTaskRunSandbox,
+    ),
+}
 
 
-def _active_profile():
-    return os.environ.get("QINYUAN_SANDBOX_PROFILE", "linux").strip().lower()
+def _profile(name: str | None = None) -> _Profile:
+    key = (name or os.environ.get("QINYUAN_SANDBOX_PROFILE", "linux")).strip().lower()
+    try:
+        return _PROFILES[key]
+    except KeyError:
+        # A typo must not fall back to the default profile.
+        raise ValueError(f"unknown QINYUAN_SANDBOX_PROFILE: {key}") from None
 
 
-def sandbox_config():
+def _settings(profile: _Profile) -> SandboxSettings:
+    return profile.settings(image=profile.image_id)
+
+
+def _sandbox_config(profile: _Profile) -> dict:
+    configured = _settings(profile)
     # Freeze the complete effective container specification, not a hand-written
     # subset that could conceal new default mounts, network or resource limits.
-    if _active_profile() == "windows":
-        return windows_sandbox_config()
-    configured = settings()
-    profile = T6TaskRunSandbox(SimpleNamespace(settings=configured))
-    return {"version": 1, "profile": "d3-fixed-readonly-v3", "image_ref": IMAGE_REF,
-            "image_id": IMAGE_ID, "docker_host": configured.docker_host,
-            "spec": profile._spec()}
+    return {
+        "version": 1,
+        "profile": profile.label,
+        "image_ref": profile.image_ref,
+        "image_id": profile.image_id,
+        "docker_host": configured.docker_host,
+        "spec": profile.sandbox(SimpleNamespace(settings=configured))._spec(),
+    }
 
 
-def windows_sandbox_config():
-    configured = windows_settings()
-    profile = WindowsTaskRunSandbox(SimpleNamespace(settings=configured))
-    return {"version": 1, "profile": WINDOWS_PROFILE, "image_ref": WINDOWS_IMAGE_REF,
-            "image_id": WINDOWS_IMAGE_ID, "docker_host": configured.docker_host,
-            "spec": profile._spec()}
+def settings() -> SandboxSettings:
+    return _settings(_profile())
+
+
+def windows_settings() -> SandboxSettings:
+    return _settings(_profile("windows"))
+
+
+def sandbox_config() -> dict:
+    return _sandbox_config(_profile())
+
+
+def windows_sandbox_config() -> dict:
+    return _sandbox_config(_profile("windows"))
 
 
 def _wait_ready(configured):
@@ -82,11 +130,13 @@ def _wait_ready(configured):
             return
         except Exception as error:
             detail = str(error).lower()
-            cold = (isinstance(error, DockerException) and any(word in detail for word in
-                    ("connection refused", "connection aborted", "filenotfounderror", "winerror 2", "winerror 10061"))
-                    and not any(word in detail for word in ("access denied", "permission denied", "winerror 5")))
             denied = isinstance(error, PermissionError) or any(word in detail for word in
                 ("access denied", "permission denied", "winerror 5"))
+            # 这里的 DockerException 基本都来自连接/命名管道：Docker Desktop
+            # 的 VM 或引擎管道尚未就绪。Windows 的错误文本会本地化（中文系统上
+            # 没有 "file not found" 这类英文子串），所以除权限拒绝外一律按冷启动
+            # 重试到 deadline，而不是立刻判定为永久失败。
+            cold = isinstance(error, DockerException) and not denied
             if denied or not cold and not DockerRuntime._is_transient(error):
                 log.warning("docker.startup_failed", code="docker_startup_permission_denied" if denied else "docker_startup_failed",
                     category="environment", exception_type=type(error).__name__)
@@ -119,21 +169,12 @@ def _connect_profile(expected, configured, sandbox_type, configuration, director
 
 
 def connect(configuration, directory, *, wait_for_ready=False):
-    if _active_profile() == "windows":
-        return _connect_profile(
-            windows_sandbox_config(),
-            windows_settings(),
-            WindowsTaskRunSandbox,
-            configuration,
-            directory,
-            wait_for_ready,
-        )
+    profile = _profile()
     return _connect_profile(
-        sandbox_config(),
-        settings(),
-        T6TaskRunSandbox,
+        _sandbox_config(profile),
+        _settings(profile),
+        profile.sandbox,
         configuration,
         directory,
         wait_for_ready,
     )
-

@@ -27,15 +27,31 @@ def test_boot_uses_tcg_without_kvm_and_fixed_console():
     assert "-S" not in args
 
 
-def test_boot_stop_at_start_and_bounds():
+def test_boot_stop_at_start_and_bounds(monkeypatch):
+    monkeypatch.delenv("QINYUAN_SANDBOX_PROFILE", raising=False)
     plan = kernel_boot("/workspace/work/bzImage", memory_mb=256, stop_at_start=True)
     assert "-S" in plan["sandbox_command"]["arguments"]
-    with pytest.raises(ValueError):
-        kernel_boot("/workspace/work/bzImage", memory_mb=1024)
+    allowed = kernel_boot("/workspace/work/bzImage", memory_mb=1024)
+    assert allowed["sandbox_command"]["arguments"][allowed["sandbox_command"]["arguments"].index("-m") + 1] == "1024"
+    with pytest.raises(ValueError, match=r"sandbox profile linux\)"):
+        kernel_boot("/workspace/work/bzImage", memory_mb=1025)
     with pytest.raises(ValueError):
         kernel_boot("/workspace/work/bzImage", append="bad\nappend")
     with pytest.raises(ValueError):
         kernel_boot("/workspace/work/bzImage", gdb_port=80)
+
+
+def test_guest_memory_follows_the_active_sandbox_profile(monkeypatch):
+    monkeypatch.setenv("QINYUAN_SANDBOX_PROFILE", "linux-heavy")
+    plan = kernel_boot("/workspace/work/bzImage", memory_mb=2048)
+    args = plan["sandbox_command"]["arguments"]
+    assert args[args.index("-m") + 1] == "2048"
+    with pytest.raises(ValueError, match=r"sandbox profile linux-heavy\)"):
+        kernel_boot("/workspace/work/bzImage", memory_mb=2049)
+
+    monkeypatch.setenv("QINYUAN_SANDBOX_PROFILE", "windows")
+    plan = kernel_boot("/workspace/work/bzImage", memory_mb=2048)
+    assert plan["sandbox_command"]["arguments"][plan["sandbox_command"]["arguments"].index("-m") + 1] == "2048"
 
 
 def test_gdb_attaches_to_loopback_gdbstub():

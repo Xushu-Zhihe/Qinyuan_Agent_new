@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 
 from MCPs.analysis_common import MAX_ARGUMENT_BYTES, validate_timeout
 from MCPs.fastmcp_compat import FastMCP
+from Sandbox.env_settings import configured as configured_operational
+from Sandbox.tool_usage import record as record_tool_download
 
 
 _NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}")
@@ -43,10 +45,9 @@ mcp = FastMCP(
 
 
 def _configured_timeout() -> int:
-    raw = os.environ.get(
-        "QINYUAN_TOOL_BOOTSTRAP_TIMEOUT_SECONDS",
-        str(_DEFAULT_BOOTSTRAP_TIMEOUT),
-    )
+    raw = configured_operational("QINYUAN_TOOL_BOOTSTRAP_TIMEOUT_SECONDS")
+    if raw is None:
+        raw = str(_DEFAULT_BOOTSTRAP_TIMEOUT)
     try:
         value = int(raw.strip())
     except ValueError as exc:
@@ -148,6 +149,79 @@ def _bootstrap_plan(script: str, timeout_seconds: int) -> dict[str, Any]:
     }
 
 
+_TOOL_CATALOG = {
+    "policy": {
+        "max_native_bytes": 240 * 1024 * 1024,
+        "tools_tmpfs_bytes": 256 * 1024 * 1024,
+        "python_version": "11",
+        "note": "Only listed recipes are supported; unsupported entries are capability gaps, not retry targets.",
+    },
+    "native": [
+        {
+            "name": "upx",
+            "url": "https://github.com/upx/upx/releases/download/v5.3.0/upx-5.3.0-amd64_linux.tar.xz",
+            "sha256": "79cea8a50b6fa102d10c7b79a419cd77dead3cc2d78661de2dc5e5815dc505c1",
+            "archive_format": "tar.xz",
+            "executable_path": "upx-5.3.0-amd64_linux/upx",
+            "self_test_args": ["--version"],
+        },
+    ],
+    "python": [
+        {"name": "pyelftools", "python_package": "pyelftools", "python_version": "11", "python_module": "elftools",
+         "self_test_args": ["-c", "from elftools.elf.elffile import ELFFile; print('ok')"]},
+        {"name": "lief", "python_package": "lief", "python_version": "11", "python_module": "lief",
+         "self_test_args": ["-c", "import lief; print(lief.__version__)"]},
+        {"name": "unicorn", "python_package": "unicorn", "python_version": "11", "python_module": "unicorn",
+         "self_test_args": ["-c", "import unicorn; print(unicorn.__version__)"]},
+        {"name": "keystone", "python_package": "keystone-engine", "python_version": "11", "python_module": "keystone",
+         "self_test_args": ["-c", "import keystone; print(keystone.__version__)"]},
+        {"name": "ropper", "python_package": "ropper", "python_version": "11", "python_module": "ropper",
+         "self_test_args": ["-c", "import ropper; print('ok')"]},
+        {"name": "ropgadget", "python_package": "ROPgadget", "python_version": "11", "python_module": "ropgadget",
+         "self_test_args": ["-c", "import ropgadget; print('ok')"]},
+        {"name": "volatility3", "python_package": "volatility3", "python_version": "11", "python_module": "volatility3",
+         "self_test_args": ["-c", "import volatility3; print('ok')"]},
+        {"name": "oletools", "python_package": "oletools", "python_version": "11", "python_module": "oletools",
+         "self_test_args": ["-c", "import oletools; print('ok')"]},
+        {"name": "impacket", "python_package": "impacket", "python_version": "11", "python_module": "impacket",
+         "self_test_args": ["-c", "import impacket; print(impacket.__version__)"]},
+        {"name": "pypykatz", "python_package": "pypykatz", "python_version": "11", "python_module": "pypykatz",
+         "self_test_args": ["-c", "import pypykatz; print('ok')"]},
+        {"name": "frida-tools", "python_package": "frida-tools", "python_version": "11", "python_module": "frida_tools",
+         "self_test_args": ["-c", "import frida_tools; print('ok')"]},
+        {"name": "angr", "python_package": "angr", "python_version": "11", "python_module": "angr",
+         "self_test_args": ["-c", "import angr; print(angr.__version__)"]},
+    ],
+    "manual": [
+        {
+            "name": "apktool",
+            "purpose": "APK decode/rebuild",
+            "url": "https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar",
+            "sha256": "dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423",
+            "note": "jar is not an executable; download it, then run: java -jar apktool_3.0.3.jar",
+        },
+    ],
+    "unsupported": [
+        {"name": "ghidra", "reason": "official zip exceeds 240 MiB download cap and needs a JDK; image change required"},
+        {"name": "radare2", "reason": "release has no Linux static executable; source build required"},
+        {"name": "rizin", "reason": "static archive is 137 MiB and extraction exceeds the 256 MiB /tools tmpfs"},
+        {"name": "blutter", "reason": "requires Dart SDK and a build step; not a single artifact"},
+        {"name": "reflutter", "reason": "requires Frida and a patched engine; not a single artifact"},
+        {"name": "frida-server", "reason": "device/architecture-specific; push to the target, not local install"},
+        {"name": "dnspy/ilspycmd", "reason": "no dotnet SDK/runtime in the image"},
+        {"name": "tshark/tcpdump/exiftool/steghide/zsteg", "reason": "apt/multi-file/Perl dependencies; image change required"},
+        {"name": "metasploit/john/hashcat/hydra", "reason": "build/runtime/dictionary dependencies; not a single artifact"},
+        {"name": "sqlmap/nikto/whatweb", "reason": "scripts/multi-file with no stable release digest; image change required"},
+    ],
+}
+
+
+@mcp.tool(title="List On-Demand Tool Catalog")
+def list_catalog() -> dict[str, Any]:
+    """Return supported on-demand tool recipes and known-unsupported tools."""
+    return _TOOL_CATALOG
+
+
 @mcp.tool(title="Install Native Tool With Python Fallback")
 def install_tool(
     name: str,
@@ -191,7 +265,7 @@ def install_tool(
         raise ValueError("native URL or Python fallback must be provided")
     normalized_args = _validate_args([] if self_test_args is None else self_test_args)
     timeout = _effective_timeout(timeout_seconds)
-    return _bootstrap_plan(
+    plan = _bootstrap_plan(
         _script(
             name=normalized_name,
             url=normalized_url or "",
@@ -206,6 +280,8 @@ def install_tool(
         ),
         timeout,
     )
+    record_tool_download(normalized_name)
+    return plan
 
 
 def main() -> None:

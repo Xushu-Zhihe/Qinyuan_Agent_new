@@ -113,6 +113,30 @@ def test_offline_install_unpacks_prepared_native_and_binds_receipt(tmp_path,monk
 class Evidence:
     def __init__(self):self.rows=[]
     def save(self,kind,key,value):self.rows.append((kind,key,dict(value)))
+    def save_lease(self,kind,key,value):self.save(kind,key,value)
+
+
+def test_download_lease_advances_states_on_one_immutable_store(tmp_path):
+    import pytest as _pytest
+    from agent_adapters.command_recorder import T6EvidenceError
+    from agent_adapters.stage_evidence import StageEvidence
+
+    evidence = StageEvidence(tmp_path / "stage-evidence", SimpleNamespace())
+    operation = str(uuid4())
+    broker = ToolDownload(SimpleNamespace(_runtime=SimpleNamespace(client=object())),
+                          SimpleNamespace(task_run_id=str(uuid4()), target_network=None),
+                          operation, evidence, allowed_hosts={"source.test"})
+    broker.record(state="creating", name="worker")
+    broker.record(state="created", worker_id="w1")
+    broker.record(state="prepared", prepared={"wheelhouse": "/tools/wheels/x"})
+    lease = evidence.read("mcp-download", operation)
+    assert lease["state"] == "prepared" and lease["worker_id"] == "w1"
+
+    # Audit evidence keeps the immutable rule: a conflicting rewrite still fails.
+    other = str(uuid4())
+    evidence.save("mcp-download", other, {"state": "creating"})
+    with _pytest.raises(T6EvidenceError):
+        evidence.save("mcp-download", other, {"state": "created"})
 
 
 def test_source_allowlist_is_fail_closed_before_any_worker():

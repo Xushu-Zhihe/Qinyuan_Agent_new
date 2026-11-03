@@ -1,7 +1,9 @@
 """Dedicated Windows/Wine profile.
 
 Wine needs a writable prefix of a few hundred MiB and more memory than the
-default 512 MiB Linux sandbox. This profile is opt-in (QINYUAN_SANDBOX_PROFILE
+default 2 GiB Linux sandbox. The two Wine prefixes live in `/workspace/work`
+and are charged to the container memcg, so 8 GiB leaves room for gdb/pwntools
+on top of that fixed cost. This profile is opt-in (QINYUAN_SANDBOX_PROFILE
 =windows); the default TaskRun profile and its boundaries are unchanged.
 """
 
@@ -12,7 +14,7 @@ from dataclasses import dataclass
 from Sandbox.command_sandbox import T6TaskRunSandbox
 from Sandbox.settings import SandboxSettings
 
-WINDOWS_MEMORY = "4g"
+WINDOWS_MEMORY = "8g"
 WINDOWS_CPU = 2_000_000_000
 WINDOWS_PROCESS_LIMIT = 512
 WINDOWS_WORKSPACE = "4g"

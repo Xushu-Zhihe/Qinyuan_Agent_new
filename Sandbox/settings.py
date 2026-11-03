@@ -85,6 +85,13 @@ def _configured_nonnegative_float(name: str, default: float) -> float:
 
 
 def _default_docker_host() -> str:
+    # QINYUAN_DOCKER_HOST works for the frozen profiles too, not only for
+    # SandboxSettings.from_environment(): the D8 real path builds the dataclass
+    # directly, so a Windows pipe that denies access can be swapped for the
+    # legacy docker_engine pipe or a local tcp endpoint without code changes.
+    configured = os.environ.get("QINYUAN_DOCKER_HOST", "").strip()
+    if configured:
+        return configured
     if os.name == "nt":
         return "npipe:////./pipe/dockerDesktopLinuxEngine"
     return "unix:///var/run/docker.sock"
@@ -92,17 +99,27 @@ def _default_docker_host() -> str:
 
 @dataclass(frozen=True)
 class SandboxSettings:
+    """linux 默认档：常规 pwn/RE、gdb+pwntools、少量 qemu。
+
+    tmpfs 页计入容器 memcg，所以各项 tmpfs 上限之和必须低于内存上限，
+    否则写文件会先触发 OOM kill 而不是 ENOSPC。本档合计
+    128+512+256+256+64=1216 MiB，低于 2 GiB。swap 与内存等额即关闭
+    swap：命中上限直接 exit 137，不让宿主抖动。
+    """
+
     image: str = "qinyuan/pentest-sandbox:0.3.8"
     network: str = "qinyuan_pentest_lab"
     network_internal: bool = True
 
-    memory_limit: str = "512m"
-    memory_swap_limit: str = "512m"
-    cpu_limit: int = 500_000_000
-    process_limit: int = 128
+    memory_limit: str = "2g"
+    memory_swap_limit: str = "2g"
+    cpu_limit: int = 1_000_000_000
+    process_limit: int = 256
 
-    workspace_size: str = "128m"
-    temporary_size: str = "64m"
+    # 只读输入区；T6 附件导入总量上限 64 MiB，128 MiB 已留出一倍余量。
+    input_size: str = "128m"
+    workspace_size: str = "512m"
+    temporary_size: str = "256m"
 
     maximum_timeout_seconds: int = 300
 
@@ -239,3 +256,20 @@ class SandboxSettings:
             raise ValueError(
                 "maximum_output_bytes_per_stream must be at least 1024"
             )
+
+
+@dataclass(frozen=True)
+class LinuxHeavySandboxSettings(SandboxSettings):
+    """linux-heavy 档：qemu -m 512 + gdb + 大 rootfs 解包。
+
+    QINYUAN_SANDBOX_PROFILE=linux-heavy 显式选择，默认档不变。tmpfs 合计
+    128+1024+512+256+64=1984 MiB，低于 4 GiB；4 GiB work 是上限不是承诺，
+    真要写满仍会被内存上限 kill。
+    """
+
+    memory_limit: str = "4g"
+    memory_swap_limit: str = "4g"
+    cpu_limit: int = 2_000_000_000
+    process_limit: int = 512
+    workspace_size: str = "1g"
+    temporary_size: str = "512m"

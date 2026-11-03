@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -73,6 +74,31 @@ class T6CommandRecorder:
                 raise T6EvidenceError("immutable_evidence_conflict") from None
         except OSError as exc:
             raise T6EvidenceError("evidence_write_failed") from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def save_mutable(self, kind: str, reference: str, value: dict) -> None:
+        """Atomically replace a lease-style record.
+
+        Audit records stay immutable (``_write``); a lease tracks the latest
+        operational state of one sidecar and must accept state transitions.
+        """
+        envelope = self.encode(kind, reference, value)
+        destination = self._path(kind, reference)
+        temporary = self.directory / f".pending-{uuid4()}"
+        try:
+            with temporary.open("xb") as output:
+                output.write(envelope)
+                output.flush()
+                os.fsync(output.fileno())
+            for attempt in range(4):
+                try:
+                    os.replace(temporary, destination)
+                    return
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
         finally:
             temporary.unlink(missing_ok=True)
 

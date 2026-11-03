@@ -225,15 +225,33 @@ def resolve_run(ref: str | None, base: Path) -> Path:
 # database access
 # --------------------------------------------------------------------------
 def connect(db_path: Path) -> sqlite3.Connection:
-    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3.0)
-    con.row_factory = sqlite3.Row
-    return con
+    """Read-only connection, falling back to an unlocked snapshot when needed.
+
+    A live workbench can hold the database in a way that makes a normal
+    read-only open fail with "unable to open database file". The immutable
+    fallback reads the last checkpointed state instead of returning an empty
+    result; it never writes and never blocks the writer.
+    """
+    uri = db_path.resolve().as_uri()
+    last_error: sqlite3.Error | None = None
+    for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
+        try:
+            con = sqlite3.connect(uri + suffix, uri=True, timeout=3.0)
+            con.execute("select count(*) from sqlite_master").fetchone()
+        except sqlite3.Error as exc:
+            last_error = exc
+            continue
+        con.row_factory = sqlite3.Row
+        return con
+    raise SystemExit("cannot read %s: %s" % (db_path, last_error))
 
 
-def query(con: sqlite3.Connection, sql: str, params=()) -> list[sqlite3.Row]:
+def query(con: sqlite3.Connection, sql: str, params=(), *, strict: bool = False) -> list[sqlite3.Row]:
     try:
         return con.execute(sql, params).fetchall()
     except sqlite3.Error:
+        if strict:
+            raise
         return []
 
 
@@ -1253,7 +1271,7 @@ def cmd_challenge(args) -> int:
     con = connect(db)
     try:
         challenges = query(con, """select id, title, category, status, endpoint, deadline_minutes, updated_at
-                                   from challenges order by updated_at desc""")
+                                   from challenges order by updated_at desc""", strict=True)
         if args.challenge:
             chosen = [row for row in challenges if row["id"].startswith(args.challenge)]
             if not chosen:

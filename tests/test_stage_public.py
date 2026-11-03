@@ -165,3 +165,109 @@ def test_public_primary_failure_still_runs_export_app_and_resource_cleanup(tmp_p
     assert owners[0] is owners[1] is owners[2]
     assert "stage.public_cleanup_failed:export" in original.__notes__
     if close_failure: assert "stage.public_cleanup_failed:application" in original.__notes__
+
+
+def test_mcp_teardown_failure_is_logged_instead_of_failing_the_run():
+    from types import SimpleNamespace
+    from MCPs.Mcp_client.client import MCPClientError
+    from agent_adapters import stage_public
+
+    calls = []
+
+    class SlowManager:
+        async def close(self):
+            calls.append("close")
+            raise MCPClientError(
+                "one or more MCP servers failed to close: shell: shutdown timed out after 10s"
+            )
+
+    # A missed shutdown deadline must not replace the run result.
+    asyncio.run(stage_public._close_mcp_best_effort(SimpleNamespace(mcp=SlowManager()), "terminal"))
+    assert calls == ["close"]
+
+    class BrokenManager:
+        async def close(self):
+            raise RuntimeError("unexpected teardown defect")
+
+    # Only the known sidecar shutdown failure is swallowed.
+    with pytest.raises(RuntimeError):
+        asyncio.run(stage_public._close_mcp_best_effort(SimpleNamespace(mcp=BrokenManager()), "terminal"))
+
+
+def test_application_teardown_absorbs_only_the_mcp_shutdown_failure():
+    from MCPs.Mcp_client.client import MCPClientError
+    from agent_adapters import stage_public
+
+    class McpFailure:
+        async def close(self):
+            raise MCPClientError(
+                "one or more MCP servers failed to close: shell: shutdown timed out after 10s"
+            )
+
+    # Application close re-raises the mcp phase; it must not fail the run.
+    assert asyncio.run(stage_public._close_application(McpFailure())) is None
+
+    class StoreFailure:
+        async def close(self):
+            raise RuntimeError("store close failed")
+
+    error = asyncio.run(stage_public._close_application(StoreFailure()))
+    assert isinstance(error, RuntimeError)
+
+
+def _public_run_harness(tmp_path, monkeypatch, close_error):
+    from types import SimpleNamespace
+    from agent_adapters import stage_public
+    from agent_adapters.web import task_result
+    from agent_core import operator_controls
+    from agent_core.runtime import TaskRunStatus
+
+    directory = tmp_path / "state" / "task"
+    directory.mkdir(parents=True)
+
+    class App:
+        def __init__(self):
+            self.state = SimpleNamespace(task_run=SimpleNamespace(status=TaskRunStatus.RUNNING))
+            self.store = SimpleNamespace()
+            self.controller = SimpleNamespace()
+            self.closed = 0
+
+        def start(self, request, *, source_root, task_run_id):
+            self.state.task_run.status = TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK
+
+        async def run(self, token):
+            return SimpleNamespace(reason="stage.awaiting_external_feedback")
+
+        async def close(self):
+            self.closed += 1
+            raise close_error
+
+    app = App()
+    monkeypatch.setattr(stage_public, "build_application", lambda *args: (app, None))
+    monkeypatch.setattr(stage_public, "_d3_request", lambda declaration: SimpleNamespace(deadline_seconds=600))
+    monkeypatch.setattr(stage_public, "_Token", lambda directory: SimpleNamespace(is_cancelled=False))
+    monkeypatch.setattr(operator_controls, "enable", lambda controller: None)
+    monkeypatch.setattr(task_result, "snapshot_v3_task_result",
+        lambda directory, declaration: {"task_run": {"status": "awaiting_external_feedback"}})
+    declaration = {"task_run_id": str(uuid4()), "mode": "simulated",
+                   "source_root": str(tmp_path), "request_id": str(uuid4())}
+    return stage_public, app, directory, declaration
+
+
+def test_public_run_absorbs_mcp_shutdown_failure_and_keeps_the_result(tmp_path, monkeypatch):
+    from MCPs.Mcp_client.client import MCPClientError
+
+    stage_public, app, directory, declaration = _public_run_harness(tmp_path, monkeypatch,
+        MCPClientError("one or more MCP servers failed to close: shell: shutdown timed out after 10s"))
+    result = stage_public.run_stage_task(directory, declaration)
+    # The awaiting-feedback run reaches the snapshot instead of failing teardown.
+    assert app.closed == 1
+    assert result["task_run"]["status"] == "awaiting_external_feedback"
+
+
+def test_public_run_still_fails_on_non_mcp_teardown_defects(tmp_path, monkeypatch):
+    stage_public, app, directory, declaration = _public_run_harness(tmp_path, monkeypatch,
+        RuntimeError("store close failed"))
+    with pytest.raises(RuntimeError, match="store close failed"):
+        stage_public.run_stage_task(directory, declaration)
+    assert app.closed == 1
