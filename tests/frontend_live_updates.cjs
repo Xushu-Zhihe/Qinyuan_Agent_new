@@ -50,6 +50,7 @@ const root = path.resolve(__dirname, "..");
           } else if (security.busy && --securityPending === 0) {
             const excluded = security.action === "Apply";
             security = { ...security, busy: false, verified: true, status: excluded ? "excluded" : "not_excluded", reason: null,
+              evidence_access: { status: "passed" },
               exact_rule_present: excluded, real_time_protection_enabled: true, tamper_protected: true, checked_at: "2026-10-29T12:00:00Z" };
           }
           body = security;
@@ -232,6 +233,13 @@ const root = path.resolve(__dirname, "..");
     await page.waitForFunction(() => document.getElementById("security-status").textContent.includes("排除已生效"));
     assert.deepEqual(securityActions, ["Apply"]);
     assert.match(await page.locator("#security-rule").innerText(), /^存在$/);
+    assert.match(await page.locator("#security-evidence-access").innerText(), /已通过/);
+    security = { ...security, evidence_access: { status: "failed", evidence_protection: { winerror: 5 },
+      error_codes: ["protected_directory_unavailable"] } };
+    await page.evaluate(value => renderWindowsSecurity(value), security);
+    assert.match(await page.locator("#security-status").innerText(), /自检失败/);
+    assert.match(await page.locator("#security-evidence-access").innerText(), /Windows 错误 5/);
+    assert.equal(await page.locator("#windows-security-hint").isVisible(), true);
     await page.click("#security-remove");
     await page.waitForFunction(() => document.getElementById("security-status").textContent.includes("未被排除"));
     assert.deepEqual(securityActions, ["Apply", "Remove"]);

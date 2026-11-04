@@ -19,6 +19,7 @@ SAFE_EXCEPTION_TYPES = frozenset({
     "JSONDecodeError", "IncompleteRead", "MCPClientError", "MCPCommandPlanError", "MCPCommandExecutionTimeout",
 })
 SAFE_HTTP_ERROR_CODES = frozenset({
+    "protected_directory_unavailable", "protected_directory_invalid", "protected_directory_failed",
     "operation.result_unconfirmed", "operation.budget_exhausted", "operation.identity_conflict",
     "execution.recovery_required", "execution.budget_exhausted", "execution.state_conflict",
     "mcp.outcome_unknown", "mcp.planner_rejected", "mcp.command_rejected",
@@ -111,6 +112,7 @@ def safe_failure_details(error, *, include_chain=False):
         traceback.print_exception(type(error), error, error.__traceback__)
     kinds, codes, seen, chain = [], [], set(), []
     capacity, http_diagnostic, operation_context = None, None, None
+    evidence_protection = None
     fact_source, operation_admission, model_call = None, None, None
     current = error
     while current is not None and id(current) not in seen and len(kinds) < 6:
@@ -127,6 +129,14 @@ def safe_failure_details(error, *, include_chain=False):
             if code is not None and code not in codes:
                 codes.append(code)
         resource_code = getattr(current, "code", None)
+        if name == "WindowsEvidenceProtectionError":
+            kinds[-1] = name
+            context = current.context
+            evidence_protection = {"code": resource_code if resource_code in SAFE_HTTP_ERROR_CODES else "d7_http_evidence_protection_failed"}
+            if type(context.get("winerror")) is int:
+                evidence_protection["winerror"] = context["winerror"]
+            if context.get("api") in {"CreateFileW", "GetFileInformationByHandleEx"}:
+                evidence_protection["api"] = context["api"]
         if (name == "StageRecoveryRequired" and resource_code == "stage.model_outcome_unknown"
                 or name == "StageModelTransportFailure" and resource_code == "stage.model_transport_failed"):
             model_call = current.context.get("model_call")
@@ -179,6 +189,8 @@ def safe_failure_details(error, *, include_chain=False):
             chain.append(node)
         current = current.__cause__ or current.__context__
     result = {"exception_types": kinds, "error_codes": codes}
+    if evidence_protection is not None:
+        result["evidence_protection"] = evidence_protection
     if capacity is not None:
         result["evidence_capacity"] = capacity
     if http_diagnostic is not None:

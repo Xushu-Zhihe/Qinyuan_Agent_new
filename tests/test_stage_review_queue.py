@@ -175,6 +175,10 @@ def test_rejected_successor_intent_returns_to_parent_planner_and_preserves_achie
     assert current.turn_id == result.turn.turn_id and current.parent_turn_id == retired.parent_turn_id == root.turn_id
     assert len(state["proposals"]) == 2 and all(request.context.session.owner_id == root.turn_id for request in state["proposals"])
     assert "narrow the successor deliverable" in json.dumps(state["proposals"][1].messages)
+    revision = stage_runtime(state["proposals"][1])["intent_revision"]
+    assert revision["proposal_operation_id"] == state["proposals"][0].model_request_id
+    recheck = next(r for r in case.models.outer.calls if r.proposal_operation_id == state["proposals"][1].model_request_id)
+    assert stage_runtime(recheck)["intent_revision"]["changed_fields"] == []
     assert len(case.tools.calls) == 3 and state["checks"] == [(True, True, "pending", "pending")] * 2
 
 
@@ -205,6 +209,41 @@ def test_rejected_provisional_root_is_corrected_with_new_identity_and_original_o
     assert len(case.tools.calls) == 2
     observations = [item for item in case.app.evidence.history(case.app.task_id) if item.identity == "tool_observation_not_fact"]
     assert {item.turn_id for item in observations} == {turn.turn_id for turn in turns}
+
+
+def test_intent_revisions_keep_exact_feedback_and_current_payload(case):
+    from agent_core.stage_contracts import TurnIntent
+    from agent_core.stage_planning import model_contract
+    from agent_adapters.deepseek_roles import _stage_input
+    reviews = []
+    def outer(request, raw):
+        if isinstance(request.proposal, TurnIntent):
+            reviews.append(request)
+            if len(reviews) <= 2:
+                return {"decision": "revise", "reason": "criterion defect " + str(len(reviews))}
+        return raw
+    def inner(request, raw):
+        if request.stage == "stage_intent":
+            raw["completion_criterion"] = "must " + ("not " if len(reviews) == 1 else "") + "record bytes"
+        return raw
+    case.models.outer.transform, case.models.inner.transform = outer, inner
+    asyncio.run(case.app.run(case.token))
+    assert len(reviews) == 3
+    assert "intent_revision" not in stage_runtime(reviews[0])
+    for index, review in enumerate(reviews[1:], 1):
+        revision = stage_runtime(review)["intent_revision"]
+        assert revision["proposal_operation_id"] == reviews[index - 1].proposal_operation_id
+        assert revision["review_operation_id"] == reviews[index - 1].model_request_id
+        assert revision["feedback"]["reason"] == "criterion defect " + str(index)
+        assert revision["changed_fields"] == ["completion_criterion"]
+        payload = _stage_input(review)
+        assert payload["current"]["proposal"]["completion_criterion"] == review.proposal.completion_criterion
+        assert "intent_revision" in payload["current"]
+        rules = model_contract(review)["rules"]
+        assert "Unchanged fields are not pre-approved" in rules
+        assert "Pursue a falsifiable hypothesis" not in rules
+    assert "criterion defect 1" in json.dumps(reviews[-1].messages)
+    assert all("intent_revision" not in stage_runtime(r) for r in case.models.inner.calls if r.stage == "stage_action")
 
 
 def test_provisional_registration_rolls_back_with_queue_and_branch(case, monkeypatch):

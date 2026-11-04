@@ -42,9 +42,11 @@ uv sync --frozen
 
 ### Windows 安全配置
 
+“配置排除（管理员）”和“检查”在管理员助手返回后，继续由工作台实际用户运行 HTTP 证据读写自检。自检复用正式存储的路径固定、SID-only ACL、DPAPI 加密、完整写入发布、校验与解密读取，在当前数据目录下创建临时测试内容并清理；不读取现有任务证据或访问网络。页面分别显示 Defender 排除和当前用户读写结果，权限／目录占用错误不会被“排除已生效”掩盖。失败保留手动启动；检查结果仅代表该时点，不保证后续不存在目录占用、权限变化或磁盘故障。无需新增按钮。
+
 启动后打开侧栏 **Windows 安全配置**，集中检查、配置或撤销当前数据目录的 Microsoft Defender 排除规则。按钮由本地服务发起标准 UAC 管理员确认；页面自动跟踪操作完成并显示核验时间，外部改动后请重新点击检查。未核验、取消或配置失败均只提示，允许继续运行，不会自动重试配置或重新执行任务。固定助手子进程使用 `-ExecutionPolicy Bypass` 加载内置脚本，只放宽该子进程的脚本检查；不修改用户/系统全局执行策略，组策略、UAC 和 Defender 权限仍有效。更新后端代码后需要重启工作台，仅刷新网页不会重新加载后端。
 
-规则固定为 `<实际 data-dir>\runs\*\agent-state\*\stage-evidence`，覆盖后续运行；不排除整个项目、Python 或 Docker 进程。配置只追加这一条，撤销只移除这一条，均不关闭实时保护或防篡改。匹配目录中的真实恶意样本也会跳过常规内容扫描；其他目录和 EDR/行为告警不在本规则保证范围内。目录排除是否生效由 `MpCmdRun -CheckExclusion` 核验，规则存在和实际生效分别显示；普通权限不可见时保持未知。参见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-exclusions-configure)。
+规则固定为三条叶子目录：`<实际 data-dir>\runs\*\agent-state\*\stage-evidence`、`<实际 data-dir>\runs\*\agent-state\*\d7-http-evidence`、`<实际 data-dir>\runs\*\agent-state\*\sensitive-evidence`，覆盖后续运行；不排除整个项目、`runs`、`agent-state`、Python 或 Docker 进程。配置一次追加三条精确规则，撤销只移除这三条，均不关闭实时保护或防篡改。匹配目录中的真实恶意样本也会跳过常规内容扫描；其他目录和 EDR/行为告警不在本规则保证范围内。目录排除是否生效由 `MpCmdRun -CheckExclusion` 逐条核验，规则存在和实际生效分别显示；普通权限不可见时保持未知。参见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-exclusions-configure)。
 
 命令行也可在**管理员 Windows PowerShell 5.1**中运行（项目根目录，`DataDir` 要和工作台启动参数一致）：
 

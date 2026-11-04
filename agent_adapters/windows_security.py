@@ -1,4 +1,4 @@
-"""Explicit, single-scope Defender setup for the local Workbench operator."""
+"""Explicit, fixed-path Defender setup for the local Workbench operator."""
 
 from __future__ import annotations
 
@@ -11,10 +11,13 @@ import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 from agent_adapters.workbench_contracts import WorkbenchError
 
 logger = logging.getLogger(__name__)
+
+_EVIDENCE_LEAVES = ("stage-evidence", "d7-http-evidence", "sensitive-evidence")
 
 
 def _ps_literal(value: str) -> str:
@@ -25,27 +28,34 @@ def _encoded(value: str) -> str:
     return base64.b64encode(value.encode("utf-16-le")).decode("ascii")
 
 
+def _patterns(root: Path) -> list[str]:
+    return [str(root / "runs" / "*" / "agent-state" / "*" / leaf) for leaf in _EVIDENCE_LEAVES]
+
+
 class WindowsSecuritySetup:
     def __init__(self, data_dir: Path):
         self.root = data_dir.resolve()
         self.script = Path(__file__).with_name("windows_defender_setup.ps1").resolve()
         self.supported = os.name == "nt"
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.patterns = _patterns(self.root)
         self.state = {
             "supported": self.supported,
             "data_dir": str(self.root),
             "script_path": str(self.script),
-            "pattern": str(self.root / "runs" / "*" / "agent-state" / "*" / "stage-evidence"),
+            "pattern": "; ".join(self.patterns),
+            "patterns": list(self.patterns),
             "status": "unknown" if self.supported else "not_applicable",
             "reason": "not_checked" if self.supported else "windows_only",
             "busy": False,
             "verified": False,
             "checked_at": None,
+            "evidence_access": {"status": "not_checked"},
         }
 
     def snapshot(self):
         with self.lock:
-            return dict(self.state)
+            return {**self.state, "patterns": list(self.state["patterns"])}
 
     def start(self, action: str):
         if action not in {"Check", "Apply", "Remove"}:
@@ -57,12 +67,15 @@ class WindowsSecuritySetup:
                 raise WorkbenchError("windows_security_operation_in_progress", 409)
             # A pending mutation invalidates the previous status until checked again.
             self.state.update(busy=True, action=action, status="unknown", verified=False,
-                              reason="awaiting_administrator_or_check", checked_at=None)
-            for key in ("exact_rule_present", "real_time_protection_enabled", "tamper_protected", "error_type", "exit_code", "errno", "winerror"):
+                              reason="awaiting_administrator_or_check", checked_at=None,
+                              evidence_access={"status": "not_checked"})
+            for key in ("exact_rule_present", "exact_rules_present", "paths",
+                        "real_time_protection_enabled", "tamper_protected",
+                        "error_type", "exit_code", "errno", "winerror"):
                 self.state.pop(key, None)
             self.worker = threading.Thread(target=self._run, args=(action,), daemon=True)
             self.worker.start()
-            return dict(self.state)
+            return self.snapshot()
 
     def _invoke(self, action: str):
         # No browser-supplied paths or shell commands cross the privilege boundary.
@@ -100,25 +113,60 @@ class WindowsSecuritySetup:
                 except OSError as exc:
                     return {"status": "unknown", "verified": False, "reason": "helper_result_read_failed",
                             "error_type": type(exc).__name__, "errno": exc.errno, "winerror": getattr(exc, "winerror", None)}
-                if not isinstance(result, dict) or result.get("action") != action or result.get("pattern") != self.state["pattern"]:
+                if not isinstance(result, dict) or result.get("action") != action:
+                    raise ValueError("unexpected_setup_result")
+                returned = result.get("patterns")
+                if isinstance(returned, list):
+                    if [str(item) for item in returned] != self.patterns:
+                        raise ValueError("unexpected_setup_result")
+                elif result.get("pattern") != self.state["pattern"]:
                     raise ValueError("unexpected_setup_result")
                 return result
             return {"status": "unknown", "verified": False,
                     "reason": "administrator_cancelled" if process.returncode == 1223 else "helper_failed_or_blocked",
                     "exit_code": process.returncode}
 
+    def _probe_evidence_access(self):
+        """Exercise the real HTTP evidence store as the unelevated service user."""
+        from agent_adapters.web.http_adapter import D7HttpResponseEvidenceStore, HttpCapabilityError
+        from agent_adapters.output_evidence import safe_failure_details
+        from qinyuan_core import QinyuanError
+        try:
+            runs = self.root / "runs"
+            runs.mkdir(exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="security-check-", dir=runs) as temporary:
+                task_id = str(uuid4())
+                task = Path(temporary) / "agent-state" / task_id
+                task.mkdir(parents=True)
+                store = D7HttpResponseEvidenceStore(task, task_id)
+                body = b"qinyuan-local-evidence-check"
+                metadata = store.save(str(uuid4()), body)
+                if store.read(metadata.evidence_id) != body:
+                    raise HttpCapabilityError("d7_http_evidence_integrity_failed")
+            return {"status": "passed"}
+        except (OSError, QinyuanError) as error:
+            details = safe_failure_details(error)
+            for key in ("errno", "winerror"):
+                if type(getattr(error, key, None)) is int:
+                    details[key] = getattr(error, key)
+            logger.warning("windows_security.evidence_probe_failed code=windows_security_evidence_probe_failed details=%s", details)
+            return {"status": "failed", **details}
+
     def _run(self, action: str):
         logger.info("windows_security.operation_started action=%s", action)
         try:
             result = self._invoke(action)
             status = result.get("status", "unknown")
-            verified = result.get("verified") is True and status in {"excluded", "not_excluded"}
+            verified = result.get("verified") is True and status in {"excluded", "not_excluded", "partial"}
+            access = self._probe_evidence_access() if verified else {"status": "not_checked"}
             # Only known diagnostic fields are projected, never arbitrary helper output.
             details = {key: result[key] for key in (
-                "reason", "exact_rule_present", "real_time_protection_enabled", "tamper_protected", "error_type", "exit_code", "errno", "winerror",
+                "reason", "exact_rule_present", "exact_rules_present", "paths",
+                "real_time_protection_enabled", "tamper_protected",
+                "error_type", "exit_code", "errno", "winerror",
             ) if key in result}
             with self.lock:
-                self.state.update(details, busy=False, status=status if verified else "unknown", verified=verified,
+                self.state.update(details, busy=False, status=status if verified else "unknown", verified=verified, evidence_access=access,
                                   checked_at=datetime.now(UTC).isoformat(timespec="seconds"))
                 final_status, reason = self.state["status"], self.state["reason"]
             logger.info("windows_security.operation_finished action=%s status=%s reason=%s", action, final_status, reason)

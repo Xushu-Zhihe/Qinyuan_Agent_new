@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes as c
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from ctypes import wintypes as w
@@ -325,6 +326,7 @@ class WindowsEvidenceProtection:
         if path.parent == path:
             raise WindowsEvidenceProtectionError("protected_directory_invalid")
         handles: list[int] = []
+        retry_delays = iter((0.05, 0.1, 0.2))
         try:
             components = (*reversed(path.parents), path)
             for component in components:
@@ -333,26 +335,32 @@ class WindowsEvidenceProtection:
                 access = 0x81  # FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY
                 if component == path:
                     access |= _READ_CONTROL | (_WRITE_DAC if writable else 0)
-                handle = self._kernel.CreateFileW(
-                    str(component),
-                    access,
-                    0x01,  # FILE_SHARE_READ: also deny in-place reparse changes
-                    None,
-                    3,
-                    0x02000000 | 0x00200000,
-                    None,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
-                )
-                if handle is None or handle == c.c_void_p(-1).value:
-                    raise WindowsEvidenceProtectionError(
-                        "protected_directory_unavailable"
+                for attempt in range(4):
+                    handle = self._kernel.CreateFileW(
+                        str(component),
+                        access,
+                        0x01,  # FILE_SHARE_READ: also deny in-place reparse changes
+                        None,
+                        3,
+                        0x02000000 | 0x00200000,
+                        None,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
                     )
+                    if handle is not None and handle != c.c_void_p(-1).value:
+                        break
+                    winerror = c.get_last_error()
+                    delay = next(retry_delays, None) if winerror == 32 else None
+                    if delay is None or attempt == 3:
+                        raise WindowsEvidenceProtectionError(
+                            "protected_directory_unavailable", winerror=winerror, api="CreateFileW"
+                        )
+                    time.sleep(delay)
                 handles.append(handle)
                 attributes = _FileAttributes()
                 if not self._kernel.GetFileInformationByHandleEx(
                     handle, 9, c.byref(attributes), c.sizeof(attributes)
                 ):
                     raise WindowsEvidenceProtectionError(
-                        "protected_directory_unavailable"
+                        "protected_directory_unavailable", winerror=c.get_last_error(), api="GetFileInformationByHandleEx"
                     )
                 if (
                     not attributes.attributes & _FILE_ATTRIBUTE_DIRECTORY

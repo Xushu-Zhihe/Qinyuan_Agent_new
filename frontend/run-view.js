@@ -679,6 +679,7 @@ const RunView = (() => {
     const historicalUnknown = progress.recovery?.reason === "execution_outcome_unknown" || current.run?.result?.recovery?.reason === "execution_outcome_unknown";
     if (progress.recovery?.reason === "state_or_evidence_unreadable") stop.append(node("strong", "状态或证据读取失败，当前视图无法确认"));
     else if (live) stop.append(node("strong", "运行中，持续读取已提交状态"));
+    else if (current.run?.status === "paused" && (progress.recovery?.required || current.run?.result?.recovery?.required)) stop.append(node("strong", "已停止，需要显式恢复 · 未自动重新执行"));
     else if (current.run?.status === "paused") stop.append(node("strong", "已暂停，Sandbox 保留"));
     else if (current.run?.status === "cleanup_confirmed" && historicalUnknown) stop.append(node("strong", "任务已结束并清理 · 历史 Execution 结果仍未知"));
     else if (current.run?.status === "recovery_required" || progress.recovery?.required) stop.append(node("strong", "需要显式恢复 · 未自动重新执行"));

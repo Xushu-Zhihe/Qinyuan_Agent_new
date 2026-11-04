@@ -317,13 +317,22 @@ function toggleModelMode(mode) { const isSingle = mode === "single"; $("mode-sin
 function renderWindowsSecurityHint() {
   const value = state.windowsSecurity;
   const realMode = $("run-mode-control").hidden ? state.executionProfile === "d7" : $("run-mode").value === "real";
-  $("windows-security-hint").hidden = !value?.supported || !realMode || (value.verified && value.status === "excluded" && !value.busy);
+  $("windows-security-hint").hidden = !value?.supported || !realMode || (value.verified && value.status === "excluded" && value.evidence_access?.status === "passed" && !value.busy);
 }
 function renderWindowsSecurity(value) {
   state.windowsSecurity = value;
-  const statuses = { excluded: "已核验：证据目录排除已生效", not_excluded: "已核验：证据目录未被排除", unknown: "无法确认当前配置", not_applicable: "当前服务不在 Windows 上，无需此配置" };
+  const statuses = { excluded: "已核验：证据目录排除已生效", not_excluded: "已核验：证据目录未被排除", partial: "已核验：部分证据目录排除生效", unknown: "无法确认当前配置", not_applicable: "当前服务不在 Windows 上，无需此配置" };
   const failures = { script_execution_blocked: "配置助手被脚本策略阻止，尚未执行 Defender 检查", helper_result_read_failed: "检查回执读取失败，配置状态未确认" };
   $("security-status").textContent = value.busy ? "正在等待管理员确认或执行检查…" : failures[value.reason] || statuses[value.status] || statuses.unknown;
+  const access = value.evidence_access || {};
+  if (!value.busy && access.status === "failed") $("security-status").textContent = "证据读写自检失败，当前配置尚未就绪";
+  const accessTarget = $("security-evidence-access");
+  if (accessTarget) {
+    const protection = access.evidence_protection || {};
+    const codes = (access.error_codes || []).join(" / ");
+    const winerror = protection.winerror ?? access.winerror;
+    accessTarget.textContent = value.busy ? "正在配置或验证…" : access.status === "passed" ? "已通过：当前用户可创建、加密写入并读取 HTTP 证据" : access.status === "failed" ? `失败：${codes || "证据目录访问或清理失败"}${winerror != null ? ` · Windows 错误 ${winerror}` : ""}。请检查目录权限及占用；仍可手动启动。` : "尚未验证当前用户的证据读写";
+  }
   const reasons = {
     not_checked: "尚未核验；普通权限下看不到排除项，不代表没有配置。",
     awaiting_administrator_or_check: "请在 Windows 管理员提示中确认；本页自动更新操作结果。",
@@ -342,11 +351,14 @@ function renderWindowsSecurity(value) {
     use_windows_powershell_exe: "请使用 Windows PowerShell 5.1 运行脚本。",
     windows_only: "此页面只管理 Windows 主机的 Microsoft Defender。",
   };
-  $("security-reason").textContent = reasons[value.reason] || (value.action === "Remove" && value.exact_rule_present === false ? (value.status === "excluded" ? "本项目精确规则已撤销，但其他规则仍将此目录排除。" : "本项目精确规则已撤销。") : "结果为最近一次实际检查；外部更改后请重新检查。");
-  $("security-diagnostic").textContent = [value.reason, value.error_type, value.exit_code == null ? null : `exit=${value.exit_code}`, value.errno == null ? null : `errno=${value.errno}`, value.winerror == null ? null : `winerror=${value.winerror}`].filter(Boolean).join(" · ");
+  const partialReason = value.status === "partial" ? "部分目录已排除；逐目录状态见诊断，未排除目录仍受 Defender 扫描。" : null;
+  $("security-reason").textContent = partialReason || reasons[value.reason] || (value.action === "Remove" && value.exact_rule_present === false ? (value.status === "excluded" ? "本项目精确规则已撤销，但其他规则仍将此目录排除。" : "本项目精确规则已撤销。") : "结果为最近一次实际检查；外部更改后请重新检查。");
+  const paths = Array.isArray(value.paths) ? value.paths : [];
+  const exact = paths.length ? paths.filter(item => item.exact_rule_present).length : null;
+  $("security-diagnostic").textContent = [value.reason, value.error_type, value.exit_code == null ? null : `exit=${value.exit_code}`, value.errno == null ? null : `errno=${value.errno}`, value.winerror == null ? null : `winerror=${value.winerror}`, ...paths.map(item => `${item.leaf || "?"}:${item.status || "unknown"}`)].filter(Boolean).join(" · ");
   $("security-data-dir").textContent = value.data_dir || "—";
-  $("security-pattern").textContent = value.pattern || "—";
-  $("security-rule").textContent = value.busy || value.exact_rule_present == null ? "尚未核验" : value.exact_rule_present ? "存在" : "不存在（其他规则仍可能覆盖）";
+  $("security-pattern").textContent = (Array.isArray(value.patterns) && value.patterns.length ? value.patterns.join(" · ") : value.pattern) || "—";
+  $("security-rule").textContent = value.busy || value.exact_rule_present == null ? "尚未核验" : exact == null ? (value.exact_rule_present ? "存在" : "不存在（其他规则仍可能覆盖）") : `${exact}/${paths.length} 存在${exact === paths.length ? "" : "（部分缺失）"}`;
   const flag = v => v == null ? "未知" : v ? "开启" : "关闭";
   $("security-protection").textContent = `${flag(value.real_time_protection_enabled)} / ${flag(value.tamper_protected)}`;
   $("security-checked-at").textContent = value.checked_at ? new Date(value.checked_at).toLocaleString() : "尚未检查";

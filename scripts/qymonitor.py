@@ -612,6 +612,82 @@ def review_report(run_dir, con, calls, operations, requests):
         inconsistent_fence_ids=sorted(set(fences) & tools.keys()))
 
 
+def intent_revision_report(run_dir, con, operations, requests):
+    """Read exact correction branches; unknown application timing stays unknown."""
+    branches = {r["branch_id"]: dict(r) for r in query(con,
+        "select branch_id,proposal_operation_id,review_operation_id from stage_branches")}
+    queue = {r["proposal_operation_id"]: dict(r) for r in query(con,
+        "select proposal_operation_id,review_operation_id,state from stage_review_queue")}
+    commits = {r["mutation_id"]: r["committed_at"] for r in query(con,
+        "select mutation_id,committed_at from control_mutations")}
+    def finished(identity):
+        return operations.get(identity, {}).get("end", {}).get("finished_at")
+    def applied(identity):
+        return commits.get(operations.get(identity, {}).get("application"))
+    def elapsed(start, end):
+        return end - start if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end >= start else None
+    def result_value(identity):
+        result = read_payload(run_dir / "stage-evidence" / ("stage-result-" + str(identity) + ".json"))
+        if result.get("outcome") != "valid":
+            return None
+        content = result.get("content")
+        if isinstance(content, str) and not result.get("tool_calls"):
+            try:
+                content = json.loads(content)
+            except ValueError:
+                return None
+        if result.get("tool_calls"):
+            try:
+                content = json.loads(result["tool_calls"][0]["function"]["arguments"])["result"]
+            except (KeyError, IndexError, TypeError, ValueError):
+                return None
+        return content if isinstance(content, dict) else {}
+    def decision(identity):
+        return (result_value(identity) or {}).get("decision")
+    successors = {}
+    for identity in queue:
+        request = requests.get(identity, {})
+        runtime = (request.get("execution_context") or {}).get("stage_runtime") or {}
+        branch = branches.get(runtime.get("branch_id"), {})
+        review_id = branch.get("review_operation_id")
+        prior = requests.get(review_id, {}).get("proposal")
+        current = result_value(identity) or {}
+        if ("completion_criterion" in current and isinstance(prior, dict)
+                and "completion_criterion" in prior and decision(review_id) == "revise"):
+            successors.setdefault(branch["proposal_operation_id"], []).append(identity)
+    roots = {identity for identity, entry in queue.items()
+        if entry["review_operation_id"] and decision(entry["review_operation_id"]) == "revise"
+        and isinstance(requests.get(entry["review_operation_id"], {}).get("proposal"), dict)
+        and "completion_criterion" in requests[entry["review_operation_id"]]["proposal"]}
+    roots -= {identity for items in successors.values() for identity in items}
+    rows = []
+    for root in sorted(roots):
+        chain, current = [], root
+        while current not in chain:
+            chain.append(current)
+            following = successors.get(current, [])
+            if len(following) != 1:
+                break
+            current = following[0]
+        first_review = queue.get(root, {}).get("review_operation_id")
+        last = queue.get(chain[-1], {})
+        last_review = last.get("review_operation_id")
+        accepted = last.get("state") == "settled" and decision(last_review) == "accept"
+        rows.append(dict(proposal_ids=chain, state="accepted" if accepted else last.get("state", "unknown"),
+            decision=decision(last_review), ambiguous_successor=len(successors.get(chain[-1], [])) > 1,
+            closed_loop_seconds=elapsed(finished(first_review), applied(last_review)) if accepted else None,
+            after_revise_applied_seconds=elapsed(applied(first_review), applied(last_review)) if accepted else None,
+            observed_wait_seconds=elapsed(finished(first_review), max(
+                (o.get("end", {}).get("finished_at") for o in operations.values()
+                 if isinstance(o.get("end", {}).get("finished_at"), (int, float))), default=None)) if not accepted else None,
+            attempts=[dict(proposal_operation_id=p, review_operation_id=queue.get(p, {}).get("review_operation_id"),
+                proposal_started_at=operations.get(p, {}).get("start", {}).get("started_at"),
+                proposal_finished_at=finished(p), review_started_at=operations.get(queue.get(p, {}).get("review_operation_id"), {}).get("start", {}).get("started_at"),
+                review_finished_at=finished(queue.get(p, {}).get("review_operation_id")),
+                review_applied_at=applied(queue.get(p, {}).get("review_operation_id"))) for p in chain]))
+    return rows
+
+
 def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
     """Read-only observations for comparison, not a causal ROI/quality score."""
     calls = {c["id"]: c for c in load_calls(run_dir, con)}
@@ -680,6 +756,7 @@ def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
     model_union = interval_seconds(intervals) if intervals else None
     plan_union = interval_seconds(plan_intervals) if intervals else None
     return dict(stages=grouped, planning_stages=sorted(planning), outcomes=outcomes,
+        intent_revision_chains=intent_revision_report(run_dir, con, operations, requests),
         reviews=review_report(run_dir, con, calls, operations, requests),
         unreadable_ledger_rows=unreadable_rows,
         model_interval_union_seconds=model_union, planning_interval_union_seconds=plan_union,
@@ -689,6 +766,7 @@ def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
             "Applied includes consumed rejected proposals; it does not mean accepted or successful.",
             "Achievements/Facts are stored records, not a fresh validity judgment; task_status may lag a recorded stop.",
             "Outcomes are observations, not proof that planning caused improvement; compare matched tasks/configurations.",
+            "Intent revision chains use stored branch links; missing or unreadable decisions are unknown. Unfinished wait ends at the last observed ledger completion.",
             "Reasoning tokens are part of completion tokens; never add them again.",
             "Semantic duplicate work and exploration beyond the criterion are not inferred from counts.",
             "Review overlap uses completed ledger intervals; it is not wall-clock time saved. Unsettled intervals are excluded.",

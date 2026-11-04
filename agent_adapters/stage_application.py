@@ -383,6 +383,37 @@ class StageApplication:
             messages=messages, capacity_recovery_of=request.model_request_id,
             context=replace(request.context, history=history), frozen_contract_ref=None)
 
+    def _intent_revision(self, stage, session, branch, proposal_id, proposal):
+        """Project the exact author correction; never infer ancestry from text."""
+        if session.scope != "turn_planning":
+            return None
+        if stage == "stage_review" and isinstance(proposal, TurnIntent):
+            source = self.evidence.request(proposal_id)
+            prior = stage_runtime(source).get("intent_revision")
+            if prior is None:
+                return None
+            old_id, review_id = prior["proposal_operation_id"], prior["review_operation_id"]
+        elif stage in {"stage_intent", "stage_continuation"} and branch and branch.review_operation_id:
+            old_id, review_id = branch.proposal_operation_id, branch.review_operation_id
+        else:
+            return None
+        original = self.evidence.read_model_result(self.store.load_d4_operation(old_id))
+        if not isinstance(original.result, TurnIntent):
+            return None
+        if (self.evidence.request(old_id).context.session != session
+                or old_id not in self.evidence.review_rejections(review_id)):
+            raise StageRecoveryRequired("stage.branch_correction_unbound")
+        review = self.evidence.read_model_result(self.store.load_d4_operation(review_id)).result
+        if review.decision != "revise":
+            return None
+        previous = asdict(original.result)
+        value = {"proposal_operation_id": old_id, "review_operation_id": review_id,
+            "previous_proposal": previous, "feedback": asdict(review)}
+        if isinstance(proposal, TurnIntent):
+            current = asdict(proposal)
+            value["changed_fields"] = [key for key in previous if previous[key] != current[key]]
+        return value
+
     def _request(self, stage, session, *, proposal_id=None, proposal=None):
         # Only synchronous stages resume an outstanding proposal directly.
         if stage not in {"stage_review", "stage_supervision", "stage_summary"}:
@@ -461,6 +492,9 @@ class StageApplication:
                 if entry.state in {"pending", "blocked"}
                 and (self.evidence.request(entry.proposal_operation_id).context.session == session
                     or entry.proposal_operation_id in visible)]}
+        revision = self._intent_revision(stage, session, branch, proposal_id, proposal)
+        if revision is not None:
+            runtime["intent_revision"] = revision
         if (self.goal is not None and self.goal_validation == "external"
                 and not self.store.list_d7_answer_candidates(self.task_id)
                 and any(i.record_type == "progress" and i.identity == "tool_observation_not_fact"

@@ -10,8 +10,8 @@ def _request(stage):
     return SimpleNamespace(stage=stage)
 
 
-def test_anchor_guidance_only_enters_planning_and_action_stages():
-    assert anchor_search_guidance(_request("stage_roads")) == ANCHOR_SEARCH_GUIDANCE
+def test_anchor_guidance_only_enters_action_stage():
+    assert anchor_search_guidance(_request("stage_roads")) == ""
     assert anchor_search_guidance(_request("stage_action")) == ANCHOR_SEARCH_GUIDANCE
     assert anchor_search_guidance(_request("stage_completion")) == ""
     assert anchor_search_guidance(_request("stage_review")) == ""

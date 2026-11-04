@@ -13,7 +13,17 @@ function Test-DefenderSetupAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Test-DefenderEvidencePath([string]$Root) {
+function Get-DefenderEvidenceLeaves {
+    return @('stage-evidence', 'd7-http-evidence', 'sensitive-evidence')
+}
+
+function Get-DefenderEvidencePatterns([string]$Root) {
+    return @(Get-DefenderEvidenceLeaves | ForEach-Object {
+        Join-Path $Root ('runs\*\agent-state\*\' + $_)
+    })
+}
+
+function Test-DefenderEvidencePath([string]$Root, [string]$Leaf) {
     $tool = Get-ChildItem -Path "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
     if (-not $tool) { $tool = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe' }
@@ -23,7 +33,7 @@ function Test-DefenderEvidencePath([string]$Root) {
     $probe = Join-Path $runs ([Guid]::NewGuid().ToString('D'))
     $agentState = Join-Path $probe 'agent-state'
     $task = Join-Path $agentState ([Guid]::NewGuid().ToString('D'))
-    $evidence = Join-Path $task 'stage-evidence'
+    $evidence = Join-Path $task $Leaf
     # Only empty directories created here are removed, without recursive delete.
     try {
         New-Item -ItemType Directory -Path $evidence -Force -ErrorAction Stop | Out-Null
@@ -45,12 +55,16 @@ function Test-DefenderEvidencePath([string]$Root) {
 }
 
 function Invoke-DefenderEvidenceSetup([string]$RequestedAction, [string]$RequestedDataDir) {
-    $result = [ordered]@{action=$RequestedAction;status='unknown';reason=$null;pattern=$null;verified=$false}
+    $result = [ordered]@{
+        action=$RequestedAction; status='unknown'; reason=$null; pattern=$null; patterns=@(); paths=@(); verified=$false
+    }
     try {
         $result.reason = 'invalid_data_directory'
         if ($RequestedDataDir.IndexOfAny([char[]]'*?') -ge 0) { throw 'data_directory_must_not_contain_wildcards' }
         $root = [IO.Path]::GetFullPath($RequestedDataDir)
-        $result.pattern = Join-Path $root 'runs\*\agent-state\*\stage-evidence'
+        $patterns = @(Get-DefenderEvidencePatterns $root)
+        $result.patterns = @($patterns)
+        $result.pattern = ($patterns -join '; ')
         if ($PSVersionTable.PSEdition -ne 'Desktop') {
             $result.reason = 'use_windows_powershell_exe'
             return [pscustomobject]$result
@@ -67,11 +81,14 @@ function Invoke-DefenderEvidenceSetup([string]$RequestedAction, [string]$Request
         }
         if ($RequestedAction -eq 'Remove') {
             $result.reason = 'rule_removal_failed'
-            if ($rules -contains $result.pattern) {
-                Remove-MpPreference -ExclusionPath $result.pattern -ErrorAction Stop
+            foreach ($pattern in $patterns) {
+                if ($rules -contains $pattern) {
+                    Remove-MpPreference -ExclusionPath $pattern -ErrorAction Stop
+                }
             }
-            if (@((Get-MpPreference -ErrorAction Stop).ExclusionPath) -contains $result.pattern) {
-                throw 'rule_removal_not_confirmed'
+            $rules = @((Get-MpPreference -ErrorAction Stop).ExclusionPath)
+            foreach ($pattern in $patterns) {
+                if ($rules -contains $pattern) { throw 'rule_removal_not_confirmed' }
             }
         }
         if ($RequestedAction -eq 'Apply') {
@@ -79,26 +96,51 @@ function Invoke-DefenderEvidenceSetup([string]$RequestedAction, [string]$Request
             if (-not (Test-Path -LiteralPath $root -PathType Container)) {
                 New-Item -ItemType Directory -Path $root -Force -ErrorAction Stop | Out-Null
             }
-            if ($rules -notcontains $result.pattern) {
-                Add-MpPreference -ExclusionPath $result.pattern -ErrorAction Stop
+            foreach ($pattern in $patterns) {
+                if ($rules -notcontains $pattern) {
+                    Add-MpPreference -ExclusionPath $pattern -ErrorAction Stop
+                }
             }
-            if (@((Get-MpPreference -ErrorAction Stop).ExclusionPath) -notcontains $result.pattern) {
-                throw 'rule_write_not_confirmed_or_managed_policy'
+            $rules = @((Get-MpPreference -ErrorAction Stop).ExclusionPath)
+            foreach ($pattern in $patterns) {
+                if ($rules -notcontains $pattern) { throw 'rule_write_not_confirmed_or_managed_policy' }
             }
         }
-        $result.exact_rule_present = @((Get-MpPreference -ErrorAction Stop).ExclusionPath) -contains $result.pattern
+        $exactRules = @($patterns | ForEach-Object { $rules -contains $_ })
+        $result.exact_rules_present = @($exactRules)
+        $result.exact_rule_present = -not ($exactRules -contains $false)
         if (-not (Test-Path -LiteralPath $root -PathType Container)) {
             $result.reason = 'data_directory_not_found'
             return [pscustomobject]$result
         }
         $result.reason = 'defender_path_check_unavailable'
-        $check = Test-DefenderEvidencePath $root
-        if ($check.ExitCode -in @(0, 1)) {
-            $result.status = if ($check.ExitCode -eq 0) { 'excluded' } else { 'not_excluded' }
-            $result.verified = $true
-            $result.reason = $null
+        $pathResults = @()
+        $allVerified = $true
+        $excludedCount = 0
+        foreach ($pattern in $patterns) {
+            $leaf = Split-Path -Leaf $pattern
+            $check = Test-DefenderEvidencePath $root $leaf
+            $verified = $check.ExitCode -in @(0, 1)
+            $status = if ($check.ExitCode -eq 0) { 'excluded' } elseif ($check.ExitCode -eq 1) { 'not_excluded' } else { 'unknown' }
+            if (-not $verified) { $allVerified = $false }
+            if ($status -eq 'excluded') { $excludedCount += 1 }
+            $pathResults += [pscustomobject]@{
+                pattern = $pattern
+                leaf = $leaf
+                status = $status
+                verified = $verified
+                exit_code = $check.ExitCode
+                exact_rule_present = ($rules -contains $pattern)
+            }
         }
-        else { $result.reason = 'defender_path_check_unavailable' }
+        $result.paths = @($pathResults)
+        $result.verified = $allVerified
+        if ($allVerified) {
+            $result.reason = $null
+            if ($excludedCount -eq $patterns.Count) { $result.status = 'excluded' }
+            elseif ($excludedCount -eq 0) { $result.status = 'not_excluded' }
+            else { $result.status = 'partial' }
+        }
         # Protection flags are informational; their failure does not undo a path check.
         $protection = Get-MpComputerStatus -ErrorAction SilentlyContinue
         if ($protection) {
@@ -119,10 +161,10 @@ if ($MyInvocation.InvocationName -ne '.') {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $setupResult = Invoke-DefenderEvidenceSetup $Action $DataDir
     if ($ResultPath) {
-        [IO.File]::WriteAllText($ResultPath, ($setupResult | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($ResultPath, ($setupResult | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
     }
-    $setupResult | ConvertTo-Json -Depth 3
+    $setupResult | ConvertTo-Json -Depth 5
     if ($setupResult.status -eq 'excluded') { exit 0 }
-    if ($setupResult.status -eq 'not_excluded') { exit 1 }
+    if ($setupResult.status -in @('not_excluded', 'partial')) { exit 1 }
     exit 2
 }

@@ -206,7 +206,7 @@
               </div>
             </header>
 
-            <p id="windows-security-hint" class="run-read-error" hidden>Windows 证据目录排除尚未核验，安全扫描可能影响证据读取。<a href="#security">打开安全配置</a>；仍可继续运行。</p>
+            <p id="windows-security-hint" class="run-read-error" hidden>Windows 证据目录排除或当前用户读写尚未通过核验。<a href="#security">打开安全配置</a>；仍可手动继续运行。</p>
             <section id="run-confirmation" class="run-confirmation" aria-label="候选答案人工确认" aria-live="polite" hidden></section>
             <div id="run-stages" class="run-stages" aria-label="运行阶段"></div>
             <div id="run-summary" class="run-summary"></div>
@@ -337,7 +337,7 @@
         <section id="security-view" class="view" hidden aria-labelledby="security-title">
           <div class="page-head">
             <div><p class="eyebrow">LOCAL ENVIRONMENT</p><h1 id="security-title">Windows 安全配置</h1>
-              <p class="subheading">管理当前工作台的证据目录排除。未配置或无法核验时，仍允许开始任务。</p></div>
+              <p class="subheading">配置证据目录排除后，以工作台当前用户验证 HTTP 证据的目录权限、加密写入和读取。失败会显示原因，仍可手动开始任务。</p></div>
           </div>
           <section class="c-panel security-panel">
             <h2>Microsoft Defender · 证据目录</h2>
@@ -348,6 +348,7 @@
               <dt>数据目录</dt><dd id="security-data-dir">—</dd>
               <dt>本项目排除规则</dt><dd id="security-pattern">—</dd>
               <dt>精确规则</dt><dd id="security-rule">尚未核验</dd>
+              <dt>当前用户证据读写</dt><dd id="security-evidence-access">尚未验证</dd>
               <dt>实时保护 / 防篡改</dt><dd id="security-protection">尚未读取</dd>
               <dt>最近检查 / 操作时间</dt><dd id="security-checked-at">尚未检查</dd>
             </dl>
@@ -356,8 +357,8 @@
               <button id="security-apply" class="primary-button" type="button">配置排除（管理员）</button>
               <button id="security-remove" class="danger-button" type="button">撤销本项目规则（管理员）</button>
             </div>
-            <p class="subheading">仅排除所有运行的 stage-evidence 目录；其中保存的真实恶意样本也会跳过常规内容扫描。实时保护与防篡改设置保持原状，其他排除规则保持原状。</p>
-            <p class="subheading">点击按钮后按 Windows 管理员提示确认。配置助手的独立子进程使用 ExecutionPolicy Bypass 加载内置脚本，仅该子进程放宽脚本检查，不更改全局执行策略，组织策略和 Defender 权限限制仍有效。页面自动更新操作进度，结果以显示的核验时间为准；外部修改安全设置后请重新检查。撤销只移除上面这一条精确规则，其他规则可能仍覆盖此目录。</p>
+            <p class="subheading">一次配置覆盖所有运行的 stage-evidence、d7-http-evidence、sensitive-evidence 三个证据目录；其中保存的真实恶意样本也会跳过常规内容扫描。实时保护与防篡改设置保持原状，其他排除规则保持原状。</p>
+            <p class="subheading">点击按钮后按 Windows 管理员提示确认。配置助手的独立子进程使用 ExecutionPolicy Bypass 加载内置脚本，仅该子进程放宽脚本检查，不更改全局执行策略，组织策略和 Defender 权限限制仍有效。页面自动更新操作进度，结果以显示的核验时间为准；外部修改安全设置后请重新检查。撤销只移除上面列出的三条精确规则，其他规则可能仍覆盖这些目录。</p>
             <details><summary>脚本与故障处理</summary><p id="security-script" class="subheading"></p><p class="subheading">取消管理员确认、组织策略或脚本执行策略限制，都会显示“无法确认”；不会关闭保护、自动重试或禁止任务运行。命令行使用说明见 README 的 Windows 安全配置。</p></details>
           </section>
         </section>

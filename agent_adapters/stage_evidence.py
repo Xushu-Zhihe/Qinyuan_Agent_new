@@ -315,7 +315,8 @@ class StageEvidence:
             _fail("stage.original_evidence_changed", Category.UNKNOWN)
         contract, diagnostics = self.read("contract", identity), {}
         value = parse(request, D8ModelResponse(result["content"], result["finish_reason"], result.get("tool_calls")),
-            result_schema=contract["schema"], normalization_policy=contract.get("output_normalization"), diagnostics=diagnostics)
+            result_schema=contract["schema"], normalization_policy=contract.get("output_normalization"), diagnostics=diagnostics,
+            pending_road_policy=contract.get("planning_validation") == "retain_pending_v1")
         if result.get("normalization") != diagnostics.get("normalization"):
             _fail("stage.original_evidence_changed", Category.UNKNOWN)
         if request.proposal_operation_id is not None:

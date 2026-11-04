@@ -78,6 +78,57 @@ class Model:
         return native_response(value) if self.native else D8ModelResponse(json.dumps(value))
 
 
+@pytest.mark.parametrize("native,exhaust", [(False, False), (True, False), (True, True)])
+def test_continuation_missing_pending_roads_uses_shared_corrections(case, native, exhaust):
+    case.models.inner.native = native
+    def review(request, raw):
+        if isinstance(request.proposal, tuple):
+            raw["accepted_road_indices"] = list(range(len(request.proposal)))
+        return raw
+    case.models.outer.transform = review
+    attempts = []
+    def transform(request, raw):
+        if request.stage == "stage_roads" and not request.context.turn.roads:
+            return {"kind": "roads", "roads": [{"description": "route " + str(i), "support_refs": []} for i in range(3)]}
+        if request.stage == "stage_continuation" and len(attempts) < 3:
+            attempts.append(request)
+            if len(attempts) == 1:
+                return {"kind": "roads", "roads": [{"description": "new route", "support_refs": []}]}
+            if len(attempts) == 2:
+                return {"kind": "roads", "roads": "format error shares the same allowance"}
+            if exhaust:
+                return {"kind": "roads", "roads": [{"description": "still new only", "support_refs": []}]}
+            return {"kind": "roads", "roads": [asdict(r.candidate) for r in request.context.turn.roads
+                if r.status is IntentStatus.PENDING] + [{"description": "new route", "support_refs": []}]}
+        return raw
+    case.models.inner.transform = transform
+    if exhaust:
+        with pytest.raises(StageStateError):
+            asyncio.run(case.app.run(case.token))
+    else:
+        asyncio.run(case.app.run(case.token))
+    assert len(attempts) == 3
+    assert attempts[1].correction_of_model_request_id == attempts[0].model_request_id
+    assert attempts[2].correction_of_model_request_id == attempts[1].model_request_id
+    correction = next(e.correction for e in case.models.inner.envelopes
+        if e.request.model_request_id == attempts[1].model_request_id)
+    assert correction["reason"] == "output_business_invalid"
+    invalid = case.app.evidence.read("result", attempts[0].model_request_id)
+    old_raw = D8ModelResponse(invalid["content"], invalid["finish_reason"], invalid.get("tool_calls"))
+    # Reading an older contract preserves its original interpretation.
+    assert parse(attempts[0], old_raw, pending_road_policy=False)[0].description == "new route"
+    with pytest.raises(ValueError, match="pending_candidates_omitted"):
+        parse(attempts[0], old_raw)
+    from agent_core.stage_planning import model_contract
+    assert all(r.road_id in model_contract(attempts[1])["rules"] for r in attempts[1].context.turn.roads
+        if r.status is IntentStatus.PENDING)
+    turn = case.app.store.list_stage_turns(case.app.task_id)[0]
+    assert {r.candidate.description for r in turn.roads} >= {"route 0", "route 1", "route 2"}
+    reviewed = {r.proposal_operation_id for r in case.models.outer.calls}
+    assert not reviewed.intersection(r.model_request_id for r in attempts[:2])
+    assert (attempts[2].model_request_id in reviewed) is not exhaust
+
+
 def native_response(value):
     return D8ModelResponse("", "tool_calls", ({"id": "call_" + uuid4().hex, "type": "function",
         "function": {"name": OUTPUT_TOOL, "arguments": json.dumps({"result": value})}},))
@@ -1159,9 +1210,11 @@ def test_stage_action_tool_preparation_guidance_requires_declared_download_tool(
     assert "Tool preparation is available in this decision" not in model_contract(without_download)["rules"]
 
 
-@pytest.mark.parametrize("stage", ["stage_roads", "stage_action", "stage_review",
-    "stage_completion", "stage_continuation", "stage_supervision"])
-def test_generic_exploration_guidance_reaches_provider_without_granting_tools(stage):
+@pytest.mark.parametrize("stage,review_kind", [("stage_intent", None), ("stage_roads", None),
+    ("stage_action", None), ("stage_review", "intent"), ("stage_review", "roads"),
+    ("stage_review", "fact"), ("stage_completion", None), ("stage_continuation", None),
+    ("stage_supervision", None)])
+def test_generic_exploration_guidance_reaches_provider_without_granting_tools(stage, review_kind):
     from agent_adapters.deepseek_roles import build_payload, role_config
     from agent_adapters.public_web import SPECS
     from agent_core.actions import MCPCall
@@ -1175,25 +1228,47 @@ def test_generic_exploration_guidance_reaches_provider_without_granting_tools(st
     role = role_config("inner_action" if stage in INNER_STAGES else "outer_planning", version=17)
     local_tool = {"qualified_name": "shell.run_bash", "input_schema": {"type": "object",
         "properties": {"script": {"type": "string"}}, "required": ["script"], "additionalProperties": False}}
+    proposal = {"intent": turn.intent, "roads": (RoadCandidate("test the uncertain relation", ()),),
+        "fact": StageFactProposal("a scoped observation", "original observation", ())}.get(review_kind)
     request = StageModelRequest(str(uuid4()), context.task_run_id, stage, role.role_config_ref, 1, context,
         tools=(*SPECS, local_tool) if stage == "stage_action" else (),
-        proposal=turn.intent if stage == "stage_review" else None)
+        proposal=proposal)
     contract = model_contract(request)
     payload = build_payload(D8OutputRequest(request, {"version": 1, "stage": stage, "schema": contract["schema"]},
         contract["instruction"], None), role)
     system = payload["messages"][-2]["content"]
-    assert "answer could change the next decision" in system
-    assert "use adequate local sources directly and reuse existing retrievals" in system
-    assert "Do not search merely because a version, error or bare attempt count exists" in system
-    assert "cannot distinguish success from failure leaves that hypothesis unresolved" in system
-    assert "Separate tool or measurement failure from target counterevidence" in system
-    assert "Supervision should challenge unsupported premises" in system
-    assert "never credentials, private task/attachment content or target identifiers" in system
-    assert "public_reference_not_target_observation" in system
-    assert "validate applicability separately through authorized observations" in system
-    assert "add no fields or calls" in system
-    assert "do not reserve retrieval for a later Road" in system
-    assert "their actual contents answer the current question" in system
+    planning = stage in {"stage_intent", "stage_roads", "stage_continuation"} or review_kind in {"intent", "roads"}
+    if planning:
+        assert "Planning stops when the next deliverable and criterion, or a startable Road, are clear" in system
+        assert "uncertainty about its result is not a reason to continue solving during planning" in system
+        assert "allow brief feasibility reasoning" in system
+        assert "never private task data" in system
+        assert "Planning grants no tool or network authority" in system
+        assert "answer could change the next decision" not in system
+        assert "Supervision should challenge unsupported premises" not in system
+        assert "The task sandbox has no direct outbound network" not in system
+        assert "use it as a search anchor" not in system
+        if review_kind in {"intent", "roads"}:
+            assert "Review grounding, authority, scope and whether work can start" in system
+            assert "reject a known contradiction, not merely an unresolved outcome" in system
+        if review_kind == "intent":
+            assert "Methods and experiment recipes belong to Roads" in system
+    else:
+        assert "answer could change the next decision" in system
+        assert "use adequate local sources directly and reuse existing retrievals" in system
+        assert "Do not search merely because a version, error or bare attempt count exists" in system
+        assert "cannot distinguish success from failure leaves that hypothesis unresolved" in system
+        assert "Separate tool or measurement failure from target counterevidence" in system
+        assert "Supervision should challenge unsupported premises" in system
+        assert "never credentials, private task/attachment content or target identifiers" in system
+        assert "public_reference_not_target_observation" in system
+        assert "validate applicability separately through authorized observations" in system
+        assert "add no fields or calls" in system
+        assert "do not reserve retrieval for a later Road" in system
+        assert "their actual contents answer the current question" in system
+        assert "The task sandbox has no direct outbound network" in system
+    if stage in {"stage_roads", "stage_continuation", "stage_review", "stage_action"}:
+        assert "never silently substitute a new version or overwrite a fixed goal" in system
     assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "high"
     assert "max_tokens" not in payload
     assert len(payload["tools"]) == 1 and payload["tools"][0]["function"]["name"] == OUTPUT_TOOL

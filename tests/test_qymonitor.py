@@ -7,6 +7,44 @@ import pytest
 from scripts import qymonitor as monitor
 
 
+@pytest.mark.parametrize("accepted", [True, False])
+def test_intent_revision_chain_uses_branch_lineage_and_application_time(tmp_path, accepted):
+    db = make_run(tmp_path)
+    with sqlite3.connect(db) as con:
+        con.row_factory = sqlite3.Row
+        con.executescript("""
+            CREATE TABLE stage_branches(branch_id TEXT,proposal_operation_id TEXT,review_operation_id TEXT);
+            INSERT INTO stage_branches VALUES ('repair','old','revise');
+            CREATE TABLE stage_review_queue(proposal_operation_id TEXT,review_operation_id TEXT,state TEXT);
+            INSERT INTO stage_review_queue VALUES ('old','revise','settled');
+            CREATE TABLE control_mutations(mutation_id TEXT,committed_at REAL);
+            INSERT INTO control_mutations VALUES ('apply-revise',15),('apply-accept',40);
+        """)
+        con.execute("INSERT INTO stage_review_queue VALUES (?,?,?)", ('new', 'accept' if accepted else None,
+            'settled' if accepted else 'pending'))
+        requests = {'revise': {'proposal': {'completion_criterion': 'old criterion'}},
+            'new': {'execution_context': {'stage_runtime': {'branch_id': 'repair'}}}}
+        operations = {'revise': {'end': {'finished_at': 10}, 'application': 'apply-revise'},
+            'new': {'start': {'started_at': 16}, 'end': {'finished_at': 22}},
+            'accept': {'start': {'started_at': 23}, 'end': {'finished_at': 30},
+                       'application': 'apply-accept' if accepted else None}}
+        for identity, verdict in [('revise', 'revise'), ('accept', 'accept')]:
+            (tmp_path / 'stage-evidence' / ('stage-result-' + identity + '.json')).write_text(json.dumps({
+                'outcome': 'valid', 'content': '', 'tool_calls': [{'function': {
+                    'arguments': json.dumps({'result': {'decision': verdict}})}}]}))
+        (tmp_path / 'stage-evidence' / 'stage-result-new.json').write_text(json.dumps({
+            'outcome': 'valid', 'content': json.dumps({'kind': 'turn_intent', 'completion_criterion': 'fixed'})}))
+        con.execute("INSERT INTO stage_review_queue VALUES ('unrelated-road',NULL,'pending')")
+        requests['unrelated-road'] = requests['new']
+        (tmp_path / 'stage-evidence' / 'stage-result-unrelated-road.json').write_text(json.dumps({
+            'outcome': 'valid', 'content': json.dumps({'kind': 'roads', 'roads': []})}))
+        rows = monitor.intent_revision_report(tmp_path, con, operations, requests)
+    assert len(rows) == 1 and rows[0]['proposal_ids'] == ['old', 'new']
+    assert rows[0]['closed_loop_seconds'] == (30 if accepted else None)
+    assert rows[0]['after_revise_applied_seconds'] == (25 if accepted else None)
+    assert rows[0]['state'] == ('accepted' if accepted else 'pending')
+
+
 def make_run(tmp_path):
     db = tmp_path / "control.sqlite"
     with sqlite3.connect(db) as con:

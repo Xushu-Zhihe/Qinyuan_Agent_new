@@ -29,6 +29,7 @@ def test_explicit_operation_scope_progress_and_single_admission(tmp_path, monkey
                 "real_time_protection_enabled": True, "unrelated_secret": "do-not-project"}
 
     monkeypatch.setattr(setup, "_invoke", invoke)
+    monkeypatch.setattr(setup, "_probe_evidence_access", lambda: {"status": "passed"})
     assert setup.snapshot()["reason"] == "not_checked"
     assert actions == []  # GET/snapshot must never launch a process or show UAC.
     assert setup.start("Apply")["busy"] is True
@@ -44,8 +45,48 @@ def test_explicit_operation_scope_progress_and_single_admission(tmp_path, monkey
     assert final["status"] == "excluded" and final["verified"] and not final["busy"]
     assert final["checked_at"] and "unrelated_secret" not in final
     assert final["data_dir"] == str(setup.root)
-    assert final["pattern"] == str(setup.root / "runs" / "*" / "agent-state" / "*" / "stage-evidence")
+    assert final["pattern"] == "; ".join(setup.patterns)
+    assert final["patterns"] == setup.patterns
     assert actions == ["Apply"]
+    assert final["evidence_access"]["status"] == "passed"
+
+
+@pytest.mark.parametrize("action", ["Apply", "Check"])
+def test_verified_exclusion_does_not_hide_runtime_access_failure(tmp_path, monkeypatch, action):
+    setup = WindowsSecuritySetup(tmp_path)
+    setup.supported = True
+    monkeypatch.setattr(setup, "_invoke", lambda action: {"verified": True, "status": "excluded"})
+    monkeypatch.setattr(setup, "_probe_evidence_access", lambda: {"status": "failed", "winerror": 5})
+    setup.start(action)
+    setup.worker.join(3)
+    state = setup.snapshot()
+    assert state["status"] == "excluded" and state["verified"]
+    assert state["evidence_access"] == {"status": "failed", "winerror": 5}
+    assert not state["busy"]
+
+
+def test_access_probe_failure_is_safe_and_cleans_only_its_temp_directory(tmp_path, monkeypatch):
+    from agent_adapters.windows_evidence_protection import WindowsEvidenceProtectionError
+    def denied(*args, **kwargs):
+        raise WindowsEvidenceProtectionError("protected_directory_unavailable", winerror=5, api="CreateFileW")
+    monkeypatch.setattr("agent_adapters.web.http_adapter.D7HttpResponseEvidenceStore", denied)
+    setup = WindowsSecuritySetup(tmp_path)
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    original = runs / "existing-run"
+    original.mkdir()
+    (original / "keep").write_text("unchanged")
+    result = setup._probe_evidence_access()
+    assert result["status"] == "failed" and result["evidence_protection"]["winerror"] == 5
+    assert str(tmp_path) not in str(result)
+    assert list(runs.iterdir()) == [original]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real local Windows evidence roundtrip")
+def test_runtime_access_probe_uses_real_store_without_defender_changes(tmp_path):
+    result = WindowsSecuritySetup(tmp_path)._probe_evidence_access()
+    assert result == {"status": "passed"}
+    assert list((tmp_path / "runs").iterdir()) == []
 
 
 @pytest.mark.parametrize("failure", ["cancelled", "invalid_result", "blocked"])
@@ -120,9 +161,12 @@ def test_powershell_check_apply_remove_with_fake_defender(tmp_path):
     $definitions = $ast.FindAll({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst]}, $false)
     foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
     $script:rules = @('C:\unrelated-exclusion')
-    $script:admin = $true; $script:probe = 1; $script:adds = 0
+    $script:admin = $true; $script:probe = 1; $script:adds = 0; $script:partial_leaf = $null
     function Test-DefenderSetupAdministrator { return $script:admin }
-    function Test-DefenderEvidencePath([string]$Root) { return [pscustomobject]@{ExitCode=$script:probe} }
+    function Test-DefenderEvidencePath([string]$Root, [string]$Leaf) {
+        $code = if ($script:partial_leaf -and $Leaf -eq $script:partial_leaf) { 1 } else { $script:probe }
+        return [pscustomobject]@{ExitCode=$code}
+    }
     function Get-MpPreference { [CmdletBinding()]param() return [pscustomobject]@{ExclusionPath=$script:rules} }
     function Add-MpPreference { [CmdletBinding()]param([string]$ExclusionPath)
         $script:rules += $ExclusionPath; $script:adds += 1; $script:probe = 0 }
@@ -134,6 +178,9 @@ def test_powershell_check_apply_remove_with_fake_defender(tmp_path):
     $before = Invoke-DefenderEvidenceSetup Check $root
     $applied = Invoke-DefenderEvidenceSetup Apply $root
     $again = Invoke-DefenderEvidenceSetup Apply $root
+    $script:partial_leaf = 'd7-http-evidence'
+    $partial = Invoke-DefenderEvidenceSetup Check $root
+    $script:partial_leaf = $null
     $removed = Invoke-DefenderEvidenceSetup Remove $root
     $remaining = @($script:rules)
     $script:probe = 0
@@ -145,7 +192,7 @@ def test_powershell_check_apply_remove_with_fake_defender(tmp_path):
     $blocked = Invoke-DefenderEvidenceSetup Apply $root
     $tokens=$null; $errors=$null
     [System.Management.Automation.Language.Parser]::ParseFile(SCRIPT, [ref]$tokens, [ref]$errors) | Out-Null
-    [ordered]@{before=$before;applied=$applied;again=$again;removed=$removed;remaining=$remaining;
+    [ordered]@{before=$before;applied=$applied;again=$again;partial=$partial;removed=$removed;remaining=$remaining;
         broader=$broader;adds=$script:adds;unprivileged=$unprivileged;blocked=$blocked;parse_errors=@($errors).Count} | ConvertTo-Json -Depth 5
     """.replace("SCRIPT", _ps_literal(str(script))).replace("ROOT", _ps_literal(str(tmp_path)))
     powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
@@ -156,7 +203,9 @@ def test_powershell_check_apply_remove_with_fake_defender(tmp_path):
     assert data["parse_errors"] == 0
     assert data["before"]["status"] == "not_excluded"
     assert data["applied"]["status"] == "excluded" and data["applied"]["exact_rule_present"] is True
-    assert data["again"]["verified"] and data["adds"] == 1
+    assert len(data["applied"]["patterns"]) == 3 and len(data["applied"]["paths"]) == 3
+    assert data["again"]["verified"] and data["adds"] == 3
+    assert data["partial"]["status"] == "partial" and data["partial"]["verified"] is True
     assert data["removed"]["status"] == "not_excluded" and data["removed"]["exact_rule_present"] is False
     assert data["remaining"] == ["C:\\unrelated-exclusion"]
     assert data["broader"]["status"] == "excluded" and data["broader"]["exact_rule_present"] is False

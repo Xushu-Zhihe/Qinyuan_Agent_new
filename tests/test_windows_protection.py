@@ -51,6 +51,68 @@ def test_current_user_identity_is_stable(protection) -> None:
     assert WindowsEvidenceProtection().identity == protection.identity
 
 
+@pytest.mark.parametrize("winerror", [5, 32])
+def test_directory_open_error_retains_only_safe_diagnostics(protection, tmp_path, monkeypatch, winerror):
+    from agent_adapters.output_evidence import safe_failure_details
+    def fail(*args):
+        c.set_last_error(winerror)
+        return c.c_void_p(-1).value
+    monkeypatch.setattr(protection._kernel, "CreateFileW", fail)
+    with pytest.raises(WindowsEvidenceProtectionError) as caught:
+        protection.verify_directory(tmp_path / "private-path")
+    details = safe_failure_details(caught.value)
+    assert details["evidence_protection"] == {"code": "protected_directory_unavailable",
+        "api": "CreateFileW", "winerror": winerror}
+    assert details["exception_types"] == ["WindowsEvidenceProtectionError"]
+    assert "private-path" not in str(details)
+
+
+def test_directory_writer_contention_is_a_sharing_violation(protection, tmp_path):
+    directory = tmp_path / "protected"
+    directory.mkdir()
+    protection.restrict_directory(directory)
+    writer = protection._kernel.CreateFileW(str(directory), 0x40000000, 7, None, 3, 0x02000000, None)
+    assert writer not in (None, c.c_void_p(-1).value)
+    try:
+        with pytest.raises(WindowsEvidenceProtectionError) as caught:
+            protection.verify_directory(directory)
+        assert caught.value.context["winerror"] == 32
+    finally:
+        protection._kernel.CloseHandle(writer)
+    protection.verify_directory(directory)
+
+
+def test_short_directory_writer_contention_recovers_without_relaxing_acl(protection, tmp_path):
+    import threading
+    directory = tmp_path / "protected"
+    directory.mkdir()
+    protection.restrict_directory(directory)
+    writer = protection._kernel.CreateFileW(str(directory), 0x40000000, 7, None, 3, 0x02000000, None)
+    assert writer not in (None, c.c_void_p(-1).value)
+    release = threading.Timer(0.025, protection._kernel.CloseHandle, args=(writer,))
+    release.start()
+    try:
+        protection.verify_directory(directory)
+    finally:
+        release.join()
+
+
+@pytest.mark.parametrize("winerror,expected_calls", [(5, 1), (32, 4), (2, 1)])
+def test_only_sharing_violation_retries_with_bounded_wait(protection, tmp_path, monkeypatch, winerror, expected_calls):
+    waits, calls = [], []
+    def fail(*args):
+        calls.append(args)
+        c.set_last_error(winerror)
+        return c.c_void_p(-1).value
+    monkeypatch.setattr(protection._kernel, "CreateFileW", fail)
+    monkeypatch.setattr("agent_adapters.windows_evidence_protection.time.sleep", waits.append)
+    with pytest.raises(WindowsEvidenceProtectionError):
+        protection.verify_directory(tmp_path)
+    assert len(calls) == expected_calls
+    assert waits == ([0.05, 0.1, 0.2] if winerror == 32 else [])
+    assert all(args[2] == 1 for args in calls)
+
+
 @pytest.mark.parametrize("value", (b"", b"test-evidence-value", bytes(range(256))))
 def test_dpapi_round_trip_requires_same_entropy(protection, value) -> None:
     ciphertext = protection.protect(value, b"run-and-evidence-binding")
