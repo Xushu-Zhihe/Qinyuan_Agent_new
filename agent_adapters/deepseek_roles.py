@@ -330,8 +330,9 @@ def _stage_input(request):
     environment = context.pop("execution_context")
     if environment is not None and "stage_runtime" in environment:
         context["review_status"] = {"pending_reviews": environment["stage_runtime"].get("pending_reviews", [])}
-        if "intent_revision" in environment["stage_runtime"]:
-            context["intent_revision"] = environment["stage_runtime"]["intent_revision"]
+        for key in ("intent_revision", "action_stall", "slow_action", "fact_revisions"):
+            if key in environment["stage_runtime"]:
+                context[key] = environment["stage_runtime"][key]
     history = []
     for message in context.pop("messages"):
         content = message["content"]

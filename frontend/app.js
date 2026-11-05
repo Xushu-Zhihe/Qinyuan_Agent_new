@@ -5,6 +5,7 @@ const $ = (id) => document.getElementById(id);
 let toastTimer;
 let runPoll;
 let runSelection = 0;
+let runRead = null;
 let securityPoll;
 const pendingLiveControls = new Map();
 const liveControlErrors = {
@@ -163,6 +164,7 @@ function setHttpMethods(methods = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PAT
   document.querySelectorAll('[name="http-method"]').forEach((input) => { input.checked = methods.includes(input.value); input.disabled = !!state.selected && state.tasks.find((task) => task.id === state.selected)?.status !== "draft"; });
 }
 function resetForm() {
+  runRead?.abort();
   $("user-hint-content").value = "";
   setHttpMethods();
   runSelection += 1; RunView.reset(); $("run-panel").hidden = true;
@@ -170,11 +172,13 @@ function resetForm() {
 }
 function selectTask(id, navigate = true) {
   const task = state.tasks.find((item) => item.id === id); if (!task) return;
+  const changed = state.selected !== id;
+  if (changed) { runRead?.abort(); RunView.reset(); }
   if (state.selected !== id) {
     $("user-hint-content").value = pendingLiveControls.get(`${id}/user_hint`)?.value.payload.content || "";
     $("user-hint-status").textContent = "下一次新决策可读取；不会打断当前生成，也不会自动成为已验证事实。";
   }
-  clearTimeout(runPoll); runSelection += 1; RunView.reset(); state.selected = id; $("task-id").value = task.id; $("task-title").value = task.title; $("task-category").value = task.category; $("task-deadline").value = task.deadline_minutes || 60; $("step-timeout").value = task.step_timeout_seconds || 60; $("task-endpoint").value = task.endpoint; $("task-description").value = task.description; const flagHeadInput = $("task-flag-head"); if (flagHeadInput) flagHeadInput.value = task.flag_head || ""; setHttpMethods(task.http_methods); $("editor-title").textContent = "题目详情"; $("editor-state").textContent = task.archived ? "已归档" : task.status; $("detail-task-title").textContent = task.title; $("detail-task-status").textContent = task.archived ? "已归档" : statusLabel(task)[1]; $("task-actions").hidden = false; $("archive-task").hidden = task.archived; $("restore-task").hidden = !task.archived; $("purge-task").hidden = !task.archived; state.pendingFiles = []; renderAttachments(); renderSavedAttachments(task); if (navigate) showView("detail"); renderRun(task.run); renderTaskList(); refreshRun(id, runSelection);
+  clearTimeout(runPoll); runSelection += 1; state.selected = id; $("task-id").value = task.id; $("task-title").value = task.title; $("task-category").value = task.category; $("task-deadline").value = task.deadline_minutes || 60; $("step-timeout").value = task.step_timeout_seconds || 60; $("task-endpoint").value = task.endpoint; $("task-description").value = task.description; const flagHeadInput = $("task-flag-head"); if (flagHeadInput) flagHeadInput.value = task.flag_head || ""; setHttpMethods(task.http_methods); $("editor-title").textContent = "题目详情"; $("editor-state").textContent = task.archived ? "已归档" : task.status; $("detail-task-title").textContent = task.title; $("detail-task-status").textContent = task.archived ? "已归档" : statusLabel(task)[1]; $("task-actions").hidden = false; $("archive-task").hidden = task.archived; $("restore-task").hidden = !task.archived; $("purge-task").hidden = !task.archived; state.pendingFiles = []; renderAttachments(); renderSavedAttachments(task); if (navigate) showView("detail"); if (changed) renderRun(task.run); renderTaskList(); refreshRun(id, runSelection);
 }
 function renderRun(run, events = [], progress = null) {
   const active = ["starting", "running", "cancelling", "cleaning", "paused", "recovery_required"].includes(run?.status);
@@ -201,19 +205,28 @@ function renderRun(run, events = [], progress = null) {
 }
 async function refreshRun(id, selection = runSelection) {
   if (state.selected !== id || selection !== runSelection) return;
+  clearTimeout(runPoll);
+  runRead?.abort();
+  const reader = new AbortController(); runRead = reader;
+  const timeout = setTimeout(() => reader.abort(), 15000);
   try {
-    const data = await request(`/api/challenges/${id}/progress`);
-    if (state.selected !== id || selection !== runSelection) return;
+    const data = await request(`/api/challenges/${id}/progress`, { signal: reader.signal, cache: "no-store" });
+    if (runRead !== reader || state.selected !== id || selection !== runSelection) return;
     $("run-read-error").hidden = true;
     renderRun(data.run, data.events, data.progress);
     const task = state.tasks.find((item) => item.id === id);
     if (task && data.run) { task.run = { ...data.run, result: data.progress || data.run.result }; task.status = data.run.status; $("editor-state").textContent = task.status; $("detail-task-status").textContent = statusLabel(task)[1]; renderTaskList(); }
   } catch (error) {
-    if (state.selected !== id || selection !== runSelection) return;
-    $("run-read-error").hidden = false; $("run-read-error").textContent = `进度读取失败，保留上次快照：${error.message}`;
+    if (runRead !== reader || state.selected !== id || selection !== runSelection) return;
+    $("run-read-error").hidden = false; $("run-read-error").textContent = reader.signal.aborted
+      ? "进度读取超时，保留上次快照并重试。" : `进度读取失败，保留上次快照：${error.message}`;
+  } finally {
+    clearTimeout(timeout);
   }
-  if (state.selected === id && selection === runSelection && ["starting", "running", "cancelling", "cleaning"].includes(state.tasks.find((task) => task.id === id)?.run?.status)) {
-    clearTimeout(runPoll); runPoll = setTimeout(() => refreshRun(id, selection), 1000);
+  if (runRead === reader && state.selected === id && selection === runSelection) {
+    runRead = null;
+    const live = LIVE_STATUSES.includes(state.tasks.find((task) => task.id === id)?.run?.status);
+    runPoll = setTimeout(() => refreshRun(id, selection), live ? 1000 : 5000);
   }
 }
 async function startRun() {

@@ -7,6 +7,8 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "..");
 
 (async () => {
+  await pollingAcceptance();
+  if (process.env.QINYUAN_POLL_ONLY) return;
   if (process.env.QINYUAN_EDGE) { edgeActivityAcceptance(); return; }
   const { chromium } = require(process.env.QINYUAN_PLAYWRIGHT || "playwright");
   const browser = await chromium.launch({ headless: true, channel: "msedge" });
@@ -257,6 +259,58 @@ const root = path.resolve(__dirname, "..");
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
+async function pollingAcceptance() {
+  const vm = require("node:vm");
+  const pending = [], timers = new Map(), rendered = [], elements = new Map();
+  let timerId = 0;
+  const context = vm.createContext({ File: class {}, AbortController,
+    document: { addEventListener() {}, getElementById(id) { if (!elements.has(id)) elements.set(id, {}); return elements.get(id); } },
+    window: { addEventListener() {} },
+    setTimeout(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    fetch(url, options) { return new Promise((resolve, reject) => pending.push({ url, options,
+      resolve: data => resolve({ ok: true, json: async () => data }), reject })); },
+    renderSpy: data => rendered.push(data),
+  });
+  vm.runInContext(fs.readFileSync(path.join(root, "frontend/app.js"), "utf8").replace(/init\(\);\s*$/, ""), context);
+  vm.runInContext(`state.selected = 'task'; state.tasks = [{id:'task', status:'running', run:{status:'running'}}];
+    renderRun = renderSpy; renderTaskList = () => {};`, context);
+  const first = vm.runInContext("refreshRun('task')", context);
+  const second = vm.runInContext("refreshRun('task')", context);
+  assert.ok(pending[0].options.signal.aborted, "superseded progress request not aborted");
+  assert.equal(pending[1].options.cache, "no-store");
+  pending[1].resolve({ run: { status: "running", run_id: "new" }, progress: { checkpoint: { sequence: 2 } } });
+  await second;
+  pending[0].resolve({ run: { status: "running", run_id: "old" }, progress: { checkpoint: { sequence: 1 } } });
+  await first;
+  assert.equal(rendered.length, 1, "late response repainted old progress");
+  assert.equal(rendered[0].run_id, "new");
+  assert.deepEqual([...timers.values()].map(t => t.delay), [1000]);
+  const third = vm.runInContext("refreshRun('task')", context);
+  pending[2].resolve({ run: { status: "finished", run_id: "new" }, progress: {} });
+  await third;
+  assert.deepEqual([...timers.values()].map(t => t.delay), [5000], "terminal task cannot observe externally started run");
+  const fourth = vm.runInContext("refreshRun('task')", context);
+  const timeout = [...timers.values()].find(t => t.delay === 15000);
+  timeout.fn(); assert.ok(pending[3].options.signal.aborted);
+  pending[3].reject(new Error("controlled timeout")); await fourth;
+  assert.equal(elements.get("run-read-error").hidden, false);
+  assert.equal(timers.size, 1, "failed request stopped polling or duplicated timers");
+  let resets = 0;
+  context.RunView = { reset() { resets++; } };
+  vm.runInContext(`setHttpMethods = renderAttachments = renderSavedAttachments = () => {};
+    Object.assign(state.tasks[0], {title:'task', attachments:[], description:''}); selectTask('task', false);`, context);
+  assert.equal(resets, 0, "list refresh reset same-task view");
+  assert.equal(rendered.length, 2, "list snapshot repainted stale progress");
+  pending[4].resolve({ run: { status: "running", run_id: "new" }, progress: {} });
+  await new Promise(resolve => setImmediate(resolve));
+  vm.runInContext(`state.tasks.push({id:'other',title:'other',attachments:[],description:''}); selectTask('other', false);`, context);
+  assert.equal(resets, 1, "switching task retained old view state");
+  pending[5].resolve({ run: null, progress: null });
+  await new Promise(resolve => setImmediate(resolve));
+  console.log("PASS progress ordering, request abort/timeout, terminal refresh and retry polling");
+}
+
 function edgeActivityAcceptance() {
   // Native browser fallback for the read-only view; no packages or API requests.
   const { spawnSync } = require("node:child_process");
@@ -290,6 +344,7 @@ function edgeActivityAcceptance() {
     ];
     progress.retrospective = [{ operation_id: "active", status: "unsettled", stage: "stage_review" }, { operation_id: "saved-review", status: "completed", stage: "stage_review" }];
     progress.inner_activity = [{ ...target, operation_id: "cancelled", stage: "stage_action", disposition: "discarded", disposition_ref: "batch-review" }];
+    progress.inner_activity.push({ ...target, operation_id: "inner-live", stage: "stage_action", status: "unsettled", started_at: 10 });
     progress.branches = [{ ...target, turn_id: "parent", road_id: null, branch_id: "root-prefix", kind: "continuation", current: true, proposal_operation_id: "intent" },
       { ...target, branch_id: "road-prefix", parent_branch_id: "root-prefix", kind: "inheritance", current: false, proposal_operation_id: "roads" },
       { ...target, branch_id: "correction", parent_branch_id: "road-prefix", kind: "correction", current: true, proposal_operation_id: "partial", review_operation_id: "batch-review" }];
@@ -298,6 +353,14 @@ function edgeActivityAcceptance() {
     document.querySelectorAll(".view").forEach(el => { el.hidden = !el.contains(get("run-panel")); });
     for (let el = get("run-panel").parentElement; el; el = el.parentElement) el.hidden = false;
     RunView.render({ run, progress });
+    check(get("run-focus").textContent.includes("Inner 决策") && get("run-focus").textContent.includes("未结算"), "live Inner request missing from focus");
+    progress.inner_activity.at(-1).status = "completed";
+    progress.tool_operations = [{ ...target, operation_id: "tool-live", status: "in_flight" }];
+    RunView.render({ run, progress });
+    check(!get("run-focus").textContent.includes("Inner 决策") && get("run-focus").textContent.includes("工具结果待结算"), "focus did not follow model-to-tool transition");
+    progress.tool_operations[0].status = "completed";
+    RunView.render({ run, progress });
+    check(!get("run-focus").textContent.includes("工具结果待结算"), "completed tool remained active");
     get("run-tab-activity").click();
     check(!get("run-pane-activity").hidden, "activity tab unavailable");
     check(document.querySelectorAll(".review-badge").length >= 3, "missing pending/accepted plan badges");
@@ -310,6 +373,23 @@ function edgeActivityAcceptance() {
     check(decisions[0].includes("已接受") && decisions[1].includes("已拒绝") && decisions[2].includes("已接受"), "per-item decisions mislabeled");
     check(!partial.querySelector("img"), "candidate content interpreted as HTML");
     check(!get("run-facts").textContent.includes("Reviewed hypothesis") && !get("run-facts").textContent.includes("<img"), "pending claims became official Facts");
+    progress.review_queue.find(review => review.proposal_operation_id === "partial").candidates.push(
+      { index: 3, content: "Unfinished bounded claim", decision: "revise", reason: "narrow the range", support_refs: ["progress:tool:1"] });
+    progress.fact_revisions = [{ revision_ref: "partial/3", origin_turn_id: "child", turn_id: "child", road_id: "road",
+      candidate: { content: "Unfinished bounded claim", support_refs: ["progress:tool:1"] },
+      review_operation_id: "batch-review", feedback: "narrow the range", status: "pending" }];
+    RunView.render({ run, progress });
+    check(get("run-facts").textContent.includes("待修正事项") && get("run-facts").textContent.includes("Unfinished bounded claim"), "revise claim missing beside accepted Facts");
+    check(partial.textContent.includes("待修正"), "mixed batch revise hidden by aggregate accept");
+    progress.fact_revisions[0].status = "handed_off"; progress.fact_revisions[0].handoff_turn_id = "child";
+    RunView.render({ run, progress });
+    check(get("run-facts").textContent.includes("待修正 · 已移交"), "handoff treated as acceptance");
+    progress.fact_revisions[0].status = "corrected";
+    progress.review_queue.push({ ...review("revision-attempt", "settled", { decision: "revise", revision_ref: "partial/3",
+      candidates: [{ index: null, content: "Unfinished bounded claim", decision: "revise", support_refs: [] }] }) });
+    RunView.render({ run, progress });
+    check(!get("run-facts").textContent.includes("Unfinished bounded claim") && partial.textContent.includes("已修正"), "corrected revision stayed pending");
+    check(keyed("run-review-queue", "review-proposal/revision-attempt").textContent.includes("已修正"), "resubmission lost its original revision identity");
     check(keyed("run-review-queue", "review-proposal/obsolete").textContent.includes("使提案失效的审核"), "supersession confused with own verdict");
     check(get("run-discarded").textContent.includes("生成未采用"), "discarded generation missing");
     const text = partial.querySelector(".review-candidate p").firstChild;

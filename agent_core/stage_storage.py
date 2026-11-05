@@ -21,7 +21,7 @@ from agent_core.stage_contracts import (
     StageModelEvidence, StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnIntent, TurnPlanningReview, TurnPlanningState, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
     TOOL_BATCH_WAIT_SECONDS,
-    StageToolBatch, tool_calls, tool_call_key, StageFactBatch, StageFactBatchReview,
+    StageToolBatch, tool_calls, tool_call_key, StageFactBatch, StageFactBatchReview, StageFactRevision,
     fact_candidates, reviewed_fact, fact_verification_ref, StageQueuedReview, StageBranchFork, StageSessionBranch,
 )
 from agent_core.turn_contracts import D1RoleConfig
@@ -429,8 +429,10 @@ def _queue_source(store, task_id, identity, *, allow_applied=False):
     if load_session(store, task_id, evidence.session) is None:
         _fail("stage.review_session_unavailable", Category.POLICY)
     value = evidence.result
+    if isinstance(value, StageFactRevision) and value.decision != "resubmit":
+        _fail("stage.review_proposal_invalid", Category.INPUT)
     if not isinstance(value, (TurnIntent, tuple, PlanningExhausted, StagePlanningDecision,
-            StageFactProposal, StageFactBatch, StageConclusionChange, TurnCompletion, RoadResolution)):
+            StageFactProposal, StageFactBatch, StageFactRevision, StageConclusionChange, TurnCompletion, RoadResolution)):
         _fail("stage.review_proposal_invalid", Category.INPUT)
     if isinstance(value, StagePlanningDecision) and value.kind in {"wait_for_tools", "wait_for_review"}:
         _fail("stage.review_proposal_invalid", Category.INPUT)
@@ -457,8 +459,7 @@ def _review_target_current(store, task_id, identity):
 def _queue_review_matches(store, task_id, source, review, proposal_id=None):
     config = require_run(store, task_id)
     request = store.stage_evidence.request(review.start.operation_id)
-    category = "fact_review" if isinstance(source.result,
-        (StageFactProposal, StageFactBatch, StageConclusionChange)) else "review"
+    category = "fact_review" if fact_candidates(source.result) or isinstance(source.result, StageConclusionChange) else "review"
     if (review.start.task_run_id != task_id or review.start.role != "outer_planning"
             or review.start.role_config_ref != config.outer_role.role_config_ref
             or review.start.budget_policy_ref != config.budget.budget_policy_ref
@@ -814,7 +815,7 @@ def _reviewed(store, mutation, change, discarded=()):
                 _fail("stage.model_context_stale")
         changing = isinstance(proposal.result, StageConclusionChange)
         batching = isinstance(proposal.result, StageFactBatch)
-        category = "fact_review" if isinstance(proposal.result, (StageFactProposal, StageFactBatch, StageConclusionChange)) else "review"
+        category = "fact_review" if fact_candidates(proposal.result) or isinstance(proposal.result, StageConclusionChange) else "review"
         if (review_record.start.category != category or not isinstance(review.result,
                 D8ChangeDecision if changing else StageFactBatchReview if batching else TurnPlanningReview)
                 or proposal.session != review.session
@@ -1016,6 +1017,8 @@ def _validate(store, mutation):
             or task.request != mutation.request or task.effective_model_backend != mutation.effective_model_backend):
         _fail("stage.task_not_active", Category.POLICY)
     _validate_queue(store, mutation, change)
+    from agent_core.stage_knowledge import StageKnowledge
+    StageKnowledge(store.stage_evidence, mutation.task_run_id, store=store).validate_fact_revision_changes(change)
     from agent_core import stage_plans
     stage_plans.submissions(store, mutation.task_run_id, change)
     discarded = _validate_branches(store, mutation, change)
@@ -1131,6 +1134,8 @@ def _validate(store, mutation):
                     _fail("stage.fact_selection_not_applied")
             elif isinstance(source.result, StageHistoryRead):
                 store.stage_evidence.read_history_result(operation)
+            elif isinstance(source.result, StageFactRevision) and source.result.decision != "resubmit":
+                knowledge.validate_fact_revision(store.stage_evidence.request(identity), source.result)
             elif isinstance(source.result, StagePlanningDecision) and source.result.kind == "wait_for_tools":
                 request = store.stage_evidence.request(identity)
                 if source.session.scope != "road_execution" or not request.context.pending_operation_ids:
@@ -1616,7 +1621,9 @@ def save(store, mutation, change):
     for identity in change.applications:
         source = store.stage_evidence.read_model_result(store.load_d4_operation(identity))
         duplicate = duplicate_fact(store, task_id, source.session, source.result) if fact_candidates(source.result) else None
-        store._mark_d4_operation_applied(identity, "stage-reused/" + duplicate.proposal_operation_id if duplicate else mutation.mutation_id)
+        application_ref = ("stage-reused/" + duplicate.proposal_operation_id if duplicate else
+            "stage-fact-revision/" + mutation.mutation_id if isinstance(source.result, StageFactRevision) else mutation.mutation_id)
+        store._mark_d4_operation_applied(identity, application_ref)
     if change.revisions:
         from types import SimpleNamespace
         from agent_core.handoff_storage import save_handoff_mutation

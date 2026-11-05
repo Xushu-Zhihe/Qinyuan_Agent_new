@@ -19,9 +19,9 @@ from agent_core.stage_contracts import (
     PlanningExhausted, RoadCandidate, StageConclusionChange, StageFactSelection, StageHistoryRead,
     StageFactProposal, StageModelEvidence, StageSessionSummary, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, StagePlanningDecision,
-    StageFactBatch, StageFactBatchReview, fact_candidates, reviewed_fact, fact_review_parts,
+    StageFactBatch, StageFactBatchReview, StageFactRevision, fact_candidates, reviewed_fact, fact_review_parts,
 )
-from agent_core.stage_planning import BUSINESS_ISSUE_CODES, INNER_STAGES, MAX_STAGE_CORRECTIONS, STAGE_CALL_POLICY, StageModelRequest, correction_hint, model_contract, stage_output_issues, parse, request_from_dict, review_members, conversation_operation_ids
+from agent_core.stage_planning import BUSINESS_ISSUE_CODES, INNER_STAGES, MAX_STAGE_CORRECTIONS, STAGE_CALL_POLICY, StageModelRequest, correction_hint, model_contract, stage_output_issues, parse, request_from_dict, review_members, conversation_operation_ids, stage_runtime
 from agent_core.stage_storage import StageRecoveryRequired, StageStateError, proposal_digest, fact_scope_failure, _fail
 from agent_core.turn_modeling import digest, stable_id
 from qinyuan_core import Category, Layer, get_logger
@@ -41,6 +41,11 @@ class StageModelTransportFailure(StageStateError):
 
 class StageModelSuperseded(Exception):
     """Local generation ended; its unused result cannot become a decision."""
+
+
+class StageActionStalled(StageModelTransportFailure):
+    """Action generation exhausted time or output capacity without a usable decision."""
+    code = "stage.action_generation_stalled"
 
 
 def _envelope(request, contract):
@@ -198,6 +203,16 @@ class StageEvidence:
                 feedback.update(reason="previous_model_transport_failed_no_usable_decision", issues=[])
             else:
                 _fail("stage.correction_binding_changed", Category.UNKNOWN)
+            if self.action_generation_failure(source, result) is not None:
+                if self.action_failure_count(source) or stage_runtime(source).get("action_stall"):
+                    _fail("stage.action_adjustment_exhausted", Category.POLICY)
+                feedback["reason"] = "action_generation_budget_exhausted"
+                hint = (" The previous action exhausted its generation time or output budget without a usable "
+                    "decision; this is not a failed experiment. Change the construction approach now: submit "
+                    "a minimal discriminating check, reuse an available implementation, or test a scaled "
+                    "instance. Do not reconstruct the same full solver. Preserve observations and useful "
+                    "scripts; no hidden reasoning is available to resume. This adjustment is allowed once "
+                    "within the existing shared correction allowance.")
         contract = model_contract(request)
         if hint:
             contract = {**contract, "instruction": contract["instruction"] + hint}
@@ -263,6 +278,22 @@ class StageEvidence:
                 _fail("stage.model_result_changed", Category.UNKNOWN)
             return None
         return result
+
+    def action_generation_failure(self, request, settled=None):
+        if (request.stage != "stage_action" or request.context.session.scope != "road_execution"
+                or not self.read("contract", request.model_request_id).get("action_generation_recovery")):
+            return None
+        if settled and settled["outcome"] == "invalid" and settled["finish_reason"] == "length":
+            return "d8_model_output_budget_exhausted"
+        provider = self.transport_failure(request, settled)
+        return "model_total_timeout" if provider and provider["error"]["code"] == "model_total_timeout" else None
+
+    def action_failure_count(self, request):
+        count = 0
+        while request.correction_of_model_request_id:
+            request = self.request(request.correction_of_model_request_id)
+            count += self.action_generation_failure(request, self.read("result", request.model_request_id)) is not None
+        return count
 
     def branch_stop(self, request):
         stop = self.read("branch-stop", request.model_request_id)
@@ -643,6 +674,24 @@ class StageEvidence:
                 "items": [asdict(i) for i in items]})
         return self.read_history_result(operation)
 
+    def history_tool_requests(self, items):
+        """Resolve original tool arguments only through version-bound observations."""
+        requests = []
+        for item in items:
+            if item.identity not in {"tool_observation_not_fact", "public_reference_not_target_observation"}:
+                continue
+            operation = self.store.load_d4_operation(item.record_id)
+            original = self.observation(operation)
+            if item.task_run_id != operation.start.task_run_id or item.ref != original.ref:
+                _fail("stage.observation_binding_changed", Category.UNKNOWN)
+            if original.source_status != "available":
+                continue
+            claim = self.read("mcp-call", item.record_id)
+            if claim is not None:
+                requests.append({"observation_ref": item.ref, "source_operation_id": claim["model_request_id"],
+                    "call": claim["call"]})
+        return requests
+
     def read_history_result(self, operation: D4OperationRecord) -> tuple[D8HistoryItem, ...]:
         source = self.read_model_result(operation)
         data = self.read("history", operation.start.operation_id)
@@ -655,12 +704,12 @@ class StageEvidence:
 
 
 class StageModelCalls:
-    """One admitted invocation identity, immutable result, at most one format correction."""
+    """Immutable invocation chains with a shared format/transport correction allowance."""
     def __init__(self, store, evidence, inner, outer, clock, capacity_port, capacity_config):
         self.store, self.evidence = store, evidence
         self.inner, self.outer, self.clock = inner, outer, clock
         self.capacity_port, self.capacity_config = capacity_port, capacity_config
-        self.messages = lambda session: ()
+        self.messages = lambda session, stage=None: ()
         self.recover_capacity = None
         self.live_operations = set()
 
@@ -669,7 +718,7 @@ class StageModelCalls:
         role = config.inner_role if stage in INNER_STAGES else config.outer_role
         sequence = self.store.load_control_state_rows(context.task_run_id).latest_checkpoint.sequence
         return StageModelRequest(operation_id, context.task_run_id, stage, role.role_config_ref,
-            sequence, context, self.messages(context.session), (), proposal_id, proposal)
+            sequence, context, self.messages(context.session, stage=stage), (), proposal_id, proposal)
 
     async def propose_turn(self, context: TurnPlanningContext, operation_id: str,
                            cancellation_token: CancellationToken) -> TurnIntent | PlanningExhausted | ModelError:
@@ -828,6 +877,8 @@ class StageModelCalls:
         call_token = _StageCallToken(token, expires, self.clock, deadline,
             deadline_reader=read_deadline, task_deadline_only=planning)
         refresh_at, cancelled_at = started, None
+        slow_seconds = self.evidence.read("contract", envelope.request.model_request_id).get("action_slow_seconds")
+        slow_reported = False
         def invoke():
             try:
                 remaining = call_token.remaining_seconds if planning else max(0, expires - monotonic())
@@ -845,6 +896,12 @@ class StageModelCalls:
                 await asyncio.sleep(0.02)
                 if finished.is_set():
                     break
+                if slow_seconds and not slow_reported and monotonic() - started >= slow_seconds:
+                    slow_reported = True
+                    get_logger("model").warning("stage.action_generation_slow", run=envelope.request.task_run_id,
+                        operation=identity, phase="stage_action", category="performance",
+                        elapsed_seconds=monotonic() - started, reminder_seconds=slow_seconds,
+                        limit_seconds=timeout)
                 if monotonic() >= refresh_at:
                     call_token.deadline = self.store.load_task_run(envelope.request.task_run_id).deadline_at
                     refresh_at = monotonic() + .25
@@ -905,14 +962,14 @@ class StageModelCalls:
                 identity = stable_id(request.task_run_id, "stage/capacity/" + request.model_request_id + "/" + summary_id)
                 saved = self.evidence.read("request", identity)
                 replacement = (self.evidence.request(identity) if saved else replace(request, model_request_id=identity,
-                    messages=self.messages(request.context.session), capacity_recovery_of=request.model_request_id))
+                    messages=self.messages(request.context.session, stage=request.stage), capacity_recovery_of=request.model_request_id))
                 return await self.call(replacement, token)
             identity = request.model_request_id
             request = self.prepare(request)
             record = self.store.load_d4_operation(identity)
             result = self.evidence.read("result", identity)
             category = "handoff_summary" if request.stage == "stage_summary" else "planning" if request.stage in {"stage_intent", "stage_roads", "stage_continuation"} else "action" if inner else (
-                "fact_review" if isinstance(request.proposal, (StageFactProposal, StageFactBatch, StageConclusionChange)) else "review")
+                "fact_review" if fact_candidates(request.proposal) or isinstance(request.proposal, StageConclusionChange) else "review")
             if record is None:
                 task = self.store.load_task_run(request.task_run_id)
                 if token.is_cancelled or self.clock() >= task.deadline_at:
@@ -1017,6 +1074,18 @@ class StageModelCalls:
                 return identity, evidence.result
             provider = self.evidence.transport_failure(request, result) if result["outcome"] == "model_error" else None
             depth = self.evidence.correction_depth(request)
+            generation_failure = self.evidence.action_generation_failure(request, result)
+            if generation_failure is not None:
+                count = self.evidence.action_failure_count(request) + 1
+                if record.completion is None:
+                    get_logger("model").warning("stage.action_generation_exhausted", run=request.task_run_id,
+                        operation=identity, phase=request.stage, category="dependency", failure_count=count,
+                        code=generation_failure)
+                if count >= 2 or depth == MAX_STAGE_CORRECTIONS or stage_runtime(request).get("action_stall"):
+                    raise StageActionStalled("stage.action_generation_stalled", retryable=False,
+                        model_call={"stage": request.stage, "operation_id": identity,
+                            "reason": "action_generation_stalled", "correction_count": depth,
+                            "model_error_code": generation_failure})
             if (result["outcome"] != "invalid" and provider is None) or depth == MAX_STAGE_CORRECTIONS:
                 if provider is not None:
                     raise StageModelTransportFailure("stage.model_transport_failed", retryable=False, model_call={

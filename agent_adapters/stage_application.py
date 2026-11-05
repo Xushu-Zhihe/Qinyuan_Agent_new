@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 from agent_adapters.mcp_plan_executor import MCPPlanExecutor
-from agent_adapters.stage_evidence import StageEvidence, StageModelCalls, StageModelTransportFailure, StageModelSuperseded
+from agent_adapters.stage_evidence import StageEvidence, StageModelCalls, StageModelTransportFailure, StageModelSuperseded, StageActionStalled
 from agent_adapters.stage_reviews import StageReviews
 from agent_adapters.output_evidence import safe_failure_details, trace_frames
 from agent_core.actions import MCPCall
@@ -27,7 +27,7 @@ from agent_core.stage_contracts import (
     StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnPlanningContext, TurnPlanningState, TurnIntent, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
     TOOL_BATCH_WAIT_SECONDS,
-    StageToolBatch, tool_calls, tool_call_key, StageFactBatch, fact_candidates, reviewed_fact, StageBranchFork,
+    StageToolBatch, tool_calls, tool_call_key, StageFactBatch, fact_candidates, reviewed_fact, StageBranchFork, StageFactRevision,
 )
 from agent_core.stage_planning import StageModelRequest, stage_runtime, review_members, formal_support_refs
 from agent_core.stage_storage import StageRecoveryRequired, StageStateError, active_turn, _just_registered_roads, execution_policy, load_branch, branch_prefix, duplicate_fact
@@ -38,6 +38,8 @@ from qinyuan_core import Category, Layer, classify, get_logger
 # A recovered request keeps this many newest history entries inline; the rest
 # stay addressable by ref, so recovery can shrink below the bound that failed.
 HISTORY_AFTER_RECOVERY = 8
+# Small original results stay readable as an index; larger bodies require an exact read.
+ACTION_OBSERVATION_BYTES = 4096
 
 
 def _compact_context(context):
@@ -50,6 +52,16 @@ def _compact_context(context):
     value.pop("history", None)
     value["history_refs"] = [item.ref for item in context.history]
     return value
+
+
+def _action_observation_index(item):
+    # Command arguments are available through history_details. This result view
+    # preserves literal output and error/truncation labels without another script copy.
+    result = json.loads(item.content)
+    result.pop("command", None)
+    size = len(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+    return {**item.visible(include_content=False), "result_bytes": size,
+        **({"result": result} if size <= ACTION_OBSERVATION_BYTES else {})}
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +120,8 @@ class StageApplication:
         self.store.live_tool_calls = lambda: tuple((entry.parent, entry.call) for entry in self._tools_in_flight.values()
             if not entry.task.done())
         self._target_network = target_network_adapter
-        self.models.messages = self._conversation
+        self.models.messages = lambda session, stage=None: self._conversation(session,
+            action_history=self.evidence.history(self.task_id) if stage == "stage_action" else None)
         self.models.recover_capacity = self._recover_capacity
         from agent_adapters.attachment_import_recorder import FileAttachmentImportRecorder
         from agent_core.attachment_importer import AttachmentImporter
@@ -263,14 +276,22 @@ class StageApplication:
         sources.sort(key=lambda row: ranks.get(row[0].start.operation_id, len(ranks)))
         return sources
 
-    def _render_conversation(self, sources):
-        # Each past decision used to carry that moment's whole history, so the
-        # body grew with every turn.  Only the two most recent decisions keep the
-        # full snapshot; older ones cite their refs, which history_details can
-        # still resolve to the original observation.
+    def _render_conversation(self, sources, *, action_history=None):
+        # The live action context carries current evidence. Its archive uses
+        # refs instead of repeating old evidence snapshots; other stages keep
+        # the two most recent full snapshots.
         contextual = [index for index, (_, request, _) in enumerate(sources)
                       if request.stage not in {"stage_review", "stage_supervision"}]
         keep = set(contextual[-2:])
+        receipts = {}
+        owners = {request.context.session.owner_id for _, request, _ in sources if request.stage == "stage_action"}
+        for item in action_history or ():
+            if (item.identity not in {"tool_observation_not_fact", "public_reference_not_target_observation"}
+                    or item.source_status != "available" or item.intent_id not in owners):
+                continue
+            claim = self.evidence.read("mcp-call", item.record_id)
+            if claim is not None:
+                receipts.setdefault((claim["model_request_id"], digest(claim["call"])), []).append(item)
         messages = []
         for index, (op, request, result) in enumerate(sources):
             content = result["content"]
@@ -287,14 +308,30 @@ class StageApplication:
                         "candidate": asdict(claim)} for identity, index, claim in self.evidence.review_claims(request)]
                 messages.append({"role": "user", "content": json.dumps(feedback, ensure_ascii=False)})
             else:
+                proof = self.evidence.read_model_result(op).result
+                calls = tool_calls(proof)
+                if action_history is not None and index not in keep and calls:
+                    indexed = []
+                    for call in calls:
+                        items = receipts.get((op.start.operation_id, digest(asdict(call))), ())
+                        indexed.append({"tool_name": call.tool_name, "observations": [
+                            _action_observation_index(item) for item in items]}
+                            if items else asdict(call))
+                    # Unsettled calls retain exact arguments. A recorded result
+                    # is an observation, never an automatic Fact or execution cache.
+                    content = json.dumps({"kind": "recorded_tool_calls", "calls": indexed}, ensure_ascii=False)
                 messages.extend([{"role": "user", "content": handoff_json({"source_operation_id": op.start.operation_id,
                     "stage": request.stage,
-                    "context": asdict(request.context) if index in keep else _compact_context(request.context)})},
+                    "context": asdict(request.context) if action_history is None and index in keep else _compact_context(request.context)})},
                     {"role": "assistant", "content": content if isinstance(content, str)
                      else json.dumps(content, ensure_ascii=False)}])
-                if isinstance(self.evidence.read_model_result(op).result, StageHistoryRead):
+                if isinstance(proof, StageHistoryRead):
                     items = self.evidence.read_history_result(op)
-                    messages.append({"role": "user", "content": json.dumps({"history_read": [asdict(i) for i in items]}, ensure_ascii=False)})
+                    body = ({"history_refs": [i.ref for i in items]}
+                        if action_history is not None and index not in keep else
+                        {"history_read": [asdict(i) for i in items],
+                         "tool_requests": self.evidence.history_tool_requests(items)})
+                    messages.append({"role": "user", "content": json.dumps(body, ensure_ascii=False)})
         return tuple(messages)
 
     def _summary_view(self, sources):
@@ -310,11 +347,11 @@ class StageApplication:
             "coverage": request.summary_coverage, "content": self.evidence.read_model_result(operation).result.content}
         return {identity for identity, _ in request.summary_coverage}, ({"role": "user", "content": json.dumps(summary, ensure_ascii=False)},)
 
-    def _conversation(self, session, sources=None):
+    def _conversation(self, session, sources=None, *, action_history=None):
         sources = self._conversation_sources(session) if sources is None else sources
         covered, prefix = self._summary_view(sources)
         current = [s for s in sources if s[0].start.operation_id not in covered and s[1].stage != "stage_summary"]
-        return (*prefix, *self._render_conversation(current))
+        return (*prefix, *self._render_conversation(current, action_history=action_history))
 
     def _planning_history(self, history, sources, *, required=(), retrieved=()):
         """Only an exact session summary can replace old raw observations by catalog refs."""
@@ -368,7 +405,8 @@ class StageApplication:
                 raise StageModelSuperseded(request.model_request_id)
         summary_id, _ = await self.models.call(summary_request, token)
         self.store.mark_d4_operation_applied(summary_id, "stage-summary/" + summary_id)
-        messages = self._conversation(request.context.session)
+        messages = self._conversation(request.context.session,
+            action_history=self.evidence.history(self.task_id) if request.stage == "stage_action" else None)
         self.evidence.save("capacity-recovery", request.model_request_id, {
             "source_request_sha256": digest(asdict(request)), "summary_operation_id": summary_id})
         # The recovered request has to be able to shrink past the bound that
@@ -464,8 +502,9 @@ class StageApplication:
             effective_support_refs=premises, goal_validation=self.goal_validation)
         inner = stage != "stage_review" and stage != "stage_supervision"
         role = self.config.inner_role if inner else self.config.outer_role
-        messages = self._conversation(session, sources)
-        if stage == "stage_review" and isinstance(proposal, (StageFactProposal, StageFactBatch, StageConclusionChange)):
+        messages = self._conversation(session, sources,
+            action_history=all_history if stage == "stage_action" else None)
+        if stage == "stage_review" and (fact_candidates(proposal) or isinstance(proposal, StageConclusionChange)):
             # A Fact judgement reads the claim and its own frozen evidence, not
             # the author's argument for it. User turns (review feedback, tool
             # observations) stay; only the author's own prose is withheld.
@@ -492,6 +531,10 @@ class StageApplication:
                 if entry.state in {"pending", "blocked"}
                 and (self.evidence.request(entry.proposal_operation_id).context.session == session
                     or entry.proposal_operation_id in visible)]}
+        if turn is not None:
+            fact_revisions = self.evidence.knowledge(self.task_id).visible_fact_revisions(turn.turn_id)
+            if fact_revisions:
+                runtime["fact_revisions"] = fact_revisions
         revision = self._intent_revision(stage, session, branch, proposal_id, proposal)
         if revision is not None:
             runtime["intent_revision"] = revision
@@ -505,6 +548,20 @@ class StageApplication:
             if advice and self.evidence.request(advice).context.session == session:
                 runtime["route_advice"] = advice
         if stage == "stage_action" and session.scope == "road_execution":
+            for operation, source, _ in reversed(sources):
+                if source.context.session != session:
+                    continue
+                if source.stage == "stage_action":
+                    elapsed = operation.completion.finished_at - operation.start.started_at
+                    threshold = self.evidence.read("contract", operation.start.operation_id).get("action_slow_seconds")
+                    if threshold and elapsed >= threshold:
+                        runtime["slow_action"] = {"operation_id": operation.start.operation_id,
+                            "elapsed_seconds": elapsed, "reminder_seconds": threshold}
+                    break
+                if source.stage == "stage_supervision" and stage_runtime(source).get("action_stall"):
+                    runtime["action_stall"] = {**stage_runtime(source)["action_stall"],
+                        "supervision_operation_id": operation.start.operation_id}
+                    break
             # The original planner decides whether to close this Road; the
             # suggestion only says which available sibling would start next.
             suggestion = stage_plans.road_suggestion(self.store, self.task_id, turn, session.owner_id)
@@ -616,6 +673,9 @@ class StageApplication:
         if decision is None:
             return
         identity, completion = decision
+        if isinstance(completion, StageFactRevision):
+            await self._knowledge_action(request, identity, completion, token)
+            return
         if isinstance(completion, StageIncomplete):
             self.store.mark_d4_operation_applied(identity, "stage-incomplete/" + identity)
             self._commit(StageStateChange())
@@ -659,7 +719,11 @@ class StageApplication:
         elif isinstance(value, StageHistoryRead):
             self.evidence.perform_history_read(self.store.load_d4_operation(identity))
             self._commit(StageStateChange(applications=(identity,)))
-        elif isinstance(value, (StageConclusionChange, StageFactProposal, StageFactBatch)):
+        elif isinstance(value, StageFactRevision) and value.decision != "resubmit":
+            self._commit(StageStateChange(applications=(identity,)))
+            get_logger("ctrl").info("stage.fact_revision_disposed", run=self.task_id, operation=identity,
+                phase=request.stage, decision=value.decision, revision_ref=value.revision_ref)
+        elif isinstance(value, (StageConclusionChange, StageFactProposal, StageFactBatch, StageFactRevision)):
             if fact_candidates(value) and request.stage == "stage_action" and request.context.session.scope == "road_execution":
                 existing = duplicate_fact(self.store, self.task_id, request.context.session, value)
                 if existing is not None and existing.proposal_operation_id != identity:
@@ -834,7 +898,7 @@ class StageApplication:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tools_in_flight.clear()
 
-    async def _supervise(self, road_id, token):
+    async def _supervise(self, road_id, token, *, stalled_operation=None):
         # HTTP subrequests may arrive during a foreground model invocation.
         # Keep the existing supervision cadence at the next safe boundary.
         if self.reviews.foreground is not None:
@@ -849,7 +913,7 @@ class StageApplication:
                 continue
             if req.context.session == PlanningSession("road_execution", road_id):
                 decisions.append(op)
-        if decisions and len(decisions) % 4 == 0:
+        if stalled_operation or decisions and len(decisions) % 4 == 0:
             # Only this foreground safe point may start supervision. Settle
             # existing tools first; HTTP callbacks cannot share an Outer call.
             if await self.reviews.drain(token):
@@ -859,12 +923,24 @@ class StageApplication:
             await self._collect_tools(drain=True)
             self._check_dispatch()
             request = self._request("stage_supervision", PlanningSession("road_execution", road_id))
-            identity = self._id("stage/supervision/" + road_id + "/" + decisions[-1].start.operation_id)
+            identity = self._id("stage/action-stall/" + stalled_operation if stalled_operation else
+                "stage/supervision/" + road_id + "/" + decisions[-1].start.operation_id)
+            if stalled_operation:
+                source = self.evidence.request(stalled_operation)
+                operation = self.store.load_d4_operation(stalled_operation)
+                if (source.stage != "stage_action" or source.context.session != request.context.session
+                        or operation.completion is None or operation.completion.result_kind != "failed"
+                        or self.evidence.action_generation_failure(source, self.evidence.read("result", stalled_operation)) is None):
+                    raise StageRecoveryRequired("stage.action_stall_binding_changed")
+                request = replace(request, frozen_contract_ref=None, execution_context={**request.execution_context,
+                    "stage_runtime": {**stage_runtime(request), "action_stall": {"operation_id": stalled_operation}}})
             request = self.evidence.request(identity) if self.evidence.read("request", identity) is not None else replace(
                 request, model_request_id=identity)
             try:
                 identity, advice = await self.models.call(request, token)
             except StageModelTransportFailure as error:
+                if stalled_operation:
+                    raise
                 if error.context["model_call"]["stage"] != "stage_supervision":
                     raise
                 self._check_dispatch()
@@ -875,6 +951,8 @@ class StageApplication:
                 self.store.mark_d4_operation_applied(identity, "stage-advice/" + identity)
                 get_logger("ctrl").info("stage.strategy_reviewed", run=self.task_id, operation=identity,
                     code=advice.decision, category="strategy_signal", phase="stage_supervision")
+            if stalled_operation:
+                self._commit(StageStateChange())
 
     async def run(self, token):
         from agent_adapters.run_files import run_lock
@@ -1072,7 +1150,14 @@ class StageApplication:
                 await self._collect_tools(wait=True)
                 continue
             request = self._request("stage_action", PlanningSession("road_execution", running.road_id))
-            decision = await self.reviews.action(request, token)
+            try:
+                decision = await self.reviews.action(request, token)
+            except StageActionStalled as error:
+                if stage_runtime(request).get("action_stall"):
+                    raise
+                await self._supervise(running.road_id, token,
+                    stalled_operation=error.context["model_call"]["operation_id"])
+                continue
             if decision is None:
                 continue
             identity, action = decision

@@ -38,6 +38,97 @@ def save_confirmed_cancel(case, envelope, *, confirmed=True):
     return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
 
 
+@pytest.mark.parametrize("disposition,second_verdict,restart", [
+    ("resubmit", "accept", False), ("withdraw", "accept", False), ("handoff", "accept", False),
+    ("resubmit", "revise", True), ("resubmit", "reject", False)])
+def test_mixed_fact_revise_requires_explicit_disposition_before_turn_closure(case, disposition, second_verdict, restart):
+    from agent_core.stage_contracts import StageFactRevision, TurnAchievement, TurnCompletion
+    from agent_core.stage_planning import parse, schema
+    drafted, handled, observed, checked, replacement_reviews, stopped = [], [], [], [], [], []
+    commit = case.app._commit
+    def guarded_commit(change, **kwargs):
+        if observed and not checked:
+            checked.append(True)
+            turn = case.app.store.load_turn(case.app.task_id, observed[0].context.turn.turn_id)
+            support = tuple(item.ref for item in observed[0].context.history if item.record_type == "verified_fact")
+            with pytest.raises(StageStateError, match="stage.fact_revision_pending"):
+                commit(StageStateChange(turns=(replace(turn, achievement=TurnAchievement(
+                    TurnCompletion("cannot bypass revision", support), str(uuid4()))),)))
+            knowledge = case.app.evidence.knowledge(case.app.task_id)
+            frozen = observed[0]
+            ref = stage_runtime(frozen)["fact_revisions"][0]["revision_ref"]
+            with pytest.raises(StageStateError, match="stage.fact_revision_binding_changed"):
+                knowledge.validate_fact_revision(frozen, StageFactRevision(str(uuid4()) + "/0", "withdraw", "foreign ref"))
+            with pytest.raises(StageStateError, match="stage.fact_revision_owner_changed"):
+                knowledge.validate_fact_revision(replace(frozen, context=replace(frozen.context,
+                    session=PlanningSession("road_execution", str(uuid4())))), StageFactRevision(ref, "withdraw", "wrong owner"))
+        result = commit(change, **kwargs)
+        if restart and not stopped and change.reviews and replacement_reviews:
+            stopped.append(True)
+            raise RuntimeError("controlled restart with unfinished fact revision")
+        return result
+    case.app._commit = guarded_commit
+    def inner(request, raw):
+        runtime = stage_runtime(request)
+        pending = [item for item in runtime.get("fact_revisions", ()) if item["status"] not in {"corrected", "withdrawn"}
+            and not (item["status"] == "handed_off" and item["handoff_turn_id"] == request.context.turn.turn_id)]
+        if request.stage == "stage_action" and not drafted and any(
+                i.identity == "tool_observation_not_fact" for i in request.context.history):
+            drafted.append(request.model_request_id)
+            refs = [i.ref for i in request.context.history if i.identity == "tool_observation_not_fact"]
+            return {"kind": "fact_candidates", "candidates": [dict(content=f"claim {i}", reason="bounded observation",
+                support_refs=refs, inferred=False) for i in range(3)]}
+        if pending and request.stage == "stage_action":
+            observed.append(request)
+            turn = request.context.turn
+            with pytest.raises(ValueError):
+                parse(request, dict(kind="turn_completion", reason="cannot silently close", support_refs=list(turn.fact_refs)))
+            ready = [item for item in pending if item["status"] != "reviewing"]
+            if not ready:
+                return dict(kind="wait_for_review", reason="wait for corrected claim review")
+            item = ready[0]
+            action = disposition if item["status"] != "handed_off" else "withdraw"
+            handled.append((item["revision_ref"], action))
+            value = dict(kind="fact_revision", revision_ref=item["revision_ref"], decision=action,
+                reason="correct the exact claim" if action == "resubmit" else "explicitly dispose of this claim")
+            if action == "resubmit":
+                value["candidate"] = {**item["candidate"], "content": "corrected " + item["candidate"]["content"]}
+            return value
+        if disposition == "handoff" and request.stage == "stage_continuation" and request.context.turn.parent_turn_id is None:
+            assert "request_final_validation" not in [branch.get("properties", {}).get("kind", {}).get("const")
+                for branch in schema(request)["anyOf"]]
+            return dict(kind="turn_intent", description="handle inherited unresolved claims", completion_criterion="explicit disposition",
+                support_refs=list(request.context.turn.fact_refs))
+        return raw
+    def outer(request, raw):
+        if isinstance(request.proposal, StageFactBatch) and len(request.proposal.candidates) == 3:
+            return {"decisions": [dict(decision="accept" if i == 0 else "revise", reason=f"decision {i}",
+                support_refs=list(claim.support_refs)) for i, claim in enumerate(request.proposal.candidates)]}
+        if isinstance(request.proposal, StageFactRevision):
+            replacement_reviews.append(request.model_request_id)
+            return dict(decision=second_verdict if len(replacement_reviews) == 1 else "accept",
+                reason="corrected claim checked", support_refs=list(request.proposal.support_refs))
+        return raw
+    case.models.inner.transform, case.models.outer.transform = inner, outer
+    if restart:
+        with pytest.raises(RuntimeError, match="controlled restart"):
+            asyncio.run(case.app.run(case.token))
+        task_id = case.app.task_id
+        asyncio.run(case.app.close())
+        case.app = StageApplication(case.path, **case.args)
+        case.app.bind(task_id)
+        assert any(item["status"] == "pending" for item in case.app.evidence.knowledge(task_id).fact_revisions())
+    result = asyncio.run(case.app.run(case.token))
+    assert result.reason == "stage.final_validation_requested" and observed
+    items = case.app.evidence.knowledge(case.app.task_id).fact_revisions()
+    assert len(items) == 2 and all(item["status"] == ("corrected" if disposition == "resubmit" else "withdrawn") for item in items)
+    assert len(case.tools.calls) == (2 if disposition == "handoff" else 1)
+    assert len(case.app.store.list_stage_turns(case.app.task_id)) == (2 if disposition == "handoff" else 1)
+    assert len(case.app.evidence.knowledge(case.app.task_id).project()) >= 1
+    if disposition == "handoff":
+        assert len(handled) == 4 and any(request.context.turn.parent_turn_id for request in observed)
+
+
 def test_road_inherits_frozen_planning_prefix_with_own_current_execution_context(case):
     result = asyncio.run(case.app.run(case.token))
     planning = next(request for request in case.models.inner.calls if request.stage == "stage_roads")
@@ -47,6 +138,10 @@ def test_road_inherits_frozen_planning_prefix_with_own_current_execution_context
     assert all(request.context.session == PlanningSession("road_execution", result.turn.roads[0].road_id)
         and request.tools for request in actions)
     assert all(request.execution_context["stage_runtime"]["branch_id"] for request in actions)
+    for request in (planning, *actions):
+        frozen = case.app.evidence.request(request.model_request_id)
+        assert frozen.execution_context == request.execution_context
+        assert 'fresh process per call' in frozen.execution_context['state']
     assert len(case.tools.calls) == 1
     assert len([request for request in case.models.inner.calls if request.stage == "stage_roads"]) == 1
 

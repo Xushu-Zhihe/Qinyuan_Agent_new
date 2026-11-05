@@ -123,10 +123,29 @@ class MCPPlanExecutor:
                 "localhost and private addresses refer to the sandbox, not the remote target. "
                 "Ports in attachments describe that deployment, not a local running service. "
                 "Local reproduction is possible only when you actually start and observe a local service. " + SANDBOX_PATH_HELP,
+            "local_runtime": "Linux sandbox, not the Windows host; non-root, read-only system. "
+                "Ordinary MCP commands start in /workspace; use cd /workspace/work in shell scripts or "
+                "os.chdir('/workspace/work') in Python when using relative filenames. "
+                "Run executable artifacts from /workspace/work; /workspace/input and /tmp are noexec. "
+                "python3 uses PYTHONPATH=/tools/python:/opt/qinyuan/python. "
+                "Shipped Sandbox/dockerfile library baseline (not a live inventory of this container): "
+                "Python standard library; pwn (pwntools), Crypto (pycryptodome), z3, pefile, capstone, "
+                "sympy, gmpy2, fpylll, cypari2. Use declared libraries directly; check a specific dependency "
+                "only when needed and not covered here, or after a concrete missing-module/executable error. "
+                "Installed tools use the path/wrapper returned by download.install_tool.",
+            "state": "The same TaskRun container and files are shared across Roads/Turns while it lives; "
+                "use distinct filenames for concurrent work. shell.run_bash/run_powershell and ordinary Python "
+                "script tools start a fresh process per call: cd, exports, imports and Python variables do not "
+                "carry to the next call. Reuse scripts/data saved under /workspace/work. "
+                "When declared, session tools explicitly retain named interactive processes; ordinary calls "
+                "do not attach to them. Container removal loses these files and processes.",
             "target_http": ("When declared, http.run_experiment uses request(method, path_query, headers={}, body='') "
                 "to reach only the authorized origin through the trusted forwarder. Its Python script cannot create "
                 "sockets or subprocesses. shell/curl/httpx/nuclei planners run inside the sandbox and cannot replace "
-                "this target channel. HTTP evidence is saved per request."
+                "this target channel. Each experiment starts fresh Python with -I: PYTHONPATH additions and "
+                "previous variables are absent; prefer the standard library and injected request(). "
+                "request() returns status, body (bytes), text (UTF-8 replacement decoding) and evidence_ref. "
+                "Cookies persist through the trusted HTTP channel; HTTP evidence is saved per request."
                 if self.experiments.enabled else "No http.run_experiment target channel is enabled in this profile."),
             "target_tcp": ("The authorized TCP endpoint is reachable from this sandbox only as "
                 "target.qinyuan:<authorized port>; the external host name does not resolve here and there is no "
@@ -142,6 +161,12 @@ class MCPPlanExecutor:
                 "SHA256, or use a pinned Python package. Use the returned path/wrapper. The execution sandbox stays networkless.",
             "boundary": "Only the current tool catalog and authorization permit dispatch. A tool or bridge error "
                 "does not prove target behavior; inspect its category, phase and original request receipts.",
+            "results": "Read current.tool_feedback for the actual execution outcome, not the MCP planner's "
+                "sandbox_command. Ordinary command feedback includes status, exit_code, stdout, stderr and "
+                "timeout/truncation indicators; failures may instead include code/category/detail. "
+                "Print only the observations needed for the next decision; no custom receipt envelope is required. "
+                "HTTP experiment print output is an unreviewed summary; each request has its own evidence. "
+                "A completed tool is not automatically a successful experiment or a formal Fact.",
             "output_limits": "Tool stdout/stderr capture is capped at 512 KiB (524,288 bytes) per stream; "
                 "after UTF-8 decoding the model-visible preview is separately capped at 64,000 characters. "
                 "stdout_bytes/stderr_bytes and truncation flags are reported. For larger output, redirect the "

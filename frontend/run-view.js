@@ -110,6 +110,40 @@ const RunView = (() => {
       if (!group.entries.length) empty(section, scope.type === "turn" ? "尚未选入阶段成果。" : "当前范围尚无记录。");
       host.append(section);
     }
+    const pending = (progress.fact_revisions || []).filter(item => !["corrected", "withdrawn"].includes(item.status)
+      && (scope.type === "task" || scope.type === "turn" && revisionFitsTurn(progress, item, scope.turn.turn_id)
+        || scope.type === "road" && (item.road_id === scope.road.road_id
+          || item.status === "handed_off" && revisionFitsTurn(progress, item, scope.turn.turn_id))));
+    if (pending.length) {
+      const section = node("section", undefined, "fact-group"); section.dataset.key = "fact-revisions";
+      section.append(node("h3", `待修正事项 · ${pending.length}`));
+      for (const item of pending) {
+        const card = node("article", undefined, "run-fact"); card.dataset.key = item.revision_ref;
+        card.append(node("strong", revisionLabel(item)), node("p", item.candidate.content, "fact-content"),
+          node("p", "尚未正式接受，不能作为有效前提。", "run-meta"));
+        if (item.feedback) card.append(code("审核意见", item.feedback));
+        if (item.disposition_reason) card.append(code("处理说明", item.disposition_reason));
+        card.append(rawRefs("原证据引用", item.candidate.support_refs, `revision-refs/${item.revision_ref}`),
+          code("原提案 / 审核", `${item.revision_ref}\n${item.review_operation_id}`));
+        section.append(card);
+      }
+      host.append(section);
+    }
+  }
+
+  function revisionFitsTurn(progress, item, turnId) {
+    if ([item.origin_turn_id, item.turn_id].includes(turnId)) return true;
+    if (item.status !== "handed_off") return false;
+    let turn = (progress.turns || []).find(turn => turn.turn_id === turnId);
+    while (turn) {
+      if (turn.turn_id === item.handoff_turn_id) return true;
+      turn = (progress.turns || []).find(parent => parent.turn_id === turn.parent_turn_id);
+    }
+    return false;
+  }
+  function revisionLabel(item) {
+    return ({ pending: "待修正", reviewing: "修正版待审", review_blocked: "修正版审核受阻",
+      handed_off: "待修正 · 已移交", corrected: "已修正", withdrawn: "已撤回" })[item?.status] || "待修正";
   }
   function stageStatus(turn) {
     const row = node("div", undefined, "detail-states");
@@ -211,15 +245,23 @@ const RunView = (() => {
     }));
   }
 
+  function pendingWork(progress) {
+    const tools = (progress.tool_operations || progress.executions || []).filter(item =>
+      ["pending", "running", "in_flight"].includes(item.status));
+    const models = [progress.inner_activity || [], progress.retrospective || []].map(items =>
+      items.filter(item => item.status === "unsettled" && !["discarded", "reused"].includes(item.disposition))
+        .sort((a, b) => (a.started_at || 0) - (b.started_at || 0)).at(-1)).filter(Boolean);
+    return [...tools.map(item => `工具结果待结算 · ${short(item.operation_id || item.plan_id)}`),
+      ...models.map(item => `${stageLabels[item.stage] || item.phase || "模型请求"} · 请求未结算 · ${short(item.operation_id)}`)];
+  }
   function renderFocus(progress, run, live) {
     const host = get("run-focus"); if (!host) return;
-    const executions = progress.tool_operations || progress.executions || [];
-    const running = executions.find((item) => ["pending", "running", "in_flight"].includes(item.status));
     const activeIntent = (progress.turns || []).flatMap(routes).find((item) => item.status === "running");
     let state = "idle";
     let text;
-    if (progress.task_run?.status === "awaiting_confirmation") { state = "warn"; text = `等待人工决定 · ${progress.goal_validation?.timeout_action === "assume" ? "五分钟无操作按默认确定结束" : "五分钟无决定则未验证结束"}`; }
-    else if (running) { state = "live"; text = `执行中 · ${short(running.operation_id || running.plan_id)}`; }
+    if (["cancelling", "cleaning"].includes(run?.status)) { state = "warn"; text = label(run.status); }
+    else if (progress.task_run?.status === "awaiting_confirmation") { state = "warn"; text = `等待人工决定 · ${progress.goal_validation?.timeout_action === "assume" ? "五分钟无操作按默认确定结束" : "五分钟无决定则未验证结束"}`; }
+    else if (live && pendingWork(progress).length) { state = "live"; text = pendingWork(progress).join("；"); }
     else if (live && activeIntent) { state = "live"; text = `${activeIntent.road_id ? "Road" : `Intent ${activeIntent.priority}`} · ${activeIntent.description || "（无描述）"}`; }
     else if (live) { state = "live"; text = "等待下一步规划或审核"; }
     else if (progress.recovery?.required) { state = "warn"; text = `已停止 · ${progress.recovery.reason || "需要恢复"}`; }
@@ -243,6 +285,7 @@ const RunView = (() => {
     let phase = label(run?.status);
     if (run?.status === "cleaning") phase = "清理 Sandbox 资源";
     else if (live && run.status !== "cancelling") phase = activeExecution ? "等待命令结果" : activeIntent ? `推进当前 ${progress.goal_validation ? "Road" : "Intent"}` : "准备运行 / 生成下一轮";
+    if (live && run.status !== "cancelling" && run.status !== "cleaning" && pendingWork(progress).length) phase = pendingWork(progress).join("；");
     if (progress.task_run?.status === "awaiting_confirmation") phase = "等待人工确认";
     let remaining = "—";
     if (progress.task_run?.deadline_at) {
@@ -538,7 +581,10 @@ const RunView = (() => {
         if (review.reason) item.append(code("审核意见", review.reason));
         for (const candidate of review.candidates || []) {
           const card = node("article", undefined, "review-candidate"); card.dataset.key = `${review.proposal_operation_id}/${candidate.index ?? "single"}`;
-          card.append(node("strong", `${candidate.inferred ? "推断提案" : "Fact 提案"}${candidate.index == null ? "" : ` ${candidate.index + 1}`} · ${reviewLabels[candidate.decision] || (review.state === "superseded" ? "已失效" : "未正式接受")}`), node("p", candidate.content));
+          const revision = (progress.fact_revisions || []).find(item => item.revision_ref === (review.revision_ref || card.dataset.key));
+          const verdict = candidate.decision === "revise" || !candidate.decision && review.revision_ref
+            ? revisionLabel(revision) : reviewLabels[candidate.decision];
+          card.append(node("strong", `${candidate.inferred ? "推断提案" : "Fact 提案"}${candidate.index == null ? "" : ` ${candidate.index + 1}`} · ${verdict || (review.state === "superseded" ? "已失效" : "未正式接受")}`), node("p", candidate.content));
           if (candidate.reason) card.append(node("p", candidate.reason, "run-meta"));
           card.append(rawRefs("逐项来源", candidate.support_refs, `claim-refs/${review.proposal_operation_id}/${candidate.index}`));
           if (candidate.fact_id) card.append(code("已登记 Fact ID", candidate.fact_id));

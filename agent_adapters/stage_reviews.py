@@ -245,9 +245,10 @@ class StageReviews:
                 await self.collect(token, unused=unused)
                 self.foreground = None
                 return None
-        result = self.foreground.task.result()
-        self.foreground = None
-        return result
+        try:
+            return self.foreground.task.result()
+        finally:
+            self.foreground = None
 
     async def stop(self):
         from agent_core.dual_llm_modeling import MODEL_CANCEL_GRACE_SECONDS

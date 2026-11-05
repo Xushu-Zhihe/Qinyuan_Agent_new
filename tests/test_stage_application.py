@@ -1161,11 +1161,13 @@ def test_real_provider_payload_keeps_role_and_reasoning_parameters(case):
     assert build_payload(envelope, outer)["reasoning_effort"] == "high"
 
 
-def test_execution_channels_are_frozen_for_inner_outer_and_catalog(case):
+@pytest.mark.parametrize("http_enabled", [False, True])
+def test_execution_channels_are_frozen_for_inner_outer_and_catalog(case, http_enabled):
     from agent_adapters.deepseek_roles import build_payload, role_config
     from agent_core.output_contracts import D8OutputRequest
     from agent_core.stage_planning import model_contract
     asyncio.run(case.app.mcp.open())
+    case.app.mcp.experiments = SimpleNamespace(enabled=http_enabled)
     assert 'sandbox-only' in case.app.mcp.tools[0]['tags']
     for stage, name in [('stage_intent', 'inner_action'), ('stage_supervision', 'outer_planning')]:
         role = role_config(name, version=17)
@@ -1176,7 +1178,19 @@ def test_execution_channels_are_frozen_for_inner_outer_and_catalog(case):
             contract['instruction'], None), role)
         runtime = next(m['content'] for m in payload['messages'] if m['role'] == 'system' and 'Trusted execution' in m['content'])
         assert 'network_mode=none' in runtime and 'localhost' in runtime
-        assert 'No http.run_experiment target channel' in runtime
+        assert ('No http.run_experiment target channel' in runtime) is not http_enabled
+        environment = json.loads(runtime.split('Trusted execution environment=', 1)[1])
+        assert environment == {k: v for k, v in req.execution_context.items() if k != 'stage_runtime'}
+        assert 'Ordinary MCP commands start in /workspace;' in environment['local_runtime']
+        assert "cd /workspace/work" in environment['local_runtime']
+        assert 'not a live inventory' in environment['local_runtime']
+        assert 'pwn (pwntools), Crypto (pycryptodome)' in environment['local_runtime']
+        assert 'fresh process per call' in environment['state']
+        assert 'session tools explicitly retain named interactive processes' in environment['state']
+        assert 'no custom receipt envelope is required' in environment['results']
+        if http_enabled:
+            assert '-I: PYTHONPATH additions' in environment['target_http']
+            assert 'body (bytes)' in environment['target_http']
         assert not req.tools and 'does not prove target behavior' in runtime
 
 
@@ -1271,6 +1285,11 @@ def test_generic_exploration_guidance_reaches_provider_without_granting_tools(st
         assert "never silently substitute a new version or overwrite a fixed goal" in system
     assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "high"
     assert "max_tokens" not in payload
+    if stage == "stage_action":
+        assert contract["action_slow_seconds"] == 300 and contract["action_generation_recovery"] is True
+        assert "Submit as soon as the next action is executable" in system
+    else:
+        assert "action_slow_seconds" not in contract and "action_generation_recovery" not in contract
     assert len(payload["tools"]) == 1 and payload["tools"][0]["function"]["name"] == OUTPUT_TOOL
     from agent_core.stage_planning import provider_schema
     assert payload["tools"][0]["function"]["parameters"]["properties"]["result"] == provider_schema(request)
@@ -1415,6 +1434,115 @@ def test_provider_history_segments_stay_identical_while_live_snapshots_change(ca
     doc = _stage_input(replace(req, messages=archive))
     assert doc['history'][0]['content']['source'] == json.loads(archive[0]['content'])['source']
     assert second['tools'] == first['tools'] and second['reasoning_effort'] == 'high'
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("large_result", [False, True])
+def test_action_history_indexes_settled_checks_and_reads_original_script(case, native, large_result, monkeypatch):
+    from agent_adapters.stage_application import ACTION_OBSERVATION_BYTES
+    from agent_core.stage_planning import model_contract
+    scripts = [f"# check-{i}: " + "bounded implementation " * 350 + f"\nprintf check-{i}" for i in range(6)]
+    outputs = [f"check-{i}: no candidate in tested range [0, 300000)" for i in range(6)]
+    if large_result:
+        outputs[0] += "\n" + "raw search output " * ACTION_OBSERVATION_BYTES
+    count, requests = [], []
+    async def call_tool(name, arguments):
+        case.tools.calls.append((name, arguments))
+        return MCPExecutionResult(case.tools.task_id, "controlled-sandbox", name, "bash", ("-lc", arguments["script"]),
+            "completed", 0, outputs[scripts.index(arguments["script"])], "", False)
+    case.tools.call_tool = call_tool
+    def transform(request, raw):
+        if request.stage != "stage_action":
+            return raw
+        if len(count) < len(scripts):
+            script = scripts[len(count)]
+            count.append(True)
+            return {"kind": "mcp_call", "tool_name": "shell.run_bash", "arguments": {"script": script}}
+        requests.append(request)
+        if len(requests) == 1:
+            first = next(i for i in request.history_catalog if i["identity"] == "tool_observation_not_fact")
+            return {"kind": "history_details", "refs": [first["ref"]]}
+        return raw
+    case.models.inner.native = native
+    case.models.inner.transform = transform
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.achievement is not None and len(case.tools.calls) == 6
+    indexed, retrieved = requests[:2]
+    rows = [json.loads(m["content"]) for m in indexed.messages]
+    calls = [r for r in rows if r.get("kind") == "recorded_tool_calls"]
+    assert len(calls) == 4
+    first = calls[0]["calls"][0]["observations"][0]
+    assert first["source_status"] == "available" and first["identity"] == "tool_observation_not_fact"
+    assert first["result_bytes"] > 0
+    if large_result:
+        assert "result" not in first and first["result_bytes"] > ACTION_OBSERVATION_BYTES
+    else:
+        assert first["result"]["stdout"] == outputs[0]
+        assert "command" not in first["result"]
+    assert "# check-0:" not in str(indexed.messages) and "# check-5:" in str(indexed.messages)
+    assert first["ref"] not in {i.ref for i in indexed.context.history}
+    with pytest.raises(ValueError):
+        parse(indexed, {"kind": "fact_candidate", "content": "range was checked", "reason": "index only",
+            "support_refs": [first["ref"]], "inferred": False})
+    assert first["ref"] in {i.ref for i in retrieved.context.history}
+    read = next(json.loads(m["content"]) for m in reversed(retrieved.messages)
+        if "history_read" in json.loads(m["content"]))
+    assert json.loads(read["history_read"][0]["content"])["stdout"] == outputs[0]
+    assert read["tool_requests"][0]["observation_ref"] == first["ref"]
+    assert read["tool_requests"][0]["call"]["arguments"]["script"] == scripts[0]
+    # Indexing is presentation only: pending calls and the original archive are intact.
+    sources = case.app._conversation_sources(indexed.context.session)
+    pending = case.app._render_conversation(sources, action_history=())
+    assert "# check-0:" in str(pending)
+    original = case.app._render_conversation(sources)
+    compact = case.app._render_conversation(sources, action_history=case.app.evidence.history(case.app.task_id))
+    assert "# check-0:" in str(original) and "# check-0:" not in str(compact)
+    assert len(json.dumps(compact)) < len(json.dumps(original))
+    item = next(i for i in retrieved.context.history if i.ref == first["ref"])
+    with pytest.raises(StageStateError, match="stage.observation_binding_changed"):
+        case.app.evidence.history_tool_requests((replace(item, source_version="f" * 64),))
+    read_evidence = case.app.evidence.read
+    def changed_call(kind, identity):
+        value = read_evidence(kind, identity)
+        if kind == "mcp-call" and identity == item.record_id:
+            return {**value, "call": {"tool_name": "shell.run_bash", "arguments": {"script": "unbound script"}}}
+        return value
+    monkeypatch.setattr(case.app.evidence, "read", changed_call)
+    with pytest.raises(StageStateError, match="stage.observation_binding_changed"):
+        case.app.evidence.history_tool_requests((item,))
+    rules = model_contract(retrieved)["rules"]
+    assert "Re-reading parameters" in rules and "expanded coverage" in rules
+    assert "cheap candidate/applicability check" in rules
+
+
+def test_action_history_partial_batch_keeps_pending_arguments_and_failure_labels():
+    from agent_core.handoff_contracts import D8HistoryItem
+    from agent_core.stage_contracts import StageToolBatch
+    task, road = str(uuid4()), str(uuid4())
+    context = TurnPlanningContext(task, "controlled goal", PlanningSession("road_execution", road), None, ())
+    private = MCPCall("shell.run_bash", {"script": "controlled failed check"})
+    pending = MCPCall("web.search", {"query": "unsettled public lookup"})
+    batch = StageToolBatch((private, pending))
+    identities = [str(uuid4()) for _ in range(3)]
+    item = D8HistoryItem(str(uuid4()), task, "progress", str(uuid4()), road, None,
+        json.dumps(dict(status="failed", exit_code=1, stdout="partial observation", stderr="tool error",
+            command=["bash", "-lc", private.arguments["script"]], stdout_truncated=True, timed_out=True)),
+        (), "a" * 64, 1, "tool_observation_not_fact", "current", "available")
+    app = object.__new__(StageApplication)
+    app.evidence = SimpleNamespace(
+        read=lambda kind, identity: {"model_request_id": identities[0], "call": asdict(private)},
+        read_model_result=lambda operation: SimpleNamespace(result=batch))
+    sources = [(SimpleNamespace(start=SimpleNamespace(operation_id=identity)),
+        StageModelRequest(identity, task, "stage_action", "controlled", 1, context),
+        {"content": json.dumps({"kind": "mcp_calls", "calls": [asdict(private), asdict(pending)]})})
+        for identity in identities]
+    rows = [json.loads(m["content"]) for m in app._render_conversation(sources, action_history=(item,))]
+    calls = next(row["calls"] for row in rows if row.get("kind") == "recorded_tool_calls")
+    failed = calls[0]["observations"][0]["result"]
+    assert failed["status"] == "failed" and failed["exit_code"] == 1
+    assert failed["timed_out"] and failed["stdout_truncated"]
+    assert failed["stdout"] == "partial observation" and failed["stderr"] == "tool error"
+    assert calls[1] == asdict(pending)
 
 
 def test_continuation_history_omits_only_exact_summary_covered_unneeded_raw():
@@ -1678,6 +1806,182 @@ def save_provider_stop(case, envelope, code, *, exit_confirmed=True, changed_bin
         result["transport"]["transport_end"] = transport_end
     case.app.evidence.save("provider-result", request.model_request_id, result)
     return result
+
+
+def action_timeouts(case, monkeypatch, count, *, exit_confirmed=True, changed_binding=False):
+    import time
+    from agent_adapters import stage_evidence
+    from agent_core.modeling import ModelError, ModelErrorKind
+    monkeypatch.setattr(stage_evidence, "model_call_timeout", lambda model, remaining: .2)
+    original = case.models.inner.invoke
+    attempts = []
+    def invoke(envelope, timeout, token):
+        value = original(envelope, timeout, token)
+        if envelope.request.stage == "stage_action":
+            attempts.append(envelope)
+            if len(attempts) <= count:
+                assert 0 <= timeout <= .201
+                while not token.is_cancelled:
+                    time.sleep(.002)
+                save_provider_stop(case, envelope, "model_total_timeout", transport_end="timeout",
+                    exit_confirmed=exit_confirmed, changed_binding=changed_binding)
+                return ModelError(ModelErrorKind.TIMED_OUT, "model_total_timeout")
+        return value
+    monkeypatch.setattr(case.models.inner, "invoke", invoke)
+    return attempts
+
+
+@pytest.mark.parametrize("timeouts", [1, 2])
+def test_action_generation_adjusts_once_then_supervises_at_safe_point(case, monkeypatch, timeouts):
+    from agent_core.stage_planning import stage_runtime
+    from agent_adapters.deepseek_roles import _stage_input
+    attempts = action_timeouts(case, monkeypatch, timeouts)
+    assert asyncio.run(case.app.run(case.token)).turn.achievement
+    assert len(case.tools.calls) == 1
+    failed = attempts[:timeouts]
+    assert all(case.app.store.load_d4_operation(e.request.model_request_id).completion.result_kind == "failed" for e in failed)
+    correction = attempts[1]
+    assert correction.correction["reason"] == "action_generation_budget_exhausted"
+    assert correction.request.correction_of_model_request_id == attempts[0].request.model_request_id
+    assert "minimal discriminating check" in correction.instruction
+    supervision = [r for r in case.models.outer.calls if r.stage == "stage_supervision"]
+    assert len(supervision) == timeouts - 1
+    if supervision:
+        source = supervision[0]
+        assert case.app.reviews.foreground is None
+        assert stage_runtime(source)["action_stall"]["operation_id"] == failed[-1].request.model_request_id
+        resumed = attempts[timeouts].request
+        assert stage_runtime(resumed)["action_stall"]["supervision_operation_id"] == source.model_request_id
+        assert _stage_input(resumed)["current"]["action_stall"] == stage_runtime(resumed)["action_stall"]
+        assert resumed.correction_of_model_request_id is None
+        assert "action_stall" not in stage_runtime(attempts[timeouts + 1].request)
+    assert not case.app.store.list_d4_unresolved_operations(case.app.task_id)
+
+
+def test_stalled_action_does_not_loop_after_outer_advice_or_replay_on_restart(case, monkeypatch):
+    from agent_adapters.stage_evidence import StageActionStalled
+    from agent_adapters.output_evidence import safe_failure_details
+    attempts = action_timeouts(case, monkeypatch, 99)
+    for index in range(2):
+        with pytest.raises(StageActionStalled) as caught:
+            asyncio.run(case.app.run(case.token))
+        details = safe_failure_details(caught.value, include_chain=True)
+        assert details["exception_types"] == ["StageActionStalled"]
+        assert "stage.action_generation_stalled" in details["error_codes"]
+        assert details["model_call"]["operation_id"] == attempts[-1].request.model_request_id
+        assert "PRIVATE_REASONING" not in json.dumps(details)
+        assert len(attempts) == 3
+        assert len([r for r in case.models.outer.calls if r.stage == "stage_supervision"]) == 1
+        assert not case.tools.calls and not case.app.store.list_d4_unresolved_operations(case.app.task_id)
+        if index == 0:
+            with pytest.raises(StageStateError, match="action_adjustment_exhausted"):
+                source = attempts[1].request
+                case.app.evidence.contract(replace(source, model_request_id=str(uuid4()),
+                    correction_of_model_request_id=source.model_request_id, frozen_contract_ref=None))
+            task_id = case.app.task_id
+            asyncio.run(case.app.close())
+            case.app = StageApplication(case.path, **case.args)
+            case.app.bind(task_id)
+    turn = case.app.store.list_stage_turns(case.app.task_id)[0]
+    assert turn.roads[0].status is IntentStatus.RUNNING and turn.achievement is None
+
+
+@pytest.mark.parametrize("exit_confirmed,changed_binding", [(False, False), (True, True)])
+def test_action_timeout_unknown_exit_or_changed_binding_never_adjusts(case, monkeypatch, exit_confirmed, changed_binding):
+    attempts = action_timeouts(case, monkeypatch, 99,
+        exit_confirmed=exit_confirmed, changed_binding=changed_binding)
+    with pytest.raises(OperationRecoveryRequired):
+        asyncio.run(case.app.run(case.token))
+    assert len(attempts) == 1 and not case.tools.calls
+    assert not any(r.stage == "stage_supervision" for r in case.models.outer.calls)
+    assert case.app.store.load_d4_operation(attempts[0].request.model_request_id).completion is None
+
+
+def test_action_slow_reminder_keeps_configured_limit_and_informs_next_decision(case, monkeypatch, caplog):
+    import time
+    from agent_core import stage_planning
+    from agent_core.stage_planning import stage_runtime
+    from agent_adapters.deepseek_roles import _stage_input
+    from agent_core.modeling import model_call_timeout
+    monkeypatch.setattr(stage_planning, "ACTION_SLOW_SECONDS", .04)
+    caplog.set_level("INFO", logger="qinyuan.model")
+    original = case.models.inner.invoke
+    actions = []
+    def invoke(envelope, timeout, token):
+        value = original(envelope, timeout, token)
+        if envelope.request.stage == "stage_action":
+            actions.append(envelope.request)
+            assert timeout == pytest.approx(model_call_timeout(case.models.inner, float("inf")), abs=1)
+            if len(actions) == 1:
+                time.sleep(.10)
+                assert not token.is_cancelled
+                case.now.value += .10
+        return value
+    monkeypatch.setattr(case.models.inner, "invoke", invoke)
+    assert asyncio.run(case.app.run(case.token)).turn.achievement
+    assert len(case.tools.calls) == 1
+    reminders = [r for r in caplog.records if r.msg == "stage.action_generation_slow"]
+    assert len(reminders) == 1
+    assert reminders[0].qy["operation"] == actions[0].model_request_id
+    feedback = stage_runtime(actions[1])["slow_action"]
+    assert feedback["operation_id"] == actions[0].model_request_id and feedback["elapsed_seconds"] >= .04
+    assert _stage_input(actions[1])["current"]["slow_action"] == feedback
+    assert "slow_action" not in stage_runtime(actions[2])
+    assert not any(e.correction for e in case.models.inner.envelopes)
+    assert not any(r.stage == "stage_supervision" for r in case.models.outer.calls)
+
+
+def test_action_adjustment_and_format_failure_share_original_allowance(case, monkeypatch):
+    attempts = action_timeouts(case, monkeypatch, 1)
+    def transform(request, raw):
+        if request.stage == "stage_action" and len(attempts) == 1:
+            return {"invalid": "format failure after the timeout adjustment"}
+        return raw
+    case.models.inner.transform = transform
+    assert asyncio.run(case.app.run(case.token)).turn.achievement
+    assert [case.app.evidence.correction_depth(e.request) for e in attempts[:3]] == [0, 1, 2]
+    assert attempts[2].correction["reason"] == "output_format_invalid"
+    assert len(case.tools.calls) == 1
+    assert not any(r.stage == "stage_supervision" for r in case.models.outer.calls)
+
+
+def test_stall_supervision_failure_does_not_allow_another_action(case, monkeypatch):
+    from agent_adapters.stage_evidence import StageModelTransportFailure
+    from agent_core.modeling import ModelError, ModelErrorKind
+    attempts = action_timeouts(case, monkeypatch, 2)
+    original = case.models.outer.invoke
+    def invoke(envelope, timeout, token):
+        value = original(envelope, timeout, token)
+        if envelope.request.stage == "stage_supervision":
+            save_provider_stop(case, envelope, "model_idle_timeout", transport_end="timeout")
+            return ModelError(ModelErrorKind.TIMED_OUT, "model_idle_timeout")
+        return value
+    monkeypatch.setattr(case.models.outer, "invoke", invoke)
+    with pytest.raises(StageModelTransportFailure) as caught:
+        asyncio.run(case.app.run(case.token))
+    assert caught.value.context["model_call"]["stage"] == "stage_supervision"
+    assert len(attempts) == 2 and not case.tools.calls
+    assert len([r for r in case.models.outer.calls if r.stage == "stage_supervision"]) == 3
+
+
+@pytest.mark.parametrize("failures", [("length",), ("length", "length"), ("timeout", "length")])
+def test_action_output_length_and_total_timeout_share_one_adjustment(case, monkeypatch, failures):
+    attempts = action_timeouts(case, monkeypatch, 1 if failures[0] == "timeout" else 0)
+    original = case.models.inner.invoke
+    def invoke(envelope, timeout, token):
+        value = original(envelope, timeout, token)
+        if (envelope.request.stage == "stage_action" and len(attempts) <= len(failures)
+                and failures[len(attempts) - 1] == "length"):
+            return D8ModelResponse("", "length")
+        return value
+    monkeypatch.setattr(case.models.inner, "invoke", invoke)
+    assert asyncio.run(case.app.run(case.token)).turn.achievement
+    assert len(case.tools.calls) == 1
+    assert attempts[1].correction["reason"] == "action_generation_budget_exhausted"
+    supervision = [r for r in case.models.outer.calls if r.stage == "stage_supervision"]
+    assert len(supervision) == len(failures) - 1
+    assert all(case.app.store.load_d4_operation(e.request.model_request_id).completion.result_kind == "failed"
+        for e in attempts[:len(failures)])
 
 
 @pytest.mark.parametrize("failures", [("timeout", "timeout"), ("timeout", "format"), ("format", "timeout")])

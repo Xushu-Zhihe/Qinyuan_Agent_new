@@ -15,7 +15,7 @@ SAFE_EXCEPTION_TYPES = frozenset({
     "ReadTimeout", "ConnectTimeout", "SSLError", "gaierror", "OtherError",
     "AttributeError", "KeyError", "IndexError", "CancelledError", "UnboundLocalError", "ProgrammingError",
     "OperationalError", "IntegrityError", "D5EvidenceError", "D5SensitiveDataError", "T6TargetNetworkError",
-    "StorageError", "T6EvidenceError", "T6EvidenceCapacityError", "StageStateError", "StageRecoveryRequired", "StageModelTransportFailure",
+    "StorageError", "T6EvidenceError", "T6EvidenceCapacityError", "StageStateError", "StageRecoveryRequired", "StageModelTransportFailure", "StageActionStalled",
     "JSONDecodeError", "IncompleteRead", "MCPClientError", "MCPCommandPlanError", "MCPCommandExecutionTimeout",
 })
 SAFE_HTTP_ERROR_CODES = frozenset({
@@ -24,6 +24,9 @@ SAFE_HTTP_ERROR_CODES = frozenset({
     "execution.recovery_required", "execution.budget_exhausted", "execution.state_conflict",
     "mcp.outcome_unknown", "mcp.planner_rejected", "mcp.command_rejected",
     "stage.operation_outcome_unknown", "stage.model_outcome_unknown", "stage.dispatch_stopped",
+    "stage.action_generation_stalled", "stage.action_adjustment_exhausted", "stage.action_stall_binding_changed",
+    "stage.fact_revision_pending", "stage.fact_revision_binding_changed", "stage.fact_revision_owner_changed",
+    "stage.fact_revision_branch_omitted", "stage.fact_revision_already_handed_off",
     "stage.evidence_capacity_exceeded", "stage.evidence_corrupt", "stage.evidence_io_failed",
     "evidence_capacity_exceeded",
     "d20_http_outcome_unknown", "d20_http_cancelled_after_result",
@@ -138,7 +141,8 @@ def safe_failure_details(error, *, include_chain=False):
             if context.get("api") in {"CreateFileW", "GetFileInformationByHandleEx"}:
                 evidence_protection["api"] = context["api"]
         if (name == "StageRecoveryRequired" and resource_code == "stage.model_outcome_unknown"
-                or name == "StageModelTransportFailure" and resource_code == "stage.model_transport_failed"):
+                or name == "StageModelTransportFailure" and resource_code == "stage.model_transport_failed"
+                or name == "StageActionStalled" and resource_code == "stage.action_generation_stalled"):
             model_call = current.context.get("model_call")
             code = model_call.get("model_error_code") if model_call else None
             if code in SAFE_MODEL_ERROR_CODES and code not in codes:

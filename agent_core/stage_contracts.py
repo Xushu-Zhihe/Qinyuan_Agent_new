@@ -218,6 +218,18 @@ class StageFactBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class StageFactRevision:
+    revision_ref: str
+    decision: Literal["resubmit", "withdraw", "handoff"]
+    reason: str
+    candidate: StageFactProposal | None = None
+
+    @property
+    def support_refs(self):
+        return self.candidate.support_refs if self.candidate else ()
+
+
+@dataclass(frozen=True, slots=True)
 class StageFactBatchReview:
     decisions: tuple[TurnPlanningReview, ...]
 
@@ -235,12 +247,16 @@ class StageFactBatchReview:
 
 
 def fact_candidates(value):
+    if isinstance(value, StageFactRevision):
+        return ((None, value.candidate),) if value.decision == "resubmit" else ()
     return (tuple(enumerate(value.candidates)) if isinstance(value, StageFactBatch)
             else ((None, value),) if isinstance(value, StageFactProposal) else ())
 
 
 def reviewed_fact(value, review, index):
     """Exact proposal order is the per-claim identity within a batch."""
+    if isinstance(value, StageFactRevision) and value.decision == "resubmit":
+        value = value.candidate
     if isinstance(value, StageFactBatch):
         if (type(index) is not int or not 0 <= index < len(value.candidates)
                 or not isinstance(review, StageFactBatchReview) or len(review.decisions) != len(value.candidates)):
@@ -357,7 +373,7 @@ class StageModelEvidence:
     session: PlanningSession
     context_sha256: str
     evidence_sha256: str
-    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | StageFactBatch | StageFactBatchReview | MCPCall | StageToolBatch | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
+    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | StageFactBatch | StageFactBatchReview | StageFactRevision | MCPCall | StageToolBatch | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
     proposal_operation_id: str | None = None
     proposal_sha256: str | None = None
 

@@ -1,12 +1,12 @@
 """Stage views over canonical knowledge and the existing append-only revision log."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 from agent_core.conclusion_revisions import ConclusionRevisions
 from agent_core.conclusion_revision_contracts import D8RevisionRecord
 from agent_core.domain import IntentStatus
-from agent_core.stage_contracts import StageConclusionChange
+from agent_core.stage_contracts import StageConclusionChange, StageFactRevision, StageFactBatch, fact_candidates, reviewed_fact
 from agent_core.stage_storage import _fail
 from agent_core.turn_modeling import digest, stable_id
 from qinyuan_core import Category
@@ -29,6 +29,123 @@ class StageKnowledge(ConclusionRevisions):
 
     def records(self):
         return self._records
+
+    def fact_revisions(self):
+        """Unfinished corrections derive from original reviews and applied dispositions."""
+        entries = {entry.proposal_operation_id: entry for entry in self.store.list_stage_reviews(self.task_id)}
+        items = {}
+        for operation in self.store.list_d4_operations(self.task_id):
+            identity = operation.start.operation_id
+            entry = entries.get(identity)
+            if (operation.start.role != "inner_action" or operation.completion is None
+                    or operation.completion.result_kind != "completed"
+                    or entry is None and not (operation.application_ref or "").startswith("stage-fact-revision/")
+                    or (operation.application_ref or "").startswith(("stage-discarded/", "stage-reused/"))):
+                continue
+            source = self.evidence.read_model_result(operation)
+            value = source.result
+            revision = isinstance(value, StageFactRevision)
+            if not revision and not fact_candidates(value):
+                continue
+            request = self.evidence.request(identity)
+            turn = request.context.turn
+            if revision and value.decision != "resubmit":
+                if operation.application_ref is None:
+                    continue
+                item = items[value.revision_ref]
+                item.update(status="withdrawn" if value.decision == "withdraw" else "handed_off",
+                    disposition_operation_id=identity, disposition_reason=value.reason)
+                if value.decision == "handoff":
+                    item["handoff_turn_id"] = turn.turn_id
+                continue
+            if entry is None or entry.state == "superseded":
+                continue
+            if revision:
+                items[value.revision_ref].pop("handoff_turn_id", None)
+            if revision and entry.state in {"pending", "blocked"}:
+                items[value.revision_ref].update(status="reviewing" if entry.state == "pending" else "review_blocked",
+                    source_operation_id=identity, candidate=asdict(value.candidate), turn_id=turn.turn_id,
+                    road_id=source.session.owner_id if source.session.scope == "road_execution" else None)
+                continue
+            if entry.state != "settled":
+                continue
+            review_request = self.evidence.request(entry.review_operation_id)
+            review = self.evidence.read_model_result(self.store.load_d4_operation(entry.review_operation_id)).result
+            for slot, (owner, index, claim) in enumerate(self.evidence.review_claims(review_request)):
+                if owner != identity:
+                    continue
+                decision = reviewed_fact(review_request.proposal, review,
+                    slot if isinstance(review_request.proposal, StageFactBatch) else None)[1]
+                if not revision and decision.decision != "revise":
+                    continue
+                ref = value.revision_ref if revision else identity + "/" + (str(index) if index is not None else "single")
+                old = items.get(ref, {})
+                items[ref] = {**old, "revision_ref": ref,
+                    "origin_turn_id": old.get("origin_turn_id", turn.turn_id),
+                    "turn_id": turn.turn_id, "road_id": source.session.owner_id if source.session.scope == "road_execution" else None,
+                    "source_operation_id": identity, "review_operation_id": entry.review_operation_id,
+                    "candidate": asdict(claim), "feedback": decision.reason,
+                    "status": "corrected" if decision.decision == "accept" else "pending"}
+        return tuple(items.values())
+
+    def visible_fact_revisions(self, turn_id, *, items=None):
+        ancestors, current = set(), self.turns.get(turn_id)
+        while current is not None:
+            ancestors.add(current.turn_id)
+            current = self.turns.get(current.parent_turn_id)
+        return tuple(item for item in (self.fact_revisions() if items is None else items)
+            if item["status"] not in {"corrected", "withdrawn"} and (item["turn_id"] == turn_id
+                or item["status"] == "handed_off" and item["handoff_turn_id"] in ancestors))
+
+    def validate_fact_revision(self, request, value):
+        from agent_core.stage_planning import stage_runtime
+        turn_id = request.context.turn.turn_id
+        item = next((item for item in self.visible_fact_revisions(turn_id)
+            if item["revision_ref"] == value.revision_ref), None)
+        frozen = next((item for item in stage_runtime(request).get("fact_revisions", ())
+            if item["revision_ref"] == value.revision_ref), None)
+        if item is None or digest(item) != digest(frozen) or item["status"] == "reviewing":
+            _fail("stage.fact_revision_binding_changed", Category.CONFLICT)
+        if item["status"] != "handed_off" and (request.context.session.owner_id != (item["road_id"] or item["turn_id"])
+                or request.context.session.scope != ("road_execution" if item["road_id"] else "turn_planning")):
+            _fail("stage.fact_revision_owner_changed", Category.POLICY)
+        if value.decision == "handoff" and item.get("handoff_turn_id") == turn_id:
+            _fail("stage.fact_revision_already_handed_off", Category.POLICY)
+
+    def validate_fact_revision_changes(self, change):
+        from agent_core.stage_planning import stage_runtime
+        items = self.fact_revisions()
+        for identity in change.review_submissions:
+            value = self.evidence.read_model_result(self.store.load_d4_operation(identity)).result
+            if isinstance(value, StageFactRevision):
+                self.validate_fact_revision(self.evidence.request(identity), value)
+            if getattr(value, "kind", None) == "request_final_validation" and any(
+                    item["status"] not in {"corrected", "withdrawn"} for item in items):
+                _fail("stage.fact_revision_pending", Category.POLICY)
+        for fork in change.branches:
+            if fork.review_operation_id or fork.target_session:
+                continue
+            request = self.evidence.request(fork.proposal_operation_id)
+            if request.context.turn is None:
+                continue
+            required = {item["revision_ref"] for item in self.visible_fact_revisions(request.context.turn.turn_id, items=items)}
+            visible = {item["revision_ref"] for item in stage_runtime(request).get("fact_revisions", ())}
+            if not required.issubset(visible):
+                _fail("stage.fact_revision_branch_omitted", Category.POLICY)
+        for turn in change.turns:
+            before = self.turns.get(turn.turn_id)
+            if before is None or turn.planning_state.value == "superseded":
+                continue
+            pending = [item for item in self.visible_fact_revisions(turn.turn_id, items=items)
+                if not (item["status"] == "handed_off" and item["handoff_turn_id"] == turn.turn_id)]
+            closing = (before.achievement is None and turn.achievement is not None
+                or before.planning_state != turn.planning_state and turn.planning_state.value in {"exhausted", "waiting_child"})
+            closed_roads = {road.road_id for road in turn.roads if road.status not in {
+                IntentStatus.RUNNING, IntentStatus.PENDING, IntentStatus.SUSPENDED}
+                and any(old.road_id == road.road_id and old.status is IntentStatus.RUNNING for old in before.roads)}
+            if any(closing or item["road_id"] in closed_roads or item["status"] == "handed_off" and closed_roads
+                    for item in pending):
+                _fail("stage.fact_revision_pending", Category.POLICY)
 
     @property
     def state(self):

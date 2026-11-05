@@ -144,7 +144,7 @@ def _empty_result(task_run_id: str, mode: str, *, error: str, recovery: bool) ->
 def _stage_activity(evidence, store, task_id, operations, requests, turns):
     """Bound public subjects and logical prefixes; ledger state is not worker liveness."""
     from agent_core.stage_contracts import (
-        PlanningSession, StageSessionBranch, TurnIntent, StageFactBatch, StageConclusionChange,
+        PlanningSession, StageSessionBranch, TurnIntent, StageFactBatch, StageFactRevision, StageConclusionChange,
         TurnCompletion, RoadResolution, StagePlanningDecision, PlanningExhausted,
         fact_candidates, reviewed_fact, fact_verification_ref,
     )
@@ -191,6 +191,8 @@ def _stage_activity(evidence, store, task_id, operations, requests, turns):
             road_id=source.session.owner_id if source.session.scope == "road_execution" else None)]
         item = dict(**asdict(entry), kind=kind, author=asdict(source.session), targets=subject,
             attempt_ids=attempts.get(entry.proposal_operation_id, []), decision=None, reason=None, candidates=[])
+        if isinstance(value, StageFactRevision):
+            item["revision_ref"] = value.revision_ref
         reviewed = review_request = None
         if entry.state == "settled":
             review_request = requests[entry.review_operation_id]
@@ -228,7 +230,9 @@ def _stage_activity(evidence, store, task_id, operations, requests, turns):
                 parent_branch_id=stage_runtime(source).get("branch_id"), current=heads[row["session_id"]] == value.branch_id,
                 kind="correction" if value.review_operation_id else "inheritance" if inherited else "continuation",
                 turn_id=owners.get(session.owner_id), road_id=session.owner_id if session.scope == "road_execution" else None))
+    from agent_core.stage_knowledge import StageKnowledge
     return dict(review_queue=queue, branches=branches,
+        fact_revisions=StageKnowledge(evidence, task_id, store=store).fact_revisions(),
         inner_activity=[item for role, item in activity if role == "inner_action"],
         retrospective=[item for role, item in activity if role == "outer_planning"])
 
