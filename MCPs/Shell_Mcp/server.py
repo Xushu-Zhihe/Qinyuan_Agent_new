@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from MCPs.fastmcp_compat import FastMCP
+from MCPs.analysis_common import validate_sandbox_path
 
 
 mcp = FastMCP(
@@ -35,47 +36,53 @@ def _validate_timeout(value: int) -> int:
 
 
 @mcp.tool(title="Run Bash In Sandbox")
-def run_bash(script: str, timeout_seconds: int = 60) -> dict[str, Any]:
-    """Run a Bash script in the Agent sandbox working directory."""
+def run_bash(script: str | None = None, timeout_seconds: int = 60, script_path: str | None = None) -> dict[str, Any]:
+    """Run inline Bash or reuse a sandbox script_path; provide exactly one."""
 
-    normalized_script = _validate_script(script)
+    arguments, metadata = _script_arguments(script, script_path, powershell=False)
     timeout = _validate_timeout(timeout_seconds)
     return {
         "sandbox_command": {
             "tool": "bash",
-            "arguments": ["--noprofile", "--norc", "-lc", normalized_script],
+            "arguments": arguments,
             "timeout_seconds": timeout,
         },
         "request": {
             "operation": "bash",
-            "script_bytes": len(normalized_script.encode("utf-8")),
+            **metadata,
         },
     }
 
 
 @mcp.tool(title="Run PowerShell In Sandbox")
-def run_powershell(script: str, timeout_seconds: int = 60) -> dict[str, Any]:
-    """Run a PowerShell script in the Agent sandbox working directory."""
+def run_powershell(script: str | None = None, timeout_seconds: int = 60, script_path: str | None = None) -> dict[str, Any]:
+    """Run inline PowerShell or reuse a sandbox script_path; provide exactly one."""
 
-    normalized_script = _validate_script(script)
+    arguments, metadata = _script_arguments(script, script_path, powershell=True)
     timeout = _validate_timeout(timeout_seconds)
     return {
         "sandbox_command": {
             "tool": "pwsh",
-            "arguments": [
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                normalized_script,
-            ],
+            "arguments": arguments,
             "timeout_seconds": timeout,
         },
         "request": {
             "operation": "powershell",
-            "script_bytes": len(normalized_script.encode("utf-8")),
+            **metadata,
         },
     }
+
+
+def _script_arguments(script, script_path, *, powershell):
+    if (script is None) == (script_path is None):
+        raise ValueError("tool_input_invalid: provide exactly one of script or script_path")
+    if script_path is not None:
+        path = validate_sandbox_path(script_path, label="script_path")
+        prefix = ["-NoLogo", "-NoProfile", "-NonInteractive", "-File"] if powershell else ["--noprofile", "--norc"]
+        return [*prefix, path], {"script_path": path}
+    source = _validate_script(script)
+    prefix = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"] if powershell else ["--noprofile", "--norc", "-lc"]
+    return [*prefix, source], {"script_bytes": len(source.encode("utf-8"))}
 
 
 def main() -> None:

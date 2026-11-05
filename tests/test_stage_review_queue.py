@@ -547,7 +547,7 @@ def test_outer_priority_returns_to_road_planner_and_inner_decides(case, switch, 
         from agent_core.stage_planning import parse, stage_output_issues
         from agent_core.output_contracts import D8ModelResponse
         invalid = D8ModelResponse(json.dumps({"kind": "roads", "roads": [asdict(choice.context.turn.roads[0].candidate)]}))
-        with pytest.raises(ValueError, match="route_order_changed_candidates"):
+        with pytest.raises(ValueError, match="pending_candidates_omitted"):
             parse(choice, invalid)
         assert stage_output_issues(choice, invalid)[0].code == "stage.route_order_changed_candidates"
 

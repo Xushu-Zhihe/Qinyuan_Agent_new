@@ -78,6 +78,10 @@ RULES = {
     "stage_summary": "Summarize only the supplied covered conversation prefix. Preserve the original goal and criterion, observations, hypotheses and uncertainty, negative findings, review feedback and open issues. Keep references and distinguish formal Fact from inference. This is an unverified conversation index, never new evidence, permission or success. Do not imply an omitted check never happened. Coverage is fixed by trusted metadata; do not invent it.",
 }
 PLANNING_SCOPE_GUIDANCE = (
+    " Scope a Turn around a method-neutral, independently checkable result, leaving genuinely different "
+    "hypotheses and methods as Roads toward that same result. If the goal chains several unresolved "
+    "deliverables, choose the nearest useful one; a mature bounded chain may stay together. Shared Facts "
+    "can support multiple Roads. Do not force multiple Roads or make routine preparation a separate Turn. "
     " Planning stops when the next deliverable and criterion, or a startable Road, are clear. "
     "An Intent defines the result and acceptance conditions, not a mandatory algorithm or attack sequence "
     "unless the user requires it. A Road needs a method direction, its decisive uncertain premise and the "
@@ -105,8 +109,9 @@ ACTION_PROGRESS_GUIDANCE = (
     "without adding a separate planning response. A negative search is bounded by its tested range, not proof "
     "that no solution exists. If downstream code depends on an unobserved candidate, first submit the cheap "
     "candidate/applicability check before constructing a costly conditional solver; keep a short, mature "
-    "conditional script together when splitting would only add a round trip. Repeated obstacles call for a changed premise, implementation "
-    "or observation; a new parameter alone is useful only when it addresses a concrete gap. "
+    "conditional script together when splitting would only add a round trip. A rewritten script is not a new "
+    "experiment: compare its hypothesis, mechanism, input version and expected distinguishing observation with "
+    "settled work. Reuse the established result unless a concrete gap warrants another execution. "
     "Generation timeout proves no technical hypothesis false. Keep existing evidence and authority."
 )
 FACT_REVISION_GUIDANCE = (
@@ -158,10 +163,29 @@ EXPLORATION_GUIDANCE = (
     "measurement failure from target counterevidence. Changed parameters, repeated responses or elapsed time alone "
     "prove neither progress nor exhaustion; controls and finite coverage can still be useful. Before extending "
     "experiments, consider whether a better observation or a missing technical premise would change the next decision. "
-    "Two consecutive failures of the same method with the same failure signature are a reason to inspect that method's "
-    "known limitations, not to repeat the same request. "
+    "Classify an obstacle as an implementation/measurement defect, a failed technical prerequisite or an "
+    "unresolved result before choosing the next action. Repair a script only for an identified defect and "
+    "check that repair; cosmetic rewrites and additional logging do not by themselves test a new premise. "
+    "After repeated equivalent failures, require new evidence, a distinct discriminating observation or a "
+    "specific untested coverage gap before continuing the same mechanism. Otherwise propose truthful Road "
+    "resolution so available alternatives can be considered; use return_to_parent only for grounded settled "
+    "blockage. Do not relabel the same failed mechanism as a new Road merely to reset its history. "
+    "A negative result applies to its tested conditions, not every method; timeout or unknown execution never "
+    "refutes the hypothesis or permits replay. "
     "Supervision should challenge unsupported premises and assess the next check's information value, not merely "
     "endorse a direction. Use existing explanations when useful; add no fields or calls just to discuss this. "
+)
+ENVIRONMENT_RECOVERY_GUIDANCE = (
+    " A local runtime/setup failure is not evidence that the artifact or solution method is unusable. "
+    "Preserve the exact error and distinguish missing runtime/dependency, wrong architecture/loader, "
+    "unwritable prefix/temp/cwd, initialization still pending, and an exception after the program started. "
+    "Use declared preparation tools and existing sandbox paths; correct a diagnosed cause and verify it with "
+    "a minimal startup/control before repeating the target experiment. Several different evidence-backed "
+    "repairs are allowed within the original deadline and authority; do not abandon after the first fixable "
+    "error or repeat an unchanged failed setup. Do not reinstall or reset working state without a specific "
+    "reason. Report only the confirmed remaining limitation when no grounded repair remains, and continue "
+    "with another supported analysis method. Unknown or still-running operations must settle before any retry; "
+    "environment recovery grants no network, privilege or execution authority."
 )
 TOOL_CONCURRENCY_GUIDANCE = (
     f" Submit one decision: mcp_call for one tool, or mcp_calls with up to {MAX_IN_FLIGHT_TOOLS} useful independent calls when declared. "
@@ -185,9 +209,31 @@ CRYPTO_TOOL_GUIDANCE = (
     " For number theory, RSA, elliptic curves, discrete logs or lattice attacks, prefer the declared crypto tools "
     "over re-implementing the math in an ad-hoc script: crypto.pari('factor(n)'), crypto.pari('ellinit([a4,a6])') "
     "or crypto.pari('znlog(g, Mod(a,p))') for PARI/GP; crypto.sympy('factorint(n)') for integer and symbolic work; "
-    "crypto.lll([[..],[..]]) for LLL/Coppersmith-style bases. Use shell only for file I/O and glue around their "
-    "results; pass a short expression instead of embedding a whole solver in one bash script. Their output is small "
-    "and directly usable as an observation."
+    "crypto.lll([[..],[..]]) for LLL/Coppersmith-style bases. When these cover the operation efficiently, "
+    "pass a short expression instead of embedding a whole solver in one bash script. Their output is small "
+    "and directly usable as an observation. Reuse data_path JSON bindings or matrix_path when declared "
+    "instead of copying large parameters or matrices. Custom algorithms and efficient composition remain allowed."
+)
+TOOL_SELECTION_GUIDANCE = (
+    " Across every tool category, prefer a declared structured operation when it expresses the required "
+    "work with existing inputs without materially increasing model round trips. Reuse its path/file inputs "
+    "instead of rewriting a shell wrapper or copying large data. Script-taking tools still require programming: "
+    "reuse script_path or an existing file runner when declared, and modify only the relevant part of a saved script. "
+    "Use short glue for composition and custom scripts for missing capabilities or new algorithms; keep a mature "
+    "combined script when splitting it would add model round trips. Do not explain tool selection in a separate "
+    "decision or request approval. No shell ban or script-length quota. File inputs are current sandbox data, "
+    "not immutable evidence or verified Facts; cite the actual execution receipt. Known tool failure, timeout "
+    "and unknown execution are distinct; an unknown result never permits replay."
+)
+ROAD_PRIORITY_GUIDANCE = (
+    " For Road review, first assess semantic admissibility and a grounded start. Compare priority using "
+    "recorded support, the cost of testing the decisive unknown and how its result would distinguish candidates. "
+    "Recommend a different order only for a concrete material advantage; otherwise retain the Inner order. "
+    "In the existing reason identify the evidence or discriminating check behind a change, without solving "
+    "the alternatives or inventing numeric scores. Compare remaining work from the current state, including "
+    "switching cost; past effort alone is no justification. Agreement is valid, and disagreement has no quota. "
+    "Outer ranking remains advice: Inner may execute its own first Road while review runs and decides whether "
+    "to retain it after advice; semantic rejection remains binding under the existing review protocol."
 )
 WEB_EFFECT_GUIDANCE = (
     " Before a target action that might consume limited state (a one-shot render, upload or submit, an attempt or "
@@ -208,6 +254,69 @@ ANCHOR_SEARCH_GUIDANCE = (
     "is a hypothesis, never evidence; if the anchor does not locate the check or does not survive verification, "
     "fall back to normal recon instead of scanning blindly. "
 )
+PWN_SCOPE_GUIDANCE = (
+    " For Pwn, define triage as the artifact identity, relevant runtime/loader/protections and enough of its "
+    "actual input contract to start the next grounded check. Do not require a full handler reconstruction, "
+    "proof of every suspected bug or exploit design merely to finish triage. A primitive-focused Turn may "
+    "establish one useful capability with its preconditions and limits instead of auditing every possible "
+    "vulnerability. These guide new scope proposals; an existing Turn's immutable criterion still governs completion."
+)
+PWN_ACTION_GUIDANCE = (
+    " For Pwn static analysis, identify the specific uncertainty that the next code slice can resolve. "
+    "Follow relevant input/dispatch, bounds, size and pointer data flow; stop expanding disassembly once "
+    "a discriminating next experiment is executable. Reuse saved disassembly, symbol maps and protocol helpers. "
+    "Check unfamiliar ABI layouts, enum values and encodings against matching local headers/library definitions "
+    "or a minimal local decode test rather than inventing them from memory. "
+    "When an authorized local runtime is available and a cheap run or debugger observation can settle the "
+    "question, prefer that bounded experiment to mentally simulating more assembly. If execution is unavailable "
+    "or uninformative, focused static work remains valid; local/debugger access is not a demonstrated remote capability. "
+    "In exploit development, inspect only the library routine, object layout or gadget needed to test the "
+    "current grounded candidate; do not reconstruct a complete libc mechanism or prepare several speculative "
+    "exploit chains before testing the decisive prerequisite. Keep each action focused on a testable question; "
+    "related cheap checks may share a script. Submit useful partial findings with their actual limits. "
+    "If the fixed triage criterion is supported, submit completion; if its necessary Fact reviews alone remain "
+    "pending, wait for review rather than start later exploit work to fill the wait. Never loosen the criterion "
+    "or force a method/Road switch simply because analysis took time."
+)
+
+
+def pwn_guidance(request) -> str:
+    """Apply Pwn guidance to the workbench's explicit category, not tool presence."""
+    if request.context.goal.lstrip().partition("\n")[0].strip() != "题型（任务提供）：pwn":
+        return ""
+    if request.stage == "stage_action":
+        return PWN_ACTION_GUIDANCE
+    if request.stage in {"stage_intent", "stage_continuation"} or (
+        request.stage == "stage_review" and isinstance(request.proposal, TurnIntent)
+    ):
+        return PWN_SCOPE_GUIDANCE
+    return ""
+
+
+REVERSE_ACTION_GUIDANCE = (
+    " For reverse engineering, use static triage to identify format, architecture and relevant input/check "
+    "code, then take a discriminating dynamic exit: when a permitted local run, breakpoint or short trace "
+    "can settle the current uncertainty more cheaply, submit that experiment before expanding static analysis. "
+    "Do not infer that PE cannot run from the host OS, file type or a missing wine64 command alias. "
+    "Check the actual declared runtime and its result. For Wine, initialize the required architecture with "
+    "wine_init, wait for it to settle, and use wine_run/wine_debug or the qy-wine32/qy-wine64 wrappers when "
+    "available. Verify writable prefix and temp paths in /workspace/work; direct wine can bypass wrapper "
+    "preparation. Reuse a working initialized prefix instead of creating a new one for every experiment. "
+    "A missing wineserver temp directory is setup failure; a program exception after startup is a different "
+    "observation, not proof that Wine is unavailable. Use the faulting address and a minimal control to "
+    "distinguish runtime compatibility, input-dependent code and target behavior; do not guess the cause. "
+    "Focus static work on the anchored routine/data flow and stop expanding once the next check is executable "
+    "or the fixed Turn criterion is supported. If runtime remains unavailable after grounded repairs or "
+    "dynamic execution cannot answer the question, continue focused static analysis without rebuilding "
+    "unrelated CRT/library internals. Neither static nor dynamic analysis has a mandatory call quota."
+)
+
+
+def reverse_guidance(request) -> str:
+    if (request.stage == "stage_action"
+        and request.context.goal.lstrip().partition("\n")[0].strip() == "题型（任务提供）：reverse"):
+        return REVERSE_ACTION_GUIDANCE
+    return ""
 
 
 def crypto_tool_guidance(request) -> str:
@@ -774,11 +883,16 @@ def model_contract(request):
                "Road switch because time elapsed. The Inner must submit a small executable decision using this "
                "advice; it has no further automatic adjustment for the same stalled decision."
                if stage_runtime(request).get("action_stall") else "")
+            + (TOOL_SELECTION_GUIDANCE if request.stage == "stage_action" and request.tools else "")
+            + (ROAD_PRIORITY_GUIDANCE if request.stage == "stage_review" and isinstance(request.proposal, tuple) else "")
             + (crypto_tool_guidance(request) if not intent_review else "")
             + (web_effect_guidance(request) if not intent_review else "")
             + (EXPLORATION_GUIDANCE + PUBLIC_REFERENCE_GUIDANCE if not planning and request.stage in {
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
             + (anchor_search_guidance(request) if not intent_review else "")
+            + pwn_guidance(request)
+            + reverse_guidance(request)
+            + (ENVIRONMENT_RECOVERY_GUIDANCE if request.stage in {"stage_action", "stage_supervision"} else "")
             + (OFFLINE_TOOLING_GUIDANCE if not planning and request.stage in {
                 "stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation", "stage_supervision"} else "")
             + (TOOL_PREPARATION_GUIDANCE if request.stage == "stage_action"

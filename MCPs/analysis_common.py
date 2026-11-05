@@ -73,6 +73,36 @@ def python_command(script: str) -> list[str]:
     return ["-c", validate_script(script)]
 
 
+def script_source(script: str | None, script_path: str | None) -> tuple[str, dict]:
+    """Select inline code or a sandbox file; planners never read host files."""
+    if (script is None) == (script_path is None):
+        raise ValueError("tool_input_invalid: provide exactly one of script or script_path")
+    if script_path is None:
+        source = validate_script(script)
+        return source, {"script_bytes": len(source.encode("utf-8"))}
+    path = validate_sandbox_path(script_path, label="script_path")
+    source = (
+        "from pathlib import Path\nimport sys\n"
+        f"_qy_file = {path!r}\n"
+        "_qy_source = Path(_qy_file).read_bytes()\n"
+        "if not _qy_source.strip() or len(_qy_source) > 65536 or b'\\x00' in _qy_source:\n"
+        "    raise ValueError('tool_input_invalid: script file must be nonempty, NUL-free and at most 64 KiB')\n"
+        "__file__ = _qy_file\nsys.argv = [_qy_file]\nsys.path.insert(0, str(Path(_qy_file).parent))\n"
+        "exec(compile(_qy_source, _qy_file, 'exec'), globals())\n"
+    )
+    return source, {"script_path": path}
+
+
+def json_input_source(path: str, variable: str) -> str:
+    """Load JSON data during sandbox execution, never on the MCP host."""
+    normalized = validate_sandbox_path(path, label="data_path")
+    return (
+        "import json\n"
+        f"with open({normalized!r}, encoding='utf-8') as _qy_input:\n"
+        f"    {variable} = json.load(_qy_input)\n"
+    )
+
+
 def needs_stage(path: str) -> bool:
     """True when an artifact lives on a noexec mount or lacks the exec bit.
 

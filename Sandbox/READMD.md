@@ -105,8 +105,7 @@ loader，因此镜像提供三个确定性入口：
   qy-wine32   固定 /usr/lib/wine/wine   + .wine32
   qy-wine-auto 读 PE 头（PE32/PE32+）自动选
 
-`Wine_Mcp` 的 `wine_init` 一次创建两个 prefix，`wine_run`/`wine_debug` 默认
-`arch=auto`，也可显式 `arch=32`/`64`。实测两个 prefix 合计约 1.9 GB，因此
+`Wine_Mcp` 的 `wine_init` 默认创建两个 prefix，也可仅初始化所需的 32/64 位 prefix；等待结算后复用成功状态。`wine_run` 默认 `arch=auto`，`wine_debug` 默认 `arch=64` 且要求明确 32/64 位。直接调用 wine 会绕过包装入口的目录准备；wineserver tmpdir 错误应先核验可写 prefix/TMPDIR，程序已启动后的异常应按故障位置另行诊断。实测两个 prefix 合计约 1.9 GB，因此
 work 从 1 GiB 提到 4 GiB、内存从 2 GiB 提到 4 GiB；32 位 PE 在 win32 prefix
 和 win64 的 WoW64 两条路径都能跑。Windows 0.3.9 基于 Linux 0.3.8，额外继承
 PARI/SymPy/fpylll 这套 crypto 栈；Wine 相关行为不变。

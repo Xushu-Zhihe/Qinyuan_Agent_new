@@ -8,7 +8,7 @@ from MCPs.analysis_common import (
     stage_python_prefix,
     staged_path,
     validate_sandbox_path,
-    validate_script,
+    script_source,
     validate_timeout,
 )
 from MCPs.fastmcp_compat import FastMCP
@@ -45,17 +45,19 @@ def _stage_prefix(source: str, target: str) -> str:
 
 @mcp.tool(title="Run Pwntools Script")
 def run_pwntools(
-    script: str,
+    script: str | None = None,
     timeout_seconds: int = 120,
     executable: str | None = None,
+    script_path: str | None = None,
 ) -> dict[str, Any]:
     """Run a Python/pwntools script inside the sandbox.
 
+    Provide exactly one of script or an existing sandbox script_path.
     timeout_seconds is capped at 120 seconds.  Print progress while the script
     runs (flush=True) instead of collecting it for the end: a timeout or a
     killed process keeps only what was already printed.
     """
-    normalized_script = validate_script(script)
+    normalized_script, metadata = script_source(script, script_path)
     # Server-side clamp: the model may ask for more time than the sandbox step
     # can ever grant, and a killed process must not look like a policy failure.
     timeout = min(validate_timeout(timeout_seconds), MAX_PWNTOOLS_TIMEOUT_SECONDS)
@@ -74,7 +76,7 @@ def run_pwntools(
         },
         "request": {
             "operation": "pwntools_python",
-            "script_bytes": len(normalized_script.encode("utf-8")),
+            **metadata,
             "staged_path": staged,
         },
     }

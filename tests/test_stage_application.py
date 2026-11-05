@@ -422,6 +422,51 @@ def review_request():
     return StageModelRequest("review", "task", "stage_review", "outer", 0, context)
 
 
+@pytest.mark.parametrize("name", ["nmap.run_nmap_tcp_scan", "binutils.inspect_binary", "pwntools.run_pwntools",
+    "crypto.lll", "file.inspect_file", "shell.run_bash"])
+def test_tool_preference_covers_all_categories_only_during_action(review_request, name):
+    from agent_core.stage_planning import model_contract, TOOL_SELECTION_GUIDANCE
+    tool = {"qualified_name": name, "input_schema": {"type": "object", "properties": {}}}
+    action = replace(review_request, stage="stage_action", tools=(tool,))
+    assert TOOL_SELECTION_GUIDANCE in model_contract(action)["rules"]
+    assert TOOL_SELECTION_GUIDANCE not in model_contract(replace(action, stage="stage_intent"))["rules"]
+
+
+def test_priority_guidance_is_scoped_to_road_reviews(review_request):
+    from agent_core.stage_planning import model_contract, ROAD_PRIORITY_GUIDANCE
+    from agent_core.stage_contracts import RoadCandidate
+    roads = replace(review_request, proposal=(RoadCandidate("route", ()),))
+    assert ROAD_PRIORITY_GUIDANCE in model_contract(roads)["rules"]
+    assert ROAD_PRIORITY_GUIDANCE not in model_contract(replace(review_request, proposal=TurnIntent("result", "check")))["rules"]
+
+
+@pytest.mark.parametrize("category", ["pwn", "reverse", "crypto", "web", "misc", "other"])
+def test_pwn_prompt_uses_explicit_category_and_preserves_output_boundary(review_request, category):
+    from agent_core.stage_planning import model_contract, PWN_ACTION_GUIDANCE, PWN_SCOPE_GUIDANCE, EXPLORATION_GUIDANCE
+    from agent_core.stage_planning import REVERSE_ACTION_GUIDANCE, ENVIRONMENT_RECOVERY_GUIDANCE
+    from agent_core.stage_contracts import StageTurnSnapshot, TurnPlanningState
+    turn = StageTurnSnapshot("turn", TurnIntent("result", "criterion"), TurnPlanningState.ACTIVE)
+    context = replace(review_request.context, goal=f"题型（任务提供）：{category}\ncontrolled task", turn=turn)
+    request = replace(review_request, context=context, stage="stage_action")
+    before = schema(request)
+    assert (PWN_ACTION_GUIDANCE in model_contract(request)["rules"]) == (category == "pwn")
+    assert (REVERSE_ACTION_GUIDANCE in model_contract(request)["rules"]) == (category == "reverse")
+    assert ENVIRONMENT_RECOVERY_GUIDANCE in model_contract(request)["rules"]
+    assert EXPLORATION_GUIDANCE in model_contract(request)["rules"]
+    assert schema(request) == before
+    for stage in ("stage_intent", "stage_continuation", "stage_review"):
+        planning = replace(request, stage=stage, proposal=TurnIntent("result", "criterion"))
+        rules = model_contract(planning)["rules"]
+        assert (PWN_SCOPE_GUIDANCE in rules) == (category == "pwn")
+        assert PWN_ACTION_GUIDANCE not in rules
+        assert REVERSE_ACTION_GUIDANCE not in rules
+        assert ENVIRONMENT_RECOVERY_GUIDANCE not in rules
+    for stage in ("stage_roads", "stage_summary", "stage_supervision"):
+        assert PWN_ACTION_GUIDANCE not in model_contract(replace(request, stage=stage))["rules"]
+    assert EXPLORATION_GUIDANCE in model_contract(replace(request, stage="stage_supervision"))["rules"]
+    assert ENVIRONMENT_RECOVERY_GUIDANCE in model_contract(replace(request, stage="stage_supervision"))["rules"]
+
+
 @pytest.mark.parametrize("proposal", [
     TurnIntent("stage", "criterion"), TurnCompletion("supported", ()),
     PlanningExhausted("no route", ()), RoadResolution(IntentStatus.SUCCEEDED, "done", ()),

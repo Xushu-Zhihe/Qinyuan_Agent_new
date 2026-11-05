@@ -12,8 +12,8 @@ mcp = FastMCP(
     instructions=(
         "Wine plans for the dedicated Windows profile (user-mode PE only; no "
         "kernel drivers, .NET Framework or anti-cheat). Workflow: "
-        "1) wine_init once per TaskRun (creates .wine64 and .wine32, ~1.9GB, "
-        "1-2 minutes). "
+        "1) wine_init before the first run; wait for completion and initialize only the needed "
+        "architecture (both prefixes together take ~1.9GB, 1-2 minutes). "
         "2) wine_run for one-shot execution; arch='auto' reads the PE header. "
         "3) wine_debug for breakpoints: it starts `winedbg --gdb Z:\\...`, so "
         "the tmux pane is a GNU gdb prompt; arch must be '32' or '64' "
@@ -59,7 +59,10 @@ def wine_init(timeout_seconds: int = 300, arch: str = "both") -> dict[str, Any]:
 
     Creates the 64-bit `.wine64` and 32-bit `.wine32` prefixes under
     /workspace/work (about 1.9GB, 1-2 minutes). `arch='both'` by default; use
-    '32' or '64' only when you need a single prefix.
+    '32' or '64' only when you need a single prefix. Wait for completion before
+    running. The wrappers prepare /workspace/work prefixes and TMPDIR; reuse
+    successful initialization. A wineserver tmpdir error is a setup failure,
+    not proof that a PE cannot execute.
     """
 
     timeout = validate_timeout(timeout_seconds)
