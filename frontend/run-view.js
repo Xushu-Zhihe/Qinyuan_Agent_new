@@ -249,10 +249,10 @@ const RunView = (() => {
     const tools = (progress.tool_operations || progress.executions || []).filter(item =>
       ["pending", "running", "in_flight"].includes(item.status));
     const models = [progress.inner_activity || [], progress.retrospective || []].map(items =>
-      items.filter(item => item.status === "unsettled" && !["discarded", "reused"].includes(item.disposition))
+      items.filter(item => (item.status === "unsettled" || item.status === "completed" && item.disposition === "unapplied") && !["discarded", "reused"].includes(item.disposition))
         .sort((a, b) => (a.started_at || 0) - (b.started_at || 0)).at(-1)).filter(Boolean);
-    return [...tools.map(item => `工具结果待结算 · ${short(item.operation_id || item.plan_id)}`),
-      ...models.map(item => `${stageLabels[item.stage] || item.phase || "模型请求"} · 请求未结算 · ${short(item.operation_id)}`)];
+    return [...tools.map(item => `工具结果待结算${Number.isInteger(item.sequence_step) ? ` · 实验步骤 ${item.sequence_step + 1}` : ""} · ${short(item.operation_id || item.plan_id)}`),
+      ...models.map(item => `${stageLabels[item.stage] || item.phase || "模型请求"} · ${item.status === "completed" ? "结果已生成，待应用" : "请求未结算"} · ${short(item.operation_id)}`)];
   }
   function renderFocus(progress, run, live) {
     const host = get("run-focus"); if (!host) return;
@@ -648,6 +648,13 @@ const RunView = (() => {
         if (scope.road && op.road_id !== scope.road.road_id || scope.type === "turn" && !scope.turn.roads.some(r => r.road_id === op.road_id)) continue;
         const item = detail(`tool-${op.operation_id}`, `工具 · ${label(op.status)} · Road ${short(op.road_id)}`);
         item.append(node("p", op.operation_id, "run-ref")); timeline.append(item);
+      }
+      const experimentLabels = { completed: "实验已完成", condition_not_met: "前提不符，已返回模型", tool_failed: "工具失败，已返回模型", review_blocked: "审核阻止后续执行" };
+      for (const experiment of progress.experiments || []) {
+        if (!activityFits(scope, experiment)) continue;
+        const item = detail(`experiment/${experiment.operation_id}`, experimentLabels[experiment.outcome] || "实验已停止");
+        item.append(node("p", experiment.outcome, "run-meta"));
+        timeline.append(item);
       }
       for (const op of progress.retrospective || []) {
         if (scope.road && op.road_id !== scope.road.road_id || scope.type === "turn" && op.turn_id !== scope.turn.turn_id) continue;

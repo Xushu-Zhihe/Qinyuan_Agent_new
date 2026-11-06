@@ -349,8 +349,16 @@ def _stage_task_result(directory, declaration, store, expected):
         "stage.supervision_unavailable", "stage.review_unavailable", "stage.generation_superseded"}]
     result["tool_operations"] = [dict(operation_id=op.start.operation_id,
         road_id=op.start.resource_ref.split("/")[1], phase="tool_dispatch",
+        started_at=op.start.started_at, finished_at=op.completion.finished_at if op.completion else None,
         status=op.completion.result_kind if op.completion else "in_flight")
         for op in operations if op.start.category == "tool_dispatch"]
+    for item in result["tool_operations"]:
+        claim = evidence.read("mcp-call", item["operation_id"])
+        if claim and "sequence_step" in claim:
+            item.update(sequence_step=claim["sequence_step"], parent_operation_id=claim["model_request_id"])
+    result["experiments"] = [dict(operation_id=identity,
+        road_id=requests[identity].context.session.owner_id, turn_id=requests[identity].context.turn.turn_id, **outcome)
+        for identity in requests if (outcome := evidence.read("sequence-result", identity)) is not None]
     result.update(_stage_activity(evidence, store, task_id, operations, requests, turns))
     usage = store.d4_budget_usage(task_id)
     result["budget"] = dict(status="available", policy_ref=usage.budget_policy_ref, total_used=usage.total_used,

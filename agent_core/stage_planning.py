@@ -2,8 +2,10 @@
 
 from dataclasses import dataclass, replace
 import json
+import re
 
 from agent_core.actions import MCPCall, PUBLIC_REFERENCE_TOOLS
+from agent_core.stage_experiments import StageToolSequence, validate_sequence
 from agent_core.domain import IntentStatus
 from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8RevisionTarget
 from agent_core.output_contracts import D8ModelResponse, D8FormatIssue, array, obj, tagged, text, decode_response, NATIVE_TRAILING_BRACE_POLICY
@@ -11,12 +13,13 @@ from agent_core.stage_contracts import (
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot,
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete, StageSessionSummary, StageStrategyAdvice, StageRoadSuggestion, StageTurnSnapshot, TurnAchievement, TurnCompletion, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, TurnPlanningState, StagePlanningDecision,
-    StageToolBatch, MAX_IN_FLIGHT_TOOLS, StageFactBatch, StageFactBatchReview, StageFactRevision,
+    StageToolBatch, StageToolDetails, MAX_IN_FLIGHT_TOOLS, StageFactBatch, StageFactBatchReview, StageFactRevision,
 )
 from agent_core.handoff_contracts import D8HistoryItem
 
 MAX_STAGE_CORRECTIONS = 2
 ACTION_SLOW_SECONDS = 300
+TOOL_SEARCH_PAGE_SIZE = 4
 STAGE_CALL_POLICY = {"max_corrections": MAX_STAGE_CORRECTIONS, "transport_recovery": "confirmed_exit_v1"}
 
 
@@ -42,6 +45,62 @@ class StageModelRequest:
 
 def stage_runtime(request):
     return (request.execution_context or {}).get("stage_runtime", {})
+
+
+def compact_action(request):
+    return request.stage == "stage_action" and "tool_details" in stage_runtime(request)
+
+
+def adaptive_tool_view(request):
+    details = stage_runtime(request).get("tool_details")
+    return details if request.stage == "stage_action" and isinstance(details, dict) else None
+
+
+def remaining_tool_matches(request):
+    search = (adaptive_tool_view(request) or {}).get("last_search", {})
+    available = {tool["qualified_name"] for tool in request.tools}
+    return tuple(name for name in search.get("remaining_tools", ()) if name in available)
+
+
+def action_tool_schemas(request):
+    """Select inline signatures without restricting the frozen tool registry."""
+    tools = request.tools
+    details = stage_runtime(request)["tool_details"]
+    view = adaptive_tool_view(request)
+    turn = request.context.turn
+    road = next((r for r in turn.roads if r.road_id == request.context.session.owner_id), None) if turn else None
+    focus = road.candidate.description if road else ""
+    names = set(details if view is None else view["recent"]) | PUBLIC_REFERENCE_TOOLS | {"shell.run_bash", "http.run_experiment"}
+    # The registry is already ordered by task category. Cover several services
+    # before spending the rest of the inline budget on their siblings.
+    if view is None or view["use_category_defaults"]:
+        leaders = {}
+        for tool in tools:
+            name = tool["qualified_name"]
+            leaders.setdefault(name.split(".", 1)[0], name)
+        names.update(list(leaders.values())[:6])
+    if view is not None:
+        names.add("file.inspect_file")
+        if view.get("paged_search"):
+            names.update(view.get("last_search", {}).get("matches", ()))
+    names.update([t["qualified_name"] for t in tools if t["qualified_name"] in focus][:4])
+    return {t["qualified_name"]: _closed_schema(t["input_schema"])
+            for t in tools if t["qualified_name"] in names}
+
+
+def _find_tools(tools, query):
+    def words(value):
+        return set(re.findall(r"[^\W_]+", value.casefold()))
+
+    terms = words(query)
+    ranked = []
+    for tool in tools:
+        name = tool["qualified_name"]
+        labels = words(" ".join((name, *tool.get("tags", ()))))
+        description = words(tool.get("description") or "")
+        if terms <= labels | description:
+            ranked.append((-len(terms & labels), name))
+    return tuple(name for _, name in sorted(ranked))
 
 
 def review_members(request):
@@ -77,6 +136,13 @@ RULES = {
     "stage_supervision": "Assess whether continuing this Road has a grounded next observation that could change the decision. An unmet criterion or absence of a final answer is not sufficient reason to continue. Briefly identify the decisive gap and next discriminating check, or recommend truthful Road resolution when no informative continuation is grounded. Do not re-solve the full task, construct an alternative solution chain, or repeat the accumulated history. Check whether useful observations should be proposed as scoped Facts, and whether current formal Facts already support the fixed Turn criterion; if so, request_intent_resolution and recommend explicit completion and truthful Road closure under the original reviews. Do not strengthen the criterion or require the final answer for an intermediate stage. Return continue_current_intent or request_intent_resolution with reason and support_refs. This is read-only advice; it never changes a Road result, stage goal, authorization or TaskRun success.",
     "stage_summary": "Summarize only the supplied covered conversation prefix. Preserve the original goal and criterion, observations, hypotheses and uncertainty, negative findings, review feedback and open issues. Keep references and distinguish formal Fact from inference. This is an unverified conversation index, never new evidence, permission or success. Do not imply an omitted check never happened. Coverage is fixed by trusted metadata; do not invent it.",
 }
+RULES["stage_action"] += (
+    " After each bounded experiment compare changed prerequisites, remaining work and switching cost, including "
+    "successful capability gains. Having another possible check alone does not make it the best next step. "
+    "Use reassess_roads to ask the original planner to keep, switch or extend routes without inventing failure. "
+    "Within the same hypothesis use a more discriminating dynamic test directly when runtime becomes available. "
+    "When formal support meets the fixed Turn criterion, prioritize completion rather than unrelated explanation."
+)
 PLANNING_SCOPE_GUIDANCE = (
     " Scope a Turn around a method-neutral, independently checkable result, leaving genuinely different "
     "hypotheses and methods as Roads toward that same result. If the goal chains several unresolved "
@@ -188,6 +254,16 @@ ENVIRONMENT_RECOVERY_GUIDANCE = (
     "environment recovery grants no network, privilege or execution authority."
 )
 TOOL_CONCURRENCY_GUIDANCE = (
+    " One Action should answer one bounded testable question. When mcp_sequence is offered, submit two to four "
+    "ordered calls for known dependencies without intermediate model turns. Each step has tool_name, arguments, "
+    "optional bindings [{step: earlier zero-based index, path: JSON Pointer in its settled payload, target: JSON Pointer "
+    "in arguments}], and optional condition {step, path, equals: scalar}. Explicit json_stdout:true on a reference "
+    "reads a complete JSON document from original non-truncated stdout; otherwise path reads the payload. "
+    "A false condition ends the sequence. "
+    "Missing fields or unexpected results return control; do not predict their meaning or create loops. "
+    "Use original tool schemas; resolved arguments are validated before each dispatch. Prefer existing typed "
+    "operations and reusable scripts over writing a new orchestration script. HTTP experiments use their existing "
+    "bounded experiment entry, not mcp_sequence. "
     f" Submit one decision: mcp_call for one tool, or mcp_calls with up to {MAX_IN_FLIGHT_TOOLS} useful independent calls when declared. "
     "Use the batch only when all arguments are already known; never guess a dependency on another call's result. "
     "A batch carries public-reference calls only, plus at most one sandbox or target call: two private actions in one batch "
@@ -204,6 +280,41 @@ TOOL_CONCURRENCY_GUIDANCE = (
     "return wait_for_tools with a brief reason; it waits for every pending call to settle, without cancelling them. "
     "Waiting is technical scheduling, not failure or exhaustion. "
     "Only the declared tools are currently eligible; a busy tool can be reconsidered after settlement. "
+)
+COMPACT_TOOL_GUIDANCE = (
+    " Submit as soon as the next action is executable. Pick one uncertainty and the cheapest observation "
+    "that can change the next choice; do not solve branches that depend on an unseen result. Related cheap "
+    "checks may share one action. Check recorded results first: reuse settled observations and saved scripts "
+    "or parsed files when inputs match. Rerun only for a changed input, a diagnosed repair, a control or an "
+    "untested condition. Do not rewrite a working script just to repeat its checks. "
+    "current.tools lists available tool names and purposes; current.tool_schemas shows their selected exact "
+    "argument signatures. Use tool_details with up to four names whose signatures are missing when needed. "
+    "It only reveals signatures, does not execute tools or create evidence. Prefer an applicable typed tool; "
+    "use a short script for work it cannot express efficiently. "
+    "When public search finds a precise match relevant to the current question, fetch the best source once "
+    "before guessing from its snippet. Reuse an already fetched body. "
+    "Use mcp_call for one call, mcp_calls for independent known inputs (at most one private sandbox/target "
+    "call), or mcp_sequence for two to four calls with known dependencies. Sequence bindings copy a scalar or "
+    "JSON value from a settled earlier step using {step,path,target} (zero-based index and JSON Pointers); "
+    "condition {step,path,equals} stops on mismatch. Use json_stdout:true only for complete JSON stdout. "
+    "Do not sequence http.run_experiment. If the result needs interpretation, return control there. "
+    "Pending calls are not observations. If the next decision needs their results, use wait_for_tools. "
+    "Never duplicate pending or unknown execution. Print useful partial results before a script timeout. "
+)
+ADAPTIVE_TOOL_GUIDANCE = (
+    " Treat the starting task category as a hint. When new evidence changes what the next check needs, "
+    "pick the capability for that check across the full catalog; do not reclassify the whole task or wait for a tool to fail. "
+    "Use a suitable tool directly if its signature is shown. If you know its name but need its signature, "
+    "use tool_details with tool_names. If you know only the capability, use tool_details with query instead: "
+    "give a few English keywords (for example 'decompile dex'), not a whole question. "
+    "The catalog matches keywords against available tool names, tags and descriptions and returns up to four signatures. "
+    "current.tool_search reports the last lookup; for no matches, try a simpler keyword or select an exact catalog name. "
+    "Use the next check to choose tools, without a separate planning or review step. "
+)
+TOOL_SEARCH_PAGING_GUIDANCE = (
+    " If none of the shown matches fits and current.tool_search.remaining is positive, "
+    'submit {"kind":"tool_details","next_page":true} to see the next four matches from the same lookup. '
+    "Use a new keyword query or an exact catalog name once the list is exhausted. "
 )
 CRYPTO_TOOL_GUIDANCE = (
     " For number theory, RSA, elliptic curves, discrete logs or lattice attacks, prefer the declared crypto tools "
@@ -352,9 +463,9 @@ def road_suggestion_guidance(request):
         + str(suggestion.get("description", "")) + " - reason: " + str(suggestion.get("reason", ""))
         + "; uncertainty: " + str(suggestion.get("uncertainty", ""))
         + "; value of staying: " + str(suggestion.get("current_direction_value", ""))
-        + ". This is advice, not an instruction and not evidence: keep this Road while it still has a grounded "
-        "next check, and never treat the suggestion as a Fact. If you instead close this Road with a truthful "
-        "road_resolution, that alternative starts next.")
+        + ". This is advice, not evidence. Compare remaining work and switching cost after meaningful changes, "
+        "including successful experiments. Use reassess_roads to let the original planner keep or switch "
+        "without claiming this Road failed; never treat the suggestion as a Fact.")
 
 
 DIRECT_SUBMISSION_GUIDANCE = (
@@ -445,7 +556,7 @@ def provider_schema(request):
                     if not (key == "enum" and field in references
                             or key == "maximum" and field == "accepted_road_indices")}
         return [project(item, field) for item in value] if isinstance(value, list) else value
-    return project(schema(request))
+    return project(schema(request, compact=compact_action(request)))
 
 
 def _within_result(issue):
@@ -719,7 +830,7 @@ def pending_roads_hint(request):
 
 
 def pending_road_issues(request, value):
-    if request.stage not in {"stage_roads", "stage_continuation"} or value.get("kind") != "roads" or request.context.turn is None:
+    if request.stage not in {"stage_roads", "stage_continuation"} or value.get("kind") not in {"roads", "extend_roads"} or request.context.turn is None:
         return []
     rows = value.get("roads")
     if not isinstance(rows, list) or any(not isinstance(row, dict) or set(row) != {"description", "support_refs"}
@@ -772,6 +883,11 @@ def stage_output_issues(request, raw, *, normalization_policy=NATIVE_TRAILING_BR
         # kind and every business rule behind the wrapper.
         value = value["result"]
     kind = value.get("kind")
+    if kind == "mcp_sequence" and not issues:
+        try:
+            validate_sequence(value["steps"], request.tools)
+        except ValueError as error:
+            return [D8FormatIssue(str(error), "$/steps", "valid_literals_and_backward_result_bindings", "invalid")]
     pending = blocking_fact_revisions(request)
     forbidden = {"turn_completion", "turn_intent", "return_to_parent", "exhausted"} if pending else set()
     if stage_runtime(request).get("fact_revisions"):
@@ -860,7 +976,7 @@ def model_contract(request):
             if request.stage == "stage_action" else {}),
         "planning_validation": "retain_pending_v1",
         "output_normalization": NATIVE_TRAILING_BRACE_POLICY,
-        "rules": ("You are the original Road planner. Read the Outer priority advice and current actual outcomes. Decide whether to keep the current Road or select another available Road; select_road may select the running Road to resume its original execution history. Alternatively return roads to order every currently available candidate exactly once with its original description and support, highest priority first. Do not alter goals, replay tools, or treat the Outer preference as a forced switch."
+        "rules": ("You are the original Road planner. Read the route reassessment reason, any Outer priority advice and current actual outcomes. Decide whether to keep the current Road or select another available Road; select_road may select the running Road to resume its original execution history. Alternatively return roads to order every currently available candidate exactly once with its original description and support, highest priority first. Use extend_roads for a genuinely new hypothesis: include every pending candidate unchanged, add new candidates in preferred order, omit running/suspended/closed candidates which remain preserved; new candidates receive the original asynchronous review. Do not alter goals, replay tools, or treat the Outer preference as a forced switch."
             if stage_runtime(request).get("route_advice") else RULES[request.stage]) + planning_guidance + turn_review + revision_guidance + pending_roads_hint(request) + closure + (KNOWLEDGE_GUIDANCE if request.stage in {"stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation"} else "")
             + (" Review submissions create logical continuation branches. Pending/blocked candidates remain unverified hypotheses, "
                "not formal Facts, completion support or authority. Continue useful independent authorized exploration while review is pending; "
@@ -869,7 +985,16 @@ def model_contract(request):
                "On correction, the restored author prefix includes feedback while current history retains real tool outcomes and formal knowledge; "
                "neither a branch switch nor old messages restore the environment. Correct or drop unsupported claims rather than asserting them again. "
                if stage_runtime(request).get("review_mode") in {"async_fact_v1", "async_planning_v1"} and request.stage == "stage_action" else "")
-            + (TOOL_CONCURRENCY_GUIDANCE if request.stage == "stage_action" else "")
+            + ((COMPACT_TOOL_GUIDANCE if compact_action(request) else TOOL_CONCURRENCY_GUIDANCE)
+               if request.stage == "stage_action" else "")
+            + (ADAPTIVE_TOOL_GUIDANCE if adaptive_tool_view(request) is not None and request.tools else "")
+            + (TOOL_SEARCH_PAGING_GUIDANCE if (adaptive_tool_view(request) or {}).get("paged_search") and request.tools else "")
+            + (" For an action likely to exhaust the generation budget, use action_checkpoint if offered. "
+               "In reason record only the chosen approach, its key constraints and the next small test. "
+               "Cite existing observations in support_refs. A checkpoint is an unverified work note. "
+               "Use current.action_checkpoint to resume the next test without reconstructing the approach. "
+               "Submit a tool action directly when the next check is already short."
+               if request.stage == "stage_action" and "action_checkpoint" in stage_runtime(request) else "")
             + (ACTION_PROGRESS_GUIDANCE if request.stage == "stage_action" else "")
             + (FACT_REVISION_GUIDANCE if stage_runtime(request).get("fact_revisions") and request.stage in {
                 "stage_action", "stage_roads", "stage_continuation", "stage_completion"} else "")
@@ -883,7 +1008,8 @@ def model_contract(request):
                "Road switch because time elapsed. The Inner must submit a small executable decision using this "
                "advice; it has no further automatic adjustment for the same stalled decision."
                if stage_runtime(request).get("action_stall") else "")
-            + (TOOL_SELECTION_GUIDANCE if request.stage == "stage_action" and request.tools else "")
+            + (TOOL_SELECTION_GUIDANCE if request.stage == "stage_action" and request.tools
+               and not compact_action(request) else "")
             + (ROAD_PRIORITY_GUIDANCE if request.stage == "stage_review" and isinstance(request.proposal, tuple) else "")
             + (crypto_tool_guidance(request) if not intent_review else "")
             + (web_effect_guidance(request) if not intent_review else "")
@@ -914,8 +1040,9 @@ def model_contract(request):
                if request.context.goal_validation is not None else "")
             + (DIRECT_SUBMISSION_GUIDANCE if request.stage == "stage_action"
                and stage_runtime(request).get("direct_submission") else ""),
-        "instruction": "Return one complete JSON result object matching output_contract.schema. "
-            "Do not copy the contract envelope or wrap the result in version/stage/schema keys. No Markdown or extra fields."
+        "instruction": (("Return one complete JSON result using the submit_stage_result tool schema. "
+            if compact_action(request) else "Return one complete JSON result object matching output_contract.schema. ")
+            + "Do not copy the contract envelope or wrap the result in version/stage/schema keys. No Markdown or extra fields."
             " Tool arguments are closed: use exactly the declared keys for the chosen tool_name;"
             " unknown fields and strings beyond a declared maxLength are rejected."
             " When the submit_stage_result output tool is provided, call it exactly once with the complete result. "
@@ -930,7 +1057,7 @@ def model_contract(request):
             "resolve them to the included original value. Only the current runtime contract grants choices; "
             "the provider tool describes structure, not the current allowed reference set."
             + (" This is a shared correction or transport retry; follow the supplied failure reason and preserve the original decision scope."
-               if request.correction_of_model_request_id else "")}
+               if request.correction_of_model_request_id else ""))}
 
 
 def _closed_schema(schema):
@@ -961,8 +1088,8 @@ def _closed_schema(schema):
     return result
 
 
-def schema(request):
-    result = _schema(request)
+def schema(request, *, compact=False):
+    result = _schema(request, compact=compact)
     if "anyOf" not in result or request.stage in {"stage_review", "stage_supervision"}:
         return result
     pending = blocking_fact_revisions(request)
@@ -988,7 +1115,7 @@ def blocking_fact_revisions(request):
             and turn is not None and item["handoff_turn_id"] == turn.turn_id))
 
 
-def _schema(request):
+def _schema(request, *, compact=False):
     if request.stage == "stage_summary":
         return obj({"content": text()})
     ref = text()
@@ -1008,7 +1135,8 @@ def _schema(request):
             return {"anyOf": [tagged("select_road", {**supported, "road_id": {"type": "string", "enum": [
                 road.road_id for road in request.context.turn.roads
                 if road.status in {IntentStatus.RUNNING, IntentStatus.PENDING, IntentStatus.SUSPENDED}]}}),
-                tagged("roads", {"roads": array(obj({"description": text(), "support_refs": refs}), minimum=1)})]}
+                tagged("roads", {"roads": array(obj({"description": text(), "support_refs": refs}), minimum=1)}),
+                tagged("extend_roads", {"roads": array(obj({"description": text(), "support_refs": refs}), minimum=1)})]}
         choices = [tagged("roads", {"roads": array(obj({"description": text(),
             "support_refs": refs}), minimum=1)}), exhausted, feedback, *knowledge_actions(request),
             *(completions if request.stage == "stage_roads" and request.context.turn.achievement is None else ())]
@@ -1071,13 +1199,47 @@ def _schema(request):
     from agent_core.conclusion_revisions import ConclusionRevisions
     by_ref = {item.ref: item for item in request.context.history}
     ready = all(ConclusionRevisions.reliable(by_ref.get(ref)) for ref in request.context.effective_support_refs)
-    selections = [obj({"tool_name": {"type": "string", "const": tool["qualified_name"]},
-        "arguments": _closed_schema({"$schema": "https://json-schema.org/draft/2020-12/schema",
-            **tool["input_schema"]})}) for tool in request.tools] if ready else []
+    names = [t["qualified_name"] for t in request.tools]
+    arguments = {"type": "object", "additionalProperties": True}
+    selections = []
+    if ready and names:
+        selections = ([obj({"tool_name": text(), "arguments": arguments})] if compact else
+            [obj({"tool_name": {"type": "string", "const": tool["qualified_name"]},
+                "arguments": _closed_schema({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                    **tool["input_schema"]})}) for tool in request.tools])
     calls = [tagged("mcp_call", selection["properties"]) for selection in selections]
+    if compact_action(request):
+        shown = action_tool_schemas(request)
+        hidden = [name for name in names if name not in shown]
+        if hidden:
+            calls.append(tagged("tool_details", {"tool_names": {**array(
+                text() if compact else {"type": "string", "enum": hidden}, minimum=1, maximum=4),
+                "uniqueItems": True}}))
+            if adaptive_tool_view(request) is not None:
+                calls.append(tagged("tool_details", {"query": {**text(96), "pattern": r"[^\W_]"}}))
+        if remaining_tool_matches(request):
+            calls.append(tagged("tool_details", {"next_page": {"type": "boolean", "const": True}}))
+    if not request.context.pending_operation_ids:
+        calls.append(tagged("reassess_roads", supported))
+        runtime = stage_runtime(request)
+        if (selections and request.context.session.scope == "road_execution"
+                and "action_checkpoint" in runtime and runtime["action_checkpoint"] is None):
+            calls.append(tagged("action_checkpoint", {**supported, "reason": text(1024)}))
+    if selections and not request.context.pending_operation_ids:
+        reference = {"step": {"type": "integer", "minimum": 0, "maximum": MAX_IN_FLIGHT_TOOLS - 1},
+            "path": {"type": "string"}, "json_stdout": {"type": "boolean"}}
+        sequence_names = [name for name in names if name != "http.run_experiment"]
+        steps = [obj({"tool_name": tool_name, "arguments": arguments,
+            "bindings": array(obj({**reference, "target": {"type": "string", "pattern": "^/"}}, optional=("json_stdout",))),
+            "condition": obj({**reference, "equals": {"type": ["string", "number", "boolean", "null"]}}, optional=("json_stdout",))},
+            optional=("bindings", "condition")) for tool_name in (
+                [text()] if compact and sequence_names else
+                [{"type": "string", "const": name} for name in sequence_names])]
+        if steps:
+            calls.append(tagged("mcp_sequence", {"steps": array({"anyOf": steps}, minimum=2, maximum=MAX_IN_FLIGHT_TOOLS)}))
     public = sorted(t["qualified_name"] for t in request.tools if t["qualified_name"] in PUBLIC_REFERENCE_TOOLS)
     if selections and public and not request.context.pending_operation_ids:
-        calls.append(tagged("mcp_calls", {"calls": {**array({"anyOf": selections}, minimum=2,
+        calls.append(tagged("mcp_calls", {"calls": {**array(selections[0] if compact else {"anyOf": selections}, minimum=2,
             maximum=MAX_IN_FLIGHT_TOOLS), "uniqueItems": True,
             "contains": {"type": "object", "properties": {"tool_name": {"type": "string", "enum": public}},
                          "required": ["tool_name"], "additionalProperties": True}}}))
@@ -1231,6 +1393,21 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
         return StageStrategyAdvice(value["decision"], checked(value, "reason"), refs,
                                    _road_suggestion(request, value.get("suggestion")))
     kind = value["kind"]
+    if kind == "tool_details":
+        if "query" in value:
+            query = value["query"].strip()
+            names = _find_tools(request.tools, query)
+            if not (adaptive_tool_view(request) or {}).get("paged_search"):
+                names = names[:TOOL_SEARCH_PAGE_SIZE]
+        elif "next_page" in value:
+            query = adaptive_tool_view(request)["last_search"]["query"]
+            names = remaining_tool_matches(request)
+        else:
+            return StageToolDetails(tuple(value["tool_names"]))
+        return StageToolDetails(names[:TOOL_SEARCH_PAGE_SIZE], query, names[TOOL_SEARCH_PAGE_SIZE:])
+    if kind == "mcp_sequence":
+        validate_sequence(value["steps"], request.tools)
+        return StageToolSequence(tuple(value["steps"]))
     if kind == "fact_revision":
         candidate = value.get("candidate")
         if candidate is not None:
@@ -1243,7 +1420,8 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
         if sum(item["tool_name"] not in PUBLIC_REFERENCE_TOOLS for item in value["calls"]) > 1:
             raise ValueError("stage.tool_batch_resource_conflict")
         return StageToolBatch(tuple(MCPCall(item["tool_name"], item["arguments"]) for item in value["calls"]))
-    if kind in {"select_road", "return_to_parent", "request_final_validation", "wait_for_tools", "wait_for_review"}:
+    if kind in {"select_road", "reassess_roads", "return_to_parent", "request_final_validation",
+                "wait_for_tools", "wait_for_review", "action_checkpoint"}:
         return StagePlanningDecision(kind, checked(value, "reason"), refs, value.get("road_id"), value.get("candidate"), value.get("source_ref"))
     if kind == "select_facts":
         return StageFactSelection(tuple(value["support_refs"]))
@@ -1267,7 +1445,13 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
         return PlanningExhausted(checked(value, "reason"), refs)
     if kind == "turn_intent":
         return TurnIntent(checked(value, "description"), checked(value, "completion_criterion"), refs)
-    if kind == "roads":
+    if kind in {"roads", "extend_roads"}:
+        if kind == "extend_roads":
+            prior = {r.candidate for r in request.context.turn.roads}
+            proposed = [RoadCandidate(checked(item, "description"), tuple(item["support_refs"])) for item in value["roads"]]
+            nonpending = {r.candidate for r in request.context.turn.roads if r.status is not IntentStatus.PENDING}
+            if not any(p not in prior for p in proposed) or any(p in nonpending for p in proposed):
+                raise ValueError("stage.route_extension_invalid")
         if pending_road_policy and pending_road_issues(request, value):
             raise ValueError("stage.pending_candidates_omitted")
         if route_order_issues(request, value):

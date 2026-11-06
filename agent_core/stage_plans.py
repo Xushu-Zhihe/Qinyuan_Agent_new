@@ -198,8 +198,18 @@ def route_advice(store, task_id):
     """A different Outer priority is answered by the original Road planner."""
     evidence = store.stage_evidence
     answered = {stage_runtime(evidence.request(op.start.operation_id)).get("route_advice")
-        for op in store.list_d4_operations(task_id) if op.start.role == "inner_action" and op.application_ref is not None
-        and not op.application_ref.startswith("stage-discarded/")}
+        for op in store.list_d4_operations(task_id) if op.start.role == "inner_action"
+        and (op.application_ref is not None and not op.application_ref.startswith("stage-discarded/") or admitted(store, op.start.operation_id))}
+    from agent_core.stage_contracts import StagePlanningDecision
+    current = active_turn(list_turns(store, task_id))
+    for operation in reversed(store.list_d4_operations(task_id)):
+        if (operation.application_ref is None or operation.completion is None
+                or operation.start.category != "action" or operation.start.operation_id in answered):
+            continue
+        source = evidence.read_model_result(operation)
+        if (isinstance(source.result, StagePlanningDecision) and source.result.kind == "reassess_roads"
+                and current is not None and any(r.road_id == source.session.owner_id for r in current.roads)):
+            return operation.start.operation_id
     for entry in list_reviews(store, task_id):
         if entry.state != "settled" or entry.review_operation_id in answered:
             continue

@@ -12,6 +12,7 @@ from typing import ClassVar, Literal, Protocol, TypeAlias
 
 from agent_core.domain import IntentStatus
 from agent_core.actions import MCPCall
+from agent_core.stage_experiments import StageToolSequence
 from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8ConclusionChange, D8RevisionRecord
 from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.operation_accounting import D4OperationRecord, D8HandoffBudgetPolicy
@@ -153,13 +154,21 @@ class StageHistoryRead:
 
 
 @dataclass(frozen=True, slots=True)
+class StageToolDetails:
+    tool_names: tuple[str, ...]
+    query: str | None = None
+    remaining_tools: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class StageConclusionChange(D8ConclusionChange):
     SUPPORT_RELATIONS: ClassVar[frozenset[str]] = frozenset({"turn_premise", "road_premise"})
 
 
 @dataclass(frozen=True, slots=True)
 class StagePlanningDecision:
-    kind: Literal["select_road", "return_to_parent", "request_final_validation", "wait_for_tools", "wait_for_review"]
+    kind: Literal["select_road", "reassess_roads", "return_to_parent", "request_final_validation",
+                  "wait_for_tools", "wait_for_review", "action_checkpoint"]
     reason: str
     support_refs: tuple[str, ...]
     road_id: str | None = None
@@ -373,7 +382,7 @@ class StageModelEvidence:
     session: PlanningSession
     context_sha256: str
     evidence_sha256: str
-    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | StageFactBatch | StageFactBatchReview | StageFactRevision | MCPCall | StageToolBatch | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
+    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | StageFactBatch | StageFactBatchReview | StageFactRevision | MCPCall | StageToolBatch | StageToolSequence | StageToolDetails | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
     proposal_operation_id: str | None = None
     proposal_sha256: str | None = None
 

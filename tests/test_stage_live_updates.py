@@ -85,6 +85,7 @@ def test_inflight_planning_survives_600_seconds_and_old_deadline_after_extension
     case.models.inner.invoke = invoke
     request = case.app._request("stage_intent", PlanningSession("turn_planning", case.app._id("stage/root")))
     contract = model_contract(request)
+    case.app.evidence.save("contract", request.model_request_id, contract)
     envelope = D8OutputRequest(request, {"version": 1, "stage": request.stage, "schema": contract["schema"]}, contract["instruction"], None)
     async def exercise():
         pending = asyncio.create_task(case.app.models._invoke(case.models.inner, envelope, 600,

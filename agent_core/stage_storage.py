@@ -17,7 +17,7 @@ from agent_core.operation_accounting import OperationIdentityConflict, Operation
 from agent_core.runtime import TaskRunStatus
 from agent_core.stage_contracts import (
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot,
-    StageConclusionChange, StageFactApplication, StageFactProposal, StageFactSelection, StageHistoryRead,
+    StageConclusionChange, StageFactApplication, StageFactProposal, StageFactSelection, StageHistoryRead, StageToolDetails,
     StageModelEvidence, StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnIntent, TurnPlanningReview, TurnPlanningState, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
     TOOL_BATCH_WAIT_SECONDS,
@@ -238,6 +238,17 @@ def live_tool_requests(store, task_id):
                  if record.start.category == "action" and live(record.start.operation_id))
 
 
+def unchanged_action(store, operation):
+    """Only operator/checkpoint movement may precede reuse of a saved decision."""
+    records = store.list_d4_operations(operation.start.task_run_id)
+    if not records or records[-1].start.operation_id != operation.start.operation_id:
+        return False
+    request = store.stage_evidence.request(operation.start.operation_id)
+    return (request.stage == "stage_action" and not request.context.pending_operation_ids
+        and request.context.turn is not None
+        and request.context.turn == load_turn(store, operation.start.task_run_id, request.context.turn.turn_id))
+
+
 def validate_tool_start(store, start):
     """Bind a new dispatch to the exact admitted Inner decision and live Road."""
     config = require_run(store, start.task_run_id)
@@ -256,12 +267,17 @@ def validate_tool_start(store, start):
     if store.stage_evidence is None:
         _fail("stage.evidence_unconfigured", Category.DEPENDENCY)
     live_experiment = experiment and getattr(store, "live_tool_request", lambda identity: False)(proposal_id)
+    from agent_core.stage_experiments import StageToolSequence, resolve_step, step_id
+    sequence = (store.stage_evidence.read_model_result(operation).result
+        if operation is not None and operation.completion is not None and operation.completion.result_kind == "completed" else None)
+    live_sequence = isinstance(sequence, StageToolSequence) and getattr(store, "live_tool_request", lambda identity: False)(proposal_id)
     applied_batch = (operation is not None and operation.application_ref == proposal_id
         and getattr(store, "live_tool_request", lambda identity: False)(proposal_id)
         and isinstance(store.stage_evidence.read_model_result(operation).result, StageToolBatch))
     if (operation is None or operation.start.task_run_id != start.task_run_id or operation.start.category != "action"
             or operation.start.role != "inner_action" or operation.start.role_config_ref != config.inner_role.role_config_ref
-            or (operation.start.base_checkpoint_sequence != start.base_checkpoint_sequence and not live_experiment)
+            or (operation.start.base_checkpoint_sequence != start.base_checkpoint_sequence
+                and not (live_experiment or live_sequence or unchanged_action(store, operation)))
             or operation.completion is None or operation.completion.result_kind != "completed"
             or (operation.application_ref is not None and not applied_batch
                 and not (live_experiment and operation.application_ref == proposal_id))):
@@ -269,7 +285,17 @@ def validate_tool_start(store, start):
     evidence = store.stage_evidence.read_model_result(operation)
     saved = store.stage_evidence.read("mcp-call", start.operation_id)
     proposed = next((call for call in tool_calls(evidence.result) if saved and asdict(call) == saved.get("call")), None)
-    if evidence.session != PlanningSession("road_execution", road_id) or not tool_calls(evidence.result):
+    if isinstance(sequence, StageToolSequence) and saved is not None:
+        index = saved.get("sequence_step")
+        if type(index) is not int or not 0 <= index < len(sequence.steps) or start.operation_id != step_id(start.task_run_id, proposal_id, index):
+            _fail("stage.sequence_reference_invalid", Category.INPUT)
+        try:
+            proposed = resolve_step(store.stage_evidence, start.task_run_id, proposal_id, sequence, index)
+        except ValueError as error:
+            _fail(str(error), Category.POLICY)
+        if proposed is None or asdict(proposed) != saved.get("call"):
+            _fail("stage.tool_proposal_changed", Category.UNKNOWN)
+    if evidence.session != PlanningSession("road_execution", road_id) or not (tool_calls(evidence.result) or isinstance(sequence, StageToolSequence)):
         _fail("stage.tool_proposal_scope_changed", Category.POLICY)
     if proposed is None:
         _fail("stage.tool_proposal_changed", Category.UNKNOWN)
@@ -297,6 +323,8 @@ def validate_tool_start(store, start):
                 or saved["experiment_request"]["ordinal"] != int(parts[4])):
             _fail("stage.experiment_binding_changed", Category.POLICY)
         claim = saved
+    elif isinstance(sequence, StageToolSequence):
+        claim["sequence_step"] = saved["sequence_step"]
     else:
         from agent_core.turn_modeling import stable_id
         if start.operation_id != stable_id(start.task_run_id, "mcp/" + tool_call_key(proposal_id, evidence.result, proposed)):
@@ -1120,7 +1148,8 @@ def _validate(store, mutation):
         for identity in change.applications:
             operation = store.load_d4_operation(identity)
             if (operation is None or operation.start.task_run_id != mutation.task_run_id
-                    or operation.start.role != "inner_action" or operation.start.base_checkpoint_sequence != mutation.base_checkpoint_sequence
+                    or operation.start.role != "inner_action" or (operation.start.base_checkpoint_sequence != mutation.base_checkpoint_sequence
+                        and not unchanged_action(store, operation))
                     or operation.start.role_config_ref != config.inner_role.role_config_ref
                     or operation.start.budget_policy_ref != config.budget.budget_policy_ref
                     or operation.completion is None or operation.completion.result_kind != "completed" or operation.application_ref is not None):
@@ -1134,12 +1163,23 @@ def _validate(store, mutation):
                     _fail("stage.fact_selection_not_applied")
             elif isinstance(source.result, StageHistoryRead):
                 store.stage_evidence.read_history_result(operation)
+            elif isinstance(source.result, StageToolDetails):
+                if source.session.scope != "road_execution":
+                    _fail("stage.tool_details_unbound", Category.POLICY)
+            elif isinstance(source.result, StagePlanningDecision) and source.result.kind == "action_checkpoint":
+                if source.session.scope != "road_execution":
+                    _fail("stage.action_checkpoint_unbound", Category.POLICY)
+                _sources(store, mutation.task_run_id, source.result.support_refs)
             elif isinstance(source.result, StageFactRevision) and source.result.decision != "resubmit":
                 knowledge.validate_fact_revision(store.stage_evidence.request(identity), source.result)
             elif isinstance(source.result, StagePlanningDecision) and source.result.kind == "wait_for_tools":
                 request = store.stage_evidence.request(identity)
                 if source.session.scope != "road_execution" or not request.context.pending_operation_ids:
                     _fail("stage.wait_without_tools", Category.POLICY)
+            elif isinstance(source.result, StagePlanningDecision) and source.result.kind == "reassess_roads":
+                if source.session.scope != "road_execution" or owner.turn_id != active_turn(tuple(knowledge.turns.values())).turn_id:
+                    _fail("stage.route_decision_unbound", Category.POLICY)
+                _sources(store, mutation.task_run_id, source.result.support_refs)
             elif isinstance(source.result, StagePlanningDecision) and source.result.kind == "wait_for_review":
                 from agent_core.stage_planning import stage_runtime
                 request = store.stage_evidence.request(identity)

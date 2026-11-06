@@ -315,6 +315,11 @@ class MCPPlanExecutor:
             if self.app.store.load_stage_run_config(claim["task_run_id"]) is not None:
                 from agent_core.stage_contracts import StageToolBatch
                 parent = self.app.store.load_d4_operation(claim["model_request_id"])
+                from agent_core.stage_experiments import StageToolSequence
+                if isinstance(self.evidence.read_model_result(parent).result, StageToolSequence):
+                    if payload["status"] == "completed":
+                        self.app.store.mark_d4_operation_applied(operation.start.operation_id, operation.start.operation_id)
+                    return
                 batch = isinstance(self.evidence.read_model_result(parent).result, StageToolBatch)
                 self.app.store.mark_d4_operation_applied(claim["model_request_id"],
                     claim["model_request_id"] if batch else operation.start.operation_id)
@@ -339,7 +344,7 @@ class MCPPlanExecutor:
                     raise
         self.experiments.reconcile()
 
-    async def execute(self, request_id, intent_id, call, token):
+    async def execute(self, request_id, intent_id, call, token, *, sequence_step=None):
         from MCPs.Mcp_client.client import MCPCommandPlanError
         from Sandbox.service import SandboxPolicyError
         from Sandbox.tool_download import ToolDownloadError, ToolDownloadUnknown
@@ -362,8 +367,13 @@ class MCPPlanExecutor:
             proposal = self.evidence.read_model_result(self.app.store.load_d4_operation(request_id)).result
             key = tool_call_key(request_id, proposal, call)
         identity = self.app._id("mcp/" + key)
+        if sequence_step is not None:
+            from agent_core.stage_experiments import step_id
+            identity = step_id(self.app.state.task_run.task_run_id, request_id, sequence_step)
         claim = {"task_run_id": self.app.state.task_run.task_run_id,
                  "intent_id": intent_id, "model_request_id": request_id, "call": asdict(call)}
+        if sequence_step is not None:
+            claim["sequence_step"] = sequence_step
         prior = self.app.store.load_d4_operation(identity)
         if prior is not None:
             result = self.evidence.read("mcp-result", identity)

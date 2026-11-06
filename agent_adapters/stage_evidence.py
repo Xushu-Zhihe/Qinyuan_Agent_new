@@ -22,9 +22,24 @@ from agent_core.stage_contracts import (
     StageFactBatch, StageFactBatchReview, StageFactRevision, fact_candidates, reviewed_fact, fact_review_parts,
 )
 from agent_core.stage_planning import BUSINESS_ISSUE_CODES, INNER_STAGES, MAX_STAGE_CORRECTIONS, STAGE_CALL_POLICY, StageModelRequest, correction_hint, model_contract, stage_output_issues, parse, request_from_dict, review_members, conversation_operation_ids, stage_runtime
+from agent_core.stage_planning import OUTPUT_TOOL
 from agent_core.stage_storage import StageRecoveryRequired, StageStateError, proposal_digest, fact_scope_failure, _fail
 from agent_core.turn_modeling import digest, stable_id
 from qinyuan_core import Category, Layer, get_logger
+
+
+def _action_truncation_phase(request, result):
+    if ("action_checkpoint" not in stage_runtime(request) or request.stage != "stage_action"
+            or result.get("finish_reason") != "length"):
+        return None
+    calls = result.get("tool_calls")
+    for call in calls if isinstance(calls, (list, tuple)) else ():
+        function = call.get("function") if isinstance(call, dict) else None
+        if isinstance(function, dict) and function.get("name") == OUTPUT_TOOL:
+            arguments = function.get("arguments")
+            if isinstance(arguments, str) and arguments.strip():
+                return "action_arguments_started"
+    return "no_native_action_arguments"
 
 
 # Transport cleanup joins its worker for at most 2 x 0.5s. The watchdog
@@ -213,6 +228,14 @@ class StageEvidence:
                     "instance. Do not reconstruct the same full solver. Preserve observations and useful "
                     "scripts; no hidden reasoning is available to resume. This adjustment is allowed once "
                     "within the existing shared correction allowance.")
+                phase = _action_truncation_phase(source, result)
+                if phase is not None:
+                    feedback["truncation_phase"] = phase
+                    if phase == "action_arguments_started":
+                        hint = (" Native action arguments appeared before the length stop, without a confirmed completion. "
+                                "Generate one complete, smaller action from the current evidence. "
+                                "If current.action_checkpoint is present, use its approach and next test. "
+                                "Do not continue a partial argument string.")
         contract = model_contract(request)
         if hint:
             contract = {**contract, "instruction": contract["instruction"] + hint}
@@ -877,7 +900,8 @@ class StageModelCalls:
         call_token = _StageCallToken(token, expires, self.clock, deadline,
             deadline_reader=read_deadline, task_deadline_only=planning)
         refresh_at, cancelled_at = started, None
-        slow_seconds = self.evidence.read("contract", envelope.request.model_request_id).get("action_slow_seconds")
+        slow_seconds = (self.evidence.read("contract", envelope.request.model_request_id).get("action_slow_seconds")
+            if envelope.request.stage == "stage_action" else None)
         slow_reported = False
         def invoke():
             try:
@@ -1080,7 +1104,7 @@ class StageModelCalls:
                 if record.completion is None:
                     get_logger("model").warning("stage.action_generation_exhausted", run=request.task_run_id,
                         operation=identity, phase=request.stage, category="dependency", failure_count=count,
-                        code=generation_failure)
+                        code=generation_failure, truncation_phase=_action_truncation_phase(request, result))
                 if count >= 2 or depth == MAX_STAGE_CORRECTIONS or stage_runtime(request).get("action_stall"):
                     raise StageActionStalled("stage.action_generation_stalled", retryable=False,
                         model_call={"stage": request.stage, "operation_id": identity,

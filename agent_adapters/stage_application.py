@@ -23,7 +23,7 @@ from agent_core.runtime import RuntimeEvent, TaskRunStatus
 from agent_core.sqlite_control_store import SqliteControlStore
 from agent_core.stage_contracts import (
     PlanningExhausted, PlanningSession, RoadResolution, RoadSnapshot, StageFactApplication,
-    StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete,
+    StageConclusionChange, StageFactSelection, StageHistoryRead, StageToolDetails, StageFactProposal, StageIncomplete,
     StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnPlanningContext, TurnPlanningState, TurnIntent, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
     TOOL_BATCH_WAIT_SECONDS,
@@ -310,6 +310,9 @@ class StageApplication:
             else:
                 proof = self.evidence.read_model_result(op).result
                 calls = tool_calls(proof)
+                from agent_core.stage_experiments import StageToolSequence
+                if isinstance(proof, StageToolSequence) and op.application_ref is not None:
+                    calls = tuple(MCPCall(t["tool_name"], t["arguments"]) for t in proof.steps)
                 if action_history is not None and index not in keep and calls:
                     indexed = []
                     for call in calls:
@@ -472,6 +475,25 @@ class StageApplication:
             if t.turn_id == session.owner_id or any(r.road_id == session.owner_id for r in t.roads)), None)
         if stage == "stage_intent":
             turn = None
+        if stage == "stage_action":
+            queued = {entry.proposal_operation_id for entry in self.store.list_stage_reviews(self.task_id)}
+            resource = "stage/" + session.scope + "/" + session.owner_id
+            for operation in reversed(self.store.list_d4_operations(self.task_id)):
+                if (operation.start.category != "action" or operation.application_ref is not None
+                        or operation.start.resource_ref != resource
+                        or operation.completion is None or operation.completion.result_kind != "completed"
+                        or operation.start.operation_id in queued):
+                    continue
+                original = self.evidence.request(operation.start.operation_id)
+                if original.stage != stage or original.context.session != session:
+                    continue
+                if stage_storage.unchanged_action(self.store, operation):
+                    get_logger("ctrl").info("stage.decision_resumed", run=self.task_id,
+                        operation=operation.start.operation_id, phase=stage)
+                    return original
+                self.store.mark_d4_operation_applied(operation.start.operation_id, "stage-discarded/state_changed")
+                get_logger("ctrl").info("stage.decision_discarded", run=self.task_id,
+                    operation=operation.start.operation_id, phase=stage, code="state_changed")
         all_history = self.evidence.history(self.task_id)
         sources = self._conversation_sources(session)
         reads = [self.evidence.read_model_result(op).result for op, _, _ in sources]
@@ -524,13 +546,49 @@ class StageApplication:
             messages += ({"role": "user", "content": json.dumps({"tool_feedback": feedback}, ensure_ascii=False)},)
         branch = load_branch(self.store, self.task_id, session)
         visible = set(branch_prefix(self.store, branch)) if branch else set()
-        runtime = {"review_mode": "async_planning_v1", "branch_id": branch.branch_id if branch else None,
+        runtime = {"remaining_seconds": max(0, state.task_run.deadline_at - self.clock()),
+            "review_mode": "async_planning_v1", "branch_id": branch.branch_id if branch else None,
             "pending_reviews": [
                 {"proposal_operation_id": entry.proposal_operation_id, "state": entry.state}
                 for entry in self.store.list_stage_reviews(self.task_id)
                 if entry.state in {"pending", "blocked"}
                 and (self.evidence.request(entry.proposal_operation_id).context.session == session
                     or entry.proposal_operation_id in visible)]}
+        if stage == "stage_action":
+            from agent_core.stage_experiments import StageToolSequence
+            applied = [(operation.start.operation_id, value)
+                for (operation, source, _), value in zip(reversed(sources), reversed(reads))
+                if source.stage == stage and source.context.session == session and operation.application_ref is not None
+                and not operation.application_ref.startswith("stage-discarded/")]
+            actions = [value for _, value in applied]
+            runtime["action_checkpoint"] = None
+            for operation_id, value in applied:
+                if isinstance(value, StagePlanningDecision) and value.kind == "action_checkpoint":
+                    runtime["action_checkpoint"] = {"operation_id": operation_id,
+                        "reason": value.reason, "support_refs": list(value.support_refs)}
+                    break
+                if isinstance(value, StageToolSequence) or tool_calls(value):
+                    break
+
+            def tool_names(value):
+                if isinstance(value, StageToolDetails):
+                    return value.tool_names if value.query is None else ()
+                if isinstance(value, StageToolSequence):
+                    return tuple(step["tool_name"] for step in value.steps)
+                return tuple(call.tool_name for call in tool_calls(value))
+
+            names = (name for value in actions for name in tool_names(value))
+            runtime["tool_details"] = {"paged_search": True, "recent": list(dict.fromkeys(names))[:8],
+                "use_category_defaults": not any(isinstance(value, StageToolDetails) and value.tool_names for value in actions)}
+            if actions and isinstance(actions[0], StageToolDetails) and actions[0].query is not None:
+                search = actions[0]
+                runtime["tool_details"]["last_search"] = {"query": search.query,
+                    "matches": list(search.tool_names), "remaining_tools": list(search.remaining_tools)}
+            for operation, _, _ in reversed(sources):
+                result = self.evidence.read("sequence-result", operation.start.operation_id)
+                if result is not None:
+                    runtime["last_experiment"] = {"operation_id": operation.start.operation_id, **result}
+                    break
         if turn is not None:
             fact_revisions = self.evidence.knowledge(self.task_id).visible_fact_revisions(turn.turn_id)
             if fact_revisions:
@@ -545,8 +603,11 @@ class StageApplication:
             runtime["direct_submission"] = "first_flag_v1"
         if stage == "stage_roads":
             advice = stage_plans.route_advice(self.store, self.task_id)
-            if advice and self.evidence.request(advice).context.session == session:
+            if advice and self.evidence.request(advice).context.turn.turn_id == session.owner_id:
                 runtime["route_advice"] = advice
+                value = self.evidence.read_model_result(self.store.load_d4_operation(advice)).result
+                runtime["route_reassessment"] = {"operation_id": advice, "reason": value.reason,
+                    "support_refs": list(value.support_refs)}
         if stage == "stage_action" and session.scope == "road_execution":
             for operation, source, _ in reversed(sources):
                 if source.context.session != session:
@@ -628,6 +689,8 @@ class StageApplication:
                 raise StageStateError("stage.pending_candidates_omitted", code="stage.pending_candidates_omitted")
             ordered = iter(pending)
             roads = [next(ordered) if road.status is IntentStatus.PENDING else road for road in turn.roads]
+            if stage_runtime(request).get("route_advice"):
+                roads = [replace(road, status=IntentStatus.SUSPENDED) if road.status is IntentStatus.RUNNING else road for road in roads]
             turns = [replace(turn, roads=(*roads, *ordered))]
         self._commit(StageStateChange(turns=tuple(turns), review_submissions=(identity,),
             planning_submissions=(identity,), branches=tuple(forks)))
@@ -635,12 +698,21 @@ class StageApplication:
     async def _decide_route(self, review_id, token):
         await self._collect_tools(drain=True)
         source = self.evidence.request(review_id)
-        request = self._request("stage_roads", source.context.session)
+        session = PlanningSession("turn_planning", source.context.turn.turn_id)
+        request = self._request("stage_roads", session)
         decision = await self.reviews.action(request, token)
         if decision is None:
             return
         identity, proposal = decision
-        turn = self.store.load_turn(self.task_id, source.context.session.owner_id)
+        turn = self.store.load_turn(self.task_id, session.owner_id)
+        if isinstance(proposal, tuple) and any(candidate not in {r.candidate for r in turn.roads} for candidate in proposal):
+            self._submit_planning(request, identity, proposal)
+            updated = self.store.load_turn(self.task_id, turn.turn_id)
+            chosen = next(r.road_id for r in updated.roads if r.candidate == proposal[0] and r.status is IntentStatus.PENDING)
+            self._commit(StageStateChange(turns=(replace(updated, roads=tuple(
+                replace(r, status=IntentStatus.RUNNING) if r.road_id == chosen else r for r in updated.roads)),)))
+            await self.reviews.start(token)
+            return
         if isinstance(proposal, tuple):
             live = [road for road in turn.roads if road.status in {IntentStatus.PENDING, IntentStatus.RUNNING, IntentStatus.SUSPENDED}]
             ordered = []
@@ -831,7 +903,7 @@ class StageApplication:
             if not drain:
                 return
 
-    async def _start_tools(self, identity, road_id, proposal, token):
+    async def _start_tools(self, identity, road_id, proposal, token, *, sequence_step=None):
         calls = tool_calls(proposal)
         from agent_core.actions import PUBLIC_REFERENCE_TOOLS
         if (not calls or len(self._tools_in_flight) + len(calls) > MAX_IN_FLIGHT_TOOLS
@@ -855,12 +927,19 @@ class StageApplication:
                 get_logger("ctrl").info("stage.tool_dispatch_fenced", run=self.task_id, operation=identity,
                     source_operation=review_id, phase="tool_dispatch", tool=entry.call.tool_name)
                 return False
-            await self.mcp.execute(identity, road_id, entry.call, ToolToken())
+            if sequence_step is None:
+                await self.mcp.execute(identity, road_id, entry.call, ToolToken())
+            else:
+                await self.mcp.execute(identity, road_id, entry.call, ToolToken(), sequence_step=sequence_step)
             return True
         entries = []
         for call in calls:
             key = tool_call_key(identity, proposal, call)
             operation_id = identity if call.tool_name == "http.run_experiment" else self._id("mcp/" + key)
+            if sequence_step is not None:
+                from agent_core.stage_experiments import step_id
+                key = identity + "/step/" + str(sequence_step)
+                operation_id = step_id(self.task_id, identity, sequence_step)
             entry = SimpleNamespace(parent=identity, road_id=road_id, call=call, operation_id=operation_id,
                 task=None, admitted=None)
             entry.task = asyncio.create_task(dispatch(entry))
@@ -876,13 +955,60 @@ class StageApplication:
         if not any(entry.admitted for entry in entries):
             await self.reviews.collect(token, unused=identity)
             return ()
-        self.store.mark_d4_operation_applied(identity, identity if isinstance(proposal, StageToolBatch) else operation_id)
+        if sequence_step is None:
+            self.store.mark_d4_operation_applied(identity, identity if isinstance(proposal, StageToolBatch) else operation_id)
         self._commit(StageStateChange())
         get_logger("ctrl").info("stage.tool_dispatched", run=self.task_id, operation=identity,
             phase="tool_dispatch", in_flight=len(self._tools_in_flight), action_count=sum(entry.admitted for entry in entries))
         if self.reviews.dispatch_fence(identity) is not None:
             await self.reviews.collect(token)
         return tuple(entry.operation_id for entry in entries if entry.admitted)
+
+    async def _execute_sequence(self, identity, road_id, sequence, token):
+        from agent_core.stage_experiments import resolve_step, step_id, settled_payload
+        await self._collect_tools(drain=True)
+        request = self.evidence.request(identity)
+        outcome = "completed"
+        for index in range(len(sequence.steps)):
+            self._check_dispatch()
+            if self.reviews.dispatch_fence(identity) is not None:
+                outcome = "review_blocked"
+                break
+            operation = self.store.load_d4_operation(step_id(self.task_id, identity, index))
+            if operation is not None:
+                # Reconcile only known receipts; an unknown dispatch remains a barrier.
+                self.mcp.reconcile()
+                payload = settled_payload(self.evidence, self.task_id, identity, index)
+                continue
+            try:
+                call = resolve_step(self.evidence, self.task_id, identity, sequence, index)
+                if call is None:
+                    outcome = "condition_not_met"
+                    break
+                from jsonschema import Draft202012Validator
+                from agent_core.stage_planning import _closed_schema
+                tool_schema = next(t["input_schema"] for t in request.tools if t["qualified_name"] == call.tool_name)
+                if not Draft202012Validator(_closed_schema(tool_schema)).is_valid(call.arguments):
+                    raise ValueError("stage.sequence_arguments_invalid")
+                self.mcp.validate(SimpleNamespace(history_context=json.dumps({"mcp_tools": list(request.tools)})), call)
+            except ValueError as error:
+                outcome = str(error)
+                get_logger("ctrl").warning("stage.sequence_stopped", run=self.task_id, operation=identity,
+                    phase="tool_dispatch", category="input", code=outcome, step=index)
+                break
+            get_logger("ctrl").info("stage.sequence_step", run=self.task_id, operation=identity,
+                phase="tool_dispatch", step=index, tool=call.tool_name)
+            admitted = await self._start_tools(identity, road_id, call, token, sequence_step=index)
+            if not admitted:
+                outcome = "review_blocked"
+                break
+            await self._collect_tools(all_pending=True, ids=admitted)
+            payload = settled_payload(self.evidence, self.task_id, identity, index)
+        if outcome == "completed" and payload["status"] != "completed":
+            outcome = "tool_failed"
+        self.evidence.save("sequence-result", identity, {"outcome": outcome, "step": index})
+        self.store.mark_d4_operation_applied(identity, identity)
+        self._commit(StageStateChange())
 
     async def _stop_tools(self):
         from agent_core.dual_llm_modeling import MODEL_CANCEL_GRACE_SECONDS
@@ -909,7 +1035,9 @@ class StageApplication:
                 continue
             req = self.evidence.request(op.start.operation_id)
             value = self.evidence.read_model_result(op).result
-            if isinstance(value, StagePlanningDecision) and value.kind in {"wait_for_tools", "wait_for_review"}:
+            if isinstance(value, StageToolDetails):
+                continue
+            if isinstance(value, StagePlanningDecision) and value.kind in {"wait_for_tools", "wait_for_review", "action_checkpoint"}:
                 continue
             if req.context.session == PlanningSession("road_execution", road_id):
                 decisions.append(op)
@@ -1146,6 +1274,15 @@ class StageApplication:
                     or not any(road.road_id == running.road_id and road.status is IntentStatus.RUNNING for road in current.roads)):
                 continue
             await self.mcp.open()
+            from agent_core.stage_experiments import StageToolSequence
+            unfinished = next((op for op in self.store.list_d4_operations(self.task_id)
+                if op.application_ref is None and op.completion is not None and op.completion.result_kind == "completed"
+                and op.start.category == "action" and op.start.resource_ref == "stage/road_execution/" + running.road_id
+                and isinstance(self.evidence.read_model_result(op).result, StageToolSequence)), None)
+            if unfinished is not None:
+                await self._execute_sequence(unfinished.start.operation_id, running.road_id,
+                    self.evidence.read_model_result(unfinished).result, token)
+                continue
             if self._tools_in_flight and (len(self._tools_in_flight) >= MAX_IN_FLIGHT_TOOLS or not self._available_tools()):
                 await self._collect_tools(wait=True)
                 continue
@@ -1163,6 +1300,24 @@ class StageApplication:
             identity, action = decision
             await self._collect_tools()
             self._check_dispatch()
+            if isinstance(action, StageToolSequence):
+                await self._execute_sequence(identity, running.road_id, action, token)
+                continue
+            if isinstance(action, StageToolDetails):
+                self._commit(StageStateChange(applications=(identity,)))
+                get_logger("ctrl").info("stage.tool_details_read", run=self.task_id, operation=identity,
+                    phase="stage_action", tool_count=len(action.tool_names),
+                    lookup="capability" if action.query is not None else "names")
+                continue
+            if isinstance(action, StagePlanningDecision) and action.kind == "action_checkpoint":
+                self._commit(StageStateChange(applications=(identity,)))
+                get_logger("ctrl").info("stage.action_checkpoint_saved", run=self.task_id,
+                    operation=identity, phase="stage_action", support_count=len(action.support_refs))
+                continue
+            if isinstance(action, StagePlanningDecision) and action.kind == "reassess_roads":
+                await self._collect_tools(drain=True)
+                self._commit(StageStateChange(applications=(identity,)))
+                continue
             if isinstance(action, StagePlanningDecision) and action.kind == "wait_for_tools":
                 self._commit(StageStateChange(applications=(identity,)))
                 await self._collect_tools(all_pending=True)

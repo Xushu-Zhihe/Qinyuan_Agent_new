@@ -2023,10 +2023,57 @@ def test_action_output_length_and_total_timeout_share_one_adjustment(case, monke
     assert asyncio.run(case.app.run(case.token)).turn.achievement
     assert len(case.tools.calls) == 1
     assert attempts[1].correction["reason"] == "action_generation_budget_exhausted"
+    if failures[0] == "length":
+        assert attempts[1].correction["truncation_phase"] == "no_native_action_arguments"
     supervision = [r for r in case.models.outer.calls if r.stage == "stage_supervision"]
     assert len(supervision) == len(failures) - 1
     assert all(case.app.store.load_d4_operation(e.request.model_request_id).completion.result_kind == "failed"
         for e in attempts[:len(failures)])
+
+
+def test_truncated_native_action_recovers_from_applied_checkpoint(case, monkeypatch):
+    from agent_adapters.deepseek_roles import _stage_input
+
+    invoke = case.models.inner.invoke
+    attempts = []
+    checkpoint = None
+    reason = "Use the measured offset. Next, check it with one small probe."
+
+    def controlled(envelope, timeout, token):
+        nonlocal checkpoint
+        raw = invoke(envelope, timeout, token)
+        request = envelope.request
+        if request.stage != "stage_action":
+            return raw
+        attempts.append(envelope)
+        current = _stage_input(request)["current"]
+        if len(attempts) == 2:
+            refs = [i.ref for i in request.context.history if i.record_type == "progress"]
+            checkpoint = {"operation_id": request.model_request_id, "reason": reason, "support_refs": refs}
+            return native_response({"kind": "action_checkpoint", "reason": reason, "support_refs": refs})
+        if len(attempts) == 3:
+            assert current["action_checkpoint"] == checkpoint and len(case.tools.calls) == 1
+            return D8ModelResponse(None, "length", ({"id": "cut", "type": "function", "function": {
+                "name": OUTPUT_TOOL, "arguments": '{"result":{"kind":"mcp_call","tool_name":"shell.run_bash"'}},))
+        if len(attempts) == 4:
+            assert not request.messages
+            assert current["action_checkpoint"] == checkpoint and len(case.tools.calls) == 1
+            assert envelope.correction["truncation_phase"] == "action_arguments_started"
+            assert "use its approach and next test" in envelope.instruction
+            return native_response({"kind": "mcp_call", "tool_name": "shell.run_bash",
+                "arguments": {"script": "printf small-probe"}})
+        assert "action_checkpoint" not in current
+        return raw
+
+    monkeypatch.setattr(case.models.inner, "invoke", controlled)
+    assert asyncio.run(case.app.run(case.token)).turn.achievement
+    assert [args["script"] for _, args in case.tools.calls] == ["printf observed", "printf small-probe"]
+    assert checkpoint is not None and checkpoint["support_refs"]
+    assert case.app.store.load_d4_operation(checkpoint["operation_id"]).application_ref
+    assert not any(r.proposal_operation_id == checkpoint["operation_id"] for r in case.models.outer.calls)
+    with pytest.raises(ValueError):
+        parse(attempts[2].request, {"kind": "action_checkpoint", "reason": reason,
+            "support_refs": checkpoint["support_refs"]})
 
 
 @pytest.mark.parametrize("failures", [("timeout", "timeout"), ("timeout", "format"), ("format", "timeout")])
@@ -3085,3 +3132,288 @@ def test_planner_rejection_settles_but_generic_mcp_error_remains_unknown(case, k
         with pytest.raises(OperationRecoveryRequired): asyncio.run(case.app.run(case.token))
     assert len(case.tools.calls) == 1
     assert not any(i.record_type == "verified_fact" for i in case.app.evidence.history(case.app.task_id))
+
+
+def test_sequence_runs_dependencies_without_model_roundtrips(case):
+    def transform(request, raw):
+        if request.stage == 'stage_action' and not any(i.record_type == 'progress' for i in request.context.history):
+            return {'kind': 'mcp_sequence', 'steps': [
+                {'tool_name': 'shell.run_bash', 'arguments': {'script': 'first'}},
+                {'tool_name': 'shell.run_bash', 'arguments': {}, 'bindings': [
+                    {'step': 0, 'path': '/stdout', 'target': '/script'}]},
+                {'tool_name': 'shell.run_bash', 'arguments': {'script': 'first'},
+                 'condition': {'step': 1, 'path': '/status', 'equals': 'completed'}}]}
+        return raw
+    case.models.inner.transform = transform
+    result = asyncio.run(case.app.run(case.token))
+    assert result.reason == 'stage.final_validation_requested'
+    assert [args['script'] for _, args in case.tools.calls] == ['first', 'observed', 'first']
+    actions = [r for r in case.models.inner.calls if r.stage == 'stage_action']
+    assert len(actions) == 3
+    calls = [op for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == 'tool_dispatch']
+    assert len({op.start.operation_id for op in calls}) == 3
+
+
+def test_action_tool_details_reveals_typed_tool_without_dispatch_or_review(case):
+    from agent_adapters.deepseek_roles import _stage_input, build_payload, role_config
+    from agent_core.output_contracts import D8OutputRequest
+    from agent_core.stage_planning import model_contract
+    tool = {**case.tools.specs[0], "qualified_name": "shell.run_saved", "description": "Run a saved script"}
+    case.tools.specs.append(tool)
+
+    def transform(request, raw):
+        if request.stage != "stage_action" or raw["kind"] != "mcp_call":
+            return raw
+        current = _stage_input(request)["current"]
+        assert current["tools"][tool["qualified_name"]].endswith(tool["description"])
+        if tool["qualified_name"] not in current["tool_schemas"]:
+            return {"kind": "tool_details", "tool_names": [tool["qualified_name"]]}
+        assert current["tool_schemas"][tool["qualified_name"]] == tool["input_schema"]
+        return {**raw, "tool_name": tool["qualified_name"]}
+
+    case.models.inner.transform = transform
+    assert asyncio.run(case.app.run(case.token)).reason == "stage.final_validation_requested"
+    initial, dispatch, *_ = [r for r in case.models.inner.calls if r.stage == "stage_action"]
+    assert case.tools.calls == [(tool["qualified_name"], {"script": "printf observed"})]
+    assert not any(r.proposal_operation_id == initial.model_request_id for r in case.models.outer.calls)
+    with pytest.raises(ValueError):
+        parse(initial, {"kind": "tool_details", "tool_names": ["unauthorized.tool"]})
+    with pytest.raises(ValueError):
+        parse(dispatch, {"kind": "mcp_call", "tool_name": tool["qualified_name"], "arguments": {"invented": "x"}})
+    role = role_config("inner_action", version=17)
+    dispatch = replace(dispatch, role_config_ref=role.role_config_ref)
+    contract = model_contract(dispatch)
+    payload = build_payload(D8OutputRequest(dispatch, {"version": 1, "stage": dispatch.stage,
+        "schema": contract["schema"]}, contract["instruction"], None), role)
+    system = payload["messages"][-2]["content"]
+    assert "Output contract=" not in system
+    assert "Submit as soon as the next action is executable" in system
+    assert payload["reasoning_effort"] == "high" and "max_tokens" not in payload
+    branches = payload["tools"][0]["function"]["parameters"]["properties"]["result"]["anyOf"]
+    assert sum(b["properties"]["kind"].get("const") == "mcp_call" for b in branches) == 1
+
+
+def test_action_discovers_cross_category_tool_after_an_observation(case):
+    from agent_adapters.deepseek_roles import _stage_input
+    defaults = ("binutils.inspect_binary", "file.inspect_file", "nmap.scan", "gdb.debug", "session.run", "wine.run")
+    first_page = tuple(f"z3.inspect_{index}" for index in range(4))
+    solver = "z3.solve"
+    case.tools.specs.extend({**case.tools.specs[0], "qualified_name": name,
+        "description": "Check a binary or runtime" if name in defaults else "Solve constraints",
+        "tags": [] if name in defaults else ["symbolic-solver"]} for name in (*defaults, *first_page, solver))
+    case.models.inner.native = True
+    actions = []
+
+    def transform(request, raw):
+        if request.stage != "stage_action":
+            return raw
+        actions.append(request)
+        current = _stage_input(request)["current"]
+        shown = current["tool_schemas"]
+        if len(actions) == 1:
+            assert defaults[0] in shown and solver in current["tools"] and solver not in shown
+            return {**raw, "tool_name": defaults[0]}
+        if len(actions) == 2:
+            assert request.context.history and len(case.tools.calls) == 1
+            return {"kind": "tool_details", "query": "unknowncapability"}
+        if len(actions) == 3:
+            assert current["tool_search"] == {"query": "unknowncapability", "matches": [], "remaining": 0}
+            assert defaults[0] in shown and solver not in shown
+            return {"kind": "tool_details", "query": "symbolic solver"}
+        assert defaults[0] in shown and defaults[2] in current["tools"] and defaults[2] not in shown
+        if len(actions) == 4:
+            assert current["tool_search"] == {
+                "query": "symbolic solver", "matches": list(first_page), "remaining": 1}
+            assert set(first_page) <= shown.keys() and solver not in shown
+            return {"kind": "tool_details", "next_page": True}
+        assert solver in shown and not set(first_page).intersection(shown)
+        if len(actions) == 5:
+            assert current["tool_search"] == {"query": "symbolic solver", "matches": [solver], "remaining": 0}
+            return {"kind": "mcp_call", "tool_name": solver, "arguments": {"script": "test constraints"}}
+        assert "tool_search" not in current
+        return raw
+
+    case.models.inner.transform = transform
+    assert asyncio.run(case.app.run(case.token)).reason == "stage.final_validation_requested"
+    assert [name for name, _ in case.tools.calls] == [defaults[0], solver]
+    assert not {r.model_request_id for r in actions[1:4]}.intersection(
+        r.proposal_operation_id for r in case.models.outer.calls)
+    initial = actions[0]
+    with pytest.raises(ValueError):
+        parse(initial, {"kind": "tool_details", "query": " "})
+    with pytest.raises(ValueError):
+        parse(initial, {"kind": "tool_details", "query": "symbolic solver", "tool_names": [solver]})
+    next_page = {"kind": "tool_details", "next_page": True}
+    for request in (actions[0], actions[2], actions[4]):
+        with pytest.raises(ValueError):
+            parse(request, next_page)
+    first = actions[3]
+    unavailable = replace(first, tools=tuple(t for t in first.tools if t["qualified_name"] != solver))
+    assert _stage_input(unavailable)["current"]["tool_search"]["remaining"] == 0
+    with pytest.raises(ValueError):
+        parse(unavailable, next_page)
+    environment = initial.execution_context
+    unpaged = replace(initial, execution_context={**environment, "stage_runtime": {
+        **environment["stage_runtime"], "tool_details": {"recent": [], "use_category_defaults": True}}})
+    old_lookup = parse(unpaged, {"kind": "tool_details", "query": "symbolic solver"})
+    assert old_lookup.tool_names == first_page and not old_lookup.remaining_tools
+    legacy = replace(initial, execution_context={**environment,
+        "stage_runtime": {**environment["stage_runtime"], "tool_details": []}})
+    with pytest.raises(ValueError):
+        parse(legacy, {"kind": "tool_details", "query": "symbolic solver"})
+    assert parse(legacy, {"kind": "tool_details", "tool_names": [solver]}).tool_names == (solver,)
+
+
+def test_inner_reassesses_and_switches_without_road_failure(case):
+    from agent_core.stage_planning import stage_runtime
+    switched = []
+    def decision(req, raw):
+        if req.stage == 'stage_roads':
+            if stage_runtime(req).get('route_advice'):
+                return dict(kind='select_road', road_id=req.context.turn.roads[1].road_id,
+                            reason='new observation makes the alternative cheaper', support_refs=[])
+            if not req.context.turn.roads:
+                return dict(kind='roads', roads=[dict(description=label, support_refs=[]) for label in ['first', 'alternative']])
+        if req.stage == 'stage_action' and any(i.record_type == 'progress' for i in req.context.history) and not switched:
+            switched.append(req.context.session.owner_id)
+            return dict(kind='reassess_roads', reason='key prerequisite is now available', support_refs=[])
+        if req.stage == 'stage_action' and switched and req.context.session.owner_id != switched[0]:
+            if len(case.tools.calls) == 1:
+                return dict(kind='mcp_call', tool_name='shell.run_bash', arguments={'script': 'alternative'})
+            if raw.get('kind') == 'fact_candidate':
+                raw['support_refs'] = [i.ref for i in req.context.history if i.record_type == 'progress'][-1:]
+        return raw
+    def review(req, raw):
+        if isinstance(req.proposal, tuple): raw['accepted_road_indices'] = list(range(len(req.proposal)))
+        return raw
+    case.models.inner.transform = decision
+    case.models.outer.transform = review
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.roads[0].status is IntentStatus.SUSPENDED
+    assert result.turn.roads[1].status is IntentStatus.SUCCEEDED
+    assert not any(isinstance(r.proposal, StagePlanningDecision) and r.proposal.kind == 'reassess_roads' for r in case.models.outer.calls)
+
+
+@pytest.mark.parametrize('condition,expected', [(False, 1), (True, 2)])
+def test_sequence_condition_returns_control(case, condition, expected):
+    def decision(req, raw):
+        if req.stage == 'stage_action' and not any(i.record_type == 'progress' for i in req.context.history):
+            return dict(kind='mcp_sequence', steps=[
+                dict(tool_name='shell.run_bash', arguments={'script': 'first'}),
+                dict(tool_name='shell.run_bash', arguments={'script': 'next'}, condition={
+                    'step': 0, 'path': '/status', 'equals': 'completed' if condition else 'failed'})])
+        return raw
+    case.models.inner.transform = decision
+    asyncio.run(case.app.run(case.token))
+    assert len(case.tools.calls) == expected
+
+
+@pytest.mark.parametrize('failure', ['missing', 'type', 'forward', 'unknown'])
+def test_sequence_invalid_dependency_never_dispatches_successor(case, failure):
+    from MCPs.Mcp_client.client import MCPClientError
+    def decision(req, raw):
+        if req.stage == 'stage_action' and not any(i.record_type == 'progress' for i in req.context.history):
+            return dict(kind='mcp_sequence', steps=[
+                dict(tool_name='shell.run_bash', arguments={'script': 'first'}),
+                dict(tool_name='shell.run_bash', arguments={}, bindings=[{
+                    'step': 1 if failure == 'forward' else 0,
+                    'path': '/missing' if failure == 'missing' else '/exit_code' if failure == 'type' else '/stdout',
+                    'target': '/script'}])])
+        return raw
+    case.models.inner.transform = decision
+    if failure == 'unknown': case.tools.error = MCPClientError('transport unavailable')
+    if failure in {'forward', 'unknown'}:
+        with pytest.raises((StageStateError, ExecutionRecoveryRequired)):
+            asyncio.run(case.app.run(case.token))
+    else:
+        asyncio.run(case.app.run(case.token))
+    assert len(case.tools.calls) == (0 if failure == 'forward' else 1)
+
+
+def test_sequence_pause_resumes_without_replaying_completed_step(case, monkeypatch):
+    from agent_core.operator_controls import OperatorPaused
+    def decision(req, raw):
+        if req.stage == 'stage_action' and not any(i.record_type == 'progress' for i in req.context.history):
+            return dict(kind='mcp_sequence', steps=[dict(tool_name='shell.run_bash', arguments={'script': s}) for s in ['first', 'second']])
+        return raw
+    case.models.inner.transform = decision
+    original = case.app._collect_tools
+    stopped = []
+    async def collect(**kwargs):
+        result = await original(**kwargs)
+        if kwargs.get('all_pending') and len(case.tools.calls) == 1 and not stopped:
+            stopped.append(True)
+            raise OperatorPaused()
+        return result
+    monkeypatch.setattr(case.app, '_collect_tools', collect)
+    with pytest.raises(OperatorPaused): asyncio.run(case.app.run(case.token))
+    assert len(case.tools.calls) == 1
+    task_id = case.app.task_id
+    asyncio.run(case.app.close())
+    case.app = StageApplication(case.path, **case.args)
+    case.app.bind(task_id)
+    asyncio.run(case.app.run(case.token))
+    assert [a['script'] for _, a in case.tools.calls] == ['first', 'second']
+    assert sum(r.stage == 'stage_action' for r in case.models.inner.calls) == 3
+
+
+def test_reassessment_can_add_a_sibling_under_async_review(case):
+    from agent_core.stage_planning import stage_runtime
+    proposed = []
+    def decision(req, raw):
+        if req.stage == 'stage_roads' and stage_runtime(req).get('route_advice'):
+            return dict(kind='extend_roads', roads=[dict(description='new mechanism', support_refs=[])])
+        if req.stage == 'stage_action' and not proposed and any(i.record_type == 'progress' for i in req.context.history):
+            proposed.append(req.context.session.owner_id)
+            return dict(kind='reassess_roads', reason='new mechanism is now testable', support_refs=[])
+        if req.stage == 'stage_action' and proposed and req.context.session.owner_id != proposed[0]:
+            if len(case.tools.calls) == 1:
+                return dict(kind='mcp_call', tool_name='shell.run_bash', arguments={'script': 'new mechanism'})
+            if raw.get('kind') == 'fact_candidate':
+                raw['support_refs'] = [i.ref for i in req.context.history if i.record_type == 'progress'][-1:]
+        return raw
+    case.models.inner.transform = decision
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.roads[0].status is IntentStatus.SUSPENDED
+    assert result.turn.roads[1].candidate.description == 'new mechanism'
+    assert any(isinstance(req.proposal, tuple) and req.proposal[0].description == 'new mechanism' for req in case.models.outer.calls)
+
+
+def test_completed_unapplied_action_survives_checkpoint_only_pause(case, monkeypatch):
+    from agent_core.operator_controls import OperatorPaused
+    original = case.app.reviews.action
+    paused = []
+    async def action(request, token):
+        result = await original(request, token)
+        if request.stage == 'stage_action' and not paused:
+            paused.append(result[0])
+            raise OperatorPaused()
+        return result
+    monkeypatch.setattr(case.app.reviews, 'action', action)
+    with pytest.raises(OperatorPaused): asyncio.run(case.app.run(case.token))
+    assert not case.tools.calls
+    case.app._commit(StageStateChange())
+    asyncio.run(case.app.run(case.token))
+    assert len(case.tools.calls) == 1
+    assert sum(r.stage == 'stage_action' for r in case.models.inner.calls) == 3
+    assert case.app.store.load_d4_operation(paused[0]).application_ref is not None
+
+
+@pytest.mark.parametrize('stdout,expected', [('{"value":"next"}', 2), ('{"value":"a","value":"b"}', 1), ('not json', 1)])
+def test_sequence_explicit_json_result_binding(case, stdout, expected):
+    original = case.tools.call_tool
+    async def call(name, arguments):
+        response = await original(name, arguments)
+        return replace(response, stdout=stdout) if len(case.tools.calls) == 1 else response
+    case.tools.call_tool = call
+    def decision(req, raw):
+        if req.stage == 'stage_action' and not any(i.record_type == 'progress' for i in req.context.history):
+            return dict(kind='mcp_sequence', steps=[
+                dict(tool_name='shell.run_bash', arguments={'script': 'first'}),
+                dict(tool_name='shell.run_bash', arguments={}, bindings=[{
+                    'step': 0, 'path': '/value', 'target': '/script', 'json_stdout': True}])])
+        return raw
+    case.models.inner.transform = decision
+    asyncio.run(case.app.run(case.token))
+    assert len(case.tools.calls) == expected
+    if expected == 2: assert case.tools.calls[1][1]['script'] == 'next'

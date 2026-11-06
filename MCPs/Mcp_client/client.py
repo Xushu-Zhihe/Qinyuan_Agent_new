@@ -462,12 +462,21 @@ class MCPManager:
                     timeout=self.shutdown_timeout_seconds,
                 )
             except asyncio.TimeoutError:
+                from qinyuan_core import get_logger
+                get_logger("ctrl").warning("mcp.server_close_failed", server=runtime.config.name,
+                    phase="mcp_close", category="dependency", code="mcp.close_timeout",
+                    timeout_seconds=self.shutdown_timeout_seconds)
                 errors.append(
                     f"{runtime.config.name}: shutdown timed out after "
                     f"{self.shutdown_timeout_seconds:g}s"
                 )
             except Exception as exc:
-                errors.append(f"{runtime.config.name}: {exc}")
+                from qinyuan_core import get_logger
+                from agent_adapters.output_evidence import safe_failure_details
+                get_logger("ctrl").warning("mcp.server_close_failed", server=runtime.config.name,
+                    phase="mcp_close", category="dependency", code="mcp.close_failed",
+                    **safe_failure_details(exc, include_chain=True))
+                errors.append(f"{runtime.config.name}: {type(exc).__name__}: {exc}")
             finally:
                 runtime.status = "stopped"
                 runtime.session = None
