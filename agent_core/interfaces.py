@@ -49,6 +49,7 @@ from agent_core.stage_contracts import (
     StageFactBatch,
     StageFactBatchReview,
     StageHistoryRead,
+    RoadTurnClosureReview,
     StagePlanningDecision,
     StageTurnSnapshot,
     TurnIntent,
@@ -242,7 +243,7 @@ class TurnPlanningReviewPort(Protocol):
         self, context: TurnPlanningContext, proposal: TurnPlanningProposal | StageFactProposal | StageFactBatch,
         proposal_operation_id: str, operation_id: str,
         cancellation_token: CancellationToken,
-    ) -> TurnPlanningReview | StageFactBatchReview | D8ChangeDecision | ModelError: ...
+    ) -> TurnPlanningReview | RoadTurnClosureReview | StageFactBatchReview | D8ChangeDecision | ModelError: ...
 
 
 class TurnProjectionPort(Protocol):

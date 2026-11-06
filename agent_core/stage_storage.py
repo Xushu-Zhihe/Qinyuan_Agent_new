@@ -16,7 +16,7 @@ from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.operation_accounting import OperationIdentityConflict, OperationRecoveryRequired, D8HandoffBudgetPolicy, _text, _uuid, _sha
 from agent_core.runtime import TaskRunStatus
 from agent_core.stage_contracts import (
-    PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot,
+    PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot, RoadTurnClosure, RoadTurnClosureReview,
     StageConclusionChange, StageFactApplication, StageFactProposal, StageFactSelection, StageHistoryRead, StageToolDetails,
     StageModelEvidence, StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnIntent, TurnPlanningReview, TurnPlanningState, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
@@ -788,6 +788,7 @@ def _withdrawn_by_review(store, mutation, change):
 
 
 def _reviewed(store, mutation, change, discarded=()):
+    from agent_core import stage_plans
     config = require_run(store, mutation.task_run_id)
     queue = {entry.proposal_operation_id: entry for entry in list_reviews(store, mutation.task_run_id)}
     accepted = []
@@ -843,14 +844,42 @@ def _reviewed(store, mutation, change, discarded=()):
                 _fail("stage.model_context_stale")
         changing = isinstance(proposal.result, StageConclusionChange)
         batching = isinstance(proposal.result, StageFactBatch)
+        closing = isinstance(proposal.result, RoadTurnClosure)
         category = "fact_review" if fact_candidates(proposal.result) or isinstance(proposal.result, StageConclusionChange) else "review"
         if (review_record.start.category != category or not isinstance(review.result,
-                D8ChangeDecision if changing else StageFactBatchReview if batching else TurnPlanningReview)
+                D8ChangeDecision if changing else StageFactBatchReview if batching else RoadTurnClosureReview if closing else TurnPlanningReview)
                 or proposal.session != review.session
                 or review.proposal_operation_id != proposal_record.start.operation_id
                 or review.proposal_sha256 != proposal_digest(proposal.result)):
             _fail("stage.review_binding_changed", Category.UNKNOWN)
         decision = review.result
+        if closing:
+            road_id = proposal.session.owner_id
+            current = active_turn(list_turns(store, mutation.task_run_id))
+            road = next((r for r in current.roads if r.road_id == road_id), None) if current else None
+            if (proposal.session.scope != "road_execution" or proposal_record.start.category != "action"
+                    or road is None or road.status is not IntentStatus.RUNNING or current.achievement is not None):
+                _fail("stage.closure_target_changed", Category.CONFLICT)
+            if decision.turn.decision == "accept" and not stage_plans.ready(store, mutation.task_run_id, current, road):
+                _fail("stage.completion_planning_not_accepted", Category.POLICY)
+            after = next((turn for turn in change.turns if turn.turn_id == current.turn_id), current)
+            for part, verdict in decision.parts(proposal.result):
+                if verdict.decision not in {"accept", "revise", "reject"} or verdict.accepted_road_indices:
+                    _fail("stage.review_invalid", Category.INPUT)
+                _text(part.reason, "proposal_text")
+                _text(verdict.reason, "review_reason")
+                _sources(store, mutation.task_run_id, verdict.support_refs)
+                _sources(store, mutation.task_run_id, part.support_refs, formal=isinstance(part, TurnCompletion)
+                    or part.outcome is IntentStatus.SUCCEEDED)
+                if verdict.decision != "accept":
+                    continue
+                applied = (after.achievement == TurnAchievement(part, binding.review_operation_id)
+                    if isinstance(part, TurnCompletion) else
+                    any(r.road_id == road_id and r.status is part.outcome for r in after.roads))
+                if not applied:
+                    _fail("stage.accepted_review_not_applied")
+                accepted.append((binding, proposal.session, part, verdict))
+            continue
         if decision.decision not in ({"accept", "reject", "insufficient"} if changing else {"accept", "revise", "reject"}):
             _fail("stage.review_invalid", Category.INPUT)
         _text(decision.reason, "review_reason")

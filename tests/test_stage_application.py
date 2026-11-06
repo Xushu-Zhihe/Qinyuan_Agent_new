@@ -20,7 +20,7 @@ from agent_core.operation_accounting import D8HandoffBudgetPolicy, OperationReco
 from agent_core.output_contracts import D8ModelResponse
 from agent_core.stage_contracts import PlanningSession, StageStateChange
 from agent_core.stage_contracts import TurnCompletion
-from agent_core.stage_contracts import (TurnIntent, RoadCandidate, RoadResolution, PlanningExhausted,
+from agent_core.stage_contracts import (TurnIntent, RoadCandidate, RoadResolution, RoadTurnClosure, PlanningExhausted,
     StageFactProposal, StagePlanningDecision, TurnPlanningContext)
 from agent_core.stage_planning import StageModelRequest, schema, parse, OUTPUT_TOOL, decode_stage_response
 from agent_core.stage_contracts import StageTurnSnapshot, StageReviewBinding, TurnPlanningState
@@ -202,6 +202,81 @@ def case(tmp_path):
         token=SimpleNamespace(is_cancelled=False))
     yield case
     asyncio.run(case.app.close())
+
+
+@pytest.mark.parametrize("revised,interrupt", [(None, None), (None, "before"), ("road", "after"), ("turn", "after")])
+def test_joint_closure_only_repairs_the_unaccepted_part(case, monkeypatch, revised, interrupt):
+    case.models.inner.native = case.models.outer.native = True
+    def act(request, raw):
+        if raw["kind"] == "mcp_call":
+            raw["arguments"]["script"] += " # earlier-tool-script"
+        if raw["kind"] == "road_resolution" and request.context.turn.achievement is None:
+            raw["completion"] = {"reason": "criterion supported", "support_refs": raw["support_refs"]}
+        if request.stage == "stage_completion":
+            assert request.context.session.scope == "turn_planning"
+            assert request.context.turn.roads[0].status is IntentStatus.SUCCEEDED
+            assert "repair only turn" in json.dumps(request.messages)
+        return raw
+    def assess(request, raw):
+        if isinstance(request.proposal, RoadTurnClosure):
+            assert "earlier-tool-script" not in json.dumps(request.messages)
+            assert not request.tools
+            return {part: {"decision": "revise" if part == revised else "accept",
+                "reason": "repair only " + part if part == revised else "supported"}
+                for part in ("road", "turn")}
+        return raw
+    case.models.inner.transform, case.models.outer.transform = act, assess
+    if interrupt:
+        apply = case.app._apply_closure
+        class Interrupted(Exception):
+            pass
+        def interrupted(*args):
+            if interrupt == "before" and len(args[-1]) == 2:
+                raise Interrupted
+            apply(*args)
+            if len(args[-1]) == 2:
+                raise Interrupted
+        monkeypatch.setattr(case.app, "_apply_closure", interrupted)
+        with pytest.raises(Interrupted):
+            asyncio.run(case.app.run(case.token))
+        task_id = case.app.task_id
+        asyncio.run(case.app.close())
+        case.app = StageApplication(case.path, **case.args)
+        case.app.bind(task_id)
+
+    result = asyncio.run(case.app.run(case.token))
+    assert result.reason == "stage.final_validation_requested"
+    assert result.turn.roads[0].status is IntentStatus.SUCCEEDED
+    assert result.turn.achievement
+    assert len(case.tools.calls) == 1
+    reviews = [r for r in case.models.outer.calls if isinstance(r.proposal, (RoadResolution, TurnCompletion))]
+    assert [type(r.proposal) for r in reviews] == [RoadTurnClosure] + (
+        [RoadResolution] if revised == "road" else [TurnCompletion] if revised == "turn" else [])
+    assert sum(r.stage == "stage_completion" for r in case.models.inner.calls) == (revised == "turn")
+    continuation = next(r for r in case.models.inner.calls if r.stage == "stage_continuation")
+    assert continuation.context.session == PlanningSession("turn_planning", result.turn.turn_id)
+    assert continuation.context.turn.roads[0].status is IntentStatus.SUCCEEDED
+    if not interrupt:
+        from agent_adapters.web.task_result import _stage_activity
+        evidence, store, task_id = case.app.evidence, case.app.store, case.app.task_id
+        ops = store.list_d4_operations(task_id)
+        requests = {op.start.operation_id: evidence.request(op.start.operation_id) for op in ops
+            if evidence.read("request", op.start.operation_id) is not None}
+        activity = _stage_activity(evidence, store, task_id, ops, requests, (result.turn,))
+        row = next(r for r in activity["review_queue"] if r["kind"] == "road_resolution")
+        assert row["decision"] == "accept" and "Road (accept)" in row["reason"] and "Turn (accept)" in row["reason"]
+
+
+def test_joint_closure_rejects_raw_observation_as_turn_support(case):
+    from agent_core.stage_planning import stage_output_issues
+    asyncio.run(case.app.run(case.token))
+    request = next(r for r in reversed(case.models.inner.calls) if r.stage == "stage_action")
+    observation = next(i.ref for i in request.context.history if i.identity == "tool_observation_not_fact")
+    value = {"kind": "road_resolution", "outcome": "inconclusive", "reason": "no result for this method",
+        "support_refs": [observation], "completion": {"reason": "this is not formal support",
+            "support_refs": [observation]}}
+    issues = stage_output_issues(request, native_response(value))
+    assert any(i.code == "stage.formal_fact_required" and i.path.endswith("/completion/support_refs") for i in issues)
 
 
 def test_single_turn_actual_mcp_path_and_single_canonical_fact(case):

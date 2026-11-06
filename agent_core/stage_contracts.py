@@ -144,6 +144,11 @@ class RoadResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class RoadTurnClosure(RoadResolution):
+    completion: TurnCompletion
+
+
+@dataclass(frozen=True, slots=True)
 class StageFactSelection:
     support_refs: tuple[str, ...]
 
@@ -194,6 +199,24 @@ class TurnPlanningReview:
     reason: str
     support_refs: tuple[str, ...] = ()
     accepted_road_indices: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RoadTurnClosureReview:
+    road: TurnPlanningReview
+    turn: TurnPlanningReview
+
+    @property
+    def decision(self):
+        return self.road.decision if self.road.decision == self.turn.decision else "revise"
+
+    @property
+    def reason(self):
+        return f"Road ({self.road.decision}): {self.road.reason}\nTurn ({self.turn.decision}): {self.turn.reason}"
+
+    def parts(self, proposal: RoadTurnClosure):
+        return ((RoadResolution(proposal.outcome, proposal.reason, proposal.support_refs), self.road),
+                (proposal.completion, self.turn))
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,7 +405,7 @@ class StageModelEvidence:
     session: PlanningSession
     context_sha256: str
     evidence_sha256: str
-    result: TurnPlanningProposal | TurnPlanningReview | StageFactProposal | StageFactBatch | StageFactBatchReview | StageFactRevision | MCPCall | StageToolBatch | StageToolSequence | StageToolDetails | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
+    result: TurnPlanningProposal | TurnPlanningReview | RoadTurnClosureReview | StageFactProposal | StageFactBatch | StageFactBatchReview | StageFactRevision | MCPCall | StageToolBatch | StageToolSequence | StageToolDetails | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
     proposal_operation_id: str | None = None
     proposal_sha256: str | None = None
 

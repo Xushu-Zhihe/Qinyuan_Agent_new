@@ -16,7 +16,7 @@ from agent_core.modeling import CancellationToken, ModelError, ModelErrorKind, m
 from agent_core.operation_accounting import D4OperationCompletion, D4OperationRecord, D4OperationStart
 from agent_core.output_contracts import D8ModelResponse, D8OutputRequest
 from agent_core.stage_contracts import (
-    PlanningExhausted, RoadCandidate, StageConclusionChange, StageFactSelection, StageHistoryRead,
+    PlanningExhausted, RoadCandidate, RoadTurnClosureReview, StageConclusionChange, StageFactSelection, StageHistoryRead,
     StageFactProposal, StageModelEvidence, StageSessionSummary, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, StagePlanningDecision,
     StageFactBatch, StageFactBatchReview, StageFactRevision, fact_candidates, reviewed_fact, fact_review_parts,
@@ -757,7 +757,7 @@ class StageModelCalls:
 
     async def review(self, context: TurnPlanningContext, proposal: TurnPlanningProposal | StageFactProposal | StageFactBatch,
                      proposal_operation_id: str, operation_id: str,
-                     cancellation_token: CancellationToken) -> TurnPlanningReview | StageFactBatchReview | D8ChangeDecision | ModelError:
+                     cancellation_token: CancellationToken) -> TurnPlanningReview | RoadTurnClosureReview | StageFactBatchReview | D8ChangeDecision | ModelError:
         proposal_operation_id = self.resolved_operation_id(proposal_operation_id)
         return (await self.call(self._port_request("stage_review", context, operation_id,
             proposal_operation_id, proposal), cancellation_token))[1]

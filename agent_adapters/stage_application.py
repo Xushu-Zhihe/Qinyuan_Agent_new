@@ -22,7 +22,7 @@ from agent_core.redaction import D5Redactor
 from agent_core.runtime import RuntimeEvent, TaskRunStatus
 from agent_core.sqlite_control_store import SqliteControlStore
 from agent_core.stage_contracts import (
-    PlanningExhausted, PlanningSession, RoadResolution, RoadSnapshot, StageFactApplication,
+    PlanningExhausted, PlanningSession, RoadResolution, RoadSnapshot, RoadTurnClosure, RoadTurnClosureReview, StageFactApplication,
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageToolDetails, StageFactProposal, StageIncomplete,
     StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
     TurnAchievement, TurnCompletion, TurnPlanningContext, TurnPlanningState, TurnIntent, StagePlanningDecision, MAX_IN_FLIGHT_TOOLS,
@@ -455,7 +455,7 @@ class StageApplication:
             value["changed_fields"] = [key for key in previous if previous[key] != current[key]]
         return value
 
-    def _request(self, stage, session, *, proposal_id=None, proposal=None):
+    def _request(self, stage, session, *, proposal_id=None, proposal=None, closure_source=None):
         # Only synchronous stages resume an outstanding proposal directly.
         if stage not in {"stage_review", "stage_supervision", "stage_summary"}:
             for entry in self.store.list_stage_reviews(self.task_id):
@@ -503,6 +503,9 @@ class StageApplication:
         else:
             history, premises = self.evidence.knowledge(self.task_id).context(session, retrieved)
         required = set(getattr(proposal, "support_refs", ())) | set(getattr(proposal, "evidence_refs", ()))
+        closing = stage == "stage_completion" or stage == "stage_review" and isinstance(proposal, (RoadResolution, TurnCompletion))
+        if isinstance(proposal, RoadTurnClosure):
+            required.update(proposal.completion.support_refs)
         if isinstance(proposal, StageConclusionChange):
             required.add(proposal.replacement_ref)
             required.update(i.ref for i in all_history if getattr(i, "logical_root_id", None) in {t.root_id for t in proposal.targets})
@@ -516,6 +519,9 @@ class StageApplication:
                     required.update(turn.achievement.completion.support_refs)
                 required.update(ref for road in turn.roads for ref in road.candidate.support_refs)
             history = self._planning_history(history, sources, required=required, retrieved=retrieved)
+        if closing:
+            history = tuple(i for i in history if i.ref in required or i.ref in premises or i.ref in retrieved
+                or stage == "stage_completion" and i.record_type == "verified_fact")
         children = {t.turn_id for t in self.store.list_stage_turns(self.task_id) if turn and t.parent_turn_id == turn.turn_id}
         context = TurnPlanningContext(self.task_id, state.task_run.request.goal, session, turn, history,
             feedback_refs=tuple(i.ref for i in history if i.record_id.startswith("feedback/") and i.turn_id in children
@@ -524,8 +530,19 @@ class StageApplication:
             effective_support_refs=premises, goal_validation=self.goal_validation)
         inner = stage != "stage_review" and stage != "stage_supervision"
         role = self.config.inner_role if inner else self.config.outer_role
-        messages = self._conversation(session, sources,
-            action_history=all_history if stage == "stage_action" else None)
+        if closing:
+            messages = self._render_conversation(tuple(s for s in sources if s[1].context.session == session
+                and (s[1].stage == "stage_review" and isinstance(s[1].proposal, (TurnCompletion, RoadResolution))
+                     or s[1].stage == "stage_completion"))[-2:], action_history=())
+            if closure_source is not None:
+                reviewed, review_request = closure_source
+                messages += ({"role": "user", "content": json.dumps({
+                    "source_operation_id": review_request.model_request_id,
+                    "settled_road": asdict(review_request.proposal),
+                    "review": asdict(reviewed),
+                }, ensure_ascii=False)},)
+        else:
+            messages = self._conversation(session, sources, action_history=all_history if stage == "stage_action" else None)
         if stage == "stage_review" and (fact_candidates(proposal) or isinstance(proposal, StageConclusionChange)):
             # A Fact judgement reads the claim and its own frozen evidence, not
             # the author's argument for it. User turns (review feedback, tool
@@ -536,7 +553,7 @@ class StageApplication:
                 {"operation_id": entry.operation_id, **asdict(entry.call)} for entry in self._tools_in_flight.values()]},
                 ensure_ascii=False)},)
         feedback = []
-        for operation, _, _ in sources:
+        for operation, _, _ in (() if closing else sources):
             if any(call.tool_name == "http.run_experiment" for call in tool_calls(
                     self.evidence.read_model_result(operation).result)):
                 result = self.mcp.experiments.result(operation.start.operation_id)
@@ -554,7 +571,10 @@ class StageApplication:
                 if entry.state in {"pending", "blocked"}
                 and (self.evidence.request(entry.proposal_operation_id).context.session == session
                     or entry.proposal_operation_id in visible)]}
+        if closing:
+            runtime["closure_context"] = True
         if stage == "stage_action":
+            runtime["road_turn_closure"] = turn is not None and turn.achievement is None
             from agent_core.stage_experiments import StageToolSequence
             applied = [(operation.start.operation_id, value)
                 for (operation, source, _), value in zip(reversed(sources), reversed(reads))
@@ -739,14 +759,37 @@ class StageApplication:
             code="roads_reordered" if isinstance(proposal, tuple) else "road_selected" if previous is None
                 else "road_kept" if previous == chosen else "road_switched")
 
-    async def _check_completion(self, turn, token):
-        request = self._request("stage_completion", PlanningSession("turn_planning", turn.turn_id))
+    def _completion_due(self, turn):
+        """Derive the follow-up from settled review and planning operations."""
+        if turn.achievement is not None:
+            return None
+        planner = "stage/turn_planning/" + turn.turn_id
+        roads = {"stage/road_execution/" + road.road_id for road in turn.roads}
+        for op in reversed(self.store.list_d4_operations(self.task_id)):
+            if not op.application_ref or op.application_ref.startswith("stage-discarded/"):
+                continue
+            if op.start.resource_ref == planner and op.start.role == "inner_action":
+                if (self.evidence.request(op.start.operation_id).stage == "stage_completion"
+                        and isinstance(self.evidence.read_model_result(op).result, (TurnCompletion, StageIncomplete))):
+                    return None
+            elif op.start.category == "review" and op.start.resource_ref in roads:
+                request = self.evidence.request(op.start.operation_id)
+                if not isinstance(request.proposal, RoadResolution):
+                    continue
+                review = self.evidence.read_model_result(op).result
+                verdict = review.road if isinstance(review, RoadTurnClosureReview) else review
+                if verdict.decision == "accept":
+                    return review, request
+        return None
+
+    async def _check_completion(self, turn, token, closure_source):
+        request = self._request("stage_completion", PlanningSession("turn_planning", turn.turn_id),
+            closure_source=closure_source)
         decision = await self.reviews.action(request, token)
         if decision is None:
             return
         identity, completion = decision
-        if isinstance(completion, StageFactRevision):
-            await self._knowledge_action(request, identity, completion, token)
+        if await self._knowledge_action(request, identity, completion, token):
             return
         if isinstance(completion, StageIncomplete):
             self.store.mark_d4_operation_applied(identity, "stage-incomplete/" + identity)
@@ -1238,6 +1281,9 @@ class StageApplication:
                     return StageRunResult(self.task_id, None, "stage.root_planning_exhausted")
                 continue
             running = next((r for r in turn.roads if r.status is IntentStatus.RUNNING), None)
+            if running is None and (closure_source := self._completion_due(turn)) is not None:
+                await self._check_completion(turn, token, closure_source)
+                continue
             if turn.achievement is not None and running is None:
                 if turn.planning_state is TurnPlanningState.EXHAUSTED:
                     return StageRunResult(self.task_id, turn, "stage.exhausted")
@@ -1268,7 +1314,11 @@ class StageApplication:
                     continue
                 self._apply_planning(turn, proposal, review, binding)
                 continue
-            await self._supervise(running.road_id, token)
+            pending_closure = any(entry.state == "pending" and isinstance(self.evidence.read_model_result(
+                self.store.load_d4_operation(entry.proposal_operation_id)).result, (RoadResolution, TurnCompletion))
+                for entry in self.store.list_stage_reviews(self.task_id))
+            if not pending_closure:
+                await self._supervise(running.road_id, token)
             current = active_turn(self.store.list_stage_turns(self.task_id))
             if (stage_plans.route_advice(self.store, self.task_id) or current is None or current.turn_id != turn.turn_id
                     or not any(road.road_id == running.road_id and road.status is IntentStatus.RUNNING for road in current.roads)):
@@ -1363,20 +1413,37 @@ class StageApplication:
                 continue
             binding = StageReviewBinding(identity, review_id)
             turn = self.store.load_turn(self.task_id, turn.turn_id)
+            if isinstance(action, RoadTurnClosure):
+                self._apply_closure(turn, running, binding, review.parts(action))
+                continue
             if review.decision != "accept":
                 self._commit(StageStateChange(reviews=(binding,)))
                 continue
             if isinstance(action, StagePlanningDecision):
                 self._apply_planning(turn, action, review, binding)
                 continue
+            self._apply_closure(turn, running, binding, ((action, review),))
+
+    def _apply_closure(self, turn, road, binding, parts):
+        before = turn
+        for action, review in parts:
+            if review.decision != "accept":
+                continue
             if isinstance(action, TurnCompletion):
-                turn = replace(turn, achievement=TurnAchievement(action, review_id),
+                turn = replace(turn, achievement=TurnAchievement(action, binding.review_operation_id),
                     fact_refs=tuple(dict.fromkeys((*turn.fact_refs, *action.support_refs))))
             elif isinstance(action, RoadResolution):
-                turn = replace(turn, roads=tuple(replace(r, status=action.outcome) if r.road_id == running.road_id else r for r in turn.roads))
-            self._commit(StageStateChange(turns=(turn,), reviews=(binding,)))
-            if isinstance(action, RoadResolution) and turn.achievement is None:
-                await self._check_completion(turn, token)
+                turn = replace(turn, roads=tuple(replace(r, status=action.outcome) if r.road_id == road.road_id else r for r in turn.roads))
+        self._commit(StageStateChange(turns=(turn,) if turn != before else (), reviews=(binding,)))
+        if len(parts) == 2:
+            submitted = self.store.load_d4_operation(binding.proposal_operation_id)
+            reviewed = self.store.load_d4_operation(binding.review_operation_id)
+            get_logger("ctrl").info("stage.road_turn_closure_reviewed", run=self.task_id,
+                operation=binding.review_operation_id, phase="stage_completion", turn=turn.turn_id,
+                road=road.road_id, road_decision=parts[0][1].decision, turn_decision=parts[1][1].decision,
+                proposal_seconds=submitted.completion.finished_at - submitted.start.started_at,
+                between_calls_seconds=reviewed.start.started_at - submitted.completion.finished_at,
+                review_seconds=reviewed.completion.finished_at - reviewed.start.started_at)
 
     async def _prepare_inputs(self, token):
         from agent_core.attachment_import import AttachmentImportRequest
