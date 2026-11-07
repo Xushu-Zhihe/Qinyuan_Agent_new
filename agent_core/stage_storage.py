@@ -378,6 +378,28 @@ def _refs(refs):
         _fail("stage.refs_invalid", Category.INPUT)
 
 
+def candidate_validation_sources(store, task_id, value, session):
+    """Bind a reviewed action handoff to its own original validation observations."""
+    if (session.scope != "road_execution" or not value.support_refs
+            or value.source_ref not in value.support_refs or not value.candidate):
+        _fail("stage.candidate_validation_unbound", Category.POLICY)
+    _sources(store, task_id, value.support_refs)
+    items = read_history(store, task_id, value.support_refs)
+    by_ref = {item.ref: item for item in items}
+    anchor = by_ref.get(value.source_ref)
+    # The observation that anchors the candidate must be this Road's own raw tool observation.
+    if anchor is None or anchor.identity != "tool_observation_not_fact" or anchor.intent_id != session.owner_id:
+        _fail("stage.candidate_validation_unbound", Category.POLICY)
+    # Supporting observations may also come from another Road of the same run (for example a Road
+    # that a later review abandoned after it had already produced observations). Only their
+    # observation identity is required here; the owning Road is not.
+    if any(i.identity != "tool_observation_not_fact" for i in items):
+        _fail("stage.candidate_validation_unbound", Category.POLICY)
+    # Resolve actual arguments through the evidence reader, never model-supplied prose.
+    store.stage_evidence.history_tool_requests(items)
+    return items
+
+
 def load_turn(store, task_id, turn_id):
     require_run(store, task_id)
     row = store._connection.execute(
@@ -918,6 +940,12 @@ def _reviewed(store, mutation, change, discarded=()):
             expected_scope = proposal.session.scope
         if isinstance(value, StagePlanningDecision) and value.kind == "return_to_parent":
             expected_scope = proposal.session.scope
+        if (isinstance(value, StagePlanningDecision) and value.kind == "request_final_validation"
+                and proposal.session.scope == "road_execution"):
+            expected_scope = "road_execution"
+            candidate_validation_sources(store, mutation.task_run_id, value, proposal.session)
+            if decision.decision == "accept" and value.source_ref not in decision.support_refs:
+                _fail("stage.candidate_validation_unsupported", Category.POLICY)
         if proposal.session.scope != expected_scope:
             _fail("stage.planning_scope_changed", Category.POLICY)
         if isinstance(value, (TurnIntent, PlanningExhausted, tuple)) and proposal_record.start.category != "planning":
@@ -1141,7 +1169,8 @@ def _validate(store, mutation):
     for binding, scope, value, _ in accepted:
         if isinstance(value, (TurnIntent, tuple, PlanningExhausted, StagePlanningDecision)) and current is not None and binding.proposal_operation_id not in plan_members:
             if scope.owner_id != current.turn_id and not (isinstance(value, StagePlanningDecision)
-                    and value.kind == "return_to_parent" and any(r.road_id == scope.owner_id for r in current.roads)):
+                    and value.kind in {"return_to_parent", "request_final_validation"}
+                    and scope.scope == "road_execution" and any(r.road_id == scope.owner_id for r in current.roads)):
                 _fail("stage.planning_frontier_changed", Category.POLICY)
         if not isinstance(value, StagePlanningDecision):
             continue
@@ -1155,6 +1184,13 @@ def _validate(store, mutation):
                     or not any(r.road_id == value.road_id and r.status is IntentStatus.RUNNING for r in updated.roads)):
                 _fail("stage.road_selection_not_applied")
         elif value.kind == "request_final_validation":
+            if scope.scope == "road_execution":
+                if config.goal_validation is None or not any(r.road_id == scope.owner_id
+                        and r.status is IntentStatus.RUNNING for r in current.roads):
+                    _fail("stage.final_handoff_not_ready", Category.POLICY)
+                candidate_validation_sources(store, mutation.task_run_id, value, scope)
+                consumed.add(binding.review_operation_id)
+                continue
             if current.achievement is None or not value.support_refs or any(r.status is IntentStatus.RUNNING for r in current.roads):
                 _fail("stage.final_handoff_not_ready", Category.POLICY)
             _sources(store, mutation.task_run_id, value.support_refs, formal=True)
@@ -1345,7 +1381,7 @@ def goal_candidate_proof(store, candidate):
         from agent_core.stage_planning import stage_runtime
         request = evidence.request(proposal_op.start.operation_id)
         if (not isinstance(value, StagePlanningDecision) or value.kind != "request_final_validation"
-                or request.stage != "stage_action" or not stage_runtime(request).get("direct_submission")
+                or request.stage != "stage_action" or value.support_refs or not stage_runtime(request).get("direct_submission")
                 or any(item.candidate_id != candidate.candidate_id
                        for item in store.list_d7_answer_candidates(candidate.task_run_id))):
             _fail("stage.candidate_not_reviewed", Category.POLICY)
@@ -1358,7 +1394,12 @@ def goal_candidate_proof(store, candidate):
                 or review.result.decision != "accept" or review.proposal_operation_id != proposal_op.start.operation_id
                 or review.proposal_sha256 != proposal_digest(value)):
             _fail("stage.candidate_not_reviewed", Category.POLICY)
-        _sources(store, candidate.task_run_id, value.support_refs, formal=True)
+        if proposal.session.scope == "road_execution":
+            candidate_validation_sources(store, candidate.task_run_id, value, proposal.session)
+            if value.source_ref not in review.result.support_refs:
+                _fail("stage.candidate_validation_unsupported", Category.POLICY)
+        else:
+            _sources(store, candidate.task_run_id, value.support_refs, formal=True)
     source = evidence.read_history(candidate.task_run_id, (value.source_ref,))[0]
     if candidate.source_ref != "mcp-result/" + source.record_id or source.intent_id != candidate.intent_id or source.turn_id != candidate.turn_id:
         _fail("stage.candidate_source_changed", Category.POLICY)

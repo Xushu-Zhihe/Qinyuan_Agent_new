@@ -1,5 +1,6 @@
 """Stage handoff into the existing protected candidate and trusted feedback lifecycle."""
 
+import json
 import re
 from uuid import uuid4
 
@@ -37,7 +38,21 @@ class StageGoal:
         result = app.evidence.read("mcp-result", source.record_id)
         original = self.grounded_value(value.source_ref)
         token = self.submission_token(value.candidate)
-        if not token or result is None or not self.candidate_in_source(token, original):
+        reviewed_validation = False
+        if request.model_request_id != request.proposal_operation_id:
+            review_op = app.store.load_d4_operation(request.model_request_id)
+            proof = app.evidence.read_model_result(review_op)
+            proposal = app.evidence.request(request.proposal_operation_id)
+            if proposal.context.session.scope == "road_execution":
+                from agent_core.stage_storage import candidate_validation_sources, proposal_digest
+                if (proof.result.decision != "accept" or proof.proposal_operation_id != request.proposal_operation_id
+                        or proof.proposal_sha256 != proposal_digest(value) or value.source_ref not in proof.result.support_refs):
+                    _fail("stage.candidate_validation_unsupported", Category.POLICY)
+                candidate_validation_sources(app.store, app.task_id, value, proposal.context.session)
+                claim = app.evidence.read("mcp-call", source.record_id)
+                actual_input = json.dumps(claim["call"], ensure_ascii=False).encode("utf-8")
+                reviewed_validation = bool(token) and self.candidate_in_source(token, actual_input)
+        if not token or result is None or not (self.candidate_in_source(token, original) or reviewed_validation):
             _fail("stage.candidate_not_in_original_source", Category.POLICY)
         candidate = D7AnswerCandidate(app.task_id, identity, source.turn_id, source.intent_id, None, None,
             operation.completion.evidence_sha256, "mcp-result/" + source.record_id, "mcp")

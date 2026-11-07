@@ -32,7 +32,8 @@ def request_for(runtime=None, *, with_observation=True):
 
 def direct_branches(request):
     return [branch for branch in schema(request)["anyOf"]
-            if branch.get("properties", {}).get("kind", {}).get("const") == "request_final_validation"]
+            if branch.get("properties", {}).get("kind", {}).get("const") == "request_final_validation"
+            and "support_refs" not in branch.get("properties", {})]
 
 
 def test_direct_schema_requires_the_runtime_marker_and_an_original_observation():
@@ -42,6 +43,25 @@ def test_direct_schema_requires_the_runtime_marker_and_an_original_observation()
     assert branch["properties"]["source_ref"]["enum"] == [enabled.context.history[0].ref]
     assert direct_branches(request_for()) == []
     assert direct_branches(request_for({"direct_submission": "first_flag_v1"}, with_observation=False)) == []
+
+
+def test_reviewed_handoff_requires_original_observation_and_bound_anchor():
+    from agent_core.output_contracts import D8ModelResponse
+    from agent_core.stage_planning import stage_output_issues
+    import json
+    request = request_for()
+    source = request.context.history[0].ref
+    value = {"kind": "request_final_validation", "reason": "tested against artifact",
+        "candidate": "flag{input}", "source_ref": source, "support_refs": [source]}
+    assert not stage_output_issues(request, D8ModelResponse(json.dumps(value)))
+    public = replace(request.context.history[0], identity="public_reference_not_target_observation")
+    restricted = replace(request, context=replace(request.context, history=(public,)))
+    assert stage_output_issues(restricted, D8ModelResponse(json.dumps(value)))
+    other = replace(request.context.history[0], record_id=str(uuid4()))
+    expanded = replace(request, context=replace(request.context, history=(*request.context.history, other)))
+    value["support_refs"] = [other.ref]
+    assert any(i.code == "stage.candidate_validation_unbound" for i in
+        stage_output_issues(expanded, D8ModelResponse(json.dumps(value))))
 
 
 def test_grounds_allows_only_the_declared_submission_head_substitution():
@@ -248,3 +268,44 @@ def test_direct_source_correction_names_eligible_sources_and_public_reference_bo
     hint = correction_hint(request, [D8FormatIssue("enum_mismatch", "$/result/source_ref", "allowed_choice", "string")])
     assert request.context.history[0].ref in hint
     assert "Public-reference" in hint and "bare digest" in hint and "not an echo" in hint
+
+
+def test_cross_road_support_observation_does_not_unbind_the_anchor(monkeypatch):
+    """A support observation from another Road stays admissible; only the anchor decides binding.
+
+    A Road can be abandoned by a later review after it already produced observations, so requiring
+    every cited observation to belong to the handing-off Road turns those observations into traps.
+    """
+    from agent_core import stage_storage
+
+    monkeypatch.setattr(stage_storage, "load_config", lambda store, task_id: object())
+    task, road, other = str(uuid4()), str(uuid4()), str(uuid4())
+
+    def item(sequence, owner):
+        return D8HistoryItem(str(uuid4()), task, "progress", None, owner, None, "observed",
+            (), "0" * 64, sequence, "tool_observation_not_fact", "current", "available")
+
+    anchor, foreign = item(1, road), item(2, other)
+
+    class Evidence:
+        def __init__(self):
+            self.resolved = None
+        def read_history(self, task_id, refs):
+            by_ref = {anchor.ref: anchor, foreign.ref: foreign}
+            return tuple(by_ref[ref] for ref in refs)
+        def history_tool_requests(self, items):
+            self.resolved = tuple(i.ref for i in items)
+
+    store = SimpleNamespace(stage_evidence=Evidence())
+    session = PlanningSession("road_execution", road)
+    value = SimpleNamespace(candidate="flag{x}", source_ref=anchor.ref,
+        support_refs=(anchor.ref, foreign.ref))
+
+    items = stage_storage.candidate_validation_sources(store, task, value, session)
+    assert [i.ref for i in items] == [anchor.ref, foreign.ref]
+    assert store.stage_evidence.resolved == (anchor.ref, foreign.ref)
+
+    # The anchoring observation itself must still be this Road's own observation.
+    value.source_ref = foreign.ref
+    with pytest.raises(stage_storage.StageStateError, match="candidate_validation_unbound"):
+        stage_storage.candidate_validation_sources(store, task, value, session)

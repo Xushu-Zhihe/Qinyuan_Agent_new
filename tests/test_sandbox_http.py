@@ -173,7 +173,8 @@ def _fake_docker_frames(monkeypatch):
     monkeypatch.setattr(docker.utils.socket, "next_frame_header", next_frame_header)
 
 
-def test_d7_http_dispatch_uses_stdin_fixed_worker_and_forwarder_binding():
+@pytest.mark.parametrize('path', ['/search?q=one', '//api/test?q=one'])
+def test_d7_http_dispatch_uses_stdin_fixed_worker_and_forwarder_binding(path):
     task_run_id = str(uuid4())
     config = _config(task_run_id)
     api = _ExecApi(
@@ -191,7 +192,7 @@ def test_d7_http_dispatch_uses_stdin_fixed_worker_and_forwarder_binding():
     result = transport.send(
         origin=transport_origin(config.endpoint),
         method="POST",
-        path_query="/search?q=one",
+        path_query=path,
         headers=(("Cookie", "session=secret"), ("Content-Type", "text/plain")),
         body=b"body-secret",
         timeout_seconds=3,
@@ -214,6 +215,7 @@ def test_d7_http_dispatch_uses_stdin_fixed_worker_and_forwarder_binding():
     assert "-c" in command and "target.qinyuan" in str(command)
     assert api.raw is not None
     sent = json.loads(api.raw.sent)
+    assert sent['path_query'] == path
     assert sent["headers"][0] == ["Cookie", "session=secret"]
     assert base64.b64decode(sent["body_b64"]) == b"body-secret"
     assert api.raw.sent.endswith(b"\n") and not api.raw.shutdowns
@@ -312,7 +314,8 @@ def test_d7_http_response_header_limits_fail_closed_after_dispatch():
 
 
 @pytest.mark.parametrize("host", ["node4.anna.nssctf.cn", "10.0.1.5"])
-def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypatch, host):
+@pytest.mark.parametrize("path", ["/start", "//api/test?data=AAAA", "//other.test/path"])
+def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypatch, host, path):
     class FakeHttpSocket:
         def __init__(self):
             self.sent = bytearray()
@@ -355,7 +358,7 @@ def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypat
         "port": 28989,
         "authority": f"{host}:28989",
         "method": "GET",
-        "path_query": "/start",
+        "path_query": path,
         "headers": [["Cookie", "session=secret"]],
         "body_b64": "",
         "timeout_seconds": 2,
@@ -371,6 +374,7 @@ def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypat
 
     response = json.loads(output.getvalue())
     assert addresses == [("target.qinyuan", 28989)]
+    assert fake_socket.sent.startswith(f"GET {path} HTTP/1.1\r\n".encode())
     assert f"Host: {host}:28989\r\n".encode() in fake_socket.sent
     assert b"Cookie: session=secret\r\n" in fake_socket.sent
     assert response["status"] == 302
@@ -383,7 +387,8 @@ def test_fixed_worker_sends_to_forwarder_and_does_not_follow_redirects(monkeypat
 
 
 @pytest.mark.parametrize("host", ["node4.anna.nssctf.cn", "10.0.1.5"])
-def test_fixed_worker_uses_authorized_hostname_for_verified_tls_sni(monkeypatch, host):
+@pytest.mark.parametrize("path", ["/", "//api/test"])
+def test_fixed_worker_uses_authorized_hostname_for_verified_tls_sni(monkeypatch, host, path):
     class FakeHttpSocket:
         def __init__(self):
             self.sent = bytearray()
@@ -407,6 +412,9 @@ def test_fixed_worker_uses_authorized_hostname_for_verified_tls_sni(monkeypatch,
             self.response.close()
 
     class FakeSSLContext:
+        verify_mode = ssl.CERT_REQUIRED
+        check_hostname = True
+
         def __init__(self):
             self.server_names = []
 
@@ -429,7 +437,7 @@ def test_fixed_worker_uses_authorized_hostname_for_verified_tls_sni(monkeypatch,
         "port": 28989,
         "authority": f"{host}:28989",
         "method": "GET",
-        "path_query": "/",
+        "path_query": path,
         "headers": [],
         "body_b64": "",
         "timeout_seconds": 2,
@@ -445,6 +453,7 @@ def test_fixed_worker_uses_authorized_hostname_for_verified_tls_sni(monkeypatch,
 
     assert addresses == [("target.qinyuan", 28989)]
     assert context.server_names == [host]
+    assert fake_socket.sent.startswith(f"GET {path} HTTP/1.1\r\n".encode())
     assert json.loads(output.getvalue())["status"] == 200
 
 

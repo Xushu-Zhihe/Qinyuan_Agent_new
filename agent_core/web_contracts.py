@@ -12,6 +12,12 @@ from uuid import UUID
 from agent_core.operation_accounting import D4BudgetPolicy
 from agent_core.turn_contracts import D1RoleConfig
 
+
+def valid_http_path_query(value: object) -> bool:
+    """Origin-form request target; authority is supplied by the trusted transport."""
+    return (isinstance(value, str) and value.startswith("/") and "\\" not in value
+        and "#" not in value and all(32 < ord(char) < 127 for char in value))
+
 D7_WEB_ALLOWED_METHODS = frozenset(
     {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 )

@@ -99,6 +99,36 @@ def _request(*, headers=(), path="/", operation_id=None):
     )
 
 
+@pytest.mark.parametrize('path', ['//api/test?data=AAAA', '/api//test', '/%2Fapi', '//other.test/path'])
+def test_origin_form_path_is_preserved_without_changing_authority(path):
+    transport = FakeTransport(D7HttpWireResponse(200, (), b'ok'))
+    adapter, _ = _adapter(transport)
+    adapter.execute(_request(path=path))
+    assert transport.calls[0]['path_query'] == path
+    assert transport.calls[0]['origin'].host == 'example.test'
+
+
+def test_double_slash_cookie_default_path_and_cross_origin_redirect_stay_bound():
+    transport = FakeTransport(
+        D7HttpWireResponse(200, (('set-cookie', 'sid=value'),), b'ok'),
+        D7HttpWireResponse(302, (('location', '//other.test/next'),), b''))
+    adapter, _ = _adapter(transport)
+    adapter.execute(_request(path='//api/login'))
+    result = adapter.execute(_request(path='//api/next'))
+    assert ('Cookie', 'sid=value') in transport.calls[1]['headers']
+    assert result.redirect_path_query is None
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.parametrize('path', ['https://other.test/', '/x\r\nHost: other', '/x y', '/x#fragment', '/x\\y', '/路径'])
+def test_unsafe_request_target_is_rejected_before_dispatch(path):
+    transport = FakeTransport()
+    adapter, _ = _adapter(transport)
+    with pytest.raises(HttpCapabilityError, match='d7_http_path_invalid'):
+        adapter.execute(_request(path=path))
+    assert not transport.calls
+
+
 def test_wire_header_limits_include_injected_cookie_and_encoding_headers():
     cookie_value = "s=" + "x" * 8174 + "; Path=/"
     transport = FakeTransport(

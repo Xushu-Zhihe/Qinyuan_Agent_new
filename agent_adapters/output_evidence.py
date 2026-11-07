@@ -41,6 +41,8 @@ SAFE_HTTP_ERROR_CODES = frozenset({
     "d7_http_authorization_or_ownership_mismatch", "d7_http_request_rejected",
     "d7_http_sandbox_profile_mismatch", "d7_http_target_network_adapter_required",
     "d7_http_origin_invalid", "d7_http_request_envelope_too_large",
+    "d7_http_path_invalid", "d7_http_method_invalid", "d7_http_method_forbidden",
+    "d7_http_body_must_be_utf8_text", "d7_http_request_too_large", "d7_http_headers_too_many",
     "d7_http_headers_invalid", "d7_http_header_rejected", "d7_http_headers_too_large",
     "d7_http_response_headers_invalid", "d7_http_response_header_invalid",
     "d7_http_response_headers_too_large", "d20_http_cookie_owner_changed",

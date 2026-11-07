@@ -254,7 +254,7 @@ def reopen(case):
 
 
 @pytest.mark.parametrize('change',[
-    dict(method='POST'),dict(path_query='http://other.test:18080/'),dict(path_query='//other.test/'),
+    dict(method='POST'),dict(path_query='http://other.test:18080/'),dict(path_query='/x\r\nHost: other.test'),
     dict(headers={'Host':'other.test'}),dict(headers={'Authorization':'test-only-placeholder'})])
 def test_http_permission_and_origin_rejected_before_send(http_case,change):
     case=http_case

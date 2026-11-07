@@ -439,24 +439,52 @@ class HttpExperiments:
                         raise ValueError('d22_experiment_bridge_invalid')
                     try:
                         phase = 'target_request'
-                        result = await self.request(parent,intent_id,call,len(self.records(parent))+1,event,token,expires)
+                        ordinal = len(self.records(parent))+1
+                        result = await self.request(parent,intent_id,call,ordinal,event,token,expires)
                     except (ValueError,HttpCapabilityError) as error:
                         from agent_adapters.output_evidence import SAFE_HTTP_ERROR_CODES
                         code=getattr(error,'code',error.args[0] if len(error.args)==1 else None)
                         if code not in SAFE_HTTP_ERROR_CODES | {'d22_experiment_method_not_authorized','d22_experiment_request_invalid'}:
                             code='d22_experiment_request_rejected'
                         category='dependency' if code==PROTOCOL_MISMATCH else 'policy'
+                        # Stable rule codes and positions only; never copy request values into diagnostics.
+                        fields = {
+                            'd7_http_path_invalid': ('path_query', 'ASCII origin-form path/query; no whitespace, controls, backslash or fragment; origin is fixed'),
+                            'd7_http_method_invalid': ('method', 'text HTTP method'),
+                            'd7_http_method_forbidden': ('method', 'method allowed by the HTTP capability'),
+                            'd22_experiment_method_not_authorized': ('method', 'method allowed by the frozen task authorization'),
+                            'd7_http_header_rejected': ('headers', 'unique permitted header; valid token name, latin-1 value, no controls; within configured size limit'),
+                            'd7_http_headers_invalid': ('headers', 'header name/value pairs'),
+                            'd7_http_headers_too_many': ('headers', 'header count within configured limit'),
+                            'd7_http_headers_too_large': ('headers', 'total header bytes within configured limit'),
+                            'd7_http_body_must_be_utf8_text': ('body', 'UTF-8 text'),
+                            'd7_http_request_too_large': ('body', 'body bytes within configured limit'),
+                            'd22_experiment_request_invalid': ('request', 'method, path_query, headers object and text body'),
+                        }
+                        details = dict(ordinal=ordinal)
+                        if code in fields:
+                            details.update(zip(('field', 'expected'), fields[code]))
+                            rule = getattr(error, 'context', {}).get('rule')
+                            if rule in {'header_encoding', 'header_name_token', 'header_owned_by_transport',
+                                    'header_unique', 'header_no_controls', 'header_value_size', 'header_identity_encoding'}:
+                                details['rule'] = rule
+                            index = getattr(error, 'context', {}).get('header_index')
+                            if type(index) is int and 0 <= index < 100:
+                                details['field'] = 'headers/' + str(index)
                         self.log.warning('experiment.request_rejected',run=session['task_run_id'],request=parent,
-                            category=category,code=code)
+                            category=category,code=code,**details)
                         finished = dict(status='rejected',code=code,output='',
-                            failure=dict(category=category,phase='target_request',code=code))
+                            failure=dict(category=category,phase='target_request',code=code,**details))
                         break
                     await self._strategy(intent_id, start=True)
                     phase = 'bridge_reply'
                     await asyncio.to_thread(runner.send,result)
         except ExecutionRecoveryRequired as error:
             primary_error = error
-            raise
+            finished = dict(status='interrupted',code=str(error) if str(error) in {
+                'd22_experiment_request_outcome_unknown','d22_experiment_process_outcome_unknown',
+                'd22_experiment_receipt_settlement_failed','http.response_evidence_save_failed'}
+                else 'd22_experiment_process_outcome_unknown',output='')
         except StageStateError as error:
             primary_error = error
             self.log.warning('experiment.local_failure',run=session['task_run_id'],request=parent,
@@ -467,15 +495,18 @@ class HttpExperiments:
         except TaskRunSandboxError as error:
             if error.outcome == 'outcome_unknown':
                 primary_error = ExecutionRecoveryRequired('d22_experiment_process_outcome_unknown')
-                raise primary_error from error
-            finished['code'] = 'd22_experiment_environment_error'
-            finished['failure'] = dict(category='environment',phase=phase,code=finished['code'],
-                error_type=type(error).__name__)
+                finished = dict(status='interrupted',code='d22_experiment_process_outcome_unknown',output='')
+            else:
+                finished['code'] = 'd22_experiment_environment_error'
+                finished['failure'] = dict(category='environment',phase=phase,code=finished['code'],
+                    error_type=type(error).__name__)
         except (TimeoutError,InterruptedError) as error:
             finished = dict(status='stopped',code='d22_experiment_timeout' if isinstance(error,TimeoutError) else 'd22_experiment_cancelled',output='')
         except Exception as error:
             code = 'd22_experiment_environment_error' if runner is None else 'd22_experiment_local_error'
             category = 'environment' if runner is None else 'bridge' if phase.startswith('bridge_') else 'technical_failure'
+            if runner is not None:
+                finished['status'] = 'interrupted'
             finished['failure'] = dict(category=category,phase=phase,code=code,
                 error_type=type(error).__name__ if type(error).__name__ in SCRIPT_ERRORS else 'OtherError')
             self.log.warning('experiment.local_failure',run=session['task_run_id'],request=parent,
@@ -507,6 +538,18 @@ class HttpExperiments:
                             finished['stop_diagnostic'] = diagnostic
             finally:
                 self.live = None
+        if primary_error is not None:
+            # Missing aggregate output does not invalidate independently settled observations.
+            # Only a confirmed local exit plus settled children can release the parent.
+            diagnostic = finished.get('stop_diagnostic', {})
+            rows = self.records(parent)
+            if not (str(primary_error) == 'd22_experiment_process_outcome_unknown'
+                    and diagnostic.get('process_stopped') is True
+                    and all(row.completion is not None for row in rows)):
+                if self.evidence.read('experiment-stop', parent) is None:
+                    self.evidence.save('experiment-stop', parent, dict(session_sha256=digest(session),
+                        requests=[row.start.operation_id for row in rows], **finished))
+                raise primary_error
         result = dict(session_sha256=digest(session),requests=[r.start.operation_id for r in self.records(parent)],**finished)
         self.evidence.save('experiment-result',parent,result)
         self._apply_parent(parent)

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from agent_core.control_store import TargetNetworkBinding
 from agent_core.web_contracts import (
+    valid_http_path_query,
     D7_WEB_MAX_HEADER_BYTES,
     D7_WEB_MAX_HEADER_COUNT,
     D7_WEB_MAX_HEADER_VALUE_BYTES,
@@ -251,12 +252,7 @@ class D7SandboxHttpRuntime:
             or method not in authorization.allowed_methods
             or method
             not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
-            or not isinstance(path_query, str)
-            or not path_query.startswith("/")
-            or path_query.startswith("//")
-            or "\\" in path_query
-            or any(ord(char) < 32 or ord(char) == 127 for char in path_query)
-            or "#" in path_query
+            or not valid_http_path_query(path_query)
             or not isinstance(body, bytes)
             or len(body) > MAX_D7_HTTP_REQUEST_BODY_BYTES
             or isinstance(timeout_seconds, bool)

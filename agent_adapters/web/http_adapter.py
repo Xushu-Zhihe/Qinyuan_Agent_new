@@ -25,6 +25,7 @@ from agent_adapters.windows_evidence_protection import (
     WindowsEvidenceProtectionError,
 )
 from agent_core.web_contracts import (
+    valid_http_path_query,
     D7_WEB_MAX_HEADER_BYTES,
     D7_WEB_MAX_HEADER_COUNT,
     D7_WEB_MAX_HEADER_VALUE_BYTES,
@@ -673,7 +674,7 @@ class _TaskRunCookieJar:
                 path = (
                     path_attr
                     if path_attr.startswith("/")
-                    else _default_cookie_path(urlsplit(request_path).path)
+                    else _default_cookie_path(request_path.partition("?")[0])
                 )
                 expires = None
                 if morsel["max-age"]:
@@ -714,19 +715,7 @@ class _TaskRunCookieJar:
 
 
 def _valid_path_query(value: object) -> str:
-    if (
-        not isinstance(value, str)
-        or not value.startswith("/")
-        or value.startswith("//")
-        or "\\" in value
-        or any(ord(char) < 32 or ord(char) == 127 for char in value)
-    ):
-        raise HttpCapabilityError("d7_http_path_invalid")
-    try:
-        parsed = urlsplit(value)
-    except ValueError as exc:
-        raise HttpCapabilityError("d7_http_path_invalid") from exc
-    if parsed.scheme or parsed.netloc or parsed.fragment:
+    if not valid_http_path_query(value):
         raise HttpCapabilityError("d7_http_path_invalid")
     return value
 
@@ -739,33 +728,31 @@ def _validated_headers(headers: object) -> tuple[tuple[str, str], ...]:
     output: list[tuple[str, str]] = []
     seen: set[str] = set()
     total_bytes = 0
-    for item in headers:
+    for index, item in enumerate(headers):
         if (
             not isinstance(item, (tuple, list))
             or len(item) != 2
             or not isinstance(item[0], str)
             or not isinstance(item[1], str)
         ):
-            raise HttpCapabilityError("d7_http_headers_invalid")
+            raise HttpCapabilityError("d7_http_headers_invalid", header_index=index)
         name, value = item
         lower = name.lower()
         try:
             name_bytes = name.encode("ascii", errors="strict")
             value_bytes = value.encode("latin-1", errors="strict")
         except UnicodeEncodeError as exc:
-            raise HttpCapabilityError("d7_http_header_rejected") from exc
-        if (
-            not _TOKEN.fullmatch(name)
-            or lower in _FORBIDDEN_HEADERS
-            or lower in seen
-            or any(
-                (ord(char) < 32 and char != "\t") or ord(char) == 127 for char in value
-            )
-            or len(value_bytes) > D7_WEB_MAX_HEADER_VALUE_BYTES
-            or lower == "accept-encoding"
-            and value.strip().lower() != "identity"
-        ):
-            raise HttpCapabilityError("d7_http_header_rejected")
+            raise HttpCapabilityError("d7_http_header_rejected", header_index=index, rule="header_encoding") from exc
+        rule = next((rule for failed, rule in (
+            (not _TOKEN.fullmatch(name), "header_name_token"),
+            (lower in _FORBIDDEN_HEADERS, "header_owned_by_transport"),
+            (lower in seen, "header_unique"),
+            (any((ord(char) < 32 and char != "\t") or ord(char) == 127 for char in value), "header_no_controls"),
+            (len(value_bytes) > D7_WEB_MAX_HEADER_VALUE_BYTES, "header_value_size"),
+            (lower == "accept-encoding" and value.strip().lower() != "identity", "header_identity_encoding"),
+        ) if failed), None)
+        if rule:
+            raise HttpCapabilityError("d7_http_header_rejected", header_index=index, rule=rule)
         seen.add(lower)
         total_bytes += len(name_bytes) + len(value_bytes) + 4
         output.append((name, value))

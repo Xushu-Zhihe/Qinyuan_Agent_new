@@ -543,6 +543,11 @@ class StageApplication:
                 }, ensure_ascii=False)},)
         else:
             messages = self._conversation(session, sources, action_history=all_history if stage == "stage_action" else None)
+        if (stage == "stage_review" and isinstance(proposal, StagePlanningDecision)
+                and proposal.kind == "request_final_validation" and session.scope == "road_execution"):
+            items = stage_storage.candidate_validation_sources(self.store, self.task_id, proposal, session)
+            messages += ({"role": "user", "content": json.dumps({"validation_tool_requests":
+                self.evidence.history_tool_requests(items)}, ensure_ascii=False)},)
         if stage == "stage_review" and (fact_candidates(proposal) or isinstance(proposal, StageConclusionChange)):
             # A Fact judgement reads the claim and its own frozen evidence, not
             # the author's argument for it. User turns (review feedback, tool
@@ -1441,7 +1446,8 @@ class StageApplication:
             if not tool_calls(action) and not fact_candidates(action):
                 await self._collect_tools(drain=True)
             if (isinstance(action, StagePlanningDecision) and action.kind == "request_final_validation"
-                    and self.goal is not None and stage_runtime(request).get("direct_submission")):
+                    and self.goal is not None and stage_runtime(request).get("direct_submission")
+                    and not action.support_refs):
                 if self._reject_direct_candidate(identity, action):
                     continue
                 # The applied marker is written before the handoff so a restart
@@ -1477,6 +1483,12 @@ class StageApplication:
                 self._commit(StageStateChange(reviews=(binding,)))
                 continue
             if isinstance(action, StagePlanningDecision):
+                if action.kind == "request_final_validation":
+                    self._commit(StageStateChange(reviews=(binding,)))
+                    if self.goal.handoff(self.evidence.request(review_id), action):
+                        return StageRunResult(self.task_id, turn,
+                            "stage.awaiting_" + self.goal_validation + "_validation")
+                    continue
                 self._apply_planning(turn, action, review, binding)
                 continue
             self._apply_closure(turn, running, binding, ((action, review),))

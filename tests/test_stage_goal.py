@@ -31,6 +31,94 @@ def prepare(case, mode="human"):
     return asyncio.run(app.run(case.token))
 
 
+@pytest.mark.parametrize("mode", ["human", "external"])
+@pytest.mark.parametrize("verdict,interrupted", [("accept", False), ("accept", True), ("revise", False),
+    ("reject", False), ("unsupported", False)])
+def test_reviewed_input_candidate_handoff_without_fact_or_closure(case, monkeypatch, mode, interrupted, verdict):
+    import json
+    from dataclasses import replace
+    from agent_adapters.stage_application import StageApplication
+    from agent_adapters.web import candidate_evidence
+    from test_candidate_evidence import _TestOnlyProtection
+    from agent_core.stage_contracts import StagePlanningDecision
+
+    monkeypatch.setattr(candidate_evidence, "WindowsEvidenceProtection", _TestOnlyProtection)
+    task = case.app.state.task_run.request
+    asyncio.run(case.app.close())
+    case.app = app = StageApplication(case.path / "reviewed-goal", **case.args, goal_validation=mode)
+    app.start(task)
+    case.tools.task_id = app.task_id
+    candidate = "flag{tested_input}"
+    reviewed = []
+    class ContinueExploring(Exception):
+        pass
+    original = case.tools.call_tool
+    async def tested(name, arguments):
+        result = await original(name, arguments)
+        return replace(result, stdout="Correct; negative control rejected")
+    monkeypatch.setattr(case.tools, "call_tool", tested)
+    def inner(request, raw):
+        if request.stage == "stage_action":
+            sources = [i.ref for i in request.context.history if i.identity == "tool_observation_not_fact"]
+            if not sources:
+                return {"kind": "mcp_call", "tool_name": "shell.run_bash",
+                    "arguments": {"script": "validate-current-artifact " + candidate}}
+            return {"kind": "request_final_validation", "candidate": candidate, "source_ref": sources[-1],
+                "support_refs": [sources[-1]], "reason": "current artifact accepted candidate, control rejected"}
+        return raw
+    def outer(request, raw):
+        if isinstance(request.proposal, StagePlanningDecision):
+            assert candidate in json.dumps(request.messages)
+            assert "validation_tool_requests" in json.dumps(request.messages)
+            reviewed.append(request)
+            return {**raw, "decision": "accept" if verdict == "unsupported" else verdict,
+                "support_refs": [] if verdict == "unsupported" else [request.proposal.source_ref]}
+        return raw
+    case.models.inner.transform = inner
+    case.models.outer.transform = outer
+    make_request = app._request
+    def next_request(stage, *args, **kwargs):
+        if stage == "stage_action" and reviewed and verdict != "accept":
+            raise ContinueExploring
+        return make_request(stage, *args, **kwargs)
+    monkeypatch.setattr(app, "_request", next_request)
+    class Interrupted(Exception):
+        pass
+    if verdict == "unsupported":
+        from agent_core.stage_storage import StageStateError
+        with pytest.raises(StageStateError, match="candidate_validation_unsupported"):
+            asyncio.run(app.run(case.token))
+        assert not app.store.list_d7_answer_candidates(app.task_id)
+        return
+    if verdict != "accept":
+        with pytest.raises(ContinueExploring):
+            asyncio.run(app.run(case.token))
+        assert not app.store.list_d7_answer_candidates(app.task_id)
+        assert app.state.task_run.status is TaskRunStatus.RUNNING
+        return
+    if interrupted:
+        monkeypatch.setattr(app.goal, "handoff", lambda *_: (_ for _ in ()).throw(Interrupted()))
+        with pytest.raises(Interrupted):
+            asyncio.run(app.run(case.token))
+        task_id, directory = app.task_id, app.directory
+        asyncio.run(app.close())
+        case.app = app = StageApplication(directory, **case.args, goal_validation=mode)
+        app.bind(task_id)
+    result = asyncio.run(app.run(case.token))
+    assert result.reason == "stage.awaiting_" + mode + "_validation"
+    assert len(app.store.list_d7_answer_candidates(app.task_id)) == 1
+    turn, = app.store.list_stage_turns(app.task_id)
+    assert turn.achievement is None
+    assert not any(i.record_type == "verified_fact" for i in app.evidence.history(app.task_id))
+    assert len(case.tools.calls) == 1
+    assert app.state.task_run.status in {TaskRunStatus.AWAITING_CONFIRMATION, TaskRunStatus.AWAITING_EXTERNAL_FEEDBACK}
+    from agent_core.stage_storage import candidate_validation_sources, StageStateError
+    from agent_core.stage_contracts import PlanningSession
+    with pytest.raises(StageStateError, match="candidate_validation_unbound"):
+        candidate_validation_sources(app.store, app.task_id, reviewed[0].proposal,
+            PlanningSession("road_execution", str(uuid4())))
+
+
 @pytest.mark.parametrize("native", [False, True])
 def test_human_candidate_is_protected_and_manual_success_is_trusted_feedback(case, native):
     case.models.inner.native = case.models.outer.native = native

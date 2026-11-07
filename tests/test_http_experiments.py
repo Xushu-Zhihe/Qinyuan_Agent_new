@@ -67,7 +67,8 @@ def test_local_failure_preserves_safe_phase_without_claiming_target_failure(http
     result = asyncio.run(c.app._run_once(c.token))
     assert not result.recovery_required
     report = c.app.mcp.experiments.result(calls[0])
-    assert report['status'] == 'failed' and report['requests'] == [] and not c.sends
+    assert report['status'] == ('failed' if failure_phase == 'script_execution' else 'interrupted')
+    assert report['requests'] == [] and not c.sends
     assert report['failure'] == dict(category='script' if failure_phase == 'script_execution' else 'bridge',
         phase=failure_phase, code=report['code'],
         error_type='PermissionError' if failure_phase == 'script_execution' else 'ValueError')
@@ -142,6 +143,30 @@ def test_failed_experiment_preserves_first_request_without_replay(http_case,tail
 
 
 @pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+@pytest.mark.parametrize('tail,code,field', [
+    ("request('GET','/bad?secret=PRIVATE value')", 'd7_http_path_invalid', 'path_query'),
+    ("request('GET','/',headers={'Host':'PRIVATE'})", 'd7_http_header_rejected', 'headers/0'),
+    ("request('POST','/')", 'd22_experiment_method_not_authorized', 'method'),
+])
+def test_rejected_request_locates_seventh_item_and_preserves_six_results(http_case, tail, code, field, caplog):
+    c=http_case
+    calls=setup(c, "for i in range(6):\n    request('GET','//api/test?i='+str(i))\n" + tail)
+    result=asyncio.run(c.app._run_once(c.token))
+    assert not result.recovery_required
+    report=c.app.mcp.experiments.result(calls[0])
+    assert report['status']=='rejected' and len(report['requests'])==len(c.sends)==6
+    failure=report['failure']
+    assert failure['code']==code and failure['ordinal']==7 and failure['field']==field
+    assert failure['expected'] and 'PRIVATE' not in json.dumps(failure)
+    assert 'PRIVATE' not in '\n'.join(r.getMessage() for r in caplog.records)
+    c.app.mcp.reconcile()
+    from agent_core.actions import MCPCall
+    saved=c.app.mcp.experiments.evidence.read('experiment-session',calls[0])['call']
+    asyncio.run(c.app.mcp.execute(calls[0],c.app.state.intents[0].intent_id,MCPCall(**saved),c.token))
+    assert len(c.sends)==6
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
 def test_lost_but_confirmed_exited_script_can_return_partial_progress_without_replay(http_case,monkeypatch):
     from types import SimpleNamespace as NS
     c=http_case
@@ -201,9 +226,41 @@ def test_unknown_request_is_not_replayed_or_reported_as_local_script_failure(htt
     result=asyncio.run(c.app._run_once(c.token))
     assert result.recovery_required and len(c.sends)==2,result
     assert c.app.mcp.experiments.result(calls[0]) is None
+    retained = c.app.mcp.experiments.evidence.read('experiment-stop', calls[0])
+    assert retained['status'] == 'interrupted' and len(retained['requests']) == 2
     assert len([r for r in c.app.mcp.records() if r.completion is not None])==1
     with pytest.raises(ExecutionRecoveryRequired):c.app.mcp.reconcile()
     assert len(c.sends)==2
+
+
+@pytest.mark.parametrize('http_case',['continuous'],indirect=True)
+@pytest.mark.parametrize('confirmed_exit', [True, False])
+def test_missing_aggregate_recovers_settled_observations_only_after_confirmed_exit(http_case, confirmed_exit):
+    from Sandbox.task_run_sandbox import TaskRunSandboxError
+    c = http_case
+    calls = setup(c, "request('GET','/once')\nprint('aggregate may be lost')")
+    class LostAggregate(ScriptProcess):
+        def receive(self):
+            event = super().receive()
+            if event.get('kind') == 'finished':
+                raise TaskRunSandboxError('experiment_read','outcome_unknown', c.task,
+                    (c.app.state.task_run.sandbox_id,))
+            return event
+        def close(self):
+            super().close()
+            self.stop_diagnostic = dict(phase='wait_exit', process_stopped=confirmed_exit)
+    c.app.mcp.experiments.runner_factory = LostAggregate
+    result = asyncio.run(c.app._run_once(c.token))
+    assert result.recovery_required is (not confirmed_exit)
+    experiments = c.app.mcp.experiments
+    parent = calls[0]
+    report = experiments.result(parent) if confirmed_exit else experiments.evidence.read('experiment-stop', parent)
+    assert report['status'] == 'interrupted' and len(report['requests']) == len(c.sends) == 1
+    assert not c.app.state.facts
+    assert c.app.store.load_d3_operation(parent).application_ref == (parent if confirmed_exit else None)
+    if confirmed_exit:
+        c.app.mcp.reconcile()
+        assert len(c.sends) == 1
 
 
 @pytest.mark.parametrize('http_case',['continuous'],indirect=True)
@@ -730,7 +787,7 @@ def test_peer_that_does_not_speak_http_is_a_recoverable_rejection(http_case):
     assert not result.recovery_required,result
     report=c.app.mcp.experiments.result(calls[0])
     assert report['status']=='rejected' and report['code']=='d22_http_protocol_mismatch'
-    assert report['failure']==dict(category='dependency',phase='target_request',code='d22_http_protocol_mismatch')
+    assert report['failure']==dict(category='dependency',phase='target_request',code='d22_http_protocol_mismatch',ordinal=1)
     assert len(report['requests'])==1 and len(c.sends)==1
     failure=c.app.mcp.evidence.read('experiment-failure',report['requests'][0])
     assert failure['code']=='d22_http_protocol_mismatch' and failure['phase']=='http_execute'
@@ -754,7 +811,7 @@ def test_request_rejected_before_send_is_a_recoverable_rejection(http_case):
     assert not result.recovery_required,result
     report=c.app.mcp.experiments.result(calls[0])
     assert report['status']=='rejected' and report['code']=='d7_http_dispatch_rejected'
-    assert report['failure']==dict(category='policy',phase='target_request',code='d7_http_dispatch_rejected')
+    assert report['failure']==dict(category='policy',phase='target_request',code='d7_http_dispatch_rejected',ordinal=1)
     assert len(report['requests'])==1 and len(c.sends)==1
     failure=c.app.mcp.evidence.read('experiment-failure',report['requests'][0])
     assert failure['code']=='d7_http_dispatch_rejected' and failure['phase']=='http_execute'

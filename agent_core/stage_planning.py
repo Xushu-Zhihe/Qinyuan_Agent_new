@@ -825,7 +825,7 @@ def fact_source_issues(request, value, *, native=False):
 
 BUSINESS_ISSUE_CODES = {"stage.formal_fact_required", "stage.fact_source_ineligible",
     "stage.formal_fact_requires_own_observation", "stage.tool_batch_resource_conflict", "stage.route_order_changed_candidates",
-    "stage.pending_candidates_omitted", "stage.fact_revision_pending"}
+    "stage.pending_candidates_omitted", "stage.fact_revision_pending", "stage.candidate_validation_unbound"}
 
 
 def pending_roads_hint(request):
@@ -928,7 +928,10 @@ def stage_output_issues(request, raw, *, normalization_policy=NATIVE_TRAILING_BR
             return [D8FormatIssue("stage.tool_batch_resource_conflict", path,
                 "at_most_one_sandbox_or_target_action; public_reference_actions_may_overlap", "two_private_actions")]
     direct = (kind == "request_final_validation" and request.stage == "stage_action"
-        and bool(stage_runtime(request).get("direct_submission")))
+        and (bool(stage_runtime(request).get("direct_submission")) or bool(value.get("support_refs"))))
+    if direct and value.get("support_refs") and value.get("source_ref") not in value["support_refs"]:
+        return [D8FormatIssue("stage.candidate_validation_unbound", "$/source_ref",
+            "validation_observation_also_in_support_refs", "unbound")]
     required = kind == "turn_completion" or (kind == "request_final_validation" and not direct)
     if required or joint_completion is not None or kind == "road_resolution" and value.get("outcome") == "succeeded":
         eligible = formal_support_refs(request)
@@ -1055,11 +1058,23 @@ def model_contract(request):
                 and any(tool.get("qualified_name") == "download.install_tool" for tool in request.tools) else "")
             + (OUTPUT_PREVIEW_GUIDANCE if request.stage == "stage_action" else "")
             + road_suggestion_guidance(request)
+            + (" A candidate tested against this task artifact/target may be handed off from stage_action with "
+               "request_final_validation, candidate, reason, source_ref naming its validation observation and nonempty "
+               "support_refs containing that source and relevant own-Road observations. This requires Outer review, "
+               "not Fact registration or Turn/Road closure. The candidate must occur in actual tool input or output. "
+               "For this review inspect validation_tool_requests and their bound results: verify the current artifact/target, "
+               "actual input and discriminating success outcome. Reject echo, unrelated hash consistency and wrong-artifact tests. "
+               "A public writeup can suggest a candidate but cannot validate it. Accept must cite source_ref in support_refs. "
+               "Approval authorizes final validation, never task success."
+               if request.context.goal_validation is not None and (request.stage == "stage_action"
+                   or request.stage == "stage_review" and isinstance(request.proposal, StagePlanningDecision)
+                   and request.proposal.kind == "request_final_validation"
+                   and request.context.session.scope == "road_execution") else "")
             + (" Final validation requests must include a candidate grounded in the cited original tool observation. "
                "If the task declares a '提交 flag 头：X' line, the body inside the braces must appear verbatim and only that "
                "X head may replace the source's own head (for example source wectf{body} becomes X{body}); otherwise submit "
                "the exact source candidate. Put only the flag token in candidate; keep any derivation in reason. "
-               "If an observed candidate plausibly answers the TaskRun goal, prioritize its supported Fact and truthful Turn/Road closure, "
+               "For the planning-session handoff, if an observed candidate plausibly answers the TaskRun goal, prioritize its supported Fact and truthful Turn/Road closure, "
                "then request_final_validation from stage_continuation before proposing extra deliverables. "
                "For a find-the-flag task, do not open a new Turn for source recovery, exploit documentation or external confirmation "
                "once a grounded flag candidate is ready; use the configured human/external validation handoff. "
@@ -1297,6 +1312,14 @@ def _schema(request, *, compact=False):
         resolutions = [obj({**choice["properties"], "completion": obj({**supported, "support_refs": formal_refs})},
             optional=("completion",)) for choice in resolutions]
     direct = []
+    if request.context.goal_validation is not None and request.context.turn is not None:
+        observations = [i.ref for i in request.context.history if i.record_type == "progress"
+            and i.identity == "tool_observation_not_fact" and i.source_status == "available"]
+        if observations:
+            direct.append(tagged("request_final_validation", {"reason": text(), "candidate": text(16384),
+                "source_ref": {"type": "string", "enum": observations},
+                "support_refs": {**array({"type": "string", "enum": observations}, minimum=1, maximum=8),
+                    "uniqueItems": True}}))
     if stage_runtime(request).get("direct_submission") and request.context.turn is not None:
         observations = [i.ref for i in request.context.history if i.record_type == "progress"
             and i.identity == "tool_observation_not_fact" and i.source_status == "available"]
