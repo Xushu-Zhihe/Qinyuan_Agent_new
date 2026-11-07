@@ -66,6 +66,8 @@ class MCPServerRuntime:
     tools: dict[str, MCPToolMeta] = field(default_factory=dict)
     status: str = "stopped"
     last_error: str | None = None
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    owner: asyncio.Task | None = None
 
 @dataclass(frozen=True,slots=True)
 class MCPExecutionResult:
@@ -364,91 +366,56 @@ class MCPManager:
                 else f"MCP startup failed: {detail}"
             )
 
-    async def _start_server(self,config: MCPServerConfig) -> None:
+    async def _start_server(self, config: MCPServerConfig) -> None:
         if config.name in self.runtimes:
-            return 
-
-        runtime = MCPServerRuntime(config=config)
-        runtime.status = "starting"
-
+            return
+        runtime = MCPServerRuntime(config=config, status="starting")
+        ready = asyncio.get_running_loop().create_future()
+        runtime.owner = asyncio.create_task(self._serve(runtime, ready))
         try:
-            if config.transport == "stdio":
-                if config.cwd is not None and not config.cwd.is_dir():
-                    raise MCPClientError(
-                        f"MCP server cwd does not exist: {config.cwd}"
-                    )
+            await ready
+        except BaseException:
+            runtime.stop.set()
+            await runtime.owner
+            raise
 
-                command = config.command or ""
-
-                # 使用当前正在运行 MCPManager 的 Python 解释器。
-                # 避免写死 .venv/Scripts/python.exe，也避免创建 MCP 独立 uv 环境。
-                if command == "{python}":
-                    command = sys.executable
-
-                environment = {
-                    key: os.environ.get(key, value)
-                    for key, value in config.env.items()
-                }
-                parameters = StdioServerParameters(
-                    command=command,
-                    args=list(config.args),
-                    env=environment,
-                    cwd=config.cwd,
-                )
-
-                read_stream,write_stream =(
-                    await asyncio.wait_for(
-                        runtime.exit_stack.enter_async_context(
-                            stdio_client(parameters)
-                        ),
-                        timeout=self.startup_timeout_seconds,
-                    )
-                )
-            else:
-                read_stream,write_stream,_ = (
-                    await asyncio.wait_for(
-                        runtime.exit_stack.enter_async_context(
-                            streamable_http_client(config.url or "")
-                        ),
-                        timeout=self.startup_timeout_seconds,
-                    )
-                )
-
-            session = await asyncio.wait_for(
-                runtime.exit_stack.enter_async_context(
-                    ClientSession(read_stream,write_stream)
-                ),
-                timeout=self.startup_timeout_seconds,
-            )
-
-            await asyncio.wait_for(
-                session.initialize(),
-                timeout=self.startup_timeout_seconds,
-            )
-
-            runtime.session = session
-            runtime.status = "ready"
-            self.runtimes[config.name] = runtime
-
-            await asyncio.wait_for(
-                self.refresh_tools(config.name),
-                timeout=self.startup_timeout_seconds,
-            )
-
+    async def _serve(self, runtime, ready):
+        """Enter and exit MCP contexts in their owning task, including timeout cleanup."""
+        config = runtime.config
+        try:
+            async with asyncio.timeout(self.startup_timeout_seconds):
+                if config.transport == "stdio":
+                    if config.cwd is not None and not config.cwd.is_dir():
+                        raise MCPClientError(f"MCP server cwd does not exist: {config.cwd}")
+                    command = sys.executable if config.command == "{python}" else config.command or ""
+                    parameters = StdioServerParameters(command=command, args=list(config.args),
+                        env={key: os.environ.get(key, value) for key, value in config.env.items()},
+                        cwd=config.cwd)
+                    read_stream, write_stream = await runtime.exit_stack.enter_async_context(stdio_client(parameters))
+                else:
+                    read_stream, write_stream, _ = await runtime.exit_stack.enter_async_context(
+                        streamable_http_client(config.url or ""))
+                session = await runtime.exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
+                await session.initialize()
+                runtime.session = session
+                runtime.status = "ready"
+                self.runtimes[config.name] = runtime
+                await self.refresh_tools(config.name)
+            ready.set_result(None)
+            await runtime.stop.wait()
         except Exception as exc:
-            runtime.status = "failed"
             runtime.last_error = str(exc)
-            self.runtimes.pop(config.name,None) 
+            if ready.done():
+                raise
+            self.runtimes.pop(config.name, None)
+            ready.set_exception(MCPClientError(f"failed to start MCP server {config.name!r}: {exc}"))
+        finally:
             try:
-                await asyncio.wait_for(
-                    runtime.exit_stack.aclose(),
-                    timeout=self.shutdown_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                pass
-            raise MCPClientError(
-                f"failed to start MCP server {config.name!r}: {exc}"
-            ) from exc
+                async with asyncio.timeout(self.shutdown_timeout_seconds):
+                    await runtime.exit_stack.aclose()
+            finally:
+                runtime.status = "stopped"
+                runtime.session = None
 
     async def stop_all(self) -> None:
         """尽最大可能关闭所有的 MCP Server"""
@@ -457,10 +424,8 @@ class MCPManager:
 
         for runtime in reversed(list(self.runtimes.values())):
             try:
-                await asyncio.wait_for(
-                    runtime.exit_stack.aclose(),
-                    timeout=self.shutdown_timeout_seconds,
-                )
+                runtime.stop.set()
+                await runtime.owner
             except asyncio.TimeoutError:
                 from qinyuan_core import get_logger
                 get_logger("ctrl").warning("mcp.server_close_failed", server=runtime.config.name,

@@ -344,7 +344,8 @@ def _stage_input(request):
     environment = context.pop("execution_context")
     if environment is not None and "stage_runtime" in environment:
         context["review_status"] = {"pending_reviews": environment["stage_runtime"].get("pending_reviews", [])}
-        for key in ("intent_revision", "action_stall", "slow_action", "fact_revisions", "remaining_seconds", "last_experiment", "route_reassessment"):
+        for key in ("intent_revision", "action_stall", "slow_action", "fact_revisions", "remaining_seconds",
+                    "last_experiment", "route_reassessment", "direct_candidate_rejection"):
             if key in environment["stage_runtime"]:
                 context[key] = environment["stage_runtime"][key]
         if environment["stage_runtime"].get("action_checkpoint") is not None:

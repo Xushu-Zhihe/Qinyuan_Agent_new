@@ -73,6 +73,21 @@ def test_arena_no_current_question_is_connected_without_receiving_question(platf
     assert not p.workbench.list()
 
 
+def test_templates_are_read_only_and_benchmark_keeps_level_and_container(platform):
+    p=platform
+    status,templates=call(p.port,"GET","/api/competition/templates")
+    assert status==200 and [t["id"] for t in templates]==["arena","benchmark"]
+    assert templates[1]["level_order"] and templates[1]["container_limit"]==3
+    assert not p.requests and not p.workbench.competitions.list()
+    profile,_=p.profile()
+    p.payload=[benchmark(level=2)]
+    p.payload[0].update(is_completed=True,container_status="available")
+    status,result=probe(p,profile)
+    item=result["preview"]["items"][0]
+    assert status==200 and item["level"]==2 and item["state"]=="completed"
+    assert item["container_status"]=="available"
+
+
 def test_arena_anonymous_attempt_preview_and_credential_reflection(platform):
     p=platform;profile,token=p.profile("arena")
     p.payload={"code":200,"data":{"agent":{"rating":1200,"secret":token},"attempt":{

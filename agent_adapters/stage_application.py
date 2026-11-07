@@ -575,6 +575,14 @@ class StageApplication:
             runtime["closure_context"] = True
         if stage == "stage_action":
             runtime["road_turn_closure"] = turn is not None and turn.achievement is None
+            if self.goal_validation == "external":
+                rejected = next(self._direct_rejections(road_id=session.owner_id), None)
+                if rejected is not None:
+                    operation, value = rejected
+                    runtime["direct_candidate_rejection"] = {
+                        "operation_id": operation.start.operation_id, "source_ref": value.source_ref,
+                        "reason": "candidate_not_grounded_in_cited_original",
+                    }
             from agent_core.stage_experiments import StageToolSequence
             applied = [(operation.start.operation_id, value)
                 for (operation, source, _), value in zip(reversed(sources), reversed(reads))
@@ -1104,7 +1112,11 @@ class StageApplication:
                         or self.evidence.action_generation_failure(source, self.evidence.read("result", stalled_operation)) is None):
                     raise StageRecoveryRequired("stage.action_stall_binding_changed")
                 request = replace(request, frozen_contract_ref=None, execution_context={**request.execution_context,
-                    "stage_runtime": {**stage_runtime(request), "action_stall": {"operation_id": stalled_operation}}})
+                    "stage_runtime": {**stage_runtime(request), "action_stall": {
+                        "operation_id": stalled_operation,
+                        "reason": self.evidence.action_generation_failure(source,
+                            self.evidence.read("result", stalled_operation)),
+                        "correction": self.evidence.read("contract", stalled_operation).get("correction")}}})
             request = self.evidence.request(identity) if self.evidence.read("request", identity) is not None else replace(
                 request, model_request_id=identity)
             try:
@@ -1149,6 +1161,52 @@ class StageApplication:
             finally:
                 await self.reviews.stop()
                 await self._stop_tools()
+
+    def _direct_rejections(self, *, road_id=None):
+        for operation in reversed(self.store.list_d4_operations(self.task_id)):
+            if stage_storage.direct_rejection_applied(operation) and (
+                    road_id is None or operation.start.resource_ref == "stage/road_execution/" + road_id):
+                yield operation, self.evidence.read_model_result(operation).result
+
+    def _reject_direct_candidate(self, identity, value):
+        operation = self.store.load_d4_operation(identity)
+        receipt = stage_storage.direct_rejection_receipt(self.store, operation)
+        if receipt is None:
+            key = self.goal.submission_token(value.candidate) or value.candidate
+            duplicate = next((old.start.operation_id for old, rejected in self._direct_rejections()
+                if rejected.source_ref == value.source_ref
+                and (self.goal.submission_token(rejected.candidate) or rejected.candidate) == key), None)
+            if duplicate is None and self.goal.grounds(value):
+                return False
+            receipt = {"result_sha256": operation.completion.evidence_sha256, "duplicate_of": duplicate}
+            self.evidence.save("direct-rejection", identity, receipt)
+        self._commit(StageStateChange(applications=(identity,)))
+        logger = get_logger("ctrl")
+        if receipt["duplicate_of"] is None:
+            logger.warning("stage.direct_candidate_ungrounded", run=self.task_id, operation=identity,
+                phase="stage_action", category="policy")
+        else:
+            logger.info("stage.direct_candidate_rejection_reused", run=self.task_id, operation=identity,
+                source_operation=receipt["duplicate_of"], phase="stage_action", category="policy")
+        return True
+
+    def _recover_direct_rejection(self, road_id):
+        if self.goal_validation != "external":
+            return
+        sequence = self.state.latest_checkpoint.sequence
+        for operation in reversed(self.store.list_d4_operations(self.task_id)):
+            if (operation.start.resource_ref != "stage/road_execution/" + road_id
+                    or operation.start.category != "action" or operation.completion is None
+                    or operation.completion.result_kind != "completed"):
+                continue
+            identity = operation.start.operation_id
+            legacy = (operation.application_ref == "stage-direct-ungrounded/" + identity
+                and operation.start.base_checkpoint_sequence == sequence)
+            if legacy or operation.application_ref is None and stage_storage.direct_rejection_receipt(self.store, operation):
+                self._commit(StageStateChange(applications=(identity,)))
+                get_logger("ctrl").info("stage.direct_candidate_rejection_recovered", run=self.task_id,
+                    operation=identity, phase="stage_action", category="recovery")
+                return
 
     def _recover_direct_submission(self):
         """Finish a saved one-shot handoff whose process stopped before registering."""
@@ -1251,6 +1309,7 @@ class StageApplication:
         if recovered is not None:
             return recovered
         root_id = self._id("stage/root")
+        recover_rejection = True
         while True:
             await self._collect_tools()
             await self.reviews.collect(token)
@@ -1281,6 +1340,9 @@ class StageApplication:
                     return StageRunResult(self.task_id, None, "stage.root_planning_exhausted")
                 continue
             running = next((r for r in turn.roads if r.status is IntentStatus.RUNNING), None)
+            if running is not None and recover_rejection:
+                self._recover_direct_rejection(running.road_id)
+                recover_rejection = False
             if running is None and (closure_source := self._completion_due(turn)) is not None:
                 await self._check_completion(turn, token, closure_source)
                 continue
@@ -1380,12 +1442,7 @@ class StageApplication:
                 await self._collect_tools(drain=True)
             if (isinstance(action, StagePlanningDecision) and action.kind == "request_final_validation"
                     and self.goal is not None and stage_runtime(request).get("direct_submission")):
-                if not self.goal.grounds(action):
-                    # The candidate must appear verbatim in the cited original;
-                    # an ungrounded value never consumes the single direct attempt.
-                    self.store.mark_d4_operation_applied(identity, "stage-direct-ungrounded/" + identity)
-                    get_logger("ctrl").warning("stage.direct_candidate_ungrounded", run=self.task_id,
-                        operation=identity, phase="stage_action")
+                if self._reject_direct_candidate(identity, action):
                     continue
                 # The applied marker is written before the handoff so a restart
                 # can finish the same handoff instead of losing the saved decision.

@@ -3492,3 +3492,42 @@ def test_sequence_explicit_json_result_binding(case, stdout, expected):
     asyncio.run(case.app.run(case.token))
     assert len(case.tools.calls) == expected
     if expected == 2: assert case.tools.calls[1][1]['script'] == 'next'
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_invalid_action_exhaustion_supervises_once_and_survives_restart(case, persistent):
+    from agent_adapters.stage_evidence import StageActionStalled
+    from agent_core.stage_planning import stage_runtime
+    attempts = []
+    previous = case.models.inner.transform
+    def invalid(request, raw):
+        if request.stage == "stage_action":
+            attempts.append(request)
+            if persistent or len(attempts) <= 3:
+                return {"kind": "not_an_offered_action"}
+        return previous(request, raw)
+    case.models.inner.transform = invalid
+    if not persistent:
+        assert asyncio.run(case.app.run(case.token)).turn.achievement
+        assert len(case.tools.calls) == 1
+    else:
+        for _ in range(2):
+            with pytest.raises(StageActionStalled):
+                asyncio.run(case.app.run(case.token))
+            count = len(attempts)
+            task_id = case.app.task_id
+            asyncio.run(case.app.close())
+            case.app = StageApplication(case.path, **case.args)
+            case.app.bind(task_id)
+        assert len(attempts) == count == 6
+        assert not case.tools.calls
+    supervision = [r for r in case.models.outer.calls if r.stage == "stage_supervision"]
+    assert len(supervision) == 1
+    assert stage_runtime(supervision[0])["action_stall"]["reason"] == "stage.model_output_unusable"
+    assert stage_runtime(supervision[0])["action_stall"]["correction"]["issues"]
+    from agent_adapters.web.task_result import _stage_task_result
+    view = _stage_task_result(case.path, dict(task_run_id=case.app.task_id, mode="simulated"),
+        case.app.store, case.args["config"])
+    assert any(f.get("handled_by") == supervision[0].model_request_id for f in view["model_failures"])
+    if not persistent:
+        assert not view["errors"] and view["recovery_status"] == "not_required"

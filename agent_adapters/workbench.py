@@ -274,6 +274,8 @@ class Workbench:
         result["cancel_requested"] = bool(result["cancel_requested"])
         result["result"] = json.loads(result.pop("result_json")) if result.get("result_json") else None
         outcome = result["result"]
+        if isinstance(outcome, dict) and result.get("finished_at"):
+            outcome.setdefault("dispatch", {}).update(status="stopped", reason=result["status"])
         cleanup = outcome.get("cleanup") if isinstance(outcome, dict) else None
         task = outcome.get("task_run") if isinstance(outcome, dict) else None
         if (has_remote_target and result["status"] not in {"starting", "running", "cancelling", "cleaning"}
@@ -740,6 +742,10 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and self.command=="GET":self._send(HTTPStatus.OK,service.project(service.get(identity)))
             elif len(parts)==5 and parts[4]=="control" and self.command=="POST":self._send(HTTPStatus.OK,service.command(identity,self._json()))
             else:raise WorkbenchError("method_not_allowed",HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+        if parts == ["api", "competition", "templates"]:
+            if self.command != "GET":raise WorkbenchError("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
+            self._send(HTTPStatus.OK, self.server.workbench.competitions.templates())
             return
         if parts == ["api", "competition", "profiles"]:
             if self.command == "GET":

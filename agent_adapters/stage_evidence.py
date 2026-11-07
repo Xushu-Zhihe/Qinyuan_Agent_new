@@ -59,7 +59,7 @@ class StageModelSuperseded(Exception):
 
 
 class StageActionStalled(StageModelTransportFailure):
-    """Action generation exhausted time or output capacity without a usable decision."""
+    """Action generation exhausted time, output capacity or bounded validation."""
     code = "stage.action_generation_stalled"
 
 
@@ -207,6 +207,17 @@ class StageEvidence:
                 # The issue list alone names a code at a JSON path; the admissible
                 # set for that path is what the retry has to satisfy.
                 hint = correction_hint(source, issues)
+                if any(i.path.endswith("/source_ref") for i in issues):
+                    try:
+                        calls = result.get("tool_calls")
+                        raw = json.loads(calls[0]["function"]["arguments"] if calls else result["content"])
+                        value = raw.get("result", raw) if isinstance(raw, dict) else {}
+                        if isinstance(value, dict) and isinstance(value.get("source_ref"), str):
+                            feedback["rejected_source_ref"] = value["source_ref"]
+                    except (ValueError, KeyError, IndexError, TypeError):
+                        pass  # Malformed envelopes retain their decoder issues.
+                if hint:
+                    feedback["hint"] = hint
                 if result.get("finish_reason") == "length":
                     # A retry with the same text and the same budget repeats the
                     # truncation; ask for the smallest admissible answer instead.
@@ -308,6 +319,9 @@ class StageEvidence:
             return None
         if settled and settled["outcome"] == "invalid" and settled["finish_reason"] == "length":
             return "d8_model_output_budget_exhausted"
+        if (settled and settled["outcome"] == "invalid"
+                and self.correction_depth(request) == MAX_STAGE_CORRECTIONS):
+            return "stage.model_output_unusable"
         provider = self.transport_failure(request, settled)
         return "model_total_timeout" if provider and provider["error"]["code"] == "model_total_timeout" else None
 
@@ -1073,6 +1087,7 @@ class StageModelCalls:
                             code = "stage.proposal_business_invalid"
                         get_logger("model").warning("stage.output_rejected", run=request.task_run_id,
                             operation=identity, phase=request.stage, code=code, category="input",
+                            issues=[asdict(i) for i in issues],
                             issue_codes=",".join(i.code for i in issues) or "stage_value_invalid")
                     result = {"request_sha256": start.context_sha256, "outcome": outcome,
                         "content": content, "finish_reason": finish, "finished_at": self.clock()}
@@ -1103,7 +1118,8 @@ class StageModelCalls:
                 count = self.evidence.action_failure_count(request) + 1
                 if record.completion is None:
                     get_logger("model").warning("stage.action_generation_exhausted", run=request.task_run_id,
-                        operation=identity, phase=request.stage, category="dependency", failure_count=count,
+                        operation=identity, phase=request.stage,
+                        category="input" if generation_failure == "stage.model_output_unusable" else "dependency", failure_count=count,
                         code=generation_failure, truncation_phase=_action_truncation_phase(request, result))
                 if count >= 2 or depth == MAX_STAGE_CORRECTIONS or stage_runtime(request).get("action_stall"):
                     raise StageActionStalled("stage.action_generation_stalled", retryable=False,

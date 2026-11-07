@@ -52,10 +52,18 @@
 
         <section id="competition-view" class="view" hidden>
           <div class="page-head c-page-head">
-            <div><p class="eyebrow">QINYUAN / COMPETITION DESK</p><h1>比赛控制</h1><p class="subheading">串行推进每一道题，保留每一步可核验的进展。</p></div>
+            <div><p class="eyebrow">QINYUAN / COMPETITION DESK</p><h1>比赛启动器</h1><p class="subheading">选择平台模板与连接配置，管理题目、赛程和 Agent 进展。</p></div>
             <span id="competition-bound-source" class="section-meta">尚未绑定赛程</span>
           </div>
+          <section class="c-panel c-launcher" aria-label="平台模板与连接配置">
+            <div><h2>选择比赛模板</h2><p class="competition-note">每个平台可保存多份连接配置；选择模板不会领取或启动题目。</p></div>
+            <div id="competition-templates" class="c-template-grid"></div>
+            <div class="competition-heading"><h3 id="competition-config-title">已保存配置</h3><button id="competition-create-profile" class="quiet-button" type="button">＋ 为此模板新建配置</button></div>
+            <div id="competition-configurations" class="c-config-list"></div>
+            <p id="competition-template-note" class="competition-note"></p>
+          </section>
           <section class="c-command c-panel" aria-label="赛程控制">
+            <label class="field"><span>查看题目槽位（单题加时作用于此槽位，其余控制作用于整个赛程）</span><select id="competition-lane"><option value="">当前赛程</option></select></label>
             <div class="c-command-head"><span class="c-live-dot" aria-hidden="true"></span><p id="competition-schedule-status" role="status">尚未创建赛程</p><span id="competition-freshness" class="competition-note">等待读取</span></div>
             <div class="c-clock-row"><div><span>整体剩余</span><strong id="competition-overall-clock">—</strong></div><div><span>本题剩余</span><strong id="competition-question-clock">—</strong></div><div><span>平台进度</span><strong id="competition-flag-score">—</strong></div></div>
             <div class="c-command-actions">
@@ -63,7 +71,7 @@
               <button id="competition-pause" class="secondary-button" type="button" disabled>立即暂停</button>
               <button id="competition-resume" class="secondary-button" type="button" disabled>继续原赛程</button>
               <button id="competition-finish" class="danger-button" type="button" disabled title="结束当前赛程；结束后才能新建赛程">结束赛程</button>
-              <label class="c-stop"><input id="competition-stop-after" type="checkbox" disabled> 本题结束后停止</label>
+              <label class="c-stop"><input id="competition-stop-after" type="checkbox" disabled> 停止补充新题，已运行题继续收尾</label>
               <div class="c-extend"><label for="competition-extend-minutes">加时</label><input id="competition-extend-minutes" aria-label="加时分钟数" type="number" min="1" value="10"><span>分钟</span><button id="competition-extend-question" class="quiet-button" type="button" disabled>本题 +</button><button id="competition-extend-overall" class="quiet-button" type="button" disabled>整体 +</button></div>
             </div>
             <p id="competition-schedule-error" class="c-error" role="alert"></p>
@@ -73,6 +81,8 @@
               <div class="competition-heading"><h2>答题队列</h2><span id="competition-queue-count" class="section-meta">0 题</span></div>
               <p id="competition-queue-note" class="competition-note">赛前编辑，开始后按冻结顺序执行。</p>
               <button id="competition-fill-queue" class="quiet-button" type="button">加入全部未完成题目</button>
+              <button id="competition-sort-level" class="quiet-button" type="button" disabled>按关卡 level 排序</button>
+              <p id="competition-order-note" class="competition-note" hidden>level 只用于排序，不代表平台解锁条件；同关保持现有顺序，未提供关卡的题排在最后。</p>
               <ol id="competition-queue-list" class="c-queue-list"></ol>
               <details id="competition-queue-editor"><summary>按题目标识批量编辑</summary><label class="field"><span class="competition-note">Benchmark 每行一个标识；Arena 自动领取，无需队列。</span><textarea id="competition-queue" rows="5" aria-label="Benchmark 队列" placeholder="测试连接后加入题目"></textarea></label></details>
             </aside>
@@ -110,7 +120,7 @@
               <form id="competition-form">
                 <fieldset id="competition-fields" class="competition-fields">
                   <label class="field"><span>配置名称</span><input id="competition-name" maxlength="80" required placeholder="例如：训练场 Arena"></label>
-                  <label class="field"><span>平台协议</span><select id="competition-adapter"><option value="arena">NSSCTF Agent Arena</option><option value="benchmark">Benchmark</option></select></label>
+                  <label class="field"><span>平台模板</span><select id="competition-adapter"><option value="arena">NSSCTF Arena</option><option value="benchmark">TSecBench</option></select></label>
                   <label class="field"><span>平台根地址</span><input id="competition-url" type="url" required maxlength="2048" placeholder="https://www.nssctf.cn"><small>活跃来源锁定；同源凭据可修正。</small></label>
                   <label class="field"><span>读取超时（秒）</span><input id="competition-timeout" type="number" min="1" max="60" value="10" required></label>
                   <label class="field"><span id="competition-credential-label">Agent Token（不含 Bearer 前缀）</span><input id="competition-credential" type="password" autocomplete="new-password" maxlength="8192" placeholder="只发送给本地服务；留空保留同配置凭据"><small>凭据仅保存在服务进程内存，重启后需重新输入。</small></label>
@@ -125,6 +135,7 @@
                       <label class="field"><span>无协议入口</span><select id="competition-scheme" required><option value="">请确认协议</option><option value="http">HTTP</option><option value="https">HTTPS</option></select></label>
                       <label class="field"><span>单题预算（分钟）</span><input id="competition-question-minutes" type="number" min="1" max="10080" value="60" required></label>
                       <label class="field"><span>整体预算（分钟）</span><input id="competition-overall-minutes" type="number" min="1" value="180" required></label>
+                      <label class="field" id="competition-concurrency-field"><span>同时运行题目数</span><select id="competition-concurrency"><option value="1">1 · 串行</option><option value="2">2 · 并发</option><option value="3">3 · 并发</option></select><small>需要相应本机资源；平台已有容器也占用最多 3 个实例的名额。</small></label>
                       <label class="field"><span>平台整体截止（可选）</span><input id="competition-platform-end" type="datetime-local"></label>
                     </div>
                     <label class="field"><span>允许的 HTTP 方法（逗号分隔）</span><input id="competition-methods" value="GET,HEAD,OPTIONS,POST,PUT,PATCH" required></label>

@@ -207,3 +207,13 @@ def test_remote_endpoint_is_optional_but_a_supplied_target_needs_a_port():
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+def test_finished_run_dispatch_is_stopped_without_changing_task_or_cleanup():
+    row = dict(run_id="run", status="recovery_required", finished_at="2026-11-07", cancel_requested=0,
+        result_json=json.dumps(dict(protocol_version=3, dispatch=dict(status="running"),
+            task_run=dict(status="running"), cleanup_status="unconfirmed")))
+    projected = Workbench._run_dict(row)["result"]
+    assert projected["dispatch"] == dict(status="stopped", reason="recovery_required")
+    assert projected["task_run"]["status"] == "running"
+    assert projected["cleanup_status"] == "unconfirmed"

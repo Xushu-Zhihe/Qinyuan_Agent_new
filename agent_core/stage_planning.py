@@ -475,6 +475,9 @@ DIRECT_SUBMISSION_GUIDANCE = (
     "braces must appear verbatim in that observation and only that X head may replace the source's own head (for example "
     "source wectf{body} becomes X{body}); if no head is declared, submit the exact source candidate. Put only the flag token "
     "in candidate; keep any derivation in reason. Never change the body, use another head, or invent a value, because an "
+    "eligible source must contain a complete token: a bare digest needs a minimal local computation emitting the "
+    "task-formatted candidate from evidenced inputs, not an echo of a proposed answer. Public search/fetch records "
+    "are reference material, not eligible direct-submission sources. An "
     "ungrounded value cannot be handed off. This path skips review and is allowed once per TaskRun: if the platform rejects "
     "it, no second direct submission is offered and only the reviewed final-validation handoff remains. Do not spend it on a guess."
 )
@@ -719,6 +722,15 @@ def correction_hint(request, issues):
         return ""
     codes = {issue.code for issue in issues}
     hints = []
+    if any(issue.path.endswith("/source_ref") for issue in issues):
+        branches = schema(request).get("anyOf", [])
+        sources = next((b["properties"]["source_ref"].get("enum", []) for b in branches
+            if b.get("properties", {}).get("kind", {}).get("const") == "request_final_validation"), [])
+        hints.append("request_final_validation.source_ref must be one of: " + "; ".join(sources)
+            + ". Public-reference search/fetch records may inform inference but cannot ground this direct submission. "
+            "An eligible original observation must contain the complete candidate token. A bare digest is insufficient; "
+            "use a minimal local computation that emits the complete task-formatted candidate from the evidenced input, "
+            "not an echo of a proposed answer. Reuse prior results rather than repeating the investigation.")
     if "stage.pending_candidates_omitted" in codes:
         hints.append(pending_roads_hint(request))
     if "stage.fact_revision_pending" in codes:
@@ -1018,7 +1030,9 @@ def model_contract(request):
                "being interrupted. Preserve its useful results. For this next decision, prefer a smaller "
                "testable action or reuse an existing implementation; elapsed time does not refute its method."
                if stage_runtime(request).get("slow_action") else "")
-            + (" The current action_stall records confirmed generation failures, not failed experiments. "
+            + (" The current action_stall records a confirmed unusable generation or exhausted output validation; "
+               "no tool or platform submission was executed by that failed decision. Use its reason and correction "
+               "to resolve the evidence or contract gap rather than repeating rejected references or arguments. "
                "Use actual observations to identify one cheaper next check or implementation, or advise truthful "
                "Road resolution when no informative continuation exists. Do not solve the task here or force a "
                "Road switch because time elapsed. The Inner must submit a small executable decision using this "
@@ -1055,7 +1069,12 @@ def model_contract(request):
                "preserve historical stage achievement and improve the proposal using actual evidence. Unknown submission is never resubmitted."
                if request.context.goal_validation is not None else "")
             + (DIRECT_SUBMISSION_GUIDANCE if request.stage == "stage_action"
-               and stage_runtime(request).get("direct_submission") else ""),
+               and stage_runtime(request).get("direct_submission") else "")
+            + (" current.direct_candidate_rejection identifies a previous attempt that could not be matched to "
+               "its cited original and was never sent to external validation. Do not submit the same candidate "
+               "with the same evidence again. Correct the candidate or cite a relevant original observation, "
+               "continue investigating, or settle the Road if no useful test remains."
+               if request.stage == "stage_action" and stage_runtime(request).get("direct_candidate_rejection") else ""),
         "instruction": (("Return one complete JSON result using the submit_stage_result tool schema. "
             if compact_action(request) else "Return one complete JSON result object matching output_contract.schema. ")
             + "Do not copy the contract envelope or wrap the result in version/stage/schema keys. No Markdown or extra fields."

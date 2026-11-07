@@ -249,6 +249,20 @@ def unchanged_action(store, operation):
         and request.context.turn == load_turn(store, operation.start.task_run_id, request.context.turn.turn_id))
 
 
+def direct_rejection_applied(operation):
+    identity = operation.start.operation_id
+    return operation.application_ref in ("stage-direct-rejected/" + identity, "stage-direct-ungrounded/" + identity)
+
+
+def direct_rejection_receipt(store, operation):
+    identity = operation.start.operation_id
+    receipt = store.stage_evidence.read("direct-rejection", identity)
+    if receipt is not None and (operation.completion is None
+            or receipt["result_sha256"] != operation.completion.evidence_sha256):
+        _fail("stage.direct_rejection_binding_changed", Category.UNKNOWN)
+    return receipt
+
+
 def validate_tool_start(store, start):
     """Bind a new dispatch to the exact admitted Inner decision and live Road."""
     config = require_run(store, start.task_run_id)
@@ -1177,13 +1191,28 @@ def _validate(store, mutation):
         for identity in change.applications:
             operation = store.load_d4_operation(identity)
             if (operation is None or operation.start.task_run_id != mutation.task_run_id
-                    or operation.start.role != "inner_action" or (operation.start.base_checkpoint_sequence != mutation.base_checkpoint_sequence
-                        and not unchanged_action(store, operation))
+                    or operation.start.role != "inner_action"
                     or operation.start.role_config_ref != config.inner_role.role_config_ref
                     or operation.start.budget_policy_ref != config.budget.budget_policy_ref
-                    or operation.completion is None or operation.completion.result_kind != "completed" or operation.application_ref is not None):
+                    or operation.completion is None or operation.completion.result_kind != "completed"):
                 _fail("stage.reference_operation_not_ready", Category.POLICY)
             source = store.stage_evidence.read_model_result(operation)
+            if isinstance(source.result, StagePlanningDecision) and source.result.kind == "request_final_validation":
+                from agent_core.stage_planning import stage_runtime
+                request = store.stage_evidence.request(identity)
+                legacy = (operation.application_ref == "stage-direct-ungrounded/" + identity
+                    and operation.start.base_checkpoint_sequence == mutation.base_checkpoint_sequence)
+                if (config.goal_validation != "external" or operation.start.category != "action"
+                        or request.stage != "stage_action" or not stage_runtime(request).get("direct_submission")
+                        or current is None or request.context.turn is None or request.context.turn.turn_id != current.turn_id
+                        or source.session.scope != "road_execution"
+                        or not any(r.road_id == source.session.owner_id and r.status is IntentStatus.RUNNING for r in current.roads)
+                        or not (legacy or operation.application_ref is None and direct_rejection_receipt(store, operation) is not None)):
+                    _fail("stage.direct_rejection_unbound", Category.POLICY)
+                continue
+            if (operation.application_ref is not None or operation.start.base_checkpoint_sequence != mutation.base_checkpoint_sequence
+                    and not unchanged_action(store, operation)):
+                _fail("stage.reference_operation_not_ready", Category.POLICY)
             owner = knowledge.turn_for(source.session)
             if isinstance(source.result, StageFactSelection):
                 _sources(store, mutation.task_run_id, source.result.support_refs, formal=True)
@@ -1688,7 +1717,11 @@ def save(store, mutation, change):
             application.fact_id, item.turn_id, value.content, item.record_id, FactStatus.VERIFIED.value,
             store._next_event_sequence(task_id), ordinal, fact_verification_ref(application.review_operation_id, application.candidate_index)))
     for identity in change.applications:
-        source = store.stage_evidence.read_model_result(store.load_d4_operation(identity))
+        operation = store.load_d4_operation(identity)
+        source = store.stage_evidence.read_model_result(operation)
+        if isinstance(source.result, StagePlanningDecision) and source.result.kind == "request_final_validation":
+            store._mark_d4_operation_applied(identity, operation.application_ref or "stage-direct-rejected/" + identity)
+            continue
         duplicate = duplicate_fact(store, task_id, source.session, source.result) if fact_candidates(source.result) else None
         application_ref = ("stage-reused/" + duplicate.proposal_operation_id if duplicate else
             "stage-fact-revision/" + mutation.mutation_id if isinstance(source.result, StageFactRevision) else mutation.mutation_id)

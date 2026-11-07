@@ -148,6 +148,69 @@ def fake_run(p,row,status="running",**extra):
     hub._finish_run(run_id,status="paused",exit_code=4,result=dict(task_run=dict(status=status),**extra),agent_task_run_id=str(uuid4()))
 
 
+def test_parallel_lanes_partition_queue_and_group_controls_are_idempotent(platform):
+    service,row,_,_=schedule(platform,queue=["a","b","c","d"],concurrency=3)
+    lanes=sorted(service.rows(),key=lambda r:r["config"]["lane"])
+    assert [r["config"]["queue"] for r in lanes]==[["a","d"],["b"],["c"]]
+    assert all(r["config"]["group_id"]==row["id"] for r in lanes)
+    service.command(row["id"],dict(action="stop_after_current",enabled=True,scope="all"))
+    assert all(r["state"]["stop_after_current"] for r in service.rows())
+    before={r["id"]:r["state"]["deadline_at"] for r in service.rows()}
+    command=dict(action="extend_overall",seconds=60,operation_id=str(uuid4()),scope="all")
+    service.command(row["id"],command);service.command(lanes[-1]["id"],command)
+    assert all(r["state"]["deadline_at"]==before[r["id"]]+60 for r in service.rows())
+    service.command(row["id"],dict(action="pause",scope="all"))
+    assert all(r["state"]["status"]=="pausing" for r in service.rows())
+    service.tick()
+    assert all(r["state"]["status"]=="paused" for r in service.rows())
+
+
+def test_parallel_tick_starts_each_independent_task(platform,monkeypatch):
+    p=platform
+    p.payload=[dict(benchmark(),unique_code=ref) for ref in ["a","b"]]
+    service,row,_,_=schedule(p,queue=["a","b"],concurrency=2)
+    starts=[]
+    monkeypatch.setattr(p.workbench.runner,"start",lambda challenge,**kw:starts.append((challenge,kw)))
+    service.tick()
+    assert len(starts)==2 and len({c for c,_ in starts})==2
+    assert {kw["competition_control"]["session_id"] for _,kw in starts}=={r["id"] for r in service.rows()}
+
+
+def test_full_platform_capacity_does_not_start_or_close_external_instances(platform,monkeypatch):
+    p=platform
+    p.payload=[dict(benchmark(),unique_code=ref) for ref in ["external1","external2","external3","queued"]]
+    p.payload[-1].update(container_status="stopped",container_addr=[])
+    service,_,_,_=schedule(p,queue=["queued"])
+    actions=[]
+    monkeypatch.setattr(module,"platform_action",lambda *args:actions.append(args))
+    service.tick()
+    assert not actions and all(r["state"]["challenge_id"] is None for r in service.rows())
+
+
+def test_arena_rejects_parallel_count(platform):
+    p=platform;p.workbench.protocol_version=3;p.workbench.execution_profile="d8_v22";p.workbench.d7_mode=None
+    profile,_=p.profile("arena")
+    with pytest.raises(WorkbenchError,match="competition_concurrency_invalid"):
+        p.workbench.schedules.start(dict(profile_id=profile["id"],default_scheme="http",question_minutes=10,
+            overall_minutes=30,queue=[],http_methods=["GET"],mode="real",concurrency=2))
+
+
+def test_parallel_stop_before_dispatch_and_restart_keep_all_lane_bindings(platform):
+    from agent_adapters.workbench import Workbench
+    p=platform
+    service,row,_,_=schedule(p,queue=["a","b","c"],concurrency=2)
+    bindings={r["id"]:r["config"] for r in service.rows()}
+    restarted=Workbench(p.workbench.root)
+    assert {r["id"]:r["config"] for r in restarted.schedules.rows()}==bindings
+    assert all(r["state"]["status"]=="paused" for r in restarted.schedules.rows())
+    assert not p.requests
+    service.command(row["id"],dict(action="resume",scope="all"))
+    service.command(row["id"],dict(action="stop_after_current",enabled=True,scope="all"))
+    service.tick()
+    assert all(r["state"]["status"]=="finished" for r in service.rows())
+    assert not p.requests
+
+
 def test_session_api_locks_origin_allows_same_origin_key_repair_and_clear_pauses(platform):
     p=platform;service,row,profile,token=schedule(p)
     body={k:v for k,v in profile.items() if k not in {"id","credential_configured"}}

@@ -563,3 +563,49 @@ def test_registry_reader_tolerates_a_utf8_bom(tmp_path):
     target = tmp_path / "registry.json"
     target.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     assert load_registry(target).servers
+
+
+@pytest.mark.parametrize("startup_failure", [False, True])
+def test_mcp_contexts_close_in_owner_task_even_when_caller_changes(monkeypatch, startup_failure):
+    from contextlib import asynccontextmanager
+    from MCPs.Mcp_client import client as module
+    closed = []
+    @asynccontextmanager
+    async def transport(parameters):
+        owner = asyncio.current_task()
+        try:
+            yield (object(), object())
+        finally:
+            assert asyncio.current_task() is owner
+            closed.append("transport")
+    class Session:
+        def __init__(self, *args):
+            pass
+        async def __aenter__(self):
+            self.owner = asyncio.current_task()
+            return self
+        async def __aexit__(self, *args):
+            assert asyncio.current_task() is self.owner
+            closed.append("session")
+        async def initialize(self):
+            if startup_failure:
+                raise ValueError("controlled startup failure")
+    async def refresh(self, name):
+        pass
+    monkeypatch.setattr(module, "stdio_client", transport)
+    monkeypatch.setattr(module, "ClientSession", Session)
+    monkeypatch.setattr(module.MCPManager, "refresh_tools", refresh)
+    async def exercise():
+        config = module.MCPServerConfig("controlled", command="unused")
+        manager = module.MCPManager(module.MCPRegistryConfig({config.name: config}), object(),
+            required_servers=(config.name,))
+        if startup_failure:
+            with pytest.raises(module.MCPClientError, match="controlled startup failure"):
+                await asyncio.create_task(manager.start_all())
+        else:
+            await asyncio.create_task(manager.start_all())
+        await asyncio.create_task(manager.stop_all())
+        await manager.stop_all()
+        assert not manager.runtimes
+    asyncio.run(exercise())
+    assert closed == ["session", "transport"]

@@ -294,6 +294,13 @@ def _stage_task_result(directory, declaration, store, expected):
     requests = {op.start.operation_id: evidence.request(op.start.operation_id)
         for op in operations if op.start.category != "tool_dispatch"}
     corrected = {r.correction_of_model_request_id for r in requests.values() if r.correction_of_model_request_id}
+    from agent_core.stage_planning import stage_runtime
+    adjustments = {stage_runtime(requests[op.start.operation_id])["action_stall"]["operation_id"]: op.start.operation_id
+        for op in operations if op.start.operation_id in requests
+        and requests[op.start.operation_id].stage == "stage_supervision"
+        and stage_runtime(requests[op.start.operation_id]).get("action_stall")
+        and op.application_ref == "stage-advice/" + op.start.operation_id
+        and op.completion is not None and op.completion.result_kind == "completed"}
     failures = []
     for op in operations:
         if op.start.operation_id not in requests or op.completion is None:
@@ -306,6 +313,8 @@ def _stage_task_result(directory, declaration, store, expected):
             failure = dict(operation_id=op.start.operation_id,
                 phase=request.stage, code="stage.model_output_unusable",
                 category="input" if saved["outcome"] == "invalid" else "dependency")
+            if op.start.operation_id in adjustments:
+                failure["handled_by"] = adjustments[op.start.operation_id]
             if saved["outcome"] == "superseded":
                 stop = evidence.branch_stop(request)
                 if stop is None or digest(stop) != saved.get("branch_stop_sha256"):
@@ -314,8 +323,10 @@ def _stage_task_result(directory, declaration, store, expected):
             if saved["outcome"] == "invalid":
                 from agent_core.output_contracts import D8ModelResponse
                 from agent_core.stage_planning import stage_output_issues
-                failure["issue_codes"] = [i.code for i in stage_output_issues(requests[op.start.operation_id],
-                    D8ModelResponse(saved["content"], saved["finish_reason"], saved.get("tool_calls")))]
+                issues = stage_output_issues(requests[op.start.operation_id],
+                    D8ModelResponse(saved["content"], saved["finish_reason"], saved.get("tool_calls")))
+                failure["issue_codes"] = [i.code for i in issues]
+                failure["issues"] = [asdict(i) for i in issues]
             provider = evidence.read("provider-result", op.start.operation_id) or {}
             if saved["outcome"] == "model_error" and evidence.transport_failure(request, saved) is not None:
                 from agent_core.stage_planning import MAX_STAGE_CORRECTIONS
@@ -345,7 +356,7 @@ def _stage_task_result(directory, declaration, store, expected):
                     done_seen=transport["done_seen"])
             failures.append(failure)
     result["model_failures"] = failures
-    result["errors"] = [f for f in failures if f["code"] not in {
+    result["errors"] = [f for f in failures if not f.get("handled_by") and f["code"] not in {
         "stage.supervision_unavailable", "stage.review_unavailable", "stage.generation_superseded"}]
     result["tool_operations"] = [dict(operation_id=op.start.operation_id,
         road_id=op.start.resource_ref.split("/")[1], phase="tool_dispatch",

@@ -1,4 +1,5 @@
-"""Serial competition orchestration. Agent decisions and TaskRun state stay in the CLI."""
+"""Competition lanes share a budget; each lane uses the original TaskRun controls."""
+import hashlib
 import json
 import math
 import os
@@ -43,9 +44,8 @@ def _default_description(value):
     return value.strip()
 
 
-# Prefill only: the operator can override or clear the field. Arena is NSSCTF;
-# benchmark flags are platform-defined, so "flag" is an editable convention.
-DEFAULT_FLAG_HEADS={"arena":"NSSCTF","benchmark":"flag"}
+# Benchmark does not prescribe a flag head; preserve the observed candidate.
+DEFAULT_FLAG_HEADS={"arena":"NSSCTF","benchmark":""}
 
 
 def _flag_head(value,adapter):
@@ -89,7 +89,7 @@ def _should_wait_address(item,adapter):
 class CompetitionSchedules:
     def __init__(self,workbench,*,clock=time.time):
         self.workbench=workbench;self.clock=clock
-        self.wake=threading.Event();self.closed=threading.Event();self.tick_lock=threading.Lock()
+        self.wake=threading.Event();self.closed=threading.Event();self.tick_lock=threading.RLock()
         self.thread=None;self.automatic=True;self.commands_lock=threading.Lock()
         self.platform_failures={};self.retry_at={}
         restarted=[]
@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
     def start(self,value):
         from agent_adapters.workbench import http_methods
         required={"profile_id","default_scheme","question_minutes","overall_minutes","queue","http_methods","mode"}
-        if not isinstance(value,dict) or set(value)-{"platform_deadline_at","default_description","default_description_enabled","flag_head"}!=required:raise WorkbenchError("competition_session_invalid")
+        if not isinstance(value,dict) or set(value)-{"platform_deadline_at","default_description","default_description_enabled","flag_head","concurrency"}!=required:raise WorkbenchError("competition_session_invalid")
         if self.workbench.protocol_version!=3 or self.workbench.execution_profile!="d8_v22":raise WorkbenchError("competition_requires_contract22",409)
         if self.workbench.d7_mode=="simulated":raise WorkbenchError("mode_configuration_mismatch",409)
         if value["mode"]!="real" or value["default_scheme"] not in {"http","https"}:raise WorkbenchError("competition_session_invalid")
@@ -182,6 +182,10 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         queue=value["queue"]
         if not isinstance(queue,list) or any(not isinstance(ref,str) or not ref for ref in queue) or len(set(queue))!=len(queue):raise WorkbenchError("competition_queue_invalid")
         if profile["adapter"]=="benchmark" and not queue or profile["adapter"]=="arena" and queue:raise WorkbenchError("competition_queue_invalid")
+        concurrency=value.get("concurrency",1)
+        if type(concurrency) is not int or not 1<=concurrency<=(3 if profile["adapter"]=="benchmark" else 1):
+            raise WorkbenchError("competition_concurrency_invalid")
+        concurrency=min(concurrency,len(queue)) if queue else 1
         try:end=self.clock()+value["overall_minutes"]*60
         except OverflowError:raise WorkbenchError("competition_session_invalid") from None
         if not math.isfinite(end):raise WorkbenchError("competition_session_invalid")
@@ -198,7 +202,12 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
         with self.workbench.lock,self.workbench._db() as db:
             if self.has_active() or self.workbench.runner._active:raise WorkbenchError("competition_schedule_active",409)
             self.workbench.competitions.credential_for(profile)
-            db.execute("INSERT INTO competition_sessions VALUES (?,?,?,?)",(identity,profile["id"],json.dumps(config),json.dumps(state)))
+            for lane in range(concurrency):
+                lane_id=identity if lane==0 else str(uuid4())
+                lane_config=dict(config)
+                if concurrency>1:
+                    lane_config.update(group_id=identity,lane=lane+1,concurrency=concurrency,queue=queue[lane::concurrency])
+                db.execute("INSERT INTO competition_sessions VALUES (?,?,?,?)",(lane_id,profile["id"],json.dumps(lane_config),json.dumps(state)))
         get_logger("ctrl").info("competition.session_started",session=identity,profile=profile["id"],category="schedule_control")
         self.launch();return self.get(identity)
 
@@ -244,7 +253,55 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
 
     def command(self,identity,value):
         try:
-            with self.commands_lock:return self._command(identity,value)
+            if value=={"action":"pause","scope":"all"}:
+                # Close admission for every lane before waiting on any worker or platform read.
+                with self.workbench.lock:
+                    row=self.get(identity);group=row["config"].get("group_id",identity)
+                    members=[r for r in self.rows() if r["config"].get("group_id",r["id"])==group and r["state"]["status"]!="finished"]
+                    for member in members:self.update(member["id"],status="pausing",reason="operator_paused")
+                for member in members:self.pause(member["id"])
+                return self.get(identity)
+            with self.tick_lock,self.commands_lock:
+                if isinstance(value,dict) and value.get("scope")=="all":
+                    command={k:v for k,v in value.items() if k!="scope"}
+                    if command.get("action") not in {"pause","resume","finish","stop_after_current","extend_overall"}:
+                        raise WorkbenchError("competition_control_invalid")
+                    row=self.get(identity);group=row["config"].get("group_id",identity)
+                    members=[r for r in self.rows() if r["config"].get("group_id",r["id"])==group and r["state"]["status"]!="finished"]
+                    if command["action"]=="extend_overall":
+                        seconds=command.get("seconds")
+                        if type(seconds) is not int or seconds<1:raise WorkbenchError("operator_extension_invalid")
+                        for member in members:
+                            ceiling=member["config"]["platform_deadline_at"]
+                            if self.clock()>=member["state"]["deadline_at"]:raise WorkbenchError("competition_overall_deadline",409)
+                            if ceiling is not None and member["state"]["deadline_at"]+seconds>ceiling:
+                                # A retry of an applied extension is checked by its receipt below.
+                                original=command.get("operation_id","")
+                                if not isinstance(original,str):raise WorkbenchError("operator_extension_invalid")
+                                operation=str(UUID(bytes=hashlib.sha256((original+member["id"]).encode()).digest()[:16],version=4))
+                                with self.workbench._db() as db:
+                                    prior=db.execute("SELECT receipt_json FROM competition_platform_operations WHERE operation_id=?",(operation,)).fetchone()
+                                if prior is None or json.loads(prior[0]).get("state")!="applied":
+                                    raise WorkbenchError("competition_extension_exceeds_platform",409)
+                    if command["action"]=="finish":
+                        for member in members:
+                            challenge=member["state"].get("challenge_id")
+                            run=self.workbench.runner.status(challenge) if challenge else None
+                            if member["state"]["status"]=="pausing" or run and run["status"] in {"starting","running","cancelling","cleaning"}:
+                                raise WorkbenchError("competition_finish_requires_pause",409)
+                    for member in members:
+                        if command["action"]=="resume" and member["state"]["status"]=="running":continue
+                        item=dict(command)
+                        if item["action"]=="extend_overall":
+                            # Stable per-lane identities make a partially applied group command retryable.
+                            try:
+                                original=str(UUID(item["operation_id"]))
+                                if UUID(original).version!=4:raise ValueError()
+                            except (KeyError,TypeError,ValueError,AttributeError):raise WorkbenchError("operator_extension_invalid") from None
+                            item["operation_id"]=str(UUID(bytes=hashlib.sha256((original+member["id"]).encode()).digest()[:16],version=4))
+                        self._command(member["id"],item)
+                    return self.get(identity)
+                return self._command(identity,value)
         except WorkbenchError as error:
             get_logger("ctrl").warning("competition.control_rejected",session=identity,code=error.code,category="operator_control")
             raise
@@ -472,11 +529,11 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                     if error.code=="competition_session_not_running":continue
                     if error.code in PLATFORM_RETRY_CODES:
                         self.platform_retry(identity,error)
-                        break
+                        continue
                     self.pause(identity,reason=error.code)
                 else:
                     self.platform_failures.pop(identity,None);self.retry_at.pop(identity,None)
-                break
+                # Every lane gets one step; one blocked lane must not starve its siblings.
         finally:self.tick_lock.release()
 
     def platform_retry(self,identity,error):
@@ -599,6 +656,10 @@ CREATE TABLE IF NOT EXISTS competition_platform_operations (
                 raise WorkbenchError("competition_question_not_found",404)
             if adapter=="benchmark" and item["state"]=="stop_pending":return
             if adapter=="benchmark" and item["state"]!="available":
+                if item.get("container_status",item["state"])=="pending":return
+                listing=read_question(row["config"]["profile"],self.workbench.competitions.credential_for(row["config"]["profile"]))
+                if sum(q.get("container_status",q["state"]) in {"pending","available","stop_pending"} for q in listing)>=3:
+                    return
                 receipt=self.perform(row,"start",item["remote_ref"])
                 item=self.read(row,item["remote_ref"])
                 if item is None or item["state"]!="available":return

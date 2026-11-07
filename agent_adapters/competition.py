@@ -22,6 +22,18 @@ READ_PATHS = {"arena": "/api/skill/agent/arena/current/", "benchmark": "/openapi
 # capability the protocol does not have (for example benchmark has no abandon).
 PLATFORM_ACTIONS = {"arena": frozenset({"next", "abandon"}), "benchmark": frozenset({"start", "close"})}
 
+# Public launcher descriptions. Protocol paths and verdicts stay in this adapter.
+PLATFORM_TEMPLATES = (
+    dict(id="arena", name="NSSCTF Arena", description="当前题结束后由平台领取下一题，保留 attempt、错误次数和评分。",
+         base_url="https://www.nssctf.cn", credential_label="Agent Token（不含 Bearer 前缀）",
+         queue=False, level_order=False, container_limit=1,
+         note="连接检查只查询当前题；放弃题目会按平台规则结算。"),
+    dict(id="benchmark", name="TSecBench", description="选择题目队列，按多 Flag 进度判断完成，独立管理靶场容器。",
+         base_url="", credential_label="BENCHMARK_TOKEN（UUID）",
+         queue=True, level_order=True, container_limit=3,
+         note="靶场入口需要 VPN；获取提示会扣分。支持 1–3 个独立题目槽位；level 排序不代表解锁规则。"),
+)
+
 
 def supports_action(adapter, action):
     return action in PLATFORM_ACTIONS.get(adapter, frozenset())
@@ -118,7 +130,9 @@ def _preview(adapter, value):
             "state": "completed" if completed else status, "description": _text(entry.get("description") or ""),
             "addresses": _addresses(entry["container_addr"]), "flag_count": total,
             "correct_flag_count": correct, "is_completed": completed,
-            "difficulty": _text(entry.get("difficulty") or ""), "remaining_seconds": None})
+            "difficulty": _text(entry.get("difficulty") or ""), "remaining_seconds": None,
+            "level": _integer(entry["level"]) if "level" in entry else None,
+            "container_status": status})
     return {"items": items, "agent": None}
 
 
@@ -403,6 +417,9 @@ def platform_action(profile,credential,action,remote_ref):
 
 
 class CompetitionConnections:
+    def templates(self):
+        return [dict(template) for template in PLATFORM_TEMPLATES]
+
     def __init__(self, workbench):
         self.workbench = workbench
         self.credentials = {}  # Same process-memory lifecycle as workbench model keys.
