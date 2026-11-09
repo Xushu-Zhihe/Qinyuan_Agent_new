@@ -176,6 +176,15 @@
       "sandboxTools": ["python3"],
       "enabled": true
     },
+    "image": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Image_Mcp",
+      "args": ["server.py"],
+      "tags": ["image", "vision", "misc", "reverse-engineering"],
+      "sandboxTools": ["python3"],
+      "enabled": true
+    },
     "file": {
       "transport": "stdio",
       "command": "{python}",

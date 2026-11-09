@@ -197,7 +197,7 @@
           <section id="run-panel" class="run-panel" hidden aria-labelledby="run-title">
             <header class="run-header">
               <div class="run-head-main">
-                <p class="eyebrow">LIVE RUN</p>
+                <p class="eyebrow">AGENT WORKSPACE</p>
                 <h2 id="run-title">解题过程</h2>
                 <p id="run-status" class="run-status" aria-live="polite">尚未运行</p>
               </div>
@@ -219,7 +219,8 @@
 
             <p id="windows-security-hint" class="run-read-error" hidden>Windows 证据目录排除或当前用户读写尚未通过核验。<a href="#security">打开安全配置</a>；仍可手动继续运行。</p>
             <section id="run-confirmation" class="run-confirmation" aria-label="候选答案人工确认" aria-live="polite" hidden></section>
-            <div id="run-stages" class="run-stages" aria-label="运行阶段"></div>
+            <section id="run-focus" class="run-focus" aria-label="当前运行状态" aria-live="polite" hidden></section>
+            <div id="run-stages" class="run-stages" aria-label="运行概览，各项可并行推进"></div>
             <div id="run-summary" class="run-summary"></div>
             <p id="run-read-error" class="run-read-error" role="status" hidden></p>
 
@@ -228,9 +229,8 @@
                 <header class="graph-heading">
                   <div class="graph-title">
                     <h3>解题关系图</h3>
-                    <p>实线：归属　虚线：阶段接续</p>
+                    <p>实线：归属 · 虚线：阶段接续 · 点击节点查看记录</p>
                   </div>
-                  <div id="run-focus" class="run-focus" aria-live="polite"></div>
                   <div class="graph-tools" aria-label="画布缩放">
                     <button id="graph-zoom-out" type="button" title="缩小画布" aria-label="缩小画布">−</button>
                     <output id="graph-zoom-level" aria-live="off">100%</output>
@@ -245,9 +245,9 @@
                 <div id="run-scope-heading" class="timeline-heading"><strong id="run-scope-label">全任务</strong><button id="run-scope-all" class="quiet-button" type="button" hidden>查看全任务</button></div>
                 <div class="run-tabs" role="tablist" aria-label="解题记录">
                   <button id="run-tab-detail" type="button" role="tab" aria-controls="run-pane-detail" aria-selected="true" class="active">详情</button>
-                  <button id="run-tab-evidence" type="button" role="tab" aria-controls="run-pane-evidence" aria-selected="false">证据</button>
+                  <button id="run-tab-evidence" type="button" role="tab" aria-controls="run-pane-evidence" aria-selected="false">成果与证据</button>
                   <button id="run-tab-activity" type="button" role="tab" aria-controls="run-pane-activity" aria-selected="false">审核与分支</button>
-                  <button id="run-tab-log" type="button" role="tab" aria-controls="run-pane-log" aria-selected="false">日志</button>
+                  <button id="run-tab-log" type="button" role="tab" aria-controls="run-pane-log" aria-selected="false">执行记录</button>
                 </div>
                 <div id="run-pane-detail" class="run-pane run-scroll" role="tabpanel" aria-labelledby="run-tab-detail">
                   <section id="run-detail"></section>

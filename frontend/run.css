@@ -1,8 +1,8 @@
 /* ==========================================================================
-   运行视图：阶段条 / KPI / 关系图 / 时间线 / 证据
+   运行视图：当前状态 / 并行工作概览 / 关系图 / 执行记录 / 证据
    ========================================================================== */
 
-.run-panel { padding: 26px 0 0; }
+.run-panel { padding: 24px clamp(16px, 2.4vw, 34px) 0; }
 .run-confirmation { margin: 12px 0; padding: 16px; border: 1px solid var(--accent); border-radius: var(--radius); background: var(--panel); }
 .run-confirmation button { margin: 8px 12px 0 0; }
 
@@ -24,13 +24,13 @@
 .security-scope dd, #security-script { margin: 0; overflow-wrap: anywhere; }
 @media (max-width: 640px) { .security-scope { grid-template-columns: 1fr; gap: 8px; } .security-scope dd { margin-bottom: 12px; } }
 
-/* ---------------- 阶段条 ---------------- */
+/* ---------------- 并行工作概览 ---------------- */
 
 .run-stages {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0;
-  margin: 22px 0 14px;
+  margin: 14px 0;
   padding: 0;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -79,13 +79,16 @@
 }
 .stage[data-state="active"] .stage-name,
 .stage[data-state="done"] .stage-name { color: var(--text); }
+.stage-status { display: block; margin-top: 9px; font-size: 13px; line-height: 1.5; color: var(--text); }
+.stage[data-state="active"] .stage-status { color: var(--accent); }
+.stage[data-state="alert"] .stage-status { color: var(--amber); }
 
 .stage-detail {
   display: block;
   margin-top: 5px;
   font: 10.5px/1.5 var(--mono);
   color: var(--dim);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 .stage[data-state="active"] .stage-detail { color: var(--accent); }
 .stage[data-state="alert"] .stage-detail { color: var(--amber); }
@@ -124,7 +127,7 @@
 
 .run-dashboard {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) clamp(340px, 28vw, 470px);
+  grid-template-columns: minmax(0, 1fr) clamp(360px, 32vw, 520px);
   height: max(580px, calc(100vh - 240px));
   min-height: 0;
   border: 1px solid var(--line);
@@ -144,23 +147,29 @@
   flex: none;
 }
 .graph-title h3 { font-size: 12.5px; }
-.graph-title p { margin-top: 3px; font-size: 10px; color: var(--dim); white-space: nowrap; }
+.graph-title { flex: 1; min-width: 0; }
+.graph-title p { margin-top: 3px; font-size: 11px; color: var(--muted); }
 
 .run-focus {
-  flex: 1; min-width: 0;
-  display: flex; align-items: center; gap: 8px;
-  font: 11px/1.4 var(--mono);
+  margin: 18px 0 14px;
+  padding: 16px 18px;
   color: var(--muted);
-  padding: 5px 10px;
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-left: 3px solid var(--dim);
+  border-radius: var(--radius);
   background: rgba(255,255,255,.02);
-  overflow: hidden;
 }
+.run-focus[data-state="live"] { border-left-color: var(--accent); }
+.run-focus[data-state="warn"] { border-color: rgba(242,181,68,.3); border-left-color: var(--amber); background: rgba(242,181,68,.045); }
+.focus-heading { display: flex; align-items: center; gap: 9px; font-size: 15px; color: var(--text); }
+.run-focus[data-state="warn"] .focus-heading { color: var(--amber); }
 .run-focus .focus-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; animation: pulse 1.6s infinite; }
 .run-focus .focus-dot[data-state="idle"] { background: var(--dim); animation: none; }
 .run-focus .focus-dot[data-state="warn"] { background: var(--amber); animation: none; }
-.run-focus .focus-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-focus .focus-text { margin-top: 6px; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.run-focus .run-event { margin: 12px 0 0; }
+.run-focus ul { margin: 0; padding: 10px 16px 10px 30px; max-height: 144px; overflow: auto; font: 11.5px/1.8 var(--mono); overflow-wrap: anywhere; }
+.run-focus .run-event > summary { font-size: 12px; }
 .run-focus:empty { display: none; }
 
 .graph-tools { display: flex; align-items: center; gap: 5px; flex: none; }
@@ -327,6 +336,9 @@
 .run-badge[data-status="pending"] { color: var(--muted); }
 .run-badge[data-status="succeeded"], .run-badge[data-status="completed"], .run-badge[data-status="achieved"], .run-badge[data-status="accepted"] { color: var(--accent); background: var(--accent-soft); border-color: rgba(61,219,165,.3); }
 .run-badge[data-status="failed"], .run-badge[data-status="inconclusive"], .run-badge[data-status="unknown"], .run-badge[data-status="conflict"], .run-badge[data-status="rejected"], .run-badge[data-status="timed_out"] { color: var(--amber); background: var(--amber-soft); border-color: rgba(242,181,68,.3); }
+.run-badge[data-status="failed"] { color: var(--red); background: var(--red-soft); border-color: rgba(255,111,111,.3); }
+.run-event[data-status="unknown"] { border-color: rgba(242,181,68,.3); }
+.run-event[data-status="unknown"] > summary::before { background: var(--amber); box-shadow: none; }
 .run-badge[data-status="suspended"] { color: var(--violet); background: var(--violet-soft); border-color: rgba(176,140,255,.3); }
 .run-badge[data-status="cancelled"] { color: #ff9b9b; background: var(--red-soft); border-color: rgba(255,111,111,.28); }
 
@@ -381,6 +393,7 @@
 .scope-link { display: block; padding: 5px 0; border: 0; background: transparent; color: var(--text); font: inherit; text-align: left; line-height: 1.6; overflow-wrap: anywhere; cursor: pointer; }
 .scope-link:hover { color: var(--accent); }
 .graph-node small.graph-outcome { color: var(--muted); font-size: 10px; }
+.graph-node small.graph-warning { color: var(--amber); }
 .graph-node .review-badge { position: static; margin-top: 6px; align-self: flex-start; }
 .review-badge { margin-right: 6px; }
 .review-badge[data-status="pending"], .review-badge[data-status="blocked"], .review-badge[data-status="superseded"] { color: var(--amber); background: var(--amber-soft); }
@@ -455,7 +468,6 @@
   .stage { border-right: 0; }
   .run-summary, .run-summary.v3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .run-header { flex-direction: column; }
-  .run-focus { display: none; }
   .graph-heading { flex-wrap: wrap; }
   .graph-viewport { min-height: 420px; max-height: 58vh; }
 }

@@ -46,12 +46,16 @@ def read_chat_stream(response, limit, report, *, allow_tool_calls=False):
     done_seen = False
     stream_error = None
     usage = None
+    reasoning_head = reasoning_tail = ""
     counts = {"response_utf8_bytes": 0, "content_chars": 0, "content_utf8_bytes": 0,
               "reasoning_chars": 0, "reasoning_utf8_bytes": 0, "sse_events": 0, "keepalive_lines": 0}
 
     def progress(end):
         report(**counts, stream_end=end, finish_reason=safe_finish_reason(finish), usage=numeric_usage(usage),
                finish_seen=finish is not None, done_seen=done_seen, stream_error=stream_error)
+        if end == "done" and finish == "length" and not content:
+            report(reasoning_excerpt={"head": reasoning_head, "tail": reasoning_tail,
+                "limit_chars": 4096, "total_chars": counts["reasoning_chars"]})
 
     def invalid(branch, path, value):
         nonlocal stream_error
@@ -60,7 +64,7 @@ def read_chat_stream(response, limit, report, *, allow_tool_calls=False):
         raise ModelStreamError("provider_stream_invalid")
 
     def event(raw):
-        nonlocal finish, usage, tool_metadata_bytes, done_seen
+        nonlocal finish, usage, tool_metadata_bytes, done_seen, reasoning_head, reasoning_tail
         counts["sse_events"] += 1
         if raw == b"[DONE]":
             done_seen = True
@@ -150,6 +154,9 @@ def read_chat_stream(response, limit, report, *, allow_tool_calls=False):
                 raise ModelStreamError("response_rejected", "response_limit", "invalid_response")
             if key == "content" and text:
                 content.append(text)
+            elif key == "reasoning_content" and text:
+                reasoning_head = (reasoning_head + text)[:4096]
+                reasoning_tail = (reasoning_tail + text)[-4096:]
         reason = choice.get("finish_reason")
         if reason is not None:
             if not isinstance(reason, str) or not reason or finish is not None:

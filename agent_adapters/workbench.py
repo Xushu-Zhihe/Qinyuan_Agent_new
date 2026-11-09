@@ -225,6 +225,7 @@ class Workbench:
         self.competitions = CompetitionConnections(self)
         from agent_adapters.competition_schedule import CompetitionSchedules
         self.schedules = CompetitionSchedules(self)
+        self.runner.start_recovery()
 
     @staticmethod
     def error(code, status=HTTPStatus.BAD_REQUEST):

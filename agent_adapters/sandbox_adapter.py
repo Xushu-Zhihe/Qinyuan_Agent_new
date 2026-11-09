@@ -30,6 +30,12 @@ class D8SandboxAdapter:
             # TaskRun wraps errors after actual dispatch as outcome_unknown.
             raise SandboxPolicyError("mcp.command_rejected") from exc
 
+    def read_image(self, agent_id, path):
+        if self.get_session(agent_id) is None:
+            raise SandboxNotFoundError('mcp.task_run_not_bound')
+        from Sandbox.image_readback import read_image
+        return read_image(self.sandbox, self.sandbox_id, path, min(30, self.maximum_timeout_seconds))
+
     def prepared_tool_command(self, qualified_name, arguments, request):
         import json
         from agent_core.turn_modeling import digest

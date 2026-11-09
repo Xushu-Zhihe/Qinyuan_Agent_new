@@ -10,6 +10,7 @@ from agent_core.domain import IntentStatus
 from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8RevisionTarget
 from agent_core.output_contracts import D8ModelResponse, D8FormatIssue, array, obj, tagged, text, decode_response, NATIVE_TRAILING_BRACE_POLICY
 from agent_core.stage_contracts import (
+    StageMethodFact, StageMethodReview, StageMethodRegistration, StagePinnedCall, method_fact,
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot, RoadTurnClosure, RoadTurnClosureReview,
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete, StageSessionSummary, StageStrategyAdvice, StageRoadSuggestion, StageTurnSnapshot, TurnAchievement, TurnCompletion, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, TurnPlanningState, StagePlanningDecision,
@@ -34,7 +35,7 @@ class StageModelRequest:
     messages: tuple[dict, ...] = ()
     tools: tuple[dict, ...] = ()
     proposal_operation_id: str | None = None
-    proposal: TurnPlanningProposal | StageFactProposal | StageFactBatch | StageFactRevision | None = None
+    proposal: TurnPlanningProposal | StageFactProposal | StageFactBatch | StageFactRevision | StageMethodRegistration | None = None
     correction_of_model_request_id: str | None = None
     summary_coverage: tuple[tuple[str, str], ...] = ()
     capacity_recovery_of: str | None = None
@@ -70,7 +71,7 @@ def action_tool_schemas(request):
     turn = request.context.turn
     road = next((r for r in turn.roads if r.road_id == request.context.session.owner_id), None) if turn else None
     focus = road.candidate.description if road else ""
-    names = set(details if view is None else view["recent"]) | PUBLIC_REFERENCE_TOOLS | {"shell.run_bash", "http.run_experiment"}
+    names = set(details if view is None else view["recent"]) | PUBLIC_REFERENCE_TOOLS | {"shell.run_bash", "http.run_experiment", "image.read_image"}
     # The registry is already ordered by task category. Cover several services
     # before spending the rest of the inline budget on their siblings.
     if view is None or view["use_category_defaults"]:
@@ -698,13 +699,16 @@ def unavailable_reasons(request, kinds):
             reasons.append("mcp_calls is unavailable while work is pending; settle it with wait_for_tools "
                 "or submit one mcp_call.")
         else:
-            reasons.append("mcp_calls is unavailable because a current premise is not reliable enough to "
-                "dispatch a batch; submit one mcp_call.")
+            reasons.append("mcp_calls is not offered by this frozen decision's dispatch constraints.")
     if "wait_for_tools" not in kinds:
-        reasons.append("wait_for_tools is unavailable because no tool operation is pending.")
+        reasons.append("wait_for_tools is not offered by this stage." if context.pending_operation_ids else "wait_for_tools is unavailable because no tool operation is pending.")
     if "turn_completion" not in kinds:
-        reasons.append("turn_completion is unavailable because no current formal Fact can support it; "
-            "propose a fact_candidate from original observations first.")
+        if context.turn is not None and context.turn.achievement is not None:
+            reasons.append("turn_completion is unavailable because this Turn already has a recorded achievement; use the offered planning actions.")
+        elif not formal_support_refs(request):
+            reasons.append("turn_completion is unavailable because no current formal Fact can support it; propose a fact_candidate from original observations first.")
+        else:
+            reasons.append("turn_completion is not offered by this frozen stage or its current execution constraints.")
     if "request_final_validation" not in kinds:
         reasons.append("request_final_validation is unavailable in this decision.")
     return reasons
@@ -742,8 +746,7 @@ def correction_hint(request, issues):
         if kinds:
             hints.append("The only result kinds available in this decision are: " + ", ".join(kinds) + ".")
             hints.extend(unavailable_reasons(request, kinds))
-    if "stage.fact_source_ineligible" in codes or ("enum_mismatch" in codes
-            and any("/support_refs" in issue.path for issue in issues)):
+    if "stage.fact_source_ineligible" in codes:
         observed = fact_support_refs(request, inferred=False)
         inferred_only = [ref for ref in fact_support_refs(request, inferred=True) if ref not in set(observed)]
         if observed:
@@ -755,7 +758,7 @@ def correction_hint(request, issues):
             hints.append("No current reference can support a fact candidate here; read the original with "
                 "history_details first, or report the gap instead of citing a catalog-only ref.")
     if "stage.formal_fact_required" in codes:
-        hints.append("turn_completion and request_final_validation need nonempty current formal Facts.")
+        hints.append("The rejected completion field needs current formal Facts; direct observation submission follows its own frozen schema.")
     if "stage.tool_batch_resource_conflict" in codes or ("array_required_item_missing" in codes
             and any(issue.path.endswith("/calls") for issue in issues)):
         hints.append("mcp_calls needs at least one public-reference tool and at most one sandbox or target "
@@ -769,20 +772,33 @@ def correction_hint(request, issues):
         hints.append("The previous generation ended at the output limit: return a smaller decision (fewer "
             "claims, shorter script, detail in reason) and do not repeat executed tools.")
     if "string_too_long" in codes:
-        limit = next((issue.expected for issue in issues if issue.code == "string_too_long"), "")
-        limit = limit.rsplit("_", 1)[-1] if limit.startswith("unicode_codepoints_le_") else ""
-        hints.append("Keep content within the declared limit" + (f" ({limit} code points)" if limit else "")
-            + ": state the claim in content and move supporting detail into reason.")
-    while hints and sum(len(hint) + 1 for hint in hints) > CORRECTION_HINT_LIMIT:
-        hints.pop()
+        hints.extend(f"Shorten {issue.path} to its declared limit ({issue.expected}); do not move more text into this field."
+            for issue in issues if issue.code == "string_too_long")
+    hints = [hint[:max(200, (CORRECTION_HINT_LIMIT - 100) // max(1, len(hints)))] for hint in hints]
     return " " + " ".join(hints) if hints else ""
+
+
+def catalog_fact_items(request):
+    """Metadata admits exact references for readback, never proves their bodies."""
+    if stage_runtime(request).get("fact_sources") != "catalog_readback_v1":
+        return ()
+    scope, turn = request.context.session, request.context.turn
+    if request.stage != "stage_action" or scope.scope != "road_execution" or turn is None:
+        return ()
+    loaded = {i.ref for i in request.context.history}
+    return tuple(D8HistoryItem.from_dict({k: v for k, v in entry.items() if k not in {"ref", "completion_eligible"}} | {"content": ""})
+        for entry in request.history_catalog if entry.get("ref") not in loaded and entry.get("record_type") == "progress"
+        and entry.get("task_run_id") == request.task_run_id and entry.get("turn_id") == turn.turn_id
+        and entry.get("intent_id") == scope.owner_id and entry.get("source_status") == "available"
+        and not entry.get("conflict") and entry.get("current_status", "effective") == "effective"
+        and entry.get("identity") in {"tool_observation_not_fact", "public_reference_not_target_observation"})
 
 
 def fact_support_refs(request, *, inferred):
     """Project existing Fact source rules onto the frozen input; commits recheck originals."""
     from agent_core.conclusion_revisions import ConclusionRevisions
     scope, turn = request.context.session, request.context.turn
-    return [i.ref for i in request.context.history if i.task_run_id == request.task_run_id
+    return [i.ref for i in (*request.context.history, *catalog_fact_items(request)) if i.task_run_id == request.task_run_id
         and ConclusionRevisions.reliable(i) and (
             i.record_type == "verified_fact" or inferred and i.record_type == "reviewed_inference"
             or i.record_type == "progress" and scope.scope == "road_execution" and turn is not None
@@ -817,7 +833,7 @@ def fact_source_issues(request, value, *, native=False):
         return [D8FormatIssue("stage.fact_source_ineligible", f"{path}/{refs.index(invalid)}",
             "current_formal_fact_or_own_road_tool_observation; inference_may_also_cite_reviewed_inference",
             (item.ref + ";identity=" + item.identity) if item else "not_in_frozen_history")]
-    if not value["inferred"] and not any(i.ref in refs and i.record_type == "progress" for i in request.context.history):
+    if not value["inferred"] and not any(i.ref in refs and i.record_type == "progress" for i in (*request.context.history, *catalog_fact_items(request))):
         return [D8FormatIssue("stage.formal_fact_requires_own_observation", path,
             "at_least_one_own_road_tool_observation", "missing")]
     return []
@@ -864,7 +880,7 @@ def pending_road_issues(request, value):
 
 
 def route_order_issues(request, value):
-    if not stage_runtime(request).get("route_advice") or value.get("kind") != "roads":
+    if request.stage == "stage_continuation" or not stage_runtime(request).get("route_advice") or value.get("kind") != "roads":
         return []
     rows = value.get("roads")
     if not isinstance(rows, list) or any(not isinstance(row, dict) or set(row) != {"description", "support_refs"}
@@ -879,9 +895,9 @@ def route_order_issues(request, value):
         "candidate_set_changed")]
 
 
-def stage_output_issues(request, raw, *, normalization_policy=NATIVE_TRAILING_BRACE_POLICY):
+def stage_output_issues(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAILING_BRACE_POLICY):
     """Explain known business rejection alongside format errors; never grant acceptance."""
-    _, issues, terminal, _ = decode_stage_response(request, raw, normalization_policy=normalization_policy)
+    _, issues, terminal, _ = decode_stage_response(request, raw, result_schema=result_schema, normalization_policy=normalization_policy)
     if terminal or request.stage not in {"stage_roads", "stage_action", "stage_completion", "stage_continuation"}:
         return issues
     value, loose_issues, _, _ = decode_stage_response(request, raw,
@@ -1005,10 +1021,25 @@ def model_contract(request):
     return {"schema": schema(request), "output_tool": output_tool(request), "call_policy": dict(STAGE_CALL_POLICY),
         **({"action_generation_recovery": True, "action_slow_seconds": ACTION_SLOW_SECONDS}
             if request.stage == "stage_action" else {}),
+        **({"fact_sources": "catalog_readback_v1"} if stage_runtime(request).get("fact_sources") == "catalog_readback_v1" else {}),
         "planning_validation": "retain_pending_v1",
         "output_normalization": NATIVE_TRAILING_BRACE_POLICY,
-        "rules": joint_closure + ("You are the original Road planner. Read the route reassessment reason, any Outer priority advice and current actual outcomes. Decide whether to keep the current Road or select another available Road; select_road may select the running Road to resume its original execution history. Alternatively return roads to order every currently available candidate exactly once with its original description and support, highest priority first. Use extend_roads for a genuinely new hypothesis: include every pending candidate unchanged, add new candidates in preferred order, omit running/suspended/closed candidates which remain preserved; new candidates receive the original asynchronous review. Do not alter goals, replay tools, or treat the Outer preference as a forced switch."
-            if stage_runtime(request).get("route_advice") else RULES[request.stage]) + planning_guidance + turn_review + revision_guidance + pending_roads_hint(request) + closure + (KNOWLEDGE_GUIDANCE if request.stage in {"stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation"} else "")
+        "rules": ("Use optional pin_files on mcp_call only when preserving a method: list absolute sandbox script/input paths. "
+            "Unlisted imports, sessions and environment dependencies remain conditions, never a claim of standalone replay. "
+            "Optional method metadata on a Fact declares the exact observed tool call and explicit method dependencies. "
+            "Do not infer dependencies from Fact citations. A Fact can be accepted while method_decision is unavailable; "
+            "accept a method only when its original execution actually achieved the declared result and dependencies are complete. "
+            "Methods are same-TaskRun references, never Fact support or permission. Use history_details on a Fact to inspect "
+            "its method and full original arguments; reuse_method proposes a fresh authorized call, never replays an operation. "
+            "Use register_method to attach a method to an existing Fact without creating another Fact. "
+            "For a standalone register_method proposal, accept/revise/reject judges only the method; Fact validity is unchanged. "
+            "materialize_method restores only saved artifacts and entry scripts for the dependency closure into an isolated "
+            "version directory and prints original-to-materialized paths; it never reruns upstream methods. "
+            "Copy a materialized entry to a new work file before editing; adapt explicit paths when needed, do not "
+            "assume arbitrary absolute paths or sessions are redirected. "
+            "Prefer existing files and local edits over rewriting whole scripts; unavailable methods need further investigation. "
+            if stage_runtime(request).get("methods_enabled") else "") + (" Fact proposals may cite eligible exact catalog observation refs. The system reads and binds those originals before Outer review; catalog metadata alone proves no claim. " if stage_runtime(request).get("fact_sources") == "catalog_readback_v1" else "") + joint_closure + ("You are the original Road planner. Read the route reassessment reason, any Outer priority advice and current actual outcomes. Decide whether to keep the current Road or select another available Road; select_road may select the running Road to resume its original execution history. Alternatively return roads to order every currently available candidate exactly once with its original description and support, highest priority first. Use extend_roads for a genuinely new hypothesis: include every pending candidate unchanged, add new candidates in preferred order, omit running/suspended/closed candidates which remain preserved; new candidates receive the original asynchronous review. Do not alter goals, replay tools, or treat the Outer preference as a forced switch."
+            if stage_runtime(request).get("route_advice") and request.stage != "stage_continuation" else RULES[request.stage]) + (" This Turn already has a recorded achievement. Use reassess_roads to return to its retained planner and reconsider the next Turn Intent or final validation; you need not re-prove this achievement or extend Roads indefinitely. " if request.stage == "stage_action" and request.context.turn is not None and request.context.turn.achievement is not None else "") + planning_guidance + turn_review + revision_guidance + pending_roads_hint(request) + closure + (KNOWLEDGE_GUIDANCE if request.stage in {"stage_roads", "stage_action", "stage_review", "stage_completion", "stage_continuation"} else "")
             + (" Review submissions create logical continuation branches. Pending/blocked candidates remain unverified hypotheses, "
                "not formal Facts, completion support or authority. Continue useful independent authorized exploration while review is pending; "
                "do not resubmit the same candidate. If the next useful decision requires a pending review, return wait_for_review. "
@@ -1140,6 +1171,8 @@ def _closed_schema(schema):
 
 def schema(request, *, compact=False):
     result = _schema(request, compact=compact)
+    from agent_core.stage_methods import method_schema
+    result = method_schema(request, result)
     if "anyOf" not in result or request.stage in {"stage_review", "stage_supervision"}:
         return result
     pending = blocking_fact_revisions(request)
@@ -1181,7 +1214,7 @@ def _schema(request, *, compact=False):
         return {"anyOf": [tagged("turn_intent", {"description": text(), "completion_criterion": text(),
             "support_refs": refs}), exhausted]}
     if request.stage in {"stage_roads", "stage_continuation"}:
-        if stage_runtime(request).get("route_advice"):
+        if stage_runtime(request).get("route_advice") and request.stage != "stage_continuation":
             return {"anyOf": [tagged("select_road", {**supported, "road_id": {"type": "string", "enum": [
                 road.road_id for road in request.context.turn.roads
                 if road.status in {IntentStatus.RUNNING, IntentStatus.PENDING, IntentStatus.SUSPENDED}]}}),
@@ -1198,7 +1231,7 @@ def _schema(request, *, compact=False):
                         if i.record_type == "progress" and i.identity == "tool_observation_not_fact" and i.source_status == "available"]}}
             choices += [tagged("turn_intent", {"description": text(), "completion_criterion": text(), "support_refs": refs}),
                 *([tagged("request_final_validation", validation)] if formal else []), tagged("select_road", {**supported,
-                    "road_id": {"type": "string", "enum": [r.road_id for r in request.context.turn.roads if r.status is IntentStatus.PENDING]}})]
+                    "road_id": {"type": "string", "enum": [r.road_id for r in request.context.turn.roads if r.status in {IntentStatus.PENDING, IntentStatus.SUSPENDED}]}})]
         return {"anyOf": choices}
     if request.stage == "stage_review":
         if isinstance(request.proposal, RoadTurnClosure):
@@ -1436,10 +1469,20 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
         raise ValueError("stage.output_invalid")
     if diagnostics is not None and units is not None and "normalization" in units:
         diagnostics["normalization"] = units["normalization"]
+    def reject(code, path, expected, actual):
+        if diagnostics is not None:
+            diagnostics['issues'] = [D8FormatIssue(code, path, expected, actual)]
+        raise ValueError(code)
+    def location(target, item, path='$'):
+        if item is target:
+            return path
+        children = item.items() if isinstance(item, dict) else enumerate(item) if isinstance(item, list) else ()
+        return next((found for key, child in children if (found := location(target, child, path + '/' + str(key))) is not None), None)
     def checked(item, key):
         result = item[key]
         if not result.strip() or "\x00" in result:
-            raise ValueError("stage.output_text_invalid")
+            reject('stage.output_text_invalid', (location(item, value) or '$') + '/' + key,
+                'nonempty_text_without_nul', 'empty_or_contains_nul')
         return result
     refs = tuple(value.get("support_refs", ()))
     if request.stage == "stage_summary":
@@ -1449,21 +1492,34 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
             return RoadTurnClosureReview(*(TurnPlanningReview(item["decision"], checked(item, "reason"),
                 tuple(item.get("support_refs", ()))) for item in (value["road"], value["turn"])))
         if isinstance(request.proposal, StageFactBatch):
-            return StageFactBatchReview(tuple(TurnPlanningReview(item["decision"], checked(item, "reason"),
-                tuple(item.get("support_refs", ()))) for item in value["decisions"]))
+            return StageFactBatchReview(tuple(
+                (StageMethodReview if "method_decision" in item else TurnPlanningReview)(
+                    **{**item, "support_refs": tuple(item.get("support_refs", ()))})
+                for item in value["decisions"]))
         if isinstance(request.proposal, StageConclusionChange):
             return D8ChangeDecision(value["decision"], checked(value, "reason"), value.get("goal_supported"), value.get("scope_explanation"))
         indices = tuple(value.get("accepted_road_indices", ()))
         if isinstance(request.proposal, tuple) and value["decision"] == "accept":
             if not indices or any(i >= len(request.proposal) for i in indices):
-                raise ValueError("stage.road_selection_invalid")
+                reject('stage.road_selection_invalid', '$/accepted_road_indices', 'nonempty_in_range_accepted_road_indices', 'invalid_indices')
         elif indices:
-            raise ValueError("stage.road_selection_invalid")
+            reject('stage.road_selection_invalid', '$/accepted_road_indices', 'empty_for_non_accept_decision', 'nonempty')
+        if "method_decision" in value:
+            return StageMethodReview(value["decision"], checked(value, "reason"), refs, indices,
+                                     value["method_decision"])
         return TurnPlanningReview(value["decision"], checked(value, "reason"), refs, indices)
     if request.stage == "stage_supervision":
         return StageStrategyAdvice(value["decision"], checked(value, "reason"), refs,
                                    _road_suggestion(request, value.get("suggestion")))
     kind = value["kind"]
+    if kind == "materialize_method":
+        from agent_core.stage_methods import resolve_materialization
+        return resolve_materialization(request, value["method_ref"])
+    if kind == "register_method":
+        return StageMethodRegistration(value["fact_ref"], value["method"], checked(value, "reason"))
+    if kind == "reuse_method":
+        from agent_core.stage_methods import resolve_method_call
+        return resolve_method_call(request, value["method_ref"])
     if kind == "tool_details":
         if "query" in value:
             query = value["query"].strip()
@@ -1484,8 +1540,7 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
         if candidate is not None:
             if fact_source_issues(request, {"kind": "fact_candidate", **candidate}):
                 raise ValueError("stage.fact_source_ineligible")
-            candidate = StageFactProposal(checked(candidate, "content"), checked(candidate, "reason"),
-                tuple(candidate["support_refs"]), candidate["inferred"])
+            candidate = method_fact({k: v for k, v in candidate.items() if k != "kind"})
         return StageFactRevision(value["revision_ref"], value["decision"], checked(value, "reason"), candidate)
     if kind == "mcp_calls":
         if sum(item["tool_name"] not in PUBLIC_REFERENCE_TOOLS for item in value["calls"]) > 1:
@@ -1522,7 +1577,7 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
             proposed = [RoadCandidate(checked(item, "description"), tuple(item["support_refs"])) for item in value["roads"]]
             nonpending = {r.candidate for r in request.context.turn.roads if r.status is not IntentStatus.PENDING}
             if not any(p not in prior for p in proposed) or any(p in nonpending for p in proposed):
-                raise ValueError("stage.route_extension_invalid")
+                reject('stage.route_extension_invalid', '$/roads', 'retain_pending_and_add_new_candidates_without_running_suspended_or_closed_candidates', 'invalid_extension')
         if pending_road_policy and pending_road_issues(request, value):
             raise ValueError("stage.pending_candidates_omitted")
         if route_order_issues(request, value):
@@ -1539,12 +1594,16 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
     if kind == "fact_candidates":
         if fact_source_issues(request, value):
             raise ValueError("stage.fact_source_ineligible")
-        return StageFactBatch(tuple(StageFactProposal(checked(item, "content"), checked(item, "reason"),
-            tuple(item["support_refs"]), item["inferred"]) for item in value["candidates"]))
+        return StageFactBatch(tuple(method_fact({k: v for k, v in item.items() if k != "kind"})
+            for item in value["candidates"]))
     if kind == "fact_candidate":
         if fact_source_issues(request, value):
             raise ValueError("stage.fact_source_ineligible")
-        return StageFactProposal(checked(value, "content"), checked(value, "reason"), refs, value["inferred"])
+        return method_fact({k: v for k, v in value.items() if k != "kind"})
+    if value.get("pin_files"):
+        if value["tool_name"] == "http.run_experiment":
+            raise ValueError("stage.method_capture_unsupported")
+        return StagePinnedCall(value["tool_name"], value["arguments"], tuple(value["pin_files"]))
     return MCPCall(value["tool_name"], value["arguments"])
 
 
@@ -1581,12 +1640,16 @@ def request_from_dict(raw, proposal_kind):
     elif proposal is not None:
         if proposal_kind == "StageFactRevision":
             candidate = proposal["candidate"]
-            data["proposal"] = StageFactRevision(**{**proposal, "candidate": StageFactProposal(**{**candidate,
-                "support_refs": tuple(candidate["support_refs"])}) if candidate else None})
+            data["proposal"] = StageFactRevision(**{**proposal, "candidate": method_fact(candidate) if candidate else None})
             return StageModelRequest(**data)
         if proposal_kind == "StageFactBatch":
-            data["proposal"] = StageFactBatch(tuple(StageFactProposal(**{**item,
-                "support_refs": tuple(item["support_refs"])}) for item in proposal["candidates"]))
+            data["proposal"] = StageFactBatch(tuple(method_fact(item) for item in proposal["candidates"]))
+            return StageModelRequest(**data)
+        if proposal_kind == "StageMethodRegistration":
+            data["proposal"] = StageMethodRegistration(**proposal)
+            return StageModelRequest(**data)
+        if proposal_kind == "StageMethodFact":
+            data["proposal"] = method_fact(proposal)
             return StageModelRequest(**data)
         if proposal_kind == "StageConclusionChange":
             data["proposal"] = StageConclusionChange.from_dict(proposal)

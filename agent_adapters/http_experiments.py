@@ -66,6 +66,55 @@ class _StrategyStop(Exception):
     pass
 
 
+def http_recovery_probe(directory):
+    """Return a stable wake key only for bound, stopped unknown HTTP workers."""
+    from agent_core.sqlite_control_store import SqliteControlStore
+    from agent_adapters.stage_evidence import StageEvidence
+    import docker
+    with SqliteControlStore.open_readonly(directory / 'control.sqlite') as store:
+        task = store.load_control_state_rows(directory.name).task_run
+        if task.status.value != 'running' or task.deadline_at <= time.time():
+            return None
+        from agent_core.operator_controls import current
+        if (current(store, directory.name) or {}).get('paused'):
+            return None
+        evidence = StageEvidence(directory / 'stage-evidence', store, create=False)
+        policy = evidence.read('policy', directory.name)
+        if not policy or policy.get('tool_execution', {}).get('unknown_isolation') != 'http_stopped_v1':
+            return None
+        rows = store.list_d4_unresolved_operations(directory.name)
+        operations = store.list_d4_operations(directory.name)
+        if operations:
+            blocked = evidence.read('isolation-blocked', operations[-1].start.operation_id)
+            if blocked == dict(task_run_id=directory.name,
+                    operations=sorted(row.start.operation_id for row in rows), reason='no_recovery_channel'):
+                return None
+        workers = []
+        for row in rows:
+            claim = evidence.read('mcp-call', row.start.operation_id)
+            failure = evidence.read('experiment-failure', row.start.operation_id)
+            if (not claim or not failure or claim.get('task_run_id') != directory.name
+                    or failure.get('code') != 'd22_experiment_request_outcome_unknown'
+                    or failure.get('request_sha256') != digest(claim)
+                    or row.start.context_sha256 != digest(claim)):
+                return None
+            exec_id = failure.get('http_diagnostic', {}).get('exec_id')
+            if not exec_id:
+                return None
+            workers.append((row.start.operation_id, exec_id, digest(failure)))
+        if not workers:
+            return None
+        client = docker.from_env(timeout=3)
+        try:
+            for _, exec_id, _ in workers:
+                status = client.api.exec_inspect(exec_id)
+                if status.get('ContainerID') != task.sandbox_id or status.get('Running') is not False:
+                    return None
+        finally:
+            client.close()
+        return digest(dict(task_run_id=directory.name, workers=sorted(workers)))
+
+
 class HttpExperiments:
     def __init__(self, mcp):
         self.mcp, self.app = mcp, mcp.app
@@ -128,11 +177,20 @@ class HttpExperiments:
         if (session is None or value['session_sha256'] != digest(session)
                 or session['task_run_id'] != self.app.state.task_run.task_run_id
                 or value['requests'] != [r.start.operation_id for r in rows]
-                or any(r.completion is None for r in rows)):
+                or any(r.completion is None and r.start.operation_id not in self._isolated() for r in rows)):
             raise ExecutionRecoveryRequired('d22_experiment_session_changed')
         for ref in value['requests']:
-            self.mcp.feedback(ref)
-        return {**value, 'identity':'unreviewed_experiment_summary_with_independent_request_evidence'}
+            if self.app.store.load_d4_operation(ref).completion is not None:
+                self.mcp.feedback(ref)
+        unknown = [r.start.operation_id for r in rows if r.completion is None]
+        return {**value, **({'unknown_requests': unknown} if unknown else {}),
+            'identity':'unreviewed_experiment_summary_with_independent_request_evidence'}
+
+    def _isolated(self):
+        if not self.stage:
+            return set()
+        from agent_core.stage_isolation import isolated_http_operations
+        return {r.start.operation_id for r in isolated_http_operations(self.app.store, self.app.task_id)}
 
     def validate_receipt(self, operation, claim, result):
         """Recheck the protected originals, not script-reported responses."""
@@ -239,7 +297,9 @@ class HttpExperiments:
             if session is None or identity == self.live:
                 continue
             rows = self.records(identity)
-            if any(r.completion is None for r in rows):
+            if self.stage:
+                self.reconcile_workers(rows)
+            if any(r.completion is None and r.start.operation_id not in self._isolated() for r in rows):
                 raise ExecutionRecoveryRequired('d22_experiment_request_outcome_unknown')
             result = self.result(identity)
             if result is None:
@@ -268,6 +328,38 @@ class HttpExperiments:
                         code='d22_experiment_process_lost',output='')
                 self.evidence.save('experiment-result',identity,restored)
             self._apply_parent(identity)
+
+    def reconcile_workers(self, rows):
+        """Collect exit proof for original HTTP execs; never dispatch a request."""
+        task = self.app.state.task_run
+        policy = self.evidence.read('policy', task.task_run_id)
+        if not policy or policy.get('tool_execution', {}).get('unknown_isolation') != 'http_stopped_v1':
+            return
+        for row in rows:
+            identity = row.start.operation_id
+            if row.completion is not None or self.evidence.read('http-worker-stop', identity) is not None:
+                continue
+            claim = self.evidence.read('mcp-call', identity)
+            failure = self.evidence.read('experiment-failure', identity)
+            if not claim or not failure or claim.get('task_run_id') != task.task_run_id:
+                continue
+            diagnostic = failure.get('http_diagnostic', {})
+            if (failure.get('code') != 'd22_experiment_request_outcome_unknown'
+                    or failure.get('request_sha256') != digest(claim)
+                    or row.start.context_sha256 != digest(claim) or not diagnostic.get('exec_id')):
+                continue
+            try:
+                status = self.app.http_sandbox._runtime.client.api.exec_inspect(diagnostic['exec_id'])
+            except Exception:
+                continue
+            if status.get('ContainerID') != task.sandbox_id or status.get('Running') is not False:
+                continue
+            self.evidence.save('http-worker-stop', identity, dict(task_run_id=task.task_run_id,
+                request_sha256=digest(claim), failure_sha256=digest(failure),
+                exec_id=diagnostic['exec_id'], running=False, sandbox_id=task.sandbox_id,
+                exit_code=status.get('ExitCode')))
+            self.log.info('experiment.worker_exit_recovered', run=task.task_run_id,
+                exec=identity, category='recovery', code='http.worker_exit_confirmed')
 
     async def _event(self, runner, token, expires, intent_id=None):
         pending = asyncio.create_task(asyncio.to_thread(runner.receive))
@@ -388,6 +480,10 @@ class HttpExperiments:
         if self.evidence.read('experiment-session',parent) is not None:
             raise ExecutionRecoveryRequired('d22_experiment_replay_forbidden')
         app._check_dispatch()
+        if self.stage:
+            from agent_core.stage_isolation import tool_allowed
+            if not tool_allowed(app.store, app.task_id, call):
+                raise ExecutionRecoveryRequired('stage.resource_outcome_unknown')
         app.web.attach()
         maximum = self._limits(intent_id)
         timeout = min(call.arguments['timeout_seconds'],maximum,app.state.task_run.deadline_at-app.clock())
@@ -549,7 +645,14 @@ class HttpExperiments:
                 if self.evidence.read('experiment-stop', parent) is None:
                     self.evidence.save('experiment-stop', parent, dict(session_sha256=digest(session),
                         requests=[row.start.operation_id for row in rows], **finished))
-                raise primary_error
+                unresolved = {row.start.operation_id for row in rows if row.completion is None}
+                if self.stage:
+                    self.reconcile_workers(rows)
+                if not (self.stage and unresolved and unresolved <= self._isolated()):
+                    raise primary_error
+                self.log.warning('experiment.remote_isolated', run=session['task_run_id'], request=parent,
+                    category='unknown', code='d22_experiment_request_outcome_unknown',
+                    operations=sorted(unresolved), scope='authorized_target')
         result = dict(session_sha256=digest(session),requests=[r.start.operation_id for r in self.records(parent)],**finished)
         self.evidence.save('experiment-result',parent,result)
         self._apply_parent(parent)

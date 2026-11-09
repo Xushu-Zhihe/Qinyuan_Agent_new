@@ -241,12 +241,13 @@ class D7HttpResponseEvidenceStore:
         protection: _Protection | None = None,
         clock=time.time,
         create: bool = True,
+        directory_name: str = 'd7-http-evidence',
     ) -> None:
         self.task_run_id = _uuid4(task_run_id, "task_run_id")
         self.run_dir = Path(run_dir)
         self.protection = protection or WindowsEvidenceProtection()
         self.clock = clock
-        self.directory = self.run_dir / "d7-http-evidence"
+        self.directory = self.run_dir / directory_name
         self._lock = RLock()
         try:
             if self.run_dir.is_symlink() or not self.run_dir.is_dir():

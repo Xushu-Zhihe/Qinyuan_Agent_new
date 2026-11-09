@@ -345,9 +345,12 @@ def _stage_input(request):
     if environment is not None and "stage_runtime" in environment:
         context["review_status"] = {"pending_reviews": environment["stage_runtime"].get("pending_reviews", [])}
         for key in ("intent_revision", "action_stall", "slow_action", "fact_revisions", "remaining_seconds",
-                    "last_experiment", "route_reassessment", "direct_candidate_rejection"):
+                    "last_experiment", "route_reassessment", "direct_candidate_rejection", "images", "execution_unknown"):
             if key in environment["stage_runtime"]:
                 context[key] = environment["stage_runtime"][key]
+        if environment["stage_runtime"].get("methods"):
+            context["methods"] = [{**{k: method[k] for k in ("ref", "fact_ref", "source_ref", "dependencies", "conditions")},
+                "tool_name": method["call"]["tool_name"]} for method in environment["stage_runtime"]["methods"]]
         if environment["stage_runtime"].get("action_checkpoint") is not None:
             context["action_checkpoint"] = environment["stage_runtime"]["action_checkpoint"]
     history = []
@@ -373,13 +376,21 @@ def _stage_input(request):
         verbatim=("#/current/proposal", "#/current/tool_schemas", "#/current/action_checkpoint"))
 
 
-def build_payload(envelope, role, *, context_loader=None):
+def build_payload(envelope, role, *, context_loader=None, image_loader=None):
     from qinyuan_core.logging import timed_phase
     request = getattr(envelope, "request", None)
     with timed_phase("model", "provider_input_assembly",
                      run=getattr(request, "task_run_id", None),
                      request=getattr(request, "model_request_id", None) or getattr(request, "review_id", None)):
-        return _build_payload(envelope, role, context_loader=context_loader)
+        payload = _build_payload(envelope, role, context_loader=context_loader)
+        from agent_core.stage_planning import stage_runtime, StageModelRequest
+        images = stage_runtime(request).get('images', ()) if isinstance(request, StageModelRequest) else ()
+        if images:
+            from agent_adapters.image_observations import attach_images
+            payload = attach_images(payload, images,
+                image_loader if TRANSPORT['base_url'] == 'https://api.deepseek.com' else None,
+                model=stage_runtime(request).get('image_model', 'deepseek-flash'))
+        return payload
 
 
 def _build_payload(envelope, role, *, context_loader=None):
@@ -946,7 +957,8 @@ class EstimatedCapacity:
                                       "Return exactly one complete JSON object matching output_contract.schema. Do not use Markdown, add fields, or repair types implicitly.", None)
         stage = request.output_contract["stage"]
         role = self.inner if stage in INNER_STAGES else self.outer
-        payload = build_payload(request, role, context_loader=getattr(self, 'context_loader', None))
+        payload = build_payload(request, role, context_loader=getattr(self, 'context_loader', None),
+            image_loader=getattr(self, 'image_loader', None))
         size = len(payload_bytes(payload))
         requested_output = payload.get("max_tokens", policy.output_reserve_units)
         if (policy != model_capacity_policy(role.model, TRANSPORT["base_url"])
@@ -968,8 +980,12 @@ class EstimatedCapacity:
             "input_tokens": None, "estimate_unit": policy.measurement_unit,
             "sections_utf8_bytes": {k: len(json.dumps(v, ensure_ascii=False).encode("utf-8"))
                                     for k, v in json.loads(payload["messages"][1]["content"]).items()},
-            "messages_utf8_bytes": [len(m["content"].encode("utf-8")) for m in payload["messages"]]}
-        units = size if ratio == 1.0 else math.ceil(size / ratio)
+            "messages_utf8_bytes": [len((m['content'] if isinstance(m['content'], str)
+                else json.dumps(m['content'], ensure_ascii=False)).encode('utf-8')) for m in payload['messages']]}
+        image_urls = [part['image_url']['url'] for m in payload['messages'] if isinstance(m['content'], list)
+            for part in m['content'] if part.get('type') == 'image_url']
+        text_size = size - sum(len(url) for url in image_urls)
+        units = (text_size if ratio == 1.0 else math.ceil(text_size / ratio)) + 1024 * len(image_urls)
         self.last_measurement.update(
             counting_method="conservative_utf8_bytes_plus_margin" if ratio == 1.0
                 else "measured_utf8_bytes_per_token_%.1f_plus_margin" % ratio,
@@ -1072,7 +1088,8 @@ class D8DeepSeekModel:
             token, deadline = self._runtime
             timeout_seconds = min(self.settings.timeout_seconds, (deadline() if callable(deadline) else deadline) - time.time())
         with model_call_phase("request_assembly"):
-            payload = build_payload(envelope, self.role_config, context_loader=getattr(self, 'context_loader', None))
+            payload = build_payload(envelope, self.role_config, context_loader=getattr(self, 'context_loader', None),
+                image_loader=getattr(self, 'image_loader', None))
         if self.settings.api_key.encode() in payload_bytes(payload):
             return (D2ModelFailure("provider_failure", "d8_model_context_rejected") if reviewing
                     else ModelError(ModelErrorKind.INVALID_RESPONSE, "d8_model_context_rejected"))
@@ -1104,6 +1121,11 @@ class D8DeepSeekModel:
                 evidence.save("provider-result", identity, {
                     "model_request_id": identity, "request_sha256": digest(sent),
                     "transport": transport, "error": error})
+                if transport.get("reasoning_excerpt"):
+                    from qinyuan_core import get_logger
+                    get_logger("model").warning("model.reasoning_excerpt", run=sent["task_run_id"],
+                        request=identity, phase=sent["stage"], category="generation",
+                        code="model.length_without_content", **transport["reasoning_excerpt"])
         try:
             with model_call_phase("provider_call"):
                 from agent_adapters.cache_probe import record as cache_probe
@@ -1111,6 +1133,24 @@ class D8DeepSeekModel:
                     session=getattr(getattr(request, "context", None), "session", None))
                 raw, attempts = _invoke_with_connect_retry(
                     self.transport, payload, timeout_seconds, token, transport)
+                if (isinstance(raw, ModelError) and transport.get('http_status') in {400, 404, 422}
+                        and transport.get('worker_exit_confirmed') is True
+                        and any(isinstance(m['content'], list) and any(p.get('type') == 'image_url'
+                            for p in m['content']) for m in payload['messages'])):
+                    fallback = build_payload(envelope, self.role_config,
+                        context_loader=getattr(self, 'context_loader', None))
+                    if evidence is not None:
+                        evidence.save('provider-image-fallback', identity, {
+                            'request_sha256': digest(sent), 'http_status': transport['http_status'],
+                            'fallback_payload_sha256': digest(fallback), 'model': fallback['model'],
+                            'image_observed': False})
+                    from qinyuan_core import get_logger
+                    get_logger('model').warning('model.image_fallback', run=sent['task_run_id'],
+                        request=identity, category='dependency', phase='provider_call',
+                        http_status=transport['http_status'], image_observed=False)
+                    transport = {}
+                    payload = fallback
+                    raw, attempts = _invoke_with_connect_retry(self.transport, payload, timeout_seconds, token, transport)
                 if attempts > 1:
                     from qinyuan_core import get_logger
                     transport["connect_attempts"] = attempts

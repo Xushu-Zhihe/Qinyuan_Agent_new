@@ -22,6 +22,7 @@ from agent_core.redaction import D5Redactor
 from agent_core.runtime import RuntimeEvent, TaskRunStatus
 from agent_core.sqlite_control_store import SqliteControlStore
 from agent_core.stage_contracts import (
+    StageMethodRegistration,
     PlanningExhausted, PlanningSession, RoadResolution, RoadSnapshot, RoadTurnClosure, RoadTurnClosureReview, StageFactApplication,
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageToolDetails, StageFactProposal, StageIncomplete,
     StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
@@ -188,6 +189,11 @@ class StageApplication:
                 categories=[record.start.category for record in orphans])
 
     def _freeze_models(self):
+        from agent_adapters.image_observations import ImageObservations
+        images = ImageObservations(self.directory, self.task_id, self.evidence)
+        for model in (self.models.inner, self.models.outer):
+            model.image_loader = images.load
+        self.models.capacity_port.image_loader = images.load
         configured = [model for model in (self.models.inner, self.models.outer) if hasattr(model, "settings")]
         if configured:
             from agent_adapters.deepseek_roles import freeze_timeout_policy
@@ -201,6 +207,9 @@ class StageApplication:
             raise StageRecoveryRequired("stage.dispatch_stopped", category=Category.POLICY, layer=Layer.CTRL)
         from agent_core.operator_controls import check_admission
         check_admission(self.store, self.task_id)
+        from agent_core.stage_isolation import isolated_http_operations
+        if tool_resource is not None and '/experiment/' in tool_resource and isolated_http_operations(self.store, self.task_id):
+            raise StageRecoveryRequired('stage.resource_outcome_unknown', layer=Layer.CTRL)
         blocking = self.store.blocking_d4_operations(self.task_id, tool_resource=tool_resource)
         if blocking:
             raise StageRecoveryRequired("stage.operation_outcome_unknown", layer=Layer.CTRL,
@@ -502,7 +511,7 @@ class StageApplication:
             history, premises = all_history, ()
         else:
             history, premises = self.evidence.knowledge(self.task_id).context(session, retrieved)
-        required = set(getattr(proposal, "support_refs", ())) | set(getattr(proposal, "evidence_refs", ()))
+        required = {ref for _, claim in fact_candidates(proposal) for ref in claim.support_refs} | set(getattr(proposal, "support_refs", ())) | set(getattr(proposal, "evidence_refs", ()))
         closing = stage == "stage_completion" or stage == "stage_review" and isinstance(proposal, (RoadResolution, TurnCompletion))
         if isinstance(proposal, RoadTurnClosure):
             required.update(proposal.completion.support_refs)
@@ -526,7 +535,8 @@ class StageApplication:
         context = TurnPlanningContext(self.task_id, state.task_run.request.goal, session, turn, history,
             feedback_refs=tuple(i.ref for i in history if i.record_id.startswith("feedback/") and i.turn_id in children
                 or i.record_id.startswith("validation/") and turn and i.turn_id == turn.turn_id),
-            pending_operation_ids=tuple(entry.operation_id for entry in self._tools_in_flight.values()),
+            pending_operation_ids=tuple(dict.fromkeys((*(entry.operation_id for entry in self._tools_in_flight.values()),
+                *(r.start.operation_id for r in self._isolated_operations())))),
             effective_support_refs=premises, goal_validation=self.goal_validation)
         inner = stage != "stage_review" and stage != "stage_supervision"
         role = self.config.inner_role if inner else self.config.outer_role
@@ -553,6 +563,20 @@ class StageApplication:
             # the author's argument for it. User turns (review feedback, tool
             # observations) stay; only the author's own prose is withheld.
             messages = tuple(message for message in messages if message.get("role") == "user")
+        if stage == "stage_review" and (fact_candidates(proposal) or isinstance(proposal, StageMethodRegistration)):
+            from agent_core.stage_contracts import StageMethodFact
+            method_sources = (proposal.method["source_ref"],) if isinstance(proposal, StageMethodRegistration) else tuple(dict.fromkeys(claim.method["source_ref"]
+                for _, claim in fact_candidates(proposal) if isinstance(claim, StageMethodFact)))
+            if method_sources:
+                items = self.evidence.read_history(self.task_id, method_sources, observations_only=True)
+                bodies = []
+                for item in items:
+                    for body in self.evidence.history_tool_requests((item,)):
+                        captured = self.evidence.read("mcp-method-inputs", item.record_id)
+                        if captured is not None:
+                            body["captured_inputs"] = captured
+                        bodies.append(body)
+                messages += ({"role": "user", "content": json.dumps({"method_tool_requests": bodies}, ensure_ascii=False)},)
         if stage == "stage_action" and self._tools_in_flight:
             messages += ({"role": "user", "content": json.dumps({"pending_tools": [
                 {"operation_id": entry.operation_id, **asdict(entry.call)} for entry in self._tools_in_flight.values()]},
@@ -576,6 +600,9 @@ class StageApplication:
                 if entry.state in {"pending", "blocked"}
                 and (self.evidence.request(entry.proposal_operation_id).context.session == session
                     or entry.proposal_operation_id in visible)]}
+        from agent_core.stage_methods import StageMethods, relevant_methods
+        runtime["methods_enabled"] = self.evidence.read("policy", self.task_id).get("method_reuse") == "reviewed_same_task_v2"
+        runtime["methods"] = relevant_methods(StageMethods(self.evidence, self.task_id).catalog(history=all_history), context.history)
         if closing:
             runtime["closure_context"] = True
         if stage == "stage_action":
@@ -661,6 +688,26 @@ class StageApplication:
             suggestion = stage_plans.road_suggestion(self.store, self.task_id, turn, session.owner_id)
             if suggestion is not None:
                 runtime["road_suggestion"] = suggestion
+        if stage == "stage_action" and self.evidence.read("policy", self.task_id).get("tool_execution", {}).get("fact_sources") == "catalog_readback_v1":
+            runtime["fact_sources"] = "catalog_readback_v1"
+        isolated = self._isolated_operations()
+        if isolated:
+            runtime['execution_unknown'] = {'scope': 'authorized_target',
+                'operations': [r.start.operation_id for r in isolated],
+                'diagnostics': [dict(operation_id=r.start.operation_id,
+                    **{key: value for key, value in self.evidence.read('experiment-failure', r.start.operation_id)
+                        .get('http_diagnostic', {}).items() if key in {'phase', 'branch', 'worker_phase', 'error_type'}},
+                    local_workers_stopped=True, remote_effect='unknown') for r in isolated],
+                'guidance': 'Remote effects remain unknown. Use saved evidence and independent networkless analysis. '
+                    'Do not infer failure, replay requests, or use affected mutable state as a proven premise. '
+                    'These workers have stopped; no result is in flight. Continue useful independent work. '
+                    'wait_for_tools without live work preserves the task as blocked pending recovery.'}
+        from agent_adapters.image_observations import ImageObservations
+        images = ImageObservations(self.directory, self.task_id, self.evidence).select(history, proposal)
+        if images:
+            runtime['images'] = images
+            from agent_adapters.image_observations import VISION_MODEL
+            runtime['image_model'] = VISION_MODEL
         request = StageModelRequest(identity, self.task_id, stage, role.role_config_ref,
             state.latest_checkpoint.sequence, context, messages,
             self._available_tools() if stage == "stage_action" else (), proposal_id, proposal,
@@ -732,12 +779,34 @@ class StageApplication:
         await self._collect_tools(drain=True)
         source = self.evidence.request(review_id)
         session = PlanningSession("turn_planning", source.context.turn.turn_id)
-        request = self._request("stage_roads", session)
+        turn = self.store.load_turn(self.task_id, session.owner_id)
+        value = self.evidence.read_model_result(self.store.load_d4_operation(review_id)).result
+        continuation = (turn.achievement is not None and isinstance(value, StagePlanningDecision)
+            and value.kind == "reassess_roads")
+        if continuation and any(road.status is IntentStatus.RUNNING for road in turn.roads):
+            self._commit(StageStateChange(turns=(replace(turn, roads=tuple(
+                replace(road, status=IntentStatus.SUSPENDED) if road.status is IntentStatus.RUNNING else road
+                for road in turn.roads)),)))
+        request = self._request("stage_continuation" if continuation else "stage_roads", session)
         decision = await self.reviews.action(request, token)
         if decision is None:
             return
         identity, proposal = decision
         turn = self.store.load_turn(self.task_id, session.owner_id)
+        if continuation and await self._knowledge_action(request, identity, proposal, token):
+            return
+        if continuation and isinstance(proposal, StagePlanningDecision) and proposal.kind == "wait_for_review":
+            self._commit(StageStateChange(applications=(identity,)))
+            await self.reviews.collect(token, wait=True)
+            return
+        if continuation and isinstance(proposal, (TurnIntent, tuple)):
+            self._submit_planning(request, identity, proposal)
+            await self.reviews.start(token)
+            return
+        if continuation and (not isinstance(proposal, StagePlanningDecision) or proposal.kind != "select_road"):
+            review_id, review = await self._queued_review(session, identity, proposal, token)
+            self._apply_planning(turn, proposal, review, StageReviewBinding(identity, review_id))
+            return
         if isinstance(proposal, tuple) and any(candidate not in {r.candidate for r in turn.roads} for candidate in proposal):
             self._submit_planning(request, identity, proposal)
             updated = self.store.load_turn(self.task_id, turn.turn_id)
@@ -827,7 +896,7 @@ class StageApplication:
         if entry.state == "superseded":
             raise StageModelSuperseded(proposal_id)
         advice = stage_plans.route_advice(self.store, self.task_id)
-        if advice:
+        if advice and self.store.load_d4_operation(advice).start.category == "review":
             from agent_core.stage_planning import conversation_operation_ids
             if set(self.evidence.review_interruptions(advice)).intersection(
                     conversation_operation_ids(self.evidence.request(proposal_id))):
@@ -844,6 +913,10 @@ class StageApplication:
         if isinstance(value, StageFactSelection):
             turn = knowledge.turn_for(request.context.session)
             self._commit(StageStateChange(turns=(replace(turn, fact_refs=value.support_refs),), applications=(identity,)))
+        elif isinstance(value, StageMethodRegistration):
+            await self._collect_tools(drain=True)
+            review_id, _ = await self._queued_review(request.context.session, identity, value, token)
+            self._commit(StageStateChange(reviews=(StageReviewBinding(identity, review_id),)))
         elif isinstance(value, StageHistoryRead):
             self.evidence.perform_history_read(self.store.load_d4_operation(identity))
             self._commit(StageStateChange(applications=(identity,)))
@@ -904,7 +977,36 @@ class StageApplication:
     def _available_tools(self):
         from agent_adapters.public_web import NAMES
         sandbox_busy = any(entry.call.tool_name not in NAMES for entry in self._tools_in_flight.values())
-        return tuple(tool for tool in self.mcp.tools if not sandbox_busy or tool["qualified_name"] in NAMES)
+        from agent_core.stage_isolation import tool_allowed
+        isolated = self._isolated_operations()
+        return tuple(tool for tool in self.mcp.tools
+            if (not sandbox_busy or tool["qualified_name"] in NAMES)
+            and tool_allowed(self.store, self.task_id, MCPCall(tool['qualified_name'], {}), isolated=isolated))
+
+    def _isolated_operations(self):
+        from agent_core.stage_isolation import isolated_http_operations
+        return isolated_http_operations(self.store, self.task_id)
+
+    async def _wait_isolated(self):
+        """Collect real work; preserve stopped unknowns as an explicit recovery block."""
+        await self._collect_tools(all_pending=True)
+        self._check_dispatch()
+        self.mcp.reconcile()
+        isolated = self._isolated_operations()
+        if not isolated:
+            return
+        await self.reviews.start(self._token)
+        if self.reviews.job is not None:
+            await self.reviews.collect(self._token, wait=True)
+            return
+        operations = sorted(r.start.operation_id for r in isolated)
+        through = self.store.list_d4_operations(self.task_id)[-1].start.operation_id
+        identity = through
+        self.evidence.save("isolation-blocked", identity, dict(task_run_id=self.task_id,
+            operations=operations, reason="no_recovery_channel"))
+        get_logger("ctrl").warning("stage.recovery_blocked", run=self.task_id,
+            category="unknown", code="stage.isolated_no_recovery_channel", operations=operations)
+        raise StageRecoveryRequired("stage.isolated_no_recovery_channel", layer=Layer.CTRL)
 
     def _live_http_model(self, identity, resource):
         parts = resource.split("/")
@@ -962,6 +1064,15 @@ class StageApplication:
     async def _start_tools(self, identity, road_id, proposal, token, *, sequence_step=None):
         calls = tool_calls(proposal)
         from agent_core.actions import PUBLIC_REFERENCE_TOOLS
+        from agent_core.stage_isolation import tool_allowed
+        if calls and any(not tool_allowed(self.store, self.task_id, call) for call in calls):
+            self.evidence.save('tool-scope-stop', identity, dict(reason='stage.resource_outcome_unknown',
+                proposal_sha256=digest(asdict(proposal)),
+                blocking_operations=[r.start.operation_id for r in self._isolated_operations()]))
+            self.store.mark_d4_operation_applied(identity, 'stage-isolated/' + identity)
+            get_logger('ctrl').info('stage.tool_scope_deferred', run=self.task_id, operation=identity,
+                phase='tool_dispatch', category='unknown', code='stage.resource_outcome_unknown')
+            return ()
         if (not calls or len(self._tools_in_flight) + len(calls) > MAX_IN_FLIGHT_TOOLS
                 or sum(call.tool_name not in PUBLIC_REFERENCE_TOOLS for call in calls) > 1
                 or any(call.tool_name not in {tool["qualified_name"] for tool in self._available_tools()} for call in calls)):
@@ -1353,6 +1464,7 @@ class StageApplication:
                 continue
             if turn.achievement is not None and running is None:
                 if turn.planning_state is TurnPlanningState.EXHAUSTED:
+                    await self._wait_isolated()
                     return StageRunResult(self.task_id, turn, "stage.exhausted")
                 if not _just_registered_roads(self.store, self.task_id, turn.turn_id):
                     proposal, review, binding = await self._review(self._request("stage_continuation",
@@ -1361,6 +1473,7 @@ class StageApplication:
                         self._apply_planning(turn, proposal, review, binding)
                     continue
             if turn.planning_state is TurnPlanningState.EXHAUSTED:
+                await self._wait_isolated()
                 return StageRunResult(self.task_id, turn, "stage.exhausted")
             if running is None:
                 # An accepted suggestion only chooses which available sibling starts;
@@ -1438,6 +1551,7 @@ class StageApplication:
             if isinstance(action, StagePlanningDecision) and action.kind == "wait_for_tools":
                 self._commit(StageStateChange(applications=(identity,)))
                 await self._collect_tools(all_pending=True)
+                await self._wait_isolated()
                 continue
             if isinstance(action, StagePlanningDecision) and action.kind == "wait_for_review":
                 self._commit(StageStateChange(applications=(identity,)))

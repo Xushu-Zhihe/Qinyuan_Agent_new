@@ -33,7 +33,8 @@ def record(*, payload, sent, role, session=None):
         return
     try:
         from agent_core.turn_modeling import digest
-        messages = payload["messages"]
+        messages = [{**message, 'content': message['content'] if isinstance(message['content'], str)
+            else json.dumps(message['content'], ensure_ascii=False)} for message in payload['messages']]
         # Keep the original first-message fields for existing timing reports.
         system = next((m["content"] for m in messages if m["role"] == "system"), "")
         runtime_system = next((m["content"] for m in reversed(messages) if m["role"] == "system"), "")

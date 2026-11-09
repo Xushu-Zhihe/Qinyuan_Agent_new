@@ -644,3 +644,29 @@ def test_http_worker_rejected_before_send_is_a_known_rejection(monkeypatch):
     detail = safe_failure_details(caught.value, include_chain=True)["http_diagnostic"]
     assert detail["worker_phase"] == "request_prepare"
     assert detail["error_type"] == "InvalidURL"
+
+@pytest.mark.parametrize('running,container', [(False, 'sandbox-1'), (True, 'sandbox-1'), (False, 'other-container')])
+def test_http_read_timeout_collects_only_bound_worker_exit(running, container):
+    from agent_adapters.web.sandbox_transport import D7SandboxHttpTransport
+    from agent_adapters.web.http_adapter import HttpCapabilityError
+    task_id = str(uuid4())
+    api = _ExecApi(b'', read_error=TimeoutError('controlled read timeout'))
+    inspections = []
+    def inspect(identity):
+        inspections.append(identity)
+        return dict(Running=running, ContainerID=container, ExitCode=124)
+    api.exec_inspect = inspect
+    sandbox, sandbox_id = _sandbox(task_id, api)
+    config = _config(task_id)
+    transport = D7SandboxHttpTransport(sandbox, sandbox_id=sandbox_id, run_config=config,
+        network_binding=_network_binding(), target_network=_TargetNetwork())
+    with pytest.raises(HttpCapabilityError, match='outcome_unknown') as caught:
+        transport.send(origin=transport_origin(config.endpoint), method='POST', path_query='/submit',
+            headers=(), body=b'payload', timeout_seconds=3, max_response_bytes=2097152)
+    diagnostic = caught.value.__cause__.http_diagnostic
+    assert inspections == ['d7-http-exec']
+    assert len(api.start_calls) == len(api.create_calls) == 1
+    if container == sandbox_id:
+        assert diagnostic['phase'] == 'exec_inspect' and diagnostic['running'] is running
+    else:
+        assert 'running' not in diagnostic

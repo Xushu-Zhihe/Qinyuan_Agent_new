@@ -173,7 +173,7 @@ function resetForm() {
 function selectTask(id, navigate = true) {
   const task = state.tasks.find((item) => item.id === id); if (!task) return;
   const changed = state.selected !== id;
-  if (changed) { runRead?.abort(); RunView.reset(); }
+  if (changed) { runRead?.abort(); runReadBackoff = 0; RunView.reset(); }
   if (state.selected !== id) {
     $("user-hint-content").value = pendingLiveControls.get(`${id}/user_hint`)?.value.payload.content || "";
     $("user-hint-status").textContent = "下一次新决策可读取；不会打断当前生成，也不会自动成为已验证事实。";
@@ -203,21 +203,30 @@ function renderRun(run, events = [], progress = null) {
   $("resume-run").hidden = ![19, 20, 21, 22].includes(report?.contract_version) || report?.task_run?.status !== "running" || !["paused", "recovery_required"].includes(run?.status) || (report?.recovery?.required && report.recovery.reason !== "operation_or_evidence_unknown");
   RunView.render({ run, events, progress, challengeId: state.selected });
 }
+let runReadBackoff = 0;
 async function refreshRun(id, selection = runSelection) {
   if (state.selected !== id || selection !== runSelection) return;
+  if (runRead?.taskId === id && runRead?.selection === selection) return;
   clearTimeout(runPoll);
   runRead?.abort();
-  const reader = new AbortController(); runRead = reader;
+  const reader = new AbortController(); reader.taskId = id; reader.selection = selection; runRead = reader;
+  let retry = false;
   const timeout = setTimeout(() => reader.abort(), 15000);
   try {
     const data = await request(`/api/challenges/${id}/progress`, { signal: reader.signal, cache: "no-store" });
     if (runRead !== reader || state.selected !== id || selection !== runSelection) return;
-    $("run-read-error").hidden = true;
-    renderRun(data.run, data.events, data.progress);
+    retry = data.snapshot?.state === "refreshing" || data.snapshot?.state === "unavailable";
+    const snapshotFailed = data.snapshot?.state === "unavailable" || data.progress?.recovery?.reason === "state_read_failed";
+    const initialSnapshot = data.snapshot?.state === "refreshing" && !data.progress;
+    $("run-read-error").hidden = !snapshotFailed && !initialSnapshot;
+    if (snapshotFailed) $("run-read-error").textContent = "进度暂不可用，稍后重试。";
+    else if (initialSnapshot) $("run-read-error").textContent = "正在生成进度快照。";
+    if (data.snapshot?.state !== "refreshing" || data.progress) renderRun(data.run, data.events, data.progress);
     const task = state.tasks.find((item) => item.id === id);
     if (task && data.run) { task.run = { ...data.run, result: data.progress || data.run.result }; task.status = data.run.status; $("editor-state").textContent = task.status; $("detail-task-status").textContent = statusLabel(task)[1]; renderTaskList(); }
   } catch (error) {
     if (runRead !== reader || state.selected !== id || selection !== runSelection) return;
+    retry = true;
     $("run-read-error").hidden = false; $("run-read-error").textContent = reader.signal.aborted
       ? "进度读取超时，保留上次快照并重试。" : `进度读取失败，保留上次快照：${error.message}`;
   } finally {
@@ -226,7 +235,8 @@ async function refreshRun(id, selection = runSelection) {
   if (runRead === reader && state.selected === id && selection === runSelection) {
     runRead = null;
     const live = LIVE_STATUSES.includes(state.tasks.find((task) => task.id === id)?.run?.status);
-    runPoll = setTimeout(() => refreshRun(id, selection), live ? 1000 : 5000);
+    runReadBackoff = retry ? Math.min(runReadBackoff ? runReadBackoff * 2 : 2000, 15000) : 0;
+    runPoll = setTimeout(() => refreshRun(id, selection), runReadBackoff || (live ? 1000 : 5000));
   }
 }
 async function startRun() {

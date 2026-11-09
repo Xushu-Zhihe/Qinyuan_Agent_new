@@ -115,7 +115,8 @@ def test_hint_repeats_the_length_budget():
     request = action_request(tools=(TOOL, PUBLIC))
     hint = correction_hint(request, [D8FormatIssue("string_too_long", "$/result/content",
         "unicode_codepoints_le_256", "unicode_codepoints_342")])
-    assert "256 code points" in hint and "reason" in hint
+    assert "unicode_codepoints_le_256" in hint and "$/result/content" in hint
+    assert "move supporting detail into reason" not in hint
 
 
 def test_hint_is_absent_for_unrelated_issues():
@@ -139,3 +140,34 @@ def test_unwrapped_text_failure_is_unchanged():
     request = action_request(tools=(TOOL, PUBLIC))
     response = D8ModelResponse(json.dumps(claim(request)))
     assert parse(request, response).content == "observed bytes"
+
+
+def test_achieved_turn_diagnostic_does_not_claim_missing_facts():
+    from agent_core.stage_contracts import TurnAchievement,TurnCompletion
+    from agent_core.stage_planning import unavailable_reasons
+    achievement=TurnAchievement(TurnCompletion('already checked',()),str(uuid4()))
+    request=action_request(facts=12,achievement=achievement)
+    assert 'turn_completion' not in offered_kinds(request)
+    reason=' '.join(unavailable_reasons(request,offered_kinds(request)))
+    assert 'already has a recorded achievement' in reason
+    assert 'no current formal Fact' not in reason
+
+
+def test_tool_argument_limits_are_explicit_without_echoing_values():
+    from agent_core.output_contracts import shape_issues
+    spec={'$schema':'https://json-schema.org/draft/2020-12/schema','type':'object','properties':{'timeout':{'type':'integer','maximum':10},'script':{'type':'string','maxLength':2}}}
+    issues=shape_issues({'timeout':11,'script':'secret value'},spec)
+    assert any('maximum' in i.expected and '10' in i.expected for i in issues)
+    assert any('maxLength' in i.expected and '2' in i.expected for i in issues)
+    assert 'secret value' not in repr(issues)
+
+
+def test_unoffered_completion_explanation_uses_frozen_kinds_and_achievement():
+    from agent_core.stage_contracts import TurnAchievement,TurnCompletion
+    from agent_core.stage_planning import schema
+    from agent_core.stage_diagnostics import output_diagnostic
+    request=action_request(facts=12,achievement=TurnAchievement(TurnCompletion('done',()),str(uuid4())))
+    raw=D8ModelResponse(json.dumps({'kind':'turn_completion','reason':'already done','support_refs':[request.context.history[1].ref]}))
+    report=output_diagnostic(request,raw,{'schema':schema(request)})
+    assert 'already has a recorded achievement' in report['hint']
+    assert 'no current formal Fact' not in report['hint']

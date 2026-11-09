@@ -2905,15 +2905,18 @@ class SqliteControlStore:
             raise StorageError("D4 operation disappeared while checking disposition")
         return row["unknown_disposition_json"] is not None
 
-    def blocking_d4_operations(self, task_run_id, *, tool_resource=None, admitting_stage_review=False):
+    def blocking_d4_operations(self, task_run_id, *, tool_resource=None, admitting_stage_review=False, include_isolated=False):
         """Process-owned Stage workers are live; all other unfinished work blocks."""
         live = getattr(self, "live_strategy_operation", lambda identity: False)
         tool = getattr(self, "live_tool_operation", lambda identity: False)
         model = getattr(self, "live_http_model", lambda identity, resource: False)
         review = getattr(self, "live_stage_review_operation", lambda identity: False)
         foreground = getattr(self, "live_stage_foreground_operation", lambda identity: False)
+        from agent_core.stage_isolation import isolated_http_operations
+        isolated = set() if include_isolated else {r.start.operation_id for r in isolated_http_operations(self, task_run_id)}
         return tuple(r for r in self.list_d4_unresolved_operations(task_run_id)
-                     if not (r.start.category == "review" and r.start.role == "outer_planning"
+                     if r.start.operation_id not in isolated
+                     and not (r.start.category == "review" and r.start.role == "outer_planning"
                              and live(r.start.operation_id))
                      and not (r.start.category == "tool_dispatch" and tool(r.start.operation_id))
                      and not review(r.start.operation_id)

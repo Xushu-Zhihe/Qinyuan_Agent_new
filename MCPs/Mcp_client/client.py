@@ -92,6 +92,7 @@ class MCPExecutionResult:
     stderr_truncated: bool = False
     stdout_bytes: int = 0
     stderr_bytes: int = 0
+    image_bytes: bytes | None = field(default=None, repr=False)
 
     def to_tool_payload(self) -> dict[str,Any]:
         """生成可以安全返回给 Agent的结果"""
@@ -569,6 +570,30 @@ class MCPManager:
                 "a command plan in time"
             ) from exc
 
+        if qualified_name == 'image.read_image':
+            from MCPs.Image_Mcp.server import read_image
+            expected = read_image(**arguments)
+            structured = getattr(mcp_result, 'structuredContent', None)
+            if structured is None:
+                texts = [c.text for c in getattr(mcp_result, 'content', ()) if getattr(c, 'type', None) == 'text']
+                try:
+                    structured = json.loads(texts[0]) if len(texts) == 1 else None
+                except ValueError as error:
+                    raise MCPCommandPlanError('image.plan_invalid') from error
+            if isinstance(structured, dict) and set(structured) == {'result'}:
+                structured = structured['result']
+            if structured != expected:
+                raise MCPCommandPlanError('image.plan_changed')
+            await self._write_audit({'event': 'started', 'agent_id': agent_id, 'tool': qualified_name})
+            try:
+                data = await asyncio.to_thread(self.sandbox_service.read_image, agent_id, arguments['path'])
+            except (ValueError, OSError, TimeoutError) as error:
+                raise MCPCommandPlanError('image.read_failed') from error
+            session = self.sandbox_service.get_session(agent_id)
+            await self._write_audit({'event': 'finished', 'agent_id': agent_id, 'tool': qualified_name,
+                'byte_size': len(data)})
+            return MCPExecutionResult(agent_id, session.sandbox_id, qualified_name, 'image_read', (),
+                'completed', 0, '', '', False, image_bytes=data)
         request, bootstrap_seconds = self._extract_command_plan(mcp_result)
         if meta.server_name == "download":
             prepare = getattr(self.sandbox_service, "prepared_tool_command", None)

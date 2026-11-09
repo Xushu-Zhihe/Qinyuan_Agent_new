@@ -242,10 +242,13 @@ def _stage_task_result(directory, declaration, store, expected):
     from agent_adapters.stage_evidence import StageEvidence
     from agent_core.stage_storage import active_turn, execution_policy
     from agent_core.turn_modeling import digest
+    started = time.monotonic()
     task_id = declaration["task_run_id"]
     config = store.load_stage_run_config(task_id)
     policy = execution_policy(expected)
     evidence = StageEvidence(Path(directory) / "stage-evidence", store, create=False)
+    # Successful originals are shared only within this read transaction.
+    evidence.snapshot_results = {}
     frozen_policy = evidence.read("policy", task_id)
     queue_policy = frozen_policy.get("review_queue") if isinstance(frozen_policy, dict) else None
     supported_queue = queue_policy is None or queue_policy in (
@@ -321,12 +324,9 @@ def _stage_task_result(directory, declaration, store, expected):
                     raise ValueError("stage.branch_stop_binding_changed")
                 failure.update(code="stage.generation_superseded", category="branch_correction")
             if saved["outcome"] == "invalid":
-                from agent_core.output_contracts import D8ModelResponse
-                from agent_core.stage_planning import stage_output_issues
-                issues = stage_output_issues(requests[op.start.operation_id],
-                    D8ModelResponse(saved["content"], saved["finish_reason"], saved.get("tool_calls")))
-                failure["issue_codes"] = [i.code for i in issues]
-                failure["issues"] = [asdict(i) for i in issues]
+                diagnostic = evidence.output_diagnostic(request, saved)
+                failure.update(diagnostic)
+                failure['issue_codes'] = [i['code'] for i in diagnostic['issues']]
             provider = evidence.read("provider-result", op.start.operation_id) or {}
             if saved["outcome"] == "model_error" and evidence.transport_failure(request, saved) is not None:
                 from agent_core.stage_planning import MAX_STAGE_CORRECTIONS
@@ -396,10 +396,32 @@ def _stage_task_result(directory, declaration, store, expected):
         completed_count=sum(r.result is not None for r in checks))
     result["imports"] = [dict(ref=i.ref, metadata=json.loads(i.content))
         for i in history if i.identity == "imported_attachment_not_fact"]
-    unresolved = store.blocking_d4_operations(task_id)
+    unresolved = store.blocking_d4_operations(task_id, include_isolated=True)
     recovery = bool(unresolved) or feedback_unknown or any(r.result is None for r in checks) or bool(result["errors"])
     result["recovery"] = dict(required=recovery, reason=result["errors"][0]["code"] if result["errors"] else "operation_or_evidence_unknown" if recovery else None)
     result["recovery_status"] = "required" if recovery else "not_required"
+    store.stage_evidence = evidence
+    from agent_core.stage_isolation import isolated_http_operations
+    isolated_ids = sorted(r.start.operation_id for r in isolated_http_operations(store, task_id))
+    unknown_ids = []
+    for row in unresolved:
+        claim = evidence.read('mcp-call', row.start.operation_id)
+        failure = evidence.read('experiment-failure', row.start.operation_id)
+        if (claim and failure and claim.get('task_run_id') == task_id
+                and failure.get('code') == 'd22_experiment_request_outcome_unknown'
+                and failure.get('request_sha256') == digest(claim)
+                and row.start.context_sha256 == digest(claim)):
+            unknown_ids.append(row.start.operation_id)
+    if unknown_ids:
+        result['dispatch']['pending_operation_ids'] = sorted(unknown_ids)
+        if task.status.value == 'running' and not isolated_ids:
+            result['dispatch'].update(status='checking_unknown', reason='http_worker_exit_unconfirmed')
+    if isolated_ids and operations and task.status.value == "running":
+        through = operations[-1].start.operation_id
+        blocked = evidence.read("isolation-blocked", through)
+        if blocked == dict(task_run_id=task_id, operations=isolated_ids, reason="no_recovery_channel"):
+            result["dispatch"].update(status="blocked_unknown", reason="no_recovery_channel", pending_operation_ids=isolated_ids)
+
     result["cleanup"], result["cleanup_status"] = _cleanup(Path(directory), task)
     from agent_core.operator_controls import current as operator_control
     control = operator_control(store, task_id)
@@ -420,6 +442,12 @@ def _stage_task_result(directory, declaration, store, expected):
         result["run_exit_code"] = outcome.run_exit_code
         result["run_outcome"] = dict(**outcome.to_dict(), recorded_checkpoint_sequence=terminal.checkpoint.sequence,
             recorded_event_sequence=terminal.event.sequence, run_status=terminal.event.status.value, goal_evaluation=terminal_goal)
+    elapsed = time.monotonic() - started
+    if elapsed >= 2:
+        from qinyuan_core import get_logger
+        get_logger("sys").info("workbench.snapshot_validation_slow", category="performance",
+            task_run_id=task_id, elapsed_seconds=round(elapsed, 3), operation_count=len(operations),
+            validated_model_results=len(evidence.snapshot_results))
     return result
 
 

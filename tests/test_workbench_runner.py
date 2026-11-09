@@ -645,3 +645,95 @@ def test_stage_cleanup_status_confirmed_clears_remote_recovery_projection():
     projected = Workbench._run_dict(row, has_remote_target=True)
     assert projected["status"] == "finished"
     assert projected["result"]["cleanup"]["status"] == "succeeded"
+
+
+def test_progress_coalesces_slow_reads_and_exposes_failures(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from agent_adapters.workbench_runner import Runner
+    runner = Runner(SimpleNamespace(root=tmp_path))
+    runner._snapshot_wait = 0
+    run = dict(directory=str(tmp_path), run_id="run", agent_task_run_id="task")
+    monkeypatch.setattr(runner, "_current", lambda _: dict(run))
+    monkeypatch.setattr(runner, "events", lambda _, **kwargs: {"events": []})
+    gate = threading.Event()
+    calls = []
+    def read(_, *, run):
+        calls.append(run["run_id"])
+        assert gate.wait(5)
+        if len(calls) == 2:
+            raise ValueError("PRIVATE")
+        return {"progress": {"checkpoint": {"sequence": 1}}}
+    monkeypatch.setattr(runner, "_progress_once", read)
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as readers:
+            results = list(readers.map(runner.progress, ["challenge"] * 8))
+        assert all(r["snapshot"]["state"] == "refreshing" for r in results)
+        entry, = runner._snapshots.values()
+        gate.set()
+        assert entry.done.wait(5)
+        result = runner.progress("challenge")
+        assert result["snapshot"]["state"] == "ready"
+        assert result["progress"]["checkpoint"]["sequence"] == 1
+        assert len(calls) == 1
+        gate.clear()
+        runner.progress("challenge")
+        entry, = runner._snapshots.values()
+        gate.set()
+        assert entry.done.wait(5)
+        result = runner.progress("challenge")
+        assert result["snapshot"]["state"] == "unavailable"
+        assert result["progress"]["errors"][0]["code"] == "state_read_failed"
+        assert "PRIVATE" not in str(result)
+        gate.clear()
+        runner.progress("challenge")
+        entry, = runner._snapshots.values()
+        gate.set()
+        assert entry.done.wait(5)
+        assert runner.progress("challenge")["snapshot"]["state"] == "ready"
+        run.update(run_id="other-run", agent_task_run_id="other-task")
+        runner.progress("challenge")
+        assert len(runner._snapshots) == 2
+    finally:
+        gate.set()
+        for entry in runner._snapshots.values():
+            assert entry.done.wait(5)
+
+
+def test_http_recovery_wakes_once_per_evidence_and_respects_operator_pause(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from agent_adapters.workbench_runner import Runner
+    import agent_adapters.http_experiments as experiments
+    directory = tmp_path / 'run'
+    agent = directory / 'agent-state' / 'task'
+    agent.mkdir(parents=True)
+    run = dict(run_id='run', directory=str(directory), agent_task_run_id='task', status='recovery_required')
+    workbench = SimpleNamespace(lock=threading.RLock(), list=lambda: [dict(id='question', run=run)])
+    runner = Runner.__new__(Runner)
+    runner.workbench = workbench; runner._lock = threading.RLock(); runner._active = {}
+    runner._current = lambda _: run
+    runner._find_agent_directory = lambda _: agent
+    probes, resumes = [], []
+    monkeypatch.setattr(experiments, 'http_recovery_probe', lambda path: probes.append(path) or 'confirmed-exit-key')
+    runner._d9_operation = lambda *args, **kwargs: resumes.append((args, kwargs))
+    class OnePass:
+        def __init__(self): self.calls = 0
+        def wait(self, delay):
+            self.calls += 1
+            return self.calls > 1
+    for _ in range(2):
+        runner._recovery_stop = OnePass()
+        runner._recover_http_runs()
+    assert len(resumes) == 1 and resumes[0][1] == dict(automatic=True)
+    marker = directory / 'http-recovery-confirmed-exit-key.json'
+    assert immutable_read(marker) == dict(task_run_id='task', wake='confirmed-exit-key')
+    (directory / 'operator-pause-request.json').write_text('{}')
+    before = len(probes)
+    runner._recovery_stop = OnePass(); runner._recover_http_runs()
+    assert len(probes) == before and len(resumes) == 1
+    (directory / 'operator-pause-request.json').unlink()
+    run['cancel_requested'] = True
+    runner._recovery_stop = OnePass(); runner._recover_http_runs()
+    assert len(probes) == before and len(resumes) == 1

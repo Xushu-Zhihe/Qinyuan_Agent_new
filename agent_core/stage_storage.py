@@ -16,6 +16,7 @@ from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.operation_accounting import OperationIdentityConflict, OperationRecoveryRequired, D8HandoffBudgetPolicy, _text, _uuid, _sha
 from agent_core.runtime import TaskRunStatus
 from agent_core.stage_contracts import (
+    StageMethodRegistration,
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot, RoadTurnClosure, RoadTurnClosureReview,
     StageConclusionChange, StageFactApplication, StageFactProposal, StageFactSelection, StageHistoryRead, StageToolDetails,
     StageModelEvidence, StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
@@ -179,12 +180,13 @@ def execution_policy(config):
         "capacity": asdict(config.handoff_config),
         "human_confirmation": "assume_after_300s_v1",
         "review_queue": {"binding": "immutable_proposal_v1", "dispatch": "async_planning_v1"},
+        "method_reuse": "reviewed_same_task_v2",
         "tool_execution": {"schema": "v2", "max_in_flight": MAX_IN_FLIGHT_TOOLS,
                            "sandbox_target_in_flight": 1,
                            "max_calls_per_decision": MAX_IN_FLIGHT_TOOLS,
                            "wake": "batch_settled_or_timeout",
                            "batch_wait_seconds": TOOL_BATCH_WAIT_SECONDS,
-                           "wait_for_tools": "all_pending"}}))
+                           "wait_for_tools": "all_pending", "unknown_isolation": "http_stopped_v1", "fact_sources": "catalog_readback_v1"}}))
 
 
 def human_confirmation_policy(store, task_id):
@@ -298,7 +300,7 @@ def validate_tool_start(store, start):
         _fail("stage.tool_proposal_not_ready", Category.POLICY)
     evidence = store.stage_evidence.read_model_result(operation)
     saved = store.stage_evidence.read("mcp-call", start.operation_id)
-    proposed = next((call for call in tool_calls(evidence.result) if saved and asdict(call) == saved.get("call")), None)
+    proposed = next((call for call in tool_calls(evidence.result) if saved and canonical_json(asdict(call)) == canonical_json(saved.get("call"))), None)
     if isinstance(sequence, StageToolSequence) and saved is not None:
         index = saved.get("sequence_step")
         if type(index) is not int or not 0 <= index < len(sequence.steps) or start.operation_id != step_id(start.task_run_id, proposal_id, index):
@@ -307,12 +309,15 @@ def validate_tool_start(store, start):
             proposed = resolve_step(store.stage_evidence, start.task_run_id, proposal_id, sequence, index)
         except ValueError as error:
             _fail(str(error), Category.POLICY)
-        if proposed is None or asdict(proposed) != saved.get("call"):
+        if proposed is None or canonical_json(asdict(proposed)) != canonical_json(saved.get("call")):
             _fail("stage.tool_proposal_changed", Category.UNKNOWN)
     if evidence.session != PlanningSession("road_execution", road_id) or not (tool_calls(evidence.result) or isinstance(sequence, StageToolSequence)):
         _fail("stage.tool_proposal_scope_changed", Category.POLICY)
     if proposed is None:
         _fail("stage.tool_proposal_changed", Category.UNKNOWN)
+    from agent_core.stage_isolation import tool_allowed
+    if not tool_allowed(store, start.task_run_id, proposed):
+        _fail("stage.resource_outcome_unknown", Category.UNKNOWN)
     others = [call for parent, call in getattr(store, "live_tool_calls", lambda: ())()
               if parent != proposal_id or call != proposed]
     if (len(others) >= MAX_IN_FLIGHT_TOOLS or proposed.tool_name not in PUBLIC_REFERENCE_TOOLS
@@ -496,7 +501,7 @@ def _queue_source(store, task_id, identity, *, allow_applied=False):
     if isinstance(value, StageFactRevision) and value.decision != "resubmit":
         _fail("stage.review_proposal_invalid", Category.INPUT)
     if not isinstance(value, (TurnIntent, tuple, PlanningExhausted, StagePlanningDecision,
-            StageFactProposal, StageFactBatch, StageFactRevision, StageConclusionChange, TurnCompletion, RoadResolution)):
+            StageFactProposal, StageFactBatch, StageFactRevision, StageMethodRegistration, StageConclusionChange, TurnCompletion, RoadResolution)):
         _fail("stage.review_proposal_invalid", Category.INPUT)
     if isinstance(value, StagePlanningDecision) and value.kind in {"wait_for_tools", "wait_for_review"}:
         _fail("stage.review_proposal_invalid", Category.INPUT)
@@ -936,7 +941,7 @@ def _reviewed(store, mutation, change, discarded=()):
             _fail("stage.pure_reference_review_forbidden", Category.POLICY)
         claims = fact_candidates(value)
         expected_scope = "road_execution" if isinstance(value, RoadResolution) or claims else "turn_planning"
-        if isinstance(value, (TurnCompletion, StageConclusionChange)) or claims and all(c.inferred for _, c in claims):
+        if isinstance(value, (TurnCompletion, StageConclusionChange, StageMethodRegistration)) or claims and all(c.inferred for _, c in claims):
             expected_scope = proposal.session.scope
         if isinstance(value, StagePlanningDecision) and value.kind == "return_to_parent":
             expected_scope = proposal.session.scope
@@ -981,6 +986,10 @@ def _reviewed(store, mutation, change, discarded=()):
                         proposal_id=binding.proposal_operation_id, review_id=binding.review_operation_id,
                         reason="source_not_tool_dispatch" if operation is None or operation.start.category != "tool_dispatch"
                             else "observation_owner_mismatch")
+        if isinstance(value, StageMethodRegistration):
+            target, source = read_history(store, mutation.task_run_id, value.support_refs)
+            if target.record_type != "verified_fact" or source.identity != "tool_observation_not_fact":
+                _fail("stage.method_registration_sources_invalid", Category.POLICY)
         feedback = isinstance(value, PlanningExhausted) or isinstance(value, StagePlanningDecision) and value.kind == "return_to_parent"
         if feedback:
             read_history(store, mutation.task_run_id, refs)
@@ -996,8 +1005,11 @@ def _reviewed(store, mutation, change, discarded=()):
     # (runs 8b06a1c8 / 904083b4: a planning call and an action call each waited
     # for the other's application commit).  Such records stay visible through
     # orphaned_operations() as a health signal instead.
+    from agent_core.stage_isolation import isolated_http_operations
+    isolated = {r.start.operation_id for r in isolated_http_operations(store, mutation.task_run_id)}
     pending = {r.start.operation_id for r in store.list_d4_operations(mutation.task_run_id)
                if r.completion is None
+               and r.start.operation_id not in isolated
                and not (r.start.category == "tool_dispatch"
                         and getattr(store, "live_tool_operation", lambda identity: False)(r.start.operation_id))
                and not getattr(store, "live_stage_review_operation", lambda identity: False)(r.start.operation_id)
@@ -1180,7 +1192,7 @@ def _validate(store, mutation):
             _fail("stage.unexpected_selected_road", Category.INPUT)
         updated = projected[current.turn_id]
         if value.kind == "select_road":
-            if (current.achievement is None or not any(r.road_id == value.road_id and r.status is IntentStatus.PENDING for r in current.roads)
+            if (current.achievement is None or not any(r.road_id == value.road_id and r.status in {IntentStatus.PENDING, IntentStatus.SUSPENDED} for r in current.roads)
                     or not any(r.road_id == value.road_id and r.status is IntentStatus.RUNNING for r in updated.roads)):
                 _fail("stage.road_selection_not_applied")
         elif value.kind == "request_final_validation":
@@ -1219,6 +1231,7 @@ def _validate(store, mutation):
         _fail("stage.accepted_fact_not_applied", Category.INPUT)
     consumed.update(b.review_operation_id for b, scope, value, _ in accepted
         if isinstance(value, PlanningExhausted) and scope.owner_id not in projected)
+    consumed.update(b.review_operation_id for b, _, value, _ in accepted if isinstance(value, StageMethodRegistration))
     selections = {}
     route_changes = set()
     if change.applications or change.revisions:

@@ -15,6 +15,7 @@ dependencies = [
     "langchain-core>=0.3,<2",
     "langchain-openai>=0.3,<2",
     "mcp[cli]>=1.9,<2",
+    "pillow>=12,<13",
     "pydantic>=2.7,<3",
     "python-dotenv>=1,<2",
 ]

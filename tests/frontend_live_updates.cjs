@@ -276,6 +276,9 @@ async function pollingAcceptance() {
   vm.runInContext(`state.selected = 'task'; state.tasks = [{id:'task', status:'running', run:{status:'running'}}];
     renderRun = renderSpy; renderTaskList = () => {};`, context);
   const first = vm.runInContext("refreshRun('task')", context);
+  await vm.runInContext("refreshRun('task')", context);
+  assert.equal(pending.length, 1, "same selection duplicated the in-flight request");
+  vm.runInContext("runSelection++", context);
   const second = vm.runInContext("refreshRun('task')", context);
   assert.ok(pending[0].options.signal.aborted, "superseded progress request not aborted");
   assert.equal(pending[1].options.cache, "no-store");
@@ -289,26 +292,61 @@ async function pollingAcceptance() {
   const third = vm.runInContext("refreshRun('task')", context);
   pending[2].resolve({ run: { status: "finished", run_id: "new" }, progress: {} });
   await third;
-  assert.deepEqual([...timers.values()].map(t => t.delay), [5000], "terminal task cannot observe externally started run");
+  assert.deepEqual([...timers.values()].map(t => t.delay), [5000]);
   const fourth = vm.runInContext("refreshRun('task')", context);
   const timeout = [...timers.values()].find(t => t.delay === 15000);
   timeout.fn(); assert.ok(pending[3].options.signal.aborted);
   pending[3].reject(new Error("controlled timeout")); await fourth;
   assert.equal(elements.get("run-read-error").hidden, false);
-  assert.equal(timers.size, 1, "failed request stopped polling or duplicated timers");
+  assert.deepEqual([...timers.values()].map(t => t.delay), [2000]);
+  for (const delay of [4000, 8000, 15000, 15000]) {
+    const refresh = vm.runInContext("refreshRun('task')", context);
+    pending.at(-1).resolve({ run: {status: "running"}, progress: null, snapshot: {state: "refreshing", generated_at: null} });
+    await refresh;
+    assert.deepEqual([...timers.values()].map(t => t.delay), [delay]);
+    assert.match(elements.get("run-read-error").textContent, /正在生成/);
+  }
+  const ready = vm.runInContext("refreshRun('task')", context);
+  pending.at(-1).resolve({ run: {status:"running"}, progress: {}, snapshot: {state:"ready"} });
+  await ready;
+  assert.deepEqual([...timers.values()].map(t => t.delay), [1000]);
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const background = vm.runInContext("refreshRun('task')", context);
+    pending.at(-1).resolve({ run: {status:"running"}, progress: {checkpoint:{sequence:3}}, snapshot: {state:"refreshing", generated_at:1} });
+    await background;
+    assert.equal(elements.get("run-read-error").hidden, true, "normal background refresh displayed an alert");
+    assert.deepEqual([...timers.values()].map(t => t.delay), [2000]);
+    const updated = vm.runInContext("refreshRun('task')", context);
+    pending.at(-1).resolve({ run: {status:"running"}, progress: {checkpoint:{sequence:4}}, snapshot: {state:"ready"} });
+    await updated;
+    assert.equal(elements.get("run-read-error").hidden, true);
+    assert.deepEqual([...timers.values()].map(t => t.delay), [1000]);
+  }
+  for (const snapshotState of ["unavailable", "refreshing"]) {
+    const failed = vm.runInContext("refreshRun('task')", context);
+    pending.at(-1).resolve({ run: {status:"running"}, progress: {recovery:{required:true,reason:"state_read_failed"}}, snapshot: {state:snapshotState,generated_at:1} });
+    await failed;
+    assert.equal(elements.get("run-read-error").hidden, false, "unreadable snapshot hidden during retry");
+    assert.match(elements.get("run-read-error").textContent, /进度暂不可用/);
+  }
+  const recovered = vm.runInContext("refreshRun('task')", context);
+  pending.at(-1).resolve({ run: {status:"running"}, progress: {}, snapshot: {state:"ready"} });
+  await recovered;
+  assert.equal(elements.get("run-read-error").hidden, true, "recovered snapshot retained failure alert");
+  const beforeListRefresh = rendered.length;
   let resets = 0;
   context.RunView = { reset() { resets++; } };
   vm.runInContext(`setHttpMethods = renderAttachments = renderSavedAttachments = () => {};
     Object.assign(state.tasks[0], {title:'task', attachments:[], description:''}); selectTask('task', false);`, context);
   assert.equal(resets, 0, "list refresh reset same-task view");
-  assert.equal(rendered.length, 2, "list snapshot repainted stale progress");
-  pending[4].resolve({ run: { status: "running", run_id: "new" }, progress: {} });
+  assert.equal(rendered.length, beforeListRefresh, "list snapshot repainted stale progress");
+  pending.at(-1).resolve({ run: { status: "running", run_id: "new" }, progress: {} });
   await new Promise(resolve => setImmediate(resolve));
   vm.runInContext(`state.tasks.push({id:'other',title:'other',attachments:[],description:''}); selectTask('other', false);`, context);
   assert.equal(resets, 1, "switching task retained old view state");
-  pending[5].resolve({ run: null, progress: null });
+  pending.at(-1).resolve({ run: null, progress: null });
   await new Promise(resolve => setImmediate(resolve));
-  console.log("PASS progress ordering, request abort/timeout, terminal refresh and retry polling");
+  console.log("PASS progress ordering, timeout/backoff, quiet cached refresh, visible read failures and recovery");
 }
 
 function edgeActivityAcceptance() {
@@ -354,6 +392,14 @@ function edgeActivityAcceptance() {
     for (let el = get("run-panel").parentElement; el; el = el.parentElement) el.hidden = false;
     RunView.render({ run, progress });
     check(get("run-focus").textContent.includes("Inner 决策") && get("run-focus").textContent.includes("未结算"), "live Inner request missing from focus");
+    progress.errors = [{ operation_id: "invalid-ref", code: "stage.output_invalid", phase: "stage_action",
+      reason: "output_business_invalid", hint: "Use this frozen field's original observation.",
+      issues: [{ code: "enum_mismatch", path: "$/result/support_refs/2", expected: "source_type_not_allowed_for_this_action", actual: "verified_fact:known" }] }];
+    run.result = {errors: structuredClone(progress.errors)};
+    RunView.render({ run, progress });
+    check(get("run-stop").querySelectorAll("details").length === 1, "same failure duplicated from current and saved snapshots");
+    check(get("run-stop").textContent.includes("$/result/support_refs/2") && get("run-stop").textContent.includes("source_type_not_allowed_for_this_action"), "field-level failure detail hidden");
+    delete progress.errors; delete run.result;
     progress.inner_activity.at(-1).status = "completed";
     progress.tool_operations = [{ ...target, operation_id: "tool-live", status: "in_flight" }];
     RunView.render({ run, progress });
@@ -361,6 +407,36 @@ function edgeActivityAcceptance() {
     progress.tool_operations[0].status = "completed";
     RunView.render({ run, progress });
     check(!get("run-focus").textContent.includes("工具结果待结算"), "completed tool remained active");
+    progress.tool_operations.push({ ...target, operation_id: "remote-unknown", status: "in_flight" });
+    progress.dispatch = { status: "blocked_unknown", reason: "no_recovery_channel", pending_operation_ids: ["remote-unknown"] };
+    progress.recovery = { required: true, reason: "operation_or_evidence_unknown" };
+    progress.goal_evaluation = "unknown";
+    progress.experiments = [{ ...target, operation_id: "interrupted-experiment", outcome: "interrupted" }];
+    const factCount = get("run-facts").querySelectorAll(".run-fact").length;
+    RunView.render({ run, progress });
+    check(get("run-focus").dataset.state === "warn" && get("run-focus").textContent.includes("等待恢复条件"), "blocked executor shown as running");
+    check(!get("run-focus").hidden && !get("run-focus").closest("#run-dashboard"), "recovery status hidden inside graph");
+    check(get("run-status").textContent.startsWith("等待恢复条件") && get("run-summary").textContent.includes("等待恢复条件"), "header/metrics disagree with recovery status");
+    check(!get("run-focus").textContent.includes("工具结果待结算 · remote-u"), "stopped unknown shown as live tool");
+    check(keyed("run-focus", "unknown-tools").textContent.includes("remote-unknown"), "unknown operation reference missing");
+    check(keyed("run-timeline", "tool-remote-unknown").dataset.status === "unknown", "unknown tool mislabeled in timeline");
+    check(keyed("run-timeline", "experiment/interrupted-experiment").textContent.includes("已知结果保留"), "interrupted experiment loses known results");
+    check(get("run-stop").textContent.includes("等待恢复条件") && get("run-facts").querySelectorAll(".run-fact").length === factCount, "recovery loses known facts or stop status");
+    const validationStage = keyed("run-stages", "目标验证");
+    check(validationStage.dataset.state === "alert", "unknown goal presented as passed");
+    const unknownRecord = keyed("run-focus", "unknown-tools"); unknownRecord.open = true;
+    RunView.render({ run, progress: structuredClone(progress) });
+    check(keyed("run-focus", "unknown-tools") === unknownRecord && unknownRecord.open, "poll rebuilt recovery details");
+    progress.dispatch = { status: "stopped" };
+    progress.tool_operations.at(-1).status = "unknown";
+    progress.goal_evaluation = "accepted"; run.status = "finished";
+    RunView.render({ run, progress });
+    check(get("run-focus").textContent.includes("目标已确认") && get("run-focus").textContent.includes("remote-unknown"), "accepted goal erased unknown operation or became failure");
+    check(keyed("run-stages", "目标验证").dataset.state === "done", "accepted goal not shown independently");
+    progress.tool_operations.pop(); delete progress.dispatch; delete progress.recovery; delete progress.experiments;
+    progress.goal_evaluation = "not_evaluated"; run.status = "running";
+    RunView.render({ run, progress });
+    check(!keyed("run-focus", "unknown-tools"), "resolved projection retains stale unknown warning");
     get("run-tab-activity").click();
     check(!get("run-pane-activity").hidden, "activity tab unavailable");
     check(document.querySelectorAll(".review-badge").length >= 3, "missing pending/accepted plan badges");
@@ -435,7 +511,7 @@ function edgeActivityAcceptance() {
     RunView.render({ run, progress });
     check(!confirmation.hidden && !confirmation.querySelector("button") && confirmation.textContent.includes("未伪造"), "default determination lost its provenance");
     get("run-dashboard").scrollIntoView({ block: "start" });
-    return "PASS native Edge: review/branch scopes, DOM preservation; prominent human determine/error controls, stable retry IDs, external isolation, timeout provenance";
+    return "PASS native Edge: recovery status, unknown/accepted goal boundaries, retained facts and DOM; review/branch scopes, human controls and timeout provenance";
   }
   let html = fs.readFileSync(path.join(root, "frontend/index.html"), "utf8")
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, "")

@@ -22,6 +22,8 @@ const RunView = (() => {
   labels.assumed_achieved = "已结束 · 超时默认确定";
   labels.in_flight = "执行结果待结算";
   labels.unsettled = "未结算";
+  labels.blocked_unknown = "等待恢复条件";
+  labels.checking_unknown = "等待本地停止核查";
   Object.assign(labels, { active: "可规划", waiting_child: "等待后继", exhausted: "当前方向耗尽" });
   Object.assign(labels, { verified: "已验证", effective: "当前有效", superseded: "已替代", withdrawn: "已撤回",
     conflicted: "存在冲突", unavailable: "当前不可用", withheld: "正文受限", unresolved: "引用未解析" });
@@ -193,42 +195,45 @@ const RunView = (() => {
     patchChildren(get(id), Array.from(draft.childNodes));
   }
 
-  // 把「一次运行走到哪」摊平成五个阶段。只做投影，不推断成功。
+  const toolOperations = progress => progress.tool_operations || progress.executions || [];
+  const toolStatus = (progress, operation) => (progress.dispatch?.pending_operation_ids || []).includes(operation.operation_id) ? "unknown" : operation.status;
+  const unknownTools = progress => toolOperations(progress).filter(item => toolStatus(progress, item) === "unknown");
+
+  // 并行工作概览；记录存在不代表目标已通过验证。
   function stageStates(progress, live) {
     const turns = progress.turns || [];
     const intents = turns.flatMap(routes);
-    const executions = progress.tool_operations || progress.executions || [];
+    const executions = toolOperations(progress);
     const facts = currentFacts(progress);
-    const recovery = progress.recovery || {};
-    const reason = String(recovery.reason || "");
+    const pending = executions.filter(item => ["pending", "running", "in_flight"].includes(toolStatus(progress, item))).length;
+    const unknown = unknownTools(progress).length;
+    const reviews = (progress.review_queue || []).filter(item => ["pending", "blocked"].includes(item.state));
     const goal = progress.goal_evaluation;
-    const goalDone = goal && goal !== "not_evaluated";
-    const bad = (fragment) => reason.includes(fragment);
     return [
       {
-        n: 1, name: "冻结根",
-        detail: progress.task_run_id ? `${progress.mode || "unknown"} · ${progress.sandbox_backend || "unknown"}` : "等待运行",
-        state: live ? "done" : progress.task_run_id ? "done" : "idle",
+        n: "根", name: "任务上下文", status: progress.task_run_id ? "已登记" : "待登记",
+        detail: progress.task_run_id ? `${progress.mode === "simulated" ? "模拟模式" : progress.mode === "real" ? "真实模式" : "模式未提供"} · ${progress.sandbox_backend || "环境未提供"}` : "等待运行信息",
+        state: progress.task_run_id ? "done" : "idle",
       },
       {
-        n: 2, name: progress.goal_validation ? "阶段规划与审核" : "外层规划",
-        detail: turns.length ? `${turns.length} Turn · ${intents.length} ${progress.goal_validation ? "Road" : "Intent"}` : "尚未提交 Turn",
-        state: turns.length ? "done" : bad("tree") || bad("planning") ? "alert" : live ? "active" : "idle",
+        n: "策", name: "规划与审核", status: reviews.length ? `${reviews.length} 项待处理` : turns.length ? "已有规划" : "待规划",
+        detail: `${turns.length} Turn · ${intents.length} ${progress.goal_validation ? "Road" : "Intent"} · 可与执行并行`,
+        state: reviews.some(item => item.state === "blocked") ? "alert" : live && (reviews.length || !turns.length) ? "active" : turns.length ? "done" : "idle",
       },
       {
-        n: 3, name: "内层执行",
-        detail: executions.length ? `${executions.length} 次执行${progress.goal_validation ? "" : ` · ${(progress.plans || []).length} Plan`}` : "当前路线尚无动作",
-        state: executions.length ? (executions.some((item) => ["pending", "running", "in_flight"].includes(item.status)) ? "active" : "done") : live && turns.length ? "active" : "idle",
+        n: "行", name: "工具执行", status: unknown ? `${unknown} 项结果未知` : pending ? `${pending} 项待结算` : executions.length ? "已有记录" : "待执行",
+        detail: `${executions.length} 条记录 · ${pending} 项待结算${unknown ? ` · ${unknown} 项未知` : ""}`,
+        state: unknown ? "alert" : pending && live ? "active" : executions.length ? "done" : "idle",
       },
       {
-        n: 4, name: "取证与复核",
-        detail: `${facts.length} 条 verified · ${(progress.retrospective || []).length} 次复盘`,
-        state: facts.length ? "done" : live && executions.length ? "active" : bad("fact") || bad("review") ? "alert" : "idle",
+        n: "证", name: "成果沉淀", status: facts.length ? "已有有效成果" : "待登记成果",
+        detail: `${facts.length} 条当前有效 Fact · 待审提案单独展示`,
+        state: facts.length ? "done" : "idle",
       },
       {
-        n: 5, name: "结论边界",
-        detail: recovery.required ? reason || "需要显式恢复" : goalDone ? label(goal) : live ? "运行中，尚未判定" : label(progress.task_run?.status) || "已结束",
-        state: recovery.required ? "alert" : goalDone ? "done" : "idle",
+        n: "验", name: "目标验证", status: label(goal || "not_evaluated"),
+        detail: "目标结论与运行恢复分别记录",
+        state: goal === "accepted" ? "done" : goal && goal !== "not_evaluated" ? "alert" : "idle",
       },
     ];
   }
@@ -237,17 +242,18 @@ const RunView = (() => {
     const host = get("run-stages"); if (!host) return;
     patchChildren(host, stageStates(progress, live).map((stage) => {
       const cell = node("div", undefined, "stage");
+      cell.dataset.key = stage.name;
       cell.dataset.state = stage.state;
       const top = node("div", undefined, "stage-top");
       top.append(node("span", String(stage.n), "stage-num"), node("span", stage.name, "stage-name"));
-      cell.append(top, node("span", stage.detail, "stage-detail"));
+      cell.append(top, node("strong", stage.status, "stage-status"), node("span", stage.detail, "stage-detail"));
       return cell;
     }));
   }
 
   function pendingWork(progress) {
-    const tools = (progress.tool_operations || progress.executions || []).filter(item =>
-      ["pending", "running", "in_flight"].includes(item.status));
+    const tools = toolOperations(progress).filter(item =>
+      ["pending", "running", "in_flight"].includes(toolStatus(progress, item)));
     const models = [progress.inner_activity || [], progress.retrospective || []].map(items =>
       items.filter(item => (item.status === "unsettled" || item.status === "completed" && item.disposition === "unapplied") && !["discarded", "reused"].includes(item.disposition))
         .sort((a, b) => (a.started_at || 0) - (b.started_at || 0)).at(-1)).filter(Boolean);
@@ -256,18 +262,40 @@ const RunView = (() => {
   }
   function renderFocus(progress, run, live) {
     const host = get("run-focus"); if (!host) return;
+    host.hidden = !run;
     const activeIntent = (progress.turns || []).flatMap(routes).find((item) => item.status === "running");
+    const pending = pendingWork(progress);
+    const unknown = unknownTools(progress);
     let state = "idle";
-    let text;
-    if (["cancelling", "cleaning"].includes(run?.status)) { state = "warn"; text = label(run.status); }
-    else if (progress.task_run?.status === "awaiting_confirmation") { state = "warn"; text = `等待人工决定 · ${progress.goal_validation?.timeout_action === "assume" ? "五分钟无操作按默认确定结束" : "五分钟无决定则未验证结束"}`; }
-    else if (live && pendingWork(progress).length) { state = "live"; text = pendingWork(progress).join("；"); }
-    else if (live && activeIntent) { state = "live"; text = `${activeIntent.road_id ? "Road" : `Intent ${activeIntent.priority}`} · ${activeIntent.description || "（无描述）"}`; }
-    else if (live) { state = "live"; text = "等待下一步规划或审核"; }
-    else if (progress.recovery?.required) { state = "warn"; text = `已停止 · ${progress.recovery.reason || "需要恢复"}`; }
-    else { text = `已结束 · ${label(progress.task_run?.status) || label(run?.status)}`; }
+    let title, text;
+    if (["cancelling", "cleaning"].includes(run?.status)) { state = "warn"; title = label(run.status); text = "正在处理停止与资源清理，以后续确认记录为准。"; }
+    else if (progress.task_run?.status === "awaiting_confirmation") { state = "warn"; title = "等待人工决定"; text = progress.goal_validation?.timeout_action === "assume" ? "五分钟无操作按默认确定结束。" : "五分钟无决定则未验证结束。"; }
+    else if (progress.dispatch?.status === "blocked_unknown") { state = "warn"; title = "等待恢复条件"; text = "远端结果未知，当前没有核查通道。任务、证据和环境已保留；不会自动重发未知动作。"; }
+    else if (progress.dispatch?.status === "checking_unknown") { state = "warn"; title = "等待本地停止核查"; text = "HTTP 结果未知，正在等待原 worker 的退出证明。已有结果保留；确认停止后可恢复独立工作。"; }
+    else if (progress.recovery?.reason === "state_or_evidence_unreadable") { state = "warn"; title = "当前状态无法确认"; text = "状态或证据读取失败，请等待有效快照。"; }
+    else if (live && pending.length) { state = "live"; title = "等待结果结算"; text = "已登记的请求与已保存待应用的结果见下方；未结算记录不代表进程仍在运行。"; }
+    else if (live && activeIntent) { state = "live"; title = "推进当前路线"; text = `${activeIntent.road_id ? "Road" : `Intent ${activeIntent.priority}`} · ${activeIntent.description || "（无描述）"}`; }
+    else if (live) { state = "live"; title = "规划与审核中"; text = "等待下一步规划或审核结果。"; }
+    else if (progress.goal_evaluation === "accepted") { title = "目标已确认"; text = "目标验证已接受；操作结果与资源清理仍以各自记录为准。"; }
+    else if (progress.recovery?.required) { state = "warn"; title = "执行器已停止，等待恢复"; text = "保留已有记录；恢复需求不等于目标失败。"; }
+    else { title = label(run?.status); text = `任务状态：${label(progress.task_run?.status)} · 目标评估：${label(progress.goal_evaluation || "not_evaluated")}`; }
+    host.dataset.state = state;
     const dot = node("span", "", "focus-dot"); dot.dataset.state = state;
-    patchChildren(host, [dot, node("span", text, "focus-text")]);
+    const heading = node("div", undefined, "focus-heading"); heading.append(dot, node("strong", title));
+    const children = [heading, node("p", text, "focus-text")];
+    if (live && pending.length) {
+      const work = detail("current-work", `待结算 / 待应用记录 · ${pending.length} 项`);
+      const list = node("ul"); for (const item of pending) list.append(node("li", item));
+      work.append(list); work.open = true; children.push(work);
+    }
+    if (unknown.length) {
+      const records = detail("unknown-tools", `结果未知 · ${unknown.length} 项 · 不计为失败`);
+      records.dataset.status = "unknown";
+      records.append(node("p", "保留已知成果；未知动作是否生效仍待核查。", "run-meta"));
+      records.append(code("原操作引用", unknown.map(item => item.operation_id || item.execution_id).join("\n")));
+      children.push(records);
+    }
+    patchChildren(host, children);
   }
   function reset() { generation += 1; current = null; filter = null; cache = new Map(); validationQueries.clear(); graphZoom = null; setTab("detail"); get("run-read-error").hidden = true; }
   function render(data) {
@@ -278,14 +306,16 @@ const RunView = (() => {
     const live = ["starting", "running", "cancelling", "cleaning"].includes(run?.status);
     get("run-dashboard").hidden = !run; get("run-raw").hidden = !run;
     const backend = progress.mode === "simulated" ? "本地模拟 · " : progress.sandbox_backend === "docker" ? "Docker · " : progress.sandbox_backend === "local_simulated" ? "真实模型／本地模拟 Sandbox · " : "";
-    get("run-status").textContent = run ? `${label(run.status)} · ${backend}${progress.task_run_id || run.agent_task_run_id || run.run_id}` : "保存题目后，可开始运行。";
-    const executions = progress.tool_operations || progress.executions || [];
-    const activeExecution = executions.find((item) => ["pending", "running", "in_flight"].includes(item.status));
+    const displayStatus = ["cancelling", "cleaning"].includes(run?.status) ? run.status : ["blocked_unknown", "checking_unknown"].includes(progress.dispatch?.status) ? progress.dispatch.status : run?.status;
+    get("run-status").textContent = run ? `${label(displayStatus)} · ${backend}${progress.task_run_id || run.agent_task_run_id || run.run_id}` : "保存题目后，可开始运行。";
+    const activeExecution = toolOperations(progress).find((item) => ["pending", "running", "in_flight"].includes(toolStatus(progress, item)));
     const activeIntent = (progress.turns || []).flatMap(routes).find((item) => item.status === "running");
     let phase = label(run?.status);
     if (run?.status === "cleaning") phase = "清理 Sandbox 资源";
     else if (live && run.status !== "cancelling") phase = activeExecution ? "等待命令结果" : activeIntent ? `推进当前 ${progress.goal_validation ? "Road" : "Intent"}` : "准备运行 / 生成下一轮";
-    if (live && run.status !== "cancelling" && run.status !== "cleaning" && pendingWork(progress).length) phase = pendingWork(progress).join("；");
+    if (live && run.status !== "cancelling" && run.status !== "cleaning" && pendingWork(progress).length) phase = `${pendingWork(progress).length} 项待结算 / 待应用`;
+    if (progress.dispatch?.status === "blocked_unknown" && !["cancelling", "cleaning"].includes(run?.status)) phase = "等待恢复条件";
+    if (progress.dispatch?.status === "checking_unknown" && !["cancelling", "cleaning"].includes(run?.status)) phase = "等待本地停止核查";
     if (progress.task_run?.status === "awaiting_confirmation") phase = "等待人工确认";
     let remaining = "—";
     if (progress.task_run?.deadline_at) {
@@ -293,7 +323,7 @@ const RunView = (() => {
       remaining = progress.task_run.finished_at ? "已结束" : `${Math.floor(seconds / 60)}分 ${seconds % 60}秒`;
     }
     const goal = progress.protocol_version === 3 ? `${progress.mode === "simulated" ? "模拟：" : ""}${label(progress.goal_evaluation)}` : "未验证";
-    const metrics = [metric("当前阶段", phase), metric("剩余总时限", remaining), metric("当前有效 Fact", String(currentFacts(progress).length)), metric("待验证候选", String((progress.answer_candidates || progress.pending_candidates || []).length)), metric("目标评估", goal)];
+    const metrics = [metric("当前推进", phase), metric("剩余总时限", remaining), metric("当前有效 Fact", String(currentFacts(progress).length)), metric("已记录候选", String((progress.answer_candidates || progress.pending_candidates || []).length)), metric("目标评估", goal)];
     if (progress.protocol_version === 3) {
       if (progress.review_queue) metrics.push(metric("待审 / 受阻", `${progress.review_queue.filter(r => r.state === "pending").length} / ${progress.review_queue.filter(r => r.state === "blocked").length}`));
       metrics.push(metric("已提交 Checkpoint", String(progress.checkpoint?.sequence ?? "—")));
@@ -405,7 +435,11 @@ const RunView = (() => {
     wires._graphEdges = true;
     wires.innerHTML = '<defs><marker id="graph-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0 L7 3.5 L0 7" fill="none" stroke="currentColor" stroke-width="1.5"/></marker></defs>';
     board.append(wires);
-    const root = graphButton("TaskRun", progress.task_run_id || current.run?.agent_task_run_id || "运行中", { id: null, type: "task", title: "TaskRun" }, progress.task_run?.status, "task");
+    const root = graphButton("TaskRun", progress.task_run_id || current.run?.agent_task_run_id || "运行信息待提供", { id: null, type: "task", title: "TaskRun" }, progress.task_run?.status, "task");
+    if (progress.dispatch?.status === "blocked_unknown") {
+      if (progress.task_run?.status === "running") root.querySelector(".run-badge").textContent = "任务未结束";
+      root.append(node("small", "执行：等待恢复条件", "graph-warning"));
+    }
     board.append(root);
     const turnNodes = [];
     for (const turn of progress.turns || []) {
@@ -646,10 +680,13 @@ const RunView = (() => {
       if (scope.type === "missing") { empty(timeline, "当前快照未提供所选节点的记录。"); return; }
       for (const op of progress.tool_operations || []) {
         if (scope.road && op.road_id !== scope.road.road_id || scope.type === "turn" && !scope.turn.roads.some(r => r.road_id === op.road_id)) continue;
-        const item = detail(`tool-${op.operation_id}`, `工具 · ${label(op.status)} · Road ${short(op.road_id)}`);
+        const status = toolStatus(progress, op);
+        const item = detail(`tool-${op.operation_id}`, `工具 · ${label(status)} · Road ${short(op.road_id)}`);
+        item.dataset.status = status;
+        if (status === "unknown") item.append(node("p", "无法确认是否生效；保留原操作身份，不计为失败，不自动重发。", "run-meta"));
         item.append(node("p", op.operation_id, "run-ref")); timeline.append(item);
       }
-      const experimentLabels = { completed: "实验已完成", condition_not_met: "前提不符，已返回模型", tool_failed: "工具失败，已返回模型", review_blocked: "审核阻止后续执行" };
+      const experimentLabels = { completed: "实验已完成", interrupted: "实验已中断 · 已知结果保留", condition_not_met: "前提不符，已返回模型", tool_failed: "工具失败，已返回模型", review_blocked: "审核阻止后续执行" };
       for (const experiment of progress.experiments || []) {
         if (!activityFits(scope, experiment)) continue;
         const item = detail(`experiment/${experiment.operation_id}`, experimentLabels[experiment.outcome] || "实验已停止");
@@ -731,6 +768,8 @@ const RunView = (() => {
     const stop = document.createDocumentFragment();
     const historicalUnknown = progress.recovery?.reason === "execution_outcome_unknown" || current.run?.result?.recovery?.reason === "execution_outcome_unknown";
     if (progress.recovery?.reason === "state_or_evidence_unreadable") stop.append(node("strong", "状态或证据读取失败，当前视图无法确认"));
+    else if (progress.dispatch?.status === "checking_unknown") stop.append(node("strong", "等待本地停止核查 · 已有结果保留"), node("p", "原 HTTP worker 退出确认后，工作台可接管恢复；未知请求不会重发。", "run-condition"));
+    else if (progress.dispatch?.status === "blocked_unknown") stop.append(node("strong", "等待恢复条件 · 已有结果与环境保留"), node("p", "远端结果未知，当前没有核查通道；不会自动重发未知动作。", "run-condition"));
     else if (live) stop.append(node("strong", "运行中，持续读取已提交状态"));
     else if (current.run?.status === "paused" && (progress.recovery?.required || current.run?.result?.recovery?.required)) stop.append(node("strong", "已停止，需要显式恢复 · 未自动重新执行"));
     else if (current.run?.status === "paused") stop.append(node("strong", "已暂停，Sandbox 保留"));
@@ -748,7 +787,18 @@ const RunView = (() => {
     if (progress.review_call_diagnostics?.length) stop.append(code("审核调用诊断", JSON.stringify(progress.review_call_diagnostics, null, 2)));
     if (progress.model_format_diagnostics?.length) stop.append(code("模型格式诊断（含已纠正的历史记录）", JSON.stringify(progress.model_format_diagnostics, null, 2)));
     if (!live) stop.append(node("p", `清理：${progress.cleanup?.status || "未确认"}`, "run-meta"));
-    for (const error of [...(progress.errors || []), ...(current.run?.result?.errors || [])]) stop.append(node("p", error.code || error.category, "run-read-error"));
+    const seenErrors = new Set();
+    for (const error of [...(progress.errors || []), ...(current.run?.result?.errors || [])]) {
+      const key = JSON.stringify(error);
+      if (seenErrors.has(key)) continue;
+      seenErrors.add(key);
+      const item = detail(`failure/${error.operation_id || key}`, `${error.code || error.category} · ${error.phase || "诊断"}`);
+      if (error.reason) item.append(node("p", error.reason, "run-meta"));
+      for (const issue of error.issues || []) item.append(node("p",
+        `${issue.path} · ${issue.code}\n要求／原因：${issue.expected}\n实际：${issue.actual}`, "run-condition"));
+      if (error.hint) item.append(node("p", error.hint, "run-condition"));
+      stop.append(item);
+    }
     patchChildren(get("run-stop"), Array.from(stop.childNodes));
     const facts = document.createDocumentFragment();
     if (progress.goal_validation) {

@@ -411,3 +411,35 @@ def test_planning_transport_ignores_role_total_and_extends_same_virtual_request(
 @pytest.mark.parametrize("raw", [b"data:\n" * 200, b":" + b"x" * 200 + b"\n"])
 def test_empty_data_lines_and_terminated_large_lines_remain_bounded(raw):
     with pytest.raises(ModelStreamError, match="response_rejected"): read(raw, limit=128)
+
+@pytest.mark.parametrize('finish,body,expected', [('length','',True),('stop','',False),('length','{}',False)])
+def test_length_without_content_retains_only_bounded_reasoning_ends(finish,body,expected):
+    head = '头' * 4096
+    middle = 'UNRETAINED-MIDDLE' * 1000
+    tail = '尾' * 4096
+    thought = head + middle + tail
+    raw = chunk({'reasoning_content':thought[:5000]}) + chunk({'reasoning_content':thought[5000:]})
+    raw += chunk({'content':body},finish) + b'data: [DONE]\n\n'
+    (_, count), reports = read(raw,limit=100000)
+    samples = [r['reasoning_excerpt'] for r in reports if 'reasoning_excerpt' in r]
+    assert bool(samples) is expected and count == len(thought)
+    if expected:
+        assert samples == [dict(head=head,tail=tail,limit_chars=4096,total_chars=len(thought))]
+        assert 'UNRETAINED-MIDDLE' not in repr(reports)
+
+
+def test_worker_reasoning_excerpt_redacts_key_across_stream_chunks(monkeypatch):
+    raw = chunk({'reasoning_content':'begin private-'}) + chunk({'reasoning_content':'key end'},'length') + b'data: [DONE]\n\n'
+    class Client:
+        def __init__(self,*args,**kwargs):self.sock=SimpleNamespace(settimeout=lambda value:None)
+        def connect(self):pass
+        def request(self,*args,**kwargs):pass
+        def getresponse(self):return SimpleNamespace(status=200,read1=io.BytesIO(raw).read1)
+        def close(self):pass
+    monkeypatch.setattr(deepseek_model.http.client,'HTTPSConnection',Client)
+    messages=[]
+    pipe=SimpleNamespace(send=messages.append,close=lambda:None)
+    deepseek_roles._raw_http_worker(pipe,DeepSeekSettings('offline','private-key'),{'stream':True},5)
+    sample=next(m['diagnostic']['reasoning_excerpt'] for m in messages if 'reasoning_excerpt' in m.get('diagnostic',{}))
+    assert sample['head']==sample['tail']=='begin [REDACTED] end'
+    assert 'private-key' not in repr(messages)

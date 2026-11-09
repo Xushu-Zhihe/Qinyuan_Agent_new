@@ -1,0 +1,1 @@
+"""Image observation planner."""

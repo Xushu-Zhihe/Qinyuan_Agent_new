@@ -364,6 +364,132 @@ def test_http_unknown_keeps_worker_diagnostic_and_original_road_operation(case):
     assert not app.evidence.history(app.task_id)
 
 
+@pytest.mark.parametrize('stopped,handoff', [(True, False), (False, False), (True, True), (True, 'blocked')])
+@pytest.mark.parametrize('late_proof', [False, True])
+def test_remote_unknown_preserves_receipts_and_admits_only_independent_work(case, stopped, handoff, monkeypatch, late_proof):
+    from agent_adapters.web.http_adapter import HttpCapabilityError
+    from Sandbox.task_run_sandbox import TaskRunSandboxError
+    from agent_core.dual_llm_contracts import ExecutionRecoveryRequired
+    from agent_core.stage_isolation import isolated_http_operations, tool_allowed
+    from agent_core.actions import MCPCall
+    from agent_core.stage_storage import StageRecoveryRequired
+    if handoff is True:
+        from agent_adapters.web import candidate_evidence
+        from test_candidate_evidence import _TestOnlyProtection
+        monkeypatch.setattr(candidate_evidence, 'WindowsEvidenceProtection', _TestOnlyProtection)
+    app = StageApplication(case.path / 'isolated-http', **case.args, http_sandbox=SimpleNamespace(),
+        goal_validation='external' if handoff is True else None)
+    app.start(case.app.state.task_run.request)
+    inspections = []
+    def inspect_worker(identity):
+        inspections.append(identity)
+        return dict(ContainerID=app.state.task_run.sandbox_id, Running=not stopped, ExitCode=124)
+    app.http_sandbox._runtime = SimpleNamespace(client=SimpleNamespace(api=SimpleNamespace(exec_inspect=inspect_worker)))
+    asyncio.run(case.app.close())
+    case.app, case.tools.task_id = app, app.task_id
+    sends = []
+    class Transport:
+        def send(self, **kwargs):
+            sends.append(kwargs)
+            if len(sends) == 1:
+                return D7HttpWireResponse(200, (), b'observed')
+            failure = TaskRunSandboxError('http_dispatch', 'outcome_unknown', app.task_id)
+            failure.http_diagnostic = dict(phase='exec_inspect', running=not stopped,
+                worker_phase='response_headers', exit_code=1)
+            if late_proof:
+                failure.http_diagnostic = dict(phase='worker_io', branch='worker_timeout', exec_id='original-http-worker')
+            raise HttpCapabilityError('outcome_unknown') from failure
+    class Process(ScriptProcess):
+        def close(self):
+            super().close()
+            self.stop_diagnostic = dict(process_stopped=True)
+    app.web.transport_factory = lambda _: Transport()
+    app.mcp.experiments.runner_factory = Process
+    decisions = []
+    class Done(Exception): pass
+    execute = app.mcp.execute
+    async def execute_once(*args, **kwargs):
+        await execute(*args, **kwargs)
+        if args[2].tool_name == 'shell.run_bash':
+            raise Done()
+    app.mcp.execute = execute_once
+    def decision(req, raw):
+        if req.stage == 'stage_action':
+            decisions.append(req)
+            if len(decisions) == 1:
+                return dict(kind='mcp_call', tool_name='http.run_experiment',
+                    arguments=dict(script="request('GET','/known')\nrequest('GET','/unknown')", timeout_seconds=60))
+            assert req.execution_context['stage_runtime']['execution_unknown']['scope'] == 'authorized_target'
+            assert req.execution_context['stage_runtime']['execution_unknown']['diagnostics'][0]['local_workers_stopped'] is True
+            assert 'http.run_experiment' not in {t['qualified_name'] for t in req.tools}
+            if len(decisions) == 2:
+                if handoff == 'blocked':
+                    return dict(kind='wait_for_tools', reason='no independent work remains')
+                if handoff:
+                    source = next(i.ref for i in req.context.history if i.identity == 'tool_observation_not_fact')
+                    return dict(kind='request_final_validation', candidate='observed', source_ref=source,
+                        reason='known original response')
+                return dict(kind='mcp_call', tool_name='shell.run_bash', arguments=dict(script='local analysis'))
+            raise AssertionError('no additional model call is needed')
+        return raw
+    case.models.inner.transform = decision
+    if handoff is True:
+        result = asyncio.run(app.run(case.token))
+        assert result.reason == 'stage.awaiting_external_validation'
+    else:
+        with pytest.raises(StageRecoveryRequired if handoff == "blocked" else ExecutionRecoveryRequired if not stopped else Done):
+            asyncio.run(app.run(case.token))
+    assert len(sends) == 2
+    unknown = app.store.list_d4_unresolved_operations(app.task_id)
+    assert len(unknown) == 1 and unknown[0].completion is None
+    if late_proof:
+        assert inspections and set(inspections) == {'original-http-worker'}
+        recovered = app.evidence.read('http-worker-stop', unknown[0].start.operation_id)
+        assert (recovered is not None) is stopped
+        assert app.evidence.read('experiment-failure', unknown[0].start.operation_id)['http_diagnostic']['phase'] == 'worker_io'
+    assert bool(isolated_http_operations(app.store, app.task_id)) is stopped
+    assert bool(app.store.blocking_d4_operations(app.task_id)) is not stopped
+    assert app.store.blocking_d4_operations(app.task_id, include_isolated=True)
+    if stopped:
+        from agent_core.stage_contracts import PlanningSession
+        outer_input = app._request('stage_supervision', PlanningSession('road_execution', decisions[0].context.session.owner_id))
+        assert outer_input.execution_context['stage_runtime']['execution_unknown']['diagnostics'][0]['remote_effect'] == 'unknown'
+        assert len(case.tools.calls) == (0 if handoff else 1)
+        assert not tool_allowed(app.store, app.task_id, MCPCall('http.run_experiment', {}))
+        assert not tool_allowed(app.store, app.task_id, MCPCall('download.install_tool', {}))
+        parent = decisions[0].model_request_id
+        summary = app.mcp.experiments.result(parent)
+        assert summary['status'] == 'interrupted' and len(summary['unknown_requests']) == 1
+        assert len(app.evidence.history(app.task_id)) == (1 if handoff else 2)
+        app.mcp.reconcile()
+        assert len(sends) == 2 and len(case.tools.calls) == (0 if handoff else 1)
+        assert app.store.load_d4_operation(unknown[0].start.operation_id).completion is None
+        if handoff == "blocked":
+            from agent_adapters.web.task_result import _stage_task_result
+            view = _stage_task_result(app.directory, dict(task_run_id=app.task_id, mode="controlled", goal_validation=None), app.store, app.config)
+            assert view["dispatch"]["status"] == "blocked_unknown"
+            assert app.state.task_run.status.value == "running"
+            assert len(decisions) == 2
+        if handoff is True:
+            from agent_core.goal_feedback import ExternalValidationFeedback
+            from agent_core.runtime import TaskRunStatus
+            candidate, = app.store.list_d7_answer_candidates(app.task_id)
+            destroyed = []
+            monkeypatch.setattr(case.args['sandbox'], 'destroy', destroyed.append)
+            app.controller.apply_external_validation_feedback(ExternalValidationFeedback(app.task_id,
+                candidate.candidate_id, candidate.evidence_version, 'accepted', 'controlled-verifier', str(uuid4())))
+            assert app.state.task_run.status is TaskRunStatus.ACHIEVED
+            assert app.store.list_d4_unresolved_operations(app.task_id)
+            assert not destroyed
+        from agent_adapters.stage_evidence import StageEvidence
+        with SqliteControlStore.open_readonly(app.directory / 'control.sqlite') as reopened:
+            reopened.stage_evidence = StageEvidence(app.directory / 'stage-evidence', reopened, create=False)
+            assert [r.start.operation_id for r in isolated_http_operations(reopened, app.task_id)] == [unknown[0].start.operation_id]
+            assert reopened.blocking_d4_operations(app.task_id, include_isolated=True)
+    else:
+        assert not case.tools.calls
+
+
 @pytest.mark.parametrize('mode', ['normal', 'corrected', 'cancel', 'deadline'])
 def test_due_supervision_is_owned_by_main_loop_after_both_tools_settle(case, mode):
     import threading

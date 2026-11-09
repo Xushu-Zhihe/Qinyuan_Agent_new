@@ -23,6 +23,24 @@ TOOL_BATCH_WAIT_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
+class StagePinnedCall(MCPCall):
+    """Explicit input capture; expected versions are supplied by trusted method lookup."""
+
+    pin_files: tuple[str, ...] = ()
+    expected_files: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class StageMethodCall(StagePinnedCall):
+    method_ref: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StageMethodMaterialize(MCPCall):
+    materialize_ref: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class StageToolBatch:
     calls: tuple[MCPCall, ...]
 
@@ -237,6 +255,38 @@ class StageFactProposal:
 
 
 @dataclass(frozen=True, slots=True)
+class StageMethodRegistration:
+    """A method for an existing Fact, with no new Fact or achievement."""
+
+    fact_ref: str
+    method: dict
+    reason: str
+
+    @property
+    def support_refs(self):
+        return (self.fact_ref, self.method["source_ref"])
+
+
+@dataclass(frozen=True, slots=True)
+class StageMethodFact(StageFactProposal):
+    """Optional method declaration; Fact acceptance is independent of reuse."""
+
+    method: dict | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StageMethodReview(TurnPlanningReview):
+    method_decision: Literal["accept", "unavailable"] = "unavailable"
+
+
+def method_fact(value):
+    if any(not value[k].strip() or "\x00" in value[k] for k in ("content", "reason")):
+        raise ValueError("stage.output_text_invalid")
+    fields = {**value, "support_refs": tuple(value["support_refs"])}
+    return (StageMethodFact if "method" in fields else StageFactProposal)(**fields)
+
+
+@dataclass(frozen=True, slots=True)
 class StageFactBatch:
     candidates: tuple[StageFactProposal, ...]
 
@@ -405,7 +455,7 @@ class StageModelEvidence:
     session: PlanningSession
     context_sha256: str
     evidence_sha256: str
-    result: TurnPlanningProposal | TurnPlanningReview | RoadTurnClosureReview | StageFactProposal | StageFactBatch | StageFactBatchReview | StageFactRevision | MCPCall | StageToolBatch | StageToolSequence | StageToolDetails | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
+    result: TurnPlanningProposal | StageMethodRegistration | TurnPlanningReview | RoadTurnClosureReview | StageFactProposal | StageFactBatch | StageFactBatchReview | StageFactRevision | MCPCall | StageToolBatch | StageToolSequence | StageToolDetails | StageIncomplete | StageStrategyAdvice | StageSessionSummary | D8ChangeDecision
     proposal_operation_id: str | None = None
     proposal_sha256: str | None = None
 

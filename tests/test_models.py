@@ -425,7 +425,7 @@ def test_transport_end_diagnostics_distinguish_wire_and_provider_failures(monkey
     assert "private" not in repr(pipe.sent)
 
 
-@pytest.mark.parametrize("failure", ["length", "timeout", "http_402", "stream"])
+@pytest.mark.parametrize("failure", ["length", "length_empty", "timeout", "http_402", "stream"])
 def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_path, monkeypatch, failure):
     from agent_adapters.output_evidence import FileD8OutputEvidence
     from agent_core.turn_modeling import digest
@@ -441,6 +441,10 @@ def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_p
     stage, schema = output_schema(business)
     env = D8OutputRequest(business, {"version": 1, "stage": stage, "schema": schema}, "Return JSON", None)
     def invoke(payload, timeout, token, *, diagnostic):
+        if failure == "length_empty":
+            diagnostic.update(finish_reason="length", content_chars=0,
+                reasoning_excerpt=dict(head="START", tail="END", limit_chars=4096, total_chars=20000))
+            return {"content": "", "finish_reason": "length"}
         if failure == "stream":
             diagnostic.update(http_status=200, transport_end="incomplete_response", finish_seen=False, done_seen=False,
                 stream_error={"branch": "tool_function_field_type", "event_index": 2,
@@ -477,6 +481,11 @@ def test_call_diagnostics_are_durable_without_debug_trace_or_provider_text(tmp_p
     if failure == "length":
         assert result["transport"]["usage"]["completion_tokens"] == 32768
         assert result["transport"]["finish_reason"] == "length" and result["transport"]["content_chars"] == 16
+    if failure == "length_empty":
+        assert result["transport"]["reasoning_excerpt"]["head"] == "START"
+        event, fields = next(item for item in events if item[0] == "model.reasoning_excerpt")
+        assert fields["request"] == business.review_id and fields["run"] == business.task_run_id
+        assert fields["head"] == "START" and fields["tail"] == "END"
     text = json.dumps([sent, result])
     assert "PRIVATE" not in text and "offline-private-key" not in text and "messages" not in text
     assert len(list(directory.glob("*.json"))) == 2

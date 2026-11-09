@@ -310,6 +310,10 @@ def _http_worker(
     phase_reported = False
     def report(**detail):
         if preserve_content:
+            if "reasoning_excerpt" in detail:
+                excerpt = detail["reasoning_excerpt"]
+                detail["reasoning_excerpt"] = {**excerpt, **{key: excerpt[key].replace(settings.api_key, "[REDACTED]")
+                    for key in ("head", "tail") if settings.api_key}}
             connection.send({"diagnostic": detail})
     try:
         # http.client ignores HTTP(S)_PROXY and performs no redirect or retry.
@@ -418,6 +422,11 @@ def _http_worker(
             )
             return
         report(**_response_diagnostic(data, message, choice.get("finish_reason"), message.get("content"), reasoning_chars=reasoning_chars))
+        if (not payload.get("stream") and choice.get("finish_reason") == "length"
+                and message.get("content") in (None, "") and isinstance(message.get("reasoning_content"), str)):
+            thought = message["reasoning_content"]
+            report(reasoning_excerpt=dict(head=thought[:4096], tail=thought[-4096:],
+                limit_chars=4096, total_chars=len(thought)))
         native_output = preserve_content and bool(payload.get("tools"))
         if message.get("function_call") or message.get("tool_calls") and not native_output:
             _invalid_provider_payload(

@@ -14,14 +14,14 @@ from agent_core.handoff_contracts import D8HistoryItem
 from agent_core.conclusion_revision_contracts import D8ChangeDecision
 from agent_core.modeling import CancellationToken, ModelError, ModelErrorKind, model_call_timeout
 from agent_core.operation_accounting import D4OperationCompletion, D4OperationRecord, D4OperationStart
-from agent_core.output_contracts import D8ModelResponse, D8OutputRequest
+from agent_core.output_contracts import D8ModelResponse, D8OutputRequest, D8FormatIssue
 from agent_core.stage_contracts import (
     PlanningExhausted, RoadCandidate, RoadTurnClosureReview, StageConclusionChange, StageFactSelection, StageHistoryRead,
     StageFactProposal, StageModelEvidence, StageSessionSummary, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, StagePlanningDecision,
     StageFactBatch, StageFactBatchReview, StageFactRevision, fact_candidates, reviewed_fact, fact_review_parts,
 )
-from agent_core.stage_planning import BUSINESS_ISSUE_CODES, INNER_STAGES, MAX_STAGE_CORRECTIONS, STAGE_CALL_POLICY, StageModelRequest, correction_hint, model_contract, stage_output_issues, parse, request_from_dict, review_members, conversation_operation_ids, stage_runtime
+from agent_core.stage_planning import INNER_STAGES, MAX_STAGE_CORRECTIONS, STAGE_CALL_POLICY, StageModelRequest, model_contract, parse, request_from_dict, review_members, conversation_operation_ids, stage_runtime
 from agent_core.stage_planning import OUTPUT_TOOL
 from agent_core.stage_storage import StageRecoveryRequired, StageStateError, proposal_digest, fact_scope_failure, _fail
 from agent_core.turn_modeling import digest, stable_id
@@ -98,6 +98,7 @@ class StageEvidence:
         self.store = store
         self.historical = not create
         self.http_validator = None
+        self.snapshot_results = None
 
     def save(self, kind, identity, value):
         try:
@@ -199,14 +200,12 @@ class StageEvidence:
                 _fail("stage.correction_binding_changed", Category.UNKNOWN)
             feedback = {"correction_of_model_request_id": source_id, "source_result_sha256": digest(result)}
             if result["outcome"] == "invalid":
-                issues = stage_output_issues(source, D8ModelResponse(result["content"], result["finish_reason"], result.get("tool_calls")),
-                    normalization_policy=self.read("contract", source_id).get("output_normalization"))
-                feedback.update(reason="output_business_invalid" if any(i.code in BUSINESS_ISSUE_CODES for i in issues) else "output_format_invalid",
-                    issues=[asdict(i) for i in issues]
-                        or [{"code": "stage_value_invalid", "path": "$", "expected": "valid_stage_value", "actual": "invalid"}])
+                diagnostic = self.output_diagnostic(source, result)
+                issues = [D8FormatIssue(**item) for item in diagnostic['issues']]
+                feedback.update(reason=diagnostic['reason'], issues=diagnostic['issues'])
                 # The issue list alone names a code at a JSON path; the admissible
                 # set for that path is what the retry has to satisfy.
-                hint = correction_hint(source, issues)
+                hint = diagnostic['hint']
                 if any(i.path.endswith("/source_ref") for i in issues):
                     try:
                         calls = result.get("tool_calls")
@@ -222,7 +221,7 @@ class StageEvidence:
                     # A retry with the same text and the same budget repeats the
                     # truncation; ask for the smallest admissible answer instead.
                     feedback["reason"] = "output_budget_exhausted"
-                    hint = (" The previous attempt stopped because its whole output budget was spent before the "
+                    hint += (" The previous attempt stopped because its whole output budget was spent before the "
                             "result object was complete. Return only the single required JSON result now, with no "
                             "extended deliberation and no intermediate working.")
             elif result["outcome"] == "model_error" and self.transport_failure(source, result) is not None:
@@ -232,25 +231,42 @@ class StageEvidence:
             if self.action_generation_failure(source, result) is not None:
                 if self.action_failure_count(source) or stage_runtime(source).get("action_stall"):
                     _fail("stage.action_adjustment_exhausted", Category.POLICY)
-                feedback["reason"] = "action_generation_budget_exhausted"
-                hint = (" The previous action exhausted its generation time or output budget without a usable "
+                failure = self.action_generation_failure(source, result)
+                feedback["reason"] = "output_correction_exhausted" if failure == "stage.model_output_unusable" else "action_generation_budget_exhausted"
+                hint += (" The format/business correction allowance was exhausted; repair the named fields. This does not prove a time or token limit was reached. " if failure == "stage.model_output_unusable" else (" The previous action exhausted its generation time or output budget without a usable "
                     "decision; this is not a failed experiment. Change the construction approach now: submit "
                     "a minimal discriminating check, reuse an available implementation, or test a scaled "
                     "instance. Do not reconstruct the same full solver. Preserve observations and useful "
                     "scripts; no hidden reasoning is available to resume. This adjustment is allowed once "
-                    "within the existing shared correction allowance.")
+                    "within the existing shared correction allowance."))
                 phase = _action_truncation_phase(source, result)
                 if phase is not None:
                     feedback["truncation_phase"] = phase
                     if phase == "action_arguments_started":
-                        hint = (" Native action arguments appeared before the length stop, without a confirmed completion. "
+                        hint += (" Native action arguments appeared before the length stop, without a confirmed completion. "
                                 "Generate one complete, smaller action from the current evidence. "
                                 "If current.action_checkpoint is present, use its approach and next test. "
                                 "Do not continue a partial argument string.")
         contract = model_contract(request)
         if hint:
+            if feedback is not None:
+                feedback['hint'] = hint
             contract = {**contract, "instruction": contract["instruction"] + hint}
         return {**contract, "correction": feedback}
+
+    def output_diagnostic(self, request, result):
+        if 'diagnostic' in result:
+            return result['diagnostic']
+        from agent_core.stage_diagnostics import output_diagnostic
+        contract = self.read('contract', request.model_request_id)
+        raw = D8ModelResponse(result['content'], result['finish_reason'], result.get('tool_calls'))
+        details = {}
+        try:
+            parse(request, raw, result_schema=contract['schema'],
+                normalization_policy=contract.get('output_normalization'), diagnostics=details)
+        except ValueError:
+            pass
+        return output_diagnostic(request, raw, contract, parser_issues=details.get('issues', ()))
 
     def correction_depth(self, request):
         """Count persisted parent links, never a process-local retry counter."""
@@ -369,6 +385,16 @@ class StageEvidence:
         return None
 
     def read_model_result(self, operation: D4OperationRecord) -> StageModelEvidence:
+        cache = self.snapshot_results
+        key = digest(asdict(operation)) if cache is not None else None
+        if cache is not None and key in cache:
+            return cache[key]
+        value = self._read_model_result(operation)
+        if cache is not None:
+            cache[key] = value
+        return value
+
+    def _read_model_result(self, operation):
         identity = operation.start.operation_id
         request = self.request(identity)
         result = self.read("result", identity)
@@ -385,6 +411,7 @@ class StageEvidence:
         value = parse(request, D8ModelResponse(result["content"], result["finish_reason"], result.get("tool_calls")),
             result_schema=contract["schema"], normalization_policy=contract.get("output_normalization"), diagnostics=diagnostics,
             pending_road_policy=contract.get("planning_validation") == "retain_pending_v1")
+        self.resolve_fact_sources(request, D8ModelResponse(result["content"], result["finish_reason"], result.get("tool_calls")), value)
         if result.get("normalization") != diagnostics.get("normalization"):
             _fail("stage.original_evidence_changed", Category.UNKNOWN)
         if request.proposal_operation_id is not None:
@@ -392,6 +419,32 @@ class StageEvidence:
         return StageModelEvidence(request.context.session, operation.start.context_sha256,
             operation.completion.evidence_sha256, value, request.proposal_operation_id,
             proposal_digest(request.proposal) if request.proposal_operation_id else None)
+
+    def resolve_fact_sources(self, request, raw, proposal, *, save=False):
+        """Bind catalog-only observations to the original output and protected sources."""
+        from agent_core.stage_planning import fact_support_refs
+        claims = fact_candidates(proposal)
+        loaded = {i.ref for i in request.context.history}
+        refs = tuple(dict.fromkeys(ref for _, claim in claims for ref in claim.support_refs if ref not in loaded))
+        if not refs:
+            return
+        if stage_runtime(request).get("fact_sources") != "catalog_readback_v1":
+            _fail("stage.fact_source_ineligible", Category.POLICY)
+        catalog = {i["ref"] for i in request.history_catalog}
+        if not set(refs) <= catalog:
+            _fail("stage.fact_source_ineligible", Category.POLICY)
+        items = self.read_history(request.task_run_id, refs, observations_only=True)
+        effective = replace(request, history_catalog=(), context=replace(request.context,
+            history=(*request.context.history, *items)))
+        for _, claim in claims:
+            if not set(claim.support_refs) <= set(fact_support_refs(effective, inferred=claim.inferred)):
+                _fail("stage.fact_source_ineligible", Category.POLICY)
+        value = dict(request_sha256=digest(asdict(request)), output_sha256=digest(asdict(raw)),
+            sources=[i.visible(include_content=False) for i in items])
+        if save:
+            self.save("source-resolution", request.model_request_id, value)
+        elif digest(self.read("source-resolution", request.model_request_id)) != digest(value):
+            _fail("stage.source_resolution_changed", Category.UNKNOWN)
 
     def review_sources(self, request):
         """Authenticate the program-assembled batch against every original."""
@@ -409,6 +462,10 @@ class StageEvidence:
                     or operation.start.budget_policy_ref != config.budget.budget_policy_ref):
                 _fail("stage.proposal_missing", Category.UNKNOWN)
             proposed = self.read_model_result(operation)
+            if stage_runtime(self.request(identity)).get("fact_sources") == "catalog_readback_v1":
+                required = {ref for _, claim in fact_candidates(proposed.result) for ref in claim.support_refs}
+                if not required <= {i.ref for i in request.context.history}:
+                    _fail("stage.source_resolution_omitted", Category.POLICY)
             if proposed.session != request.context.session:
                 _fail("stage.proposal_changed", Category.UNKNOWN)
             if len(members) > 1:
@@ -715,6 +772,14 @@ class StageEvidence:
         """Resolve original tool arguments only through version-bound observations."""
         requests = []
         for item in items:
+            if item.record_type == "verified_fact":
+                from agent_core.stage_methods import StageMethods
+                from agent_core.stage_methods import method_artifacts
+                methods = StageMethods(self, item.task_run_id).catalog()
+                for method in methods:
+                    if method["fact_ref"] == item.ref:
+                        requests.append({"method": method, "artifacts": method_artifacts(methods, method["ref"])})
+                continue
             if item.identity not in {"tool_observation_not_fact", "public_reference_not_target_observation"}:
                 continue
             operation = self.store.load_d4_operation(item.record_id)
@@ -1075,22 +1140,30 @@ class StageModelCalls:
                     finish = raw.finish_reason if isinstance(raw, D8ModelResponse) else "stop"
                     tool_calls = raw.tool_calls if isinstance(raw, D8ModelResponse) else None
                     diagnostics = {}
+                    rejected = None
                     try:
-                        parse(request, D8ModelResponse(content, finish, tool_calls),
-                            normalization_policy=contract.get("output_normalization"), diagnostics=diagnostics)
+                        proposed = parse(request, D8ModelResponse(content, finish, tool_calls),
+                            result_schema=contract['schema'], normalization_policy=contract.get("output_normalization"), diagnostics=diagnostics)
+                        self.evidence.resolve_fact_sources(request, D8ModelResponse(content, finish, tool_calls), proposed, save=True)
                         outcome = "valid"
                     except ValueError as error:
                         outcome = "invalid"
                         code = "stage.output_envelope_invalid" if error.args == ("stage.output_envelope_invalid",) else "stage.output_invalid"
-                        issues = stage_output_issues(request, D8ModelResponse(content, finish, tool_calls))
-                        if any(i.code in BUSINESS_ISSUE_CODES for i in issues):
+                        from agent_core.stage_diagnostics import output_diagnostic
+                        rejected = output_diagnostic(request, D8ModelResponse(content, finish, tool_calls), contract,
+                            parser_issues=diagnostics.get('issues', ()))
+                        issues = [D8FormatIssue(**item) for item in rejected['issues']]
+                        if rejected['reason'] == 'output_business_invalid':
                             code = "stage.proposal_business_invalid"
                         get_logger("model").warning("stage.output_rejected", run=request.task_run_id,
                             operation=identity, phase=request.stage, code=code, category="input",
                             issues=[asdict(i) for i in issues],
+                            hint=rejected['hint'], reason=rejected['reason'],
                             issue_codes=",".join(i.code for i in issues) or "stage_value_invalid")
                     result = {"request_sha256": start.context_sha256, "outcome": outcome,
                         "content": content, "finish_reason": finish, "finished_at": self.clock()}
+                    if rejected is not None:
+                        result['diagnostic'] = rejected
                     if tool_calls is not None:
                         result["tool_calls"] = tool_calls
                     if outcome == "valid" and diagnostics.get("normalization"):

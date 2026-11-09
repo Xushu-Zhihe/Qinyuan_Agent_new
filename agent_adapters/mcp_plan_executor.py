@@ -104,8 +104,11 @@ class MCPPlanExecutor:
 
     def authorize(self, task_id):
         """Freeze one capability binding for new runs; old runs have no marker."""
+        registry = json.loads(self.registry_path().read_text(encoding='utf-8'))
         self.evidence.save("mcp-registry", task_id, {
             "registry_sha256": hashlib.sha256(self.registry_path().read_bytes()).hexdigest(),
+            "sandbox_servers": [name for name, spec in registry['mcpServers'].items()
+                if spec.get('enabled', True) and spec.get('sandboxTools') and name != 'download'],
             **({"public_web": self.public_web.binding} if self.public_web else {})
         })
 
@@ -353,7 +356,30 @@ class MCPPlanExecutor:
             await self.experiments.run(request_id,intent_id,call,token)
             return
         self.app._check_dispatch()
+        if hasattr(self.app, 'task_id'):
+            from agent_core.stage_isolation import tool_allowed
+            if not tool_allowed(self.app.store, self.app.task_id, call):
+                raise ExecutionRecoveryRequired('stage.resource_outcome_unknown')
         from agent_adapters.public_web import NAMES
+        if getattr(call, "materialize_ref", ""):
+            from agent_core.stage_methods import resolve_materialization
+            request = self.evidence.request(request_id)
+            expected = resolve_materialization(request, call.materialize_ref)
+            if expected != call:
+                raise ExecutionRecoveryRequired("stage.method_materialization_changed")
+            from agent_core.stage_methods import StageMethods
+            current = StageMethods(self.evidence, self.app.task_id).catalog()
+            if not any(m["ref"] == call.materialize_ref for m in current):
+                raise ExecutionRecoveryRequired("stage.method_source_changed")
+        if getattr(call, "method_ref", ""):
+            from agent_core.stage_methods import StageMethods
+            method = next((m for m in StageMethods(self.evidence, self.app.task_id).catalog()
+                           if m["ref"] == call.method_ref), None)
+            if (method is None or method["call"]["tool_name"] != call.tool_name
+                    or method["call"]["arguments"] != call.arguments
+                    or tuple(method["call"].get("pin_files", ())) != call.pin_files
+                    or tuple(tuple(p) for p in method["call"].get("expected_files", ())) != call.expected_files):
+                raise ExecutionRecoveryRequired("stage.method_source_changed")
         public = call.tool_name in NAMES
         if public:
             frozen = self.evidence.read("mcp-registry", self.app.state.task_run.task_run_id)
@@ -466,7 +492,11 @@ class MCPPlanExecutor:
                     raise ToolDownloadError("download.stopped_before_install")
                 self.service.maximum_timeout_seconds = min(maximum, remaining_install)
                 self.service.prepared_download = (digest(dict(call.arguments)), prepared)
-            return await self.client.call_tool(call.tool_name, dict(call.arguments))
+            arguments = dict(call.arguments)
+            if getattr(call, "pin_files", ()):
+                from agent_adapters.method_inputs import capture_inputs
+                arguments = await capture_inputs(self.service, self.evidence, identity, claim, call)
+            return await self.client.call_tool(call.tool_name, arguments)
         pending = asyncio.create_task(invoke())
         try:
             while not pending.done():
@@ -490,6 +520,20 @@ class MCPPlanExecutor:
                     or response.qualified_name != call.tool_name):
                 raise ExecutionRecoveryRequired("mcp.execution_binding_changed")
             payload = self.app.redactor.redact_value(response if public else response.to_tool_payload())
+            if call.tool_name == 'image.read_image' and response.status == 'completed':
+                from agent_adapters.image_observations import ImageObservations
+                images = ImageObservations(self.app.directory, claim['task_run_id'], self.evidence)
+                try:
+                    payload['image'] = images.save(identity, response.image_bytes)
+                    payload['stdout'] = 'Image pixels available by frozen reference; unreviewed observation.'
+                    self._log.info('image.observation_saved', run=claim['task_run_id'], exec=identity,
+                        category='observation', phase='image_readback', sha256=payload['image']['sha256'],
+                        byte_size=payload['image']['byte_size'], resized=payload['image']['resized'])
+                except ValueError as error:
+                    code = str(error) if str(error) in {'image.source_size_rejected', 'image.format_rejected',
+                        'image.pixel_limit', 'image.render_size_rejected', 'image.decode_failed'} else 'image.decode_failed'
+                    payload.update(ok=False, status='rejected', code=code, category='input', exit_code=1,
+                        stdout='', stderr='Image was not inspected.')
         except ToolDownloadError as exc:
             payload = {"ok": False, "status": "failed", "tool": call.tool_name,
                        "code": str(exc), "category": ("integrity" if "sha256" in str(exc) else
@@ -524,6 +568,14 @@ class MCPPlanExecutor:
             failure = ExecutionRecoveryRequired(code)
             failure.operation_context = context
             raise failure from exc
+        if getattr(call, "materialize_ref", "") and (payload.get("status") != "completed" or payload.get("exit_code", 0) != 0):
+            codes = ("scope", "hash", "conflict", "symlink", "directory")
+            code = next(("method.materialization_" + c for c in codes
+                         if "method.materialization_" + c in payload.get("stderr", "")), "method.materialization_failed")
+            payload.update(code=code, category="input" if code.endswith(("scope", "hash")) else "dependency")
+        captured = self.evidence.read("mcp-method-inputs", identity)
+        if captured is not None:
+            payload["method_inputs_sha256"] = digest(captured)
         result = {"request_sha256": digest(claim), "payload": payload, "finished_at": self.app.clock()}
         self.evidence.save("mcp-result", identity, result)
         self._apply(self.app.store.load_d4_operation(identity), claim, result)

@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -76,6 +76,16 @@ class ActiveRun:
     log_prefix: str = "agent"
 
 
+@dataclass
+class ProgressSnapshot:
+    done: threading.Event = field(default_factory=threading.Event)
+    result: dict | None = None
+    generated_at: float | None = None
+    delivered: bool = False
+    failed: bool = False
+    joined: int = 0
+
+
 class Runner:
     """Own independent CLI processes and durable workbench run metadata."""
 
@@ -85,6 +95,55 @@ class Runner:
         self.root.mkdir(exist_ok=True)
         self._lock = threading.RLock()
         self._active: dict[str, ActiveRun] = {}
+        self._snapshots = {}
+        self._snapshot_wait = 0.1
+        self._recovery_stop = threading.Event()
+
+    def start_recovery(self):
+        threading.Thread(target=self._recover_http_runs, daemon=True).start()
+
+    def _recover_http_runs(self):
+        from agent_adapters.http_experiments import http_recovery_probe
+        from qinyuan_core import get_logger
+        delay = 5
+        while not self._recovery_stop.wait(delay):
+            failed = False
+            try:
+                challenges = self.workbench.list()
+            except Exception as error:
+                get_logger('ctrl').warning('workbench.http_recovery_waiting', category='recovery',
+                    code='http.recovery_store_unavailable', exception_type=type(error).__name__)
+                delay = min(60, delay * 2)
+                continue
+            for challenge in challenges:
+                run = challenge.get('run')
+                if not run or run['status'] != 'recovery_required' or run.get('cancel_requested'):
+                    continue
+                directory = Path(run['directory'])
+                try:
+                    if (directory / 'operator-pause-request.json').exists():
+                        continue
+                    agent_dir = self._find_agent_directory(directory)
+                    if agent_dir is None or agent_dir.name != run.get('agent_task_run_id') or (agent_dir / 'cancel-request.json').exists():
+                        continue
+                    key = http_recovery_probe(agent_dir)
+                    if key is None:
+                        continue
+                    marker = directory / ('http-recovery-' + key + '.json')
+                    with self.workbench.lock, self._lock:
+                        current = self._current(challenge['id'])
+                        if (marker.exists() or run['run_id'] in self._active or not current
+                                or current['run_id'] != run['run_id'] or current['status'] != 'recovery_required'):
+                            continue
+                        self._d9_operation(challenge['id'], 'resume', automatic=True)
+                        immutable_write(marker, dict(task_run_id=agent_dir.name, wake=key))
+                    get_logger('ctrl').info('workbench.http_recovery_started', run=run['run_id'],
+                        category='recovery', code='http.worker_exit_confirmed')
+                except Exception as error:
+                    failed = True
+                    get_logger('ctrl').warning('workbench.http_recovery_waiting', run=run['run_id'],
+                        category='recovery', code='http.recovery_unavailable', exception_type=type(error).__name__)
+            delay = min(60, delay * 2) if failed else 5
 
     @staticmethod
     def _scheduled_process_options(scheduled):
@@ -752,7 +811,7 @@ class Runner:
                 task=store.load_task_run(directory.name)
                 if task is None:return None
                 return {"task_run_id":task.task_run_id,"status":task.status.value,"deadline_at":task.deadline_at,
-                        "control":current(store,task.task_run_id),"unknown":bool(store.blocking_d4_operations(task.task_run_id))}
+                        "control":current(store,task.task_run_id),"unknown":bool(store.blocking_d4_operations(task.task_run_id, include_isolated=True))}
         except (OSError,ValueError,sqlite3.Error,StorageError):raise WorkbenchError("operator_state_read_failed",409) from None
 
     def reconcile_stopped_process(self,challenge_id):
@@ -827,7 +886,7 @@ class Runner:
             raise WorkbenchError(errors[0]["code"] if errors else "stage.human_decision_rejected", 409)
         return self.status(challenge_id)
 
-    def _d9_operation(self, challenge_id, operation, selection=None):
+    def _d9_operation(self, challenge_id, operation, selection=None, *, automatic=False):
         """Only the CLI owns checks, continuation and persisted transitions."""
         from agent_adapters.web.task_result import snapshot_v3_task_result
         from agent_adapters.validation_check import validate_selection
@@ -847,6 +906,9 @@ class Runner:
             if operation == 'resume':
                 if run.get('cancel_requested') or (agent_dir / 'cancel-request.json').exists():
                     raise WorkbenchError('d9_resume_cancelled', 409)
+                if automatic and ((directory / 'operator-pause-request.json').exists()
+                        or self._recovery_stop.is_set() or run['run_id'] in self._active):
+                    raise WorkbenchError('d9_resume_cancelled', 409)
                 (directory / 'operator-pause-request.json').unlink(missing_ok=True)
                 from agent_core.sqlite_control_store import SqliteControlStore
                 from agent_core.operator_controls import current as current_operator
@@ -855,6 +917,8 @@ class Runner:
                     with SqliteControlStore.open(agent_dir / 'control.sqlite') as store:
                         state = current_operator(store, agent_dir.name)
                         if state is not None and state.get('paused'):
+                            if automatic:
+                                raise WorkbenchError('d9_resume_cancelled', 409)
                             TaskRunController.submit_operator_control(
                                 store, agent_dir.name, str(uuid4()), 'resume', {})
                 except ValueError as error:
@@ -1042,8 +1106,8 @@ class Runner:
     def status(self, challenge_id):
         return self._current(challenge_id)
 
-    def events(self, challenge_id):
-        run = self._current(challenge_id)
+    def events(self, challenge_id, *, run=None):
+        run = run or self._current(challenge_id)
         if not run:
             return {"run_id": None, "events": []}
         path = Path(run["directory"]) / "events.jsonl"
@@ -1060,11 +1124,66 @@ class Runner:
         return {"run_id": run["run_id"], "events": list(events)}
 
     def progress(self, challenge_id):
-        """Return a bounded, read-only projection of committed T6 state."""
+        """Coalesce display reads; cached projections never authorize execution."""
         run = self._current(challenge_id)
         if not run:
             return {"run_id": None, "run": None, "events": [], "progress": None}
-        events = self.events(challenge_id)["events"]
+        key = (str(Path(run["directory"]).resolve()), run["run_id"], run.get("agent_task_run_id"))
+        with self._lock:
+            entry = self._snapshots.get(key)
+            if entry is None or entry.done.is_set() and entry.delivered:
+                previous = entry.result if entry is not None else None
+                generated = entry.generated_at if entry is not None else None
+                entry = ProgressSnapshot(result=previous, generated_at=generated)
+                self._snapshots[key] = entry
+                # Keep at most 64 idle display entries; in-flight work stays bound.
+                for old in list(self._snapshots):
+                    if len(self._snapshots) <= 64:
+                        break
+                    if old != key and self._snapshots[old].done.is_set():
+                        del self._snapshots[old]
+                threading.Thread(target=self._generate_progress,
+                    args=(challenge_id, run, entry), daemon=True).start()
+            else:
+                entry.joined += 1
+        entry.done.wait(self._snapshot_wait)
+        with self._lock:
+            ready = entry.done.is_set()
+            if ready:
+                entry.delivered = True
+            result = entry.result
+            snapshot = dict(state="unavailable" if ready and entry.failed else "ready" if ready else "refreshing",
+                generated_at=entry.generated_at)
+        return {"run_id": run["run_id"], "run": run, "events": self.events(challenge_id, run=run)["events"],
+            "progress": result, "snapshot": snapshot}
+
+    def _generate_progress(self, challenge_id, run, entry):
+        from qinyuan_core import get_logger
+        started = time.monotonic()
+        try:
+            result = self._progress_once(challenge_id, run=run)["progress"]
+        except Exception as error:  # display boundary; never retain a hidden healthy verdict
+            result = {"errors": [{"code": "state_read_failed", "exception_type": type(error).__name__}],
+                "recovery": {"required": True, "reason": "state_read_failed"}}
+            entry.failed = True
+            get_logger("sys").warning("workbench.snapshot_failed", category="dependency",
+                run=run["run_id"], code="state_read_failed", exception_type=type(error).__name__)
+        with self._lock:
+            entry.result = result
+            entry.generated_at = time.time()
+            entry.done.set()
+        elapsed = time.monotonic() - started
+        if elapsed >= 2:
+            get_logger("sys").info("workbench.snapshot_slow", category="performance",
+                run=run["run_id"], task_run_id=run.get("agent_task_run_id"),
+                elapsed_seconds=round(elapsed, 3), joined_requests=entry.joined)
+
+    def _progress_once(self, challenge_id, *, run=None):
+        """Return a bounded, read-only projection of committed T6 state."""
+        run = run or self._current(challenge_id)
+        if not run:
+            return {"run_id": None, "run": None, "events": [], "progress": None}
+        events = self.events(challenge_id, run=run)["events"]
         progress = None
         directory = self._find_agent_directory(Path(run["directory"]))
         if directory is not None:
@@ -1249,6 +1368,7 @@ class Runner:
 
     def shutdown(self):
         """Request cancellation and wait briefly for all owned children."""
+        self._recovery_stop.set()
         with self.workbench.lock, self._lock:
             active = [item for item in self._active.values() if not self.workbench.schedules.owns(item.challenge_id)]
             for item in active:

@@ -3531,3 +3531,236 @@ def test_invalid_action_exhaustion_supervises_once_and_survives_restart(case, pe
     assert any(f.get("handled_by") == supervision[0].model_request_id for f in view["model_failures"])
     if not persistent:
         assert not view["errors"] and view["recovery_status"] == "not_required"
+
+
+def test_snapshot_result_reuse_is_local_and_rechecks_changed_evidence(case, monkeypatch):
+    from agent_adapters.stage_evidence import StageEvidence
+    from agent_core.sqlite_control_store import SqliteControlStore
+    asyncio.run(case.app.run(case.token))
+    operation = next(op for op in case.app.store.list_d4_operations(case.app.task_id)
+        if op.start.category == "action" and op.completion and op.completion.result_kind == "completed")
+    with SqliteControlStore.open_readonly(case.path / "control.sqlite") as store:
+        reader = StageEvidence(case.path / "stage-evidence", store, create=False)
+        reader.snapshot_results = {}
+        original = reader._read_model_result
+        calls = []
+        def read(op):
+            calls.append(op.start.operation_id)
+            return original(op)
+        monkeypatch.setattr(reader, "_read_model_result", read)
+        first = reader.read_model_result(operation)
+        assert reader.read_model_result(operation) == first
+        assert calls.count(operation.start.operation_id) == 1
+        changed = replace(operation, start=replace(operation.start, context_sha256="0" * 64))
+        with pytest.raises(StageStateError, match="stage.original_evidence_changed"):
+            reader.read_model_result(changed)
+        assert len(reader.snapshot_results) >= 1
+    path = case.app.evidence.records._path("stage-result", operation.start.operation_id)
+    saved = path.read_bytes()
+    try:
+        path.write_bytes(b"{}")
+        with SqliteControlStore.open_readonly(case.path / "control.sqlite") as store:
+            fresh = StageEvidence(case.path / "stage-evidence", store, create=False)
+            fresh.snapshot_results = {}
+            for _ in range(2):
+                with pytest.raises(StageStateError, match="stage.evidence_corrupt"):
+                    fresh.read_model_result(operation)
+                assert not fresh.snapshot_results
+    finally:
+        path.write_bytes(saved)
+
+
+@pytest.mark.parametrize("native,batch", [(False, False), (True, True)])
+def test_catalog_fact_readback_keeps_original_and_binds_review(case, monkeypatch, native, batch):
+    from agent_core.stage_contracts import StageFactBatch
+    case.models.inner.native = case.models.outer.native = native
+    sources, reviews = [], []
+    make = case.app._request
+    def request(stage, session, **kwargs):
+        req = make(stage, session, **kwargs)
+        if stage == "stage_action" and any(i.record_type == "progress" for i in req.context.history) and not any(i.record_type == "verified_fact" for i in req.context.history):
+            req = replace(req, context=replace(req.context, history=()))
+        return req
+    monkeypatch.setattr(case.app, "_request", request)
+    def act(req, raw):
+        catalog = [i for i in req.history_catalog if i.get("identity") == "tool_observation_not_fact"]
+        if req.stage == "stage_action" and catalog and not req.context.history:
+            sources.append(req.model_request_id)
+            claim = dict(content="The tool returned observed.", reason="original observation",
+                support_refs=[catalog[0]["ref"]], inferred=False)
+            return dict(kind="fact_candidates", candidates=[claim]) if batch else dict(kind="fact_candidate", **claim)
+        return raw
+    def review(req, raw):
+        if isinstance(req.proposal, (StageFactProposal, StageFactBatch)):
+            from agent_core.stage_contracts import fact_candidates
+            assert {ref for _, c in fact_candidates(req.proposal) for ref in c.support_refs} <= {i.ref for i in req.context.history}
+            assert any("observed" in i.content for i in req.context.history)
+            reviews.append(req)
+            if isinstance(req.proposal, StageFactBatch):
+                return dict(decisions=[dict(decision="accept", reason="original observation checked")])
+        return raw
+    case.models.inner.transform, case.models.outer.transform = act, review
+    asyncio.run(case.app.run(case.token))
+    assert len(sources) == len(reviews) == 1
+    identity = sources[0]
+    with pytest.raises(StageStateError, match="stage.source_resolution_omitted"):
+        case.app.evidence.review_sources(replace(reviews[0], context=replace(reviews[0].context, history=())))
+    original = case.app.evidence.request(identity)
+    assert not original.context.history
+    receipt = case.app.evidence.read("source-resolution", identity)
+    assert receipt and len(receipt["sources"]) == 1
+    from agent_core.turn_modeling import digest
+    assert receipt["request_sha256"] == digest(asdict(original))
+    case.app.evidence.read_model_result(case.app.store.load_d4_operation(identity))
+    path = case.app.evidence.records._path("stage-source-resolution", identity)
+    saved = path.read_bytes()
+    try:
+        path.write_bytes(b"{}")
+        with pytest.raises(StageStateError, match="stage.evidence_corrupt"):
+            case.app.evidence.read_model_result(case.app.store.load_d4_operation(identity))
+        forged = {**receipt, "output_sha256": "0" * 64}
+        path.write_bytes(case.app.evidence.records.encode("stage-source-resolution", identity, forged))
+        with pytest.raises(StageStateError, match="stage.source_resolution_changed"):
+            case.app.evidence.read_model_result(case.app.store.load_d4_operation(identity))
+    finally:
+        path.write_bytes(saved)
+    legacy = replace(original, execution_context={**original.execution_context, "stage_runtime": {}})
+    result = case.app.evidence.read("result", identity)
+    with pytest.raises(ValueError):
+        parse(legacy, D8ModelResponse(result["content"], result["finish_reason"], result.get("tool_calls")))
+
+@pytest.mark.parametrize('verdict', ['reject', 'revise'])
+def test_rejected_successor_returns_to_parent_continuation(case, verdict):
+    continuations = []
+    rejected = []
+    def inner(request, raw):
+        if request.stage == 'stage_continuation':
+            continuations.append(request)
+            if len(continuations) == 1:
+                return dict(kind='turn_intent', description='successor to review',
+                    completion_criterion='a separately supported result', support_refs=raw['support_refs'])
+            if len(continuations) > 3:
+                raise AssertionError('parent continuation did not recover')
+        return raw
+    def outer(request, raw):
+        if isinstance(request.proposal, TurnIntent) and request.proposal.description == 'successor to review':
+            rejected.append(request)
+            return dict(decision=verdict, reason='successor must address another useful result')
+        return raw
+    case.models.inner.transform = inner
+    case.models.outer.transform = outer
+    result = asyncio.run(case.app.run(case.token))
+    assert result.reason == 'stage.final_validation_requested'
+    assert len(rejected) == 1 and len(continuations) == 2
+    assert continuations[0].context.session == continuations[1].context.session
+    assert 'successor must address another useful result' in json.dumps(continuations[1].messages)
+    turns = case.app.store.list_stage_turns(case.app.task_id)
+    parent, child = turns[:2]
+    assert parent.achievement is not None and child.planning_state is TurnPlanningState.SUPERSEDED
+
+
+@pytest.mark.parametrize('next_intent', [False, True])
+def test_achieved_turn_reassessment_reopens_continuation_after_road_execution(case, next_intent):
+    continuations, reassessments = [], []
+    def inner(request, raw):
+        if request.stage == 'stage_continuation':
+            continuations.append(request)
+            if len(continuations) == 1:
+                return dict(kind='roads',roads=[dict(description='extra analysis after achievement',support_refs=raw['support_refs'])])
+            assert len(continuations) <= (3 if next_intent else 2)
+            assert request.context.turn.achievement is not None
+            assert not any(r.status is IntentStatus.RUNNING for r in request.context.turn.roads)
+            if next_intent and len(continuations) == 2:
+                return dict(kind='turn_intent',description='reentered successor',
+                    completion_criterion='a new bounded result',support_refs=raw['support_refs'])
+        if request.stage == 'stage_roads' and request.context.turn.intent.description == 'reentered successor':
+            return dict(kind='wait_for_review',reason='await successor review',support_refs=[])
+        if request.stage == 'stage_action' and request.context.turn.achievement is not None:
+            reassessments.append(request)
+            if len(reassessments) > 1:raise AssertionError('reassessment loop')
+            return dict(kind='reassess_roads',reason='turn achieved; plan next deliverable',support_refs=[])
+        return raw
+    case.models.inner.transform = inner
+    def outer(request, raw):
+        if isinstance(request.proposal, TurnIntent) and request.proposal.description == 'reentered successor':
+            return dict(decision='reject',reason='revise successor scope')
+        return raw
+    case.models.outer.transform = outer
+    result=asyncio.run(case.app.run(case.token))
+    assert result.reason == 'stage.final_validation_requested'
+    assert len(continuations)==(3 if next_intent else 2) and len(reassessments)==1
+    assert len(case.tools.calls)==1
+    assert any(r.status is IntentStatus.SUSPENDED for r in result.turn.roads)
+
+
+def feedback_request():
+    from agent_core.handoff_contracts import D8HistoryItem
+    from agent_core.stage_planning import StageModelRequest
+    task,turn,road=(str(uuid4()) for _ in range(3))
+    own=D8HistoryItem(str(uuid4()),task,'progress',turn,road,None,'private observation',(), 'a'*64,1,'tool_observation_not_fact','current','available')
+    fact=replace(own,record_id=str(uuid4()),record_type='verified_fact',identity='reviewed_formal_fact')
+    request=StageModelRequest(str(uuid4()),task,'stage_action','role',1,TurnPlanningContext(task,'goal',PlanningSession('road_execution',road),StageTurnSnapshot(turn,TurnIntent('goal','criterion'),TurnPlanningState.ACTIVE),(own,fact)))
+    return request,own,fact
+
+
+def test_frozen_submission_diagnostic_never_uses_fact_candidate_sources():
+    from agent_core.stage_diagnostics import output_diagnostic
+    request,own,fact=feedback_request()
+    branch={'type':'object','additionalProperties':False,'required':['kind','reason','source_ref','support_refs'], 'properties':{
+        'kind':{'type':'string','const':'request_final_validation'},'reason':{'type':'string'},'source_ref':{'type':'string','enum':[own.ref]},
+        'support_refs':{'type':'array','items':{'type':'string','enum':[own.ref]}}}}
+    raw=native_response(dict(kind='request_final_validation',reason='grounded',source_ref=own.ref,support_refs=[own.ref,fact.ref]))
+    report=output_diagnostic(request,raw,{'schema':{'anyOf':[branch]}})
+    assert report['issues'][0]['actual']==fact.ref
+    assert report['issues'][0]['expected']=='source_type_not_allowed_for_this_action'
+    assert report['issues'][0]['path']=='$/result/support_refs/1'
+    assert 'fact_candidate' not in report['hint'] and 'private observation' not in json.dumps(report)
+    assert own.ref in report['hint'] and report['reason']=='output_business_invalid'
+
+
+def test_long_source_diagnostic_keeps_rejected_reference_and_cause():
+    from agent_core.stage_diagnostics import output_diagnostic
+    from agent_core.stage_planning import schema
+    request,own,fact=feedback_request()
+    observations=tuple(replace(own,record_id=str(uuid4())) for _ in range(40))
+    request=replace(request,context=replace(request.context,history=observations))
+    # Keep the actual per-field frozen schema instead of recomputing admission.
+    spec={'type':'object','properties':{'kind':{'type':'string','const':'reassess_roads'},'reason':{'type':'string'},'support_refs':{'type':'array','items':{'type':'string','enum':[x.ref for x in observations]}}},'required':['kind','reason','support_refs'],'additionalProperties':False}
+    report=output_diagnostic(request,native_response(dict(kind='reassess_roads',reason='review',support_refs=[fact.ref])),{'schema':spec})
+    assert fact.ref in report['hint'] and 'not_in_frozen_sources' in report['hint']
+    assert 'more omitted' in report['hint'] and len(report['hint'])<=3000
+
+
+def test_reason_field_diagnostic_and_discriminator_keep_original_meaning():
+    from agent_core.stage_diagnostics import output_diagnostic
+    from agent_core.output_contracts import shape_issues
+    request,_,_=feedback_request()
+    spec={'type':'object','properties':{'kind':{'type':'string','const':'reassess_roads'},'reason':{'type':'string','maxLength':2},'support_refs':{'type':'array','items':{'type':'string'}}},'required':['kind','reason','support_refs'],'additionalProperties':False}
+    report=output_diagnostic(request,native_response(dict(kind='reassess_roads',reason='long reason',support_refs=[])),{'schema':spec})
+    assert 'Shorten this field' in report['hint'] and '$/result/reason' in report['hint']
+    assert 'move supporting detail into reason' not in report['hint']
+    def branch(flag,refs):return {'type':'object','properties':{'inferred':{'type':'boolean','const':flag},'support_refs':{'type':'array','items':{'type':'string','enum':refs}}},'required':['inferred','support_refs'],'additionalProperties':False}
+    issues=shape_issues({'inferred':False,'support_refs':['a','b']},{'anyOf':[branch(False,['x']),branch(True,['a','b'])]})
+    assert all(i.code=='enum_mismatch' and '/support_refs/' in i.path for i in issues)
+
+
+def test_rejection_receipt_matches_correction_and_log(case,caplog):
+    first=[]
+    def inner(req,raw):
+        if req.stage=='stage_intent' and not first:
+            first.append(req.model_request_id)
+            return {**raw,'description':'   '}
+        return raw
+    case.models.inner.transform=inner
+    asyncio.run(case.app.run(case.token))
+    result=case.app.evidence.read('result',first[0])
+    diagnostic=result['diagnostic']
+    assert diagnostic['issues'][0]['code']=='stage.output_text_invalid'
+    assert diagnostic['issues'][0]['path']=='$/description'
+    corrected=next(req for req in case.models.inner.calls if req.correction_of_model_request_id==first[0])
+    contract=case.app.evidence.read('contract',corrected.model_request_id)
+    assert contract['correction']['issues']==diagnostic['issues']
+    assert contract['correction']['hint']==diagnostic['hint']
+    assert diagnostic['hint'] in contract['instruction']
+    event=next(getattr(record,'qy',{}) for record in caplog.records if getattr(record,'qy',{}).get('event')=='stage.output_rejected')
+    assert event['issues']==diagnostic['issues'] and event['hint']==diagnostic['hint']

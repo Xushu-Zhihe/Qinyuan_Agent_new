@@ -323,6 +323,18 @@ def json_type(value):
     return "unsupported"
 
 
+def diagnostic_branches(branches, value):
+    """Choose explanations by existing discriminators after acceptance failed."""
+    if not isinstance(value, dict):
+        return branches
+    def score(branch):
+        fields = branch.get('properties', {})
+        return sum(value[key] != spec['const'] for key, spec in fields.items()
+            if key in value and 'const' in spec)
+    minimum = min(map(score, branches), default=0)
+    return [branch for branch in branches if score(branch) == minimum]
+
+
 def shape_issues(value, schema, path="$"):
     if "$schema" in schema:
         # MCP advertises standard JSON Schema, including optional fields and refs.
@@ -330,7 +342,9 @@ def shape_issues(value, schema, path="$"):
         from jsonschema.validators import validator_for
         return [D8FormatIssue("tool_argument_" + str(error.validator),
                     path + "".join("/" + str(part) for part in error.absolute_path),
-                    "registered_tool_schema", json_type(error.instance))
+                    (json.dumps({error.validator: error.validator_value}, ensure_ascii=True)[:400]
+                        if error.validator in {'minimum', 'maximum', 'minLength', 'maxLength', 'minItems', 'maxItems', 'type', 'required'}
+                        else 'registered_tool_schema:' + str(error.validator)), json_type(error.instance))
                 for error in islice(validator_for(schema)(schema).iter_errors(value), 8)]
     if "anyOf" in schema:
         branches = schema["anyOf"]
@@ -352,6 +366,9 @@ def shape_issues(value, schema, path="$"):
         options = [shape_issues(value, s, path) for s in branches]
         if any(not issues for issues in options):
             return []
+        preferred = diagnostic_branches(branches, value)
+        options = [issues for branch, issues in zip(branches, options) if branch in preferred]
+        branches = preferred
         # Preserve acceptance; diagnose an invalid object against object branches,
         # rather than letting a nullable branch hide its actionable field errors.
         matching = [issues for branch, issues in zip(branches, options)

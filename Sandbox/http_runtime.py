@@ -308,6 +308,16 @@ class D7SandboxHttpRuntime:
             _fail("http_dispatch", task_run_id, sandbox_id)
         diagnostic = {"phase": "admission"}
         def unknown(branch, error=None):
+            # Closing the stream does not stop its container exec. Inspect the
+            # original worker even when reading its output timed out.
+            if diagnostic.get("exec_id") and diagnostic.get("phase") != "exec_inspect":
+                try:
+                    status = self.sandbox._runtime.client.api.exec_inspect(diagnostic["exec_id"])
+                    if status.get("ContainerID") == sandbox_id:
+                        diagnostic.update(phase="exec_inspect", running=status.get("Running"),
+                            exit_code=status.get("ExitCode"))
+                except Exception:
+                    diagnostic["inspection_failed"] = True
             _unknown("http_dispatch", task_run_id, sandbox_id, error,
                 diagnostic={**diagnostic, "branch": branch})
         try:
@@ -349,13 +359,16 @@ class D7SandboxHttpRuntime:
                     exec_id, socket=True, tty=False
                 )
             raw = getattr(sock, "_sock", sock)
+            # The fixed timeout wrapper owns termination (TERM, then KILL after
+            # five seconds). This extra time only collects its exit and output.
+            collection_timeout = float(timeout_seconds) + 6.0
             if hasattr(raw, "settimeout"):
-                raw.settimeout(float(timeout_seconds))
+                raw.settimeout(collection_timeout)
             done = threading.Event()
 
             def interrupt_wait() -> None:
                 while not done.wait(0.025):
-                    if time.monotonic() - started >= timeout_seconds:
+                    if time.monotonic() - started >= collection_timeout:
                         try:
                             raw.close()
                         except OSError:
@@ -386,8 +399,6 @@ class D7SandboxHttpRuntime:
                 if len(target) + length > limit:
                     unknown("stdout_limit" if stream == 1 else "stderr_limit")
                 target.extend(read_exactly(raw, length))
-            if time.monotonic() - started >= timeout_seconds:
-                unknown("worker_timeout")
             diagnostic["phase"] = "exec_inspect"
             result = self.sandbox._runtime.client.api.exec_inspect(exec_id)
             diagnostic.update(running=result.get("Running"), exit_code=result.get("ExitCode"))

@@ -2562,6 +2562,11 @@ class TaskRunController(LegacyTaskRunController):
         """Clean a persisted terminal TaskRun after its commit is durable."""
 
         task_run, state = self._require_bound_state()
+        from agent_core.stage_isolation import isolated_http_operations
+        if isolated_http_operations(self._require_persistent().store, task_run.task_run_id):
+            # Goal feedback may be conclusive while an external effect is not.
+            # Preserve the environment and its original recovery records.
+            return
         if task_run.sandbox_id is not None:
             d4_attempt_id: str | None = None
             d4_state, prior_attempt_id = self._d4_cleanup_state(task_run.sandbox_id)
