@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -34,6 +35,28 @@ MAX_JSON_BYTES = 64 * 1024
 MAX_ATTACHMENTS = 16
 VALID_CATEGORIES = {"pwn", "reverse", "web", "misc", "crypto", "other"}
 VALID_PROVIDERS = {"deepseek", "openai_compatible"}
+DESKTOP_BUSY_STATUSES = {"starting", "running", "cancelling", "cleaning", "recovery_required"}
+
+
+def data_directory_lease(root):
+    """Serialize service ownership and offline profile edits for one data directory."""
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    handle = (root / ".workbench.lock").open("a+b")
+    if handle.tell() == 0:
+        handle.write(b"0"); handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise WorkbenchError("launcher.data_directory_in_use", 409) from None
+    return handle
 
 
 def now() -> str:
@@ -133,6 +156,7 @@ class Workbench:
         execution_profile: str = "d7",
     ):
         self.root = root.resolve()
+        self.desktop_token = os.environ.get("QINYUAN_DESKTOP_TOKEN", "")
         self.root.mkdir(parents=True, exist_ok=True)
         from agent_adapters.windows_security import WindowsSecuritySetup
 
@@ -225,6 +249,9 @@ class Workbench:
         self.competitions = CompetitionConnections(self)
         from agent_adapters.competition_schedule import CompetitionSchedules
         self.schedules = CompetitionSchedules(self)
+        if self.desktop_token:
+            from agent_adapters.launcher_settings import SecretStore
+            self.competitions.credentials = SecretStore(Path(__file__).resolve().parent.parent / ".launcher-secrets" / "competition")
         self.runner.start_recovery()
 
     @staticmethod
@@ -687,6 +714,42 @@ class Handler(BaseHTTPRequestHandler):
         self._trusted()
         parsed = urlsplit(self.path)
         parts = parsed.path.strip("/").split("/")
+        if parts == ["api", "launch-defaults"] and self.command == "GET":
+            from agent_adapters.launcher_settings import LauncherSettings
+            self._send(200, LauncherSettings().public()["values"])
+            return
+        if parts == ["api", "desktop"]:
+            store = self.server.workbench
+            token = self.headers.get("X-Qinyuan-Desktop", "")
+            if not store.desktop_token or not hmac.compare_digest(token, store.desktop_token):
+                raise WorkbenchError("launcher.session_rejected", HTTPStatus.FORBIDDEN)
+            if self.command == "POST":
+                value = self._json()
+                if value not in ({"action": "pause"}, {"action": "shutdown"}):
+                    raise WorkbenchError("launcher.action_invalid")
+                if value["action"] == "pause":
+                    groups = set()
+                    for row in store.schedules.rows():
+                        group = row["config"].get("group_id", row["id"])
+                        if row["state"]["status"] != "finished" and group not in groups:
+                            groups.add(group)
+                            store.schedules.command(row["id"], {"action": "pause", "scope": "all"})
+                    for task in store.list():
+                        if task["status"] in {"starting", "running"} and not store.schedules.owns(task["id"]):
+                            store.runner.cancel(task["id"])
+                else:
+                    if any(t["status"] in DESKTOP_BUSY_STATUSES for t in store.list()):
+                        raise WorkbenchError("launcher.runs_still_active", 409)
+                    if any(r["state"]["status"] not in {"finished", "paused", "needs_attention"} for r in store.schedules.rows()):
+                        raise WorkbenchError("launcher.schedules_still_active", 409)
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
+            elif self.command != "GET":
+                raise WorkbenchError("method_not_allowed", 405)
+            from agent_adapters.launcher_settings import LauncherSettings
+            self._send(200, {"data_dir": str(store.root), "project": str(Path(__file__).resolve().parent.parent),
+                "active": any(t["status"] in DESKTOP_BUSY_STATUSES for t in store.list()) or any(r["state"]["status"] not in {"finished", "paused", "needs_attention"} for r in store.schedules.rows()),
+                "defaults": LauncherSettings().public()["values"]})
+            return
         if self.command == "GET" and parsed.path in {"/", "/index.html", "/app.js", "/run-view.js", "/competition.js", "/styles.css", "/run.css"}:
             name = "index.html" if parsed.path == "/" else parsed.path[1:]
             mime = "text/html" if name.endswith(".html") else "text/javascript" if name.endswith(".js") else "text/css"
@@ -951,6 +1014,7 @@ def main(argv=None):
     try:
         # Public launcher defaults to D8; explicit legacy protocol/profile
         # selections and historical Python assembly retain their old behavior.
+        lease = data_directory_lease(args.data_dir)
         protocol = args.protocol_version
         if protocol is None:
             protocol = int(os.environ.get("QINYUAN_WORKBENCH_PROTOCOL_VERSION", "3"))
@@ -973,6 +1037,15 @@ def main(argv=None):
     except sqlite3.Error:
         parser.exit(1, "Cannot open the workbench database. Check the data directory and permissions.\n")
     with server:
+        instance = os.environ.get("QINYUAN_DESKTOP_INSTANCE")
+        if instance and workbench.desktop_token:
+            record = Path(instance)
+            record.parent.mkdir(parents=True, exist_ok=True)
+            temporary = record.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"port": server.server_port, "token": workbench.desktop_token,
+                "pid": os.getpid(), "project": str(Path(__file__).resolve().parent.parent),
+                "data_dir": str(workbench.root)}), encoding="utf-8")
+            temporary.replace(record)
         print("Qinyuan local workbench backend", flush=True)
         print(f"Open: http://127.0.0.1:{server.server_port}/", flush=True)
         print(f"Data: {workbench.root}", flush=True)
@@ -991,6 +1064,10 @@ def main(argv=None):
             server.serve_forever()
         except KeyboardInterrupt:
             print("\nWorkbench backend stopped.", flush=True)
+        finally:
+            if instance and workbench.desktop_token:
+                record.unlink(missing_ok=True)
+    lease.close()
 
 
 if __name__ == "__main__":

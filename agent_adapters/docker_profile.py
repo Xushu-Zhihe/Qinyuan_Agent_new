@@ -64,7 +64,13 @@ _PROFILES = {
 
 
 def _profile(name: str | None = None) -> _Profile:
-    key = (name or os.environ.get("QINYUAN_SANDBOX_PROFILE", "linux")).strip().lower()
+    configured = os.environ.get("QINYUAN_SANDBOX_PROFILE", "linux")
+    if name is None:
+        from agent_adapters.launcher_settings import ROOT, env_values
+        values = env_values(ROOT / ".env")
+        if values.get("QINYUAN_DESKTOP_SETTINGS") == "1":
+            configured = values.get("QINYUAN_SANDBOX_PROFILE") or configured
+    key = (name or configured).strip().lower()
     try:
         return _PROFILES[key]
     except KeyError:

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Qinyuan Agent · 启动器</title>
+  <link rel="stylesheet" href="launcher.css"><script src="launcher.js" defer></script>
+</head>
+<body>
+  <div id="launcher-background" aria-hidden="true"></div>
+  <header class="topbar"><a class="brand" href="#start" aria-label="Qinyuan 首页"><b>Q</b><span>Qinyuan <small>AGENT</small></span></a>
+    <nav aria-label="主导航"><button data-tab="start" class="active">启动</button><button data-tab="settings">设置</button><button data-tab="checks">检测</button><button data-tab="downloads">下载</button></nav>
+    <span id="service-badge" class="badge">本地启动器</span>
+  </header>
+  <div class="workspace">
+    <aside class="sidebar">
+      <div class="sidebar-top"><span class="eyebrow">WORKSPACE</span><h2 id="side-title">启动准备</h2></div>
+      <div id="side-start" class="side-group"><label for="agent-mode">运行模式</label><select id="agent-mode"><option>CTFAgent</option><option disabled>BenchAgent · 待定</option></select><p>选择比赛配置，准备你的下一次探索。</p><button class="side-item selected" data-pane="launch">比赛启动</button></div>
+      <div id="side-settings" class="side-group" hidden><button class="side-item" data-pane="llm">LLM 连接</button><button class="side-item" data-pane="agent">Agent 参数</button><button class="side-item" data-pane="appearance">外观</button><button class="side-item" data-pane="security">Windows 安全配置</button></div>
+      <div id="side-checks" class="side-group" hidden><button class="side-item" data-pane="basic">基本环境</button><button class="side-item" data-pane="images">镜像检测</button><button class="side-item" data-pane="files">文件与依赖</button></div>
+      <div id="side-downloads" class="side-group" hidden><button class="side-item" data-pane="dependencies">项目依赖</button><button class="side-item" data-pane="build">Sandbox 镜像</button></div>
+      <div class="sidebar-foot"><span id="local-status" class="status-label">准备就绪</span><button id="launch-button" class="primary launch-button">启动工作台 <span>↗</span></button><p>在浏览器中管理比赛与运行</p></div>
+    </aside>
+    <main>
+      <section data-page="launch">
+        <div class="page-heading"><div><span class="eyebrow">READY FOR YOUR NEXT CHALLENGE</span><h1>开始一次新的探索</h1><p>选择平台与连接配置，赛程由你掌控。</p></div><span class="badge">CTFAgent</span></div>
+        <div id="template-cards" class="template-grid"></div>
+        <section class="card"><div class="card-heading"><h2>比赛连接</h2><button id="new-profile" class="text-button">＋ 新建配置</button></div>
+          <label class="field"><span>已保存配置</span><select id="profiles"><option value="">新建配置</option></select></label>
+          <form id="profile-form"><div class="form-grid"><label class="field"><span>配置名称</span><input id="profile-name" maxlength="80" required placeholder="例如：日常训练"></label><label class="field"><span>平台根地址</span><input id="profile-url" type="url" required placeholder="https://…"></label>
+            <label class="field"><span id="credential-label">Agent Token</span><input id="profile-key" type="password" autocomplete="new-password" maxlength="8192" placeholder="留空保留已有凭据"></label><label class="field"><span>读取超时 <small>秒</small></span><input id="profile-timeout" type="number" min="1" max="60" value="10" required></label></div>
+            <div class="actions"><button class="secondary" type="submit">保存连接</button><button id="check-profile" type="button">测试连接</button><button id="clear-profile" class="text-button" type="button">清除凭据</button><span id="profile-state" class="muted"></span></div>
+          </form><p id="template-note" class="note"></p><p id="preview-summary" class="note" role="status"></p>
+        </section>
+        <section class="card"><div class="card-heading"><h2>新赛程默认值</h2><span class="muted">仅应用于新赛程</span></div><div class="form-grid three">
+          <label class="field"><span>题目并发 <small>个槽位</small></span><select data-key="QINYUAN_LAUNCH_CONCURRENCY" id="launch-concurrency"><option value="1">1 · 串行</option><option value="2">2 · 并发</option><option value="3">3 · 并发</option></select></label>
+          <label class="field"><span>单题时长 <small>分钟</small></span><input data-key="QINYUAN_LAUNCH_QUESTION_MINUTES" type="number" min="1" max="10080" value="60" required></label>
+          <label class="field"><span>整体时长 <small>分钟</small></span><input data-key="QINYUAN_LAUNCH_OVERALL_MINUTES" type="number" min="1" max="10080" value="180" required></label></div>
+          <div class="hint-line"><span>ⓘ</span><p id="hint-note">不会自动领取题目或获取扣分提示；题目队列与实际开赛在工作台完成。</p></div><button class="secondary save-settings">保存启动默认值</button>
+        </section>
+      </section>
+      <section data-page="appearance" hidden>
+        <div class="page-heading"><div><span class="eyebrow">APPEARANCE</span><h1>让工作台更像你</h1><p>选择本地背景图片，按喜好调整显示强度。</p></div></div>
+        <section class="card"><div class="card-heading"><h2>背景图片</h2><div class="actions"><button id="choose-background" class="secondary">＋ 添加背景图片</button><button id="clear-background" class="text-button" disabled>移除</button></div></div>
+          <p id="background-state" class="note" role="status">尚未设置背景图片</p><p class="note">支持 PNG、JPEG、WebP，最大 16 MiB。所选图片会保存本地副本。</p>
+          <label class="field background-opacity-field" for="background-opacity"><span>图片不透明度 <output id="background-opacity-value" for="background-opacity">30%</output></span><input id="background-opacity" data-key="QINYUAN_BACKGROUND_OPACITY" type="range" min="0" max="100" value="30"><small>0% 完全透明 · 100% 完全显示；拖动实时预览，松开后自动保存。</small></label>
+        </section>
+      </section>
+      <section data-page="llm" hidden>
+        <div class="page-heading"><div><span class="eyebrow">MODEL CONNECTIONS</span><h1>各司其职，协同探索</h1><p>配置 Outer 与 Inner 的模型连接。密钥由 Windows 当前用户加密保存。</p></div><span class="badge">high</span></div>
+        <div class="role-grid">
+          <section class="card role"><span class="role-number">01 / OUTER</span><h2>规划与审核</h2><p class="muted">规划 Turn 与 Intent，审核证据和结论。</p><label class="field"><span>模型名称</span><input data-key="QINYUAN_MODEL" required maxlength="128" placeholder="deepseek-flash"></label><label class="field"><span>Base URI</span><input data-key="OPENAI_BASE_URL" type="url" required placeholder="https://api.deepseek.com"></label><label class="field"><span>API Key <small id="outer-key-state">未配置</small></span><input id="outer-key" type="password" autocomplete="new-password" placeholder="留空保留已有密钥"></label><button class="text-button clear-key" data-role="outer">清除 Outer 密钥</button></section>
+          <section class="card role"><span class="role-number">02 / INNER</span><h2>执行与探索</h2><p class="muted">在审核和授权范围内执行，提出成果。</p><label class="toggle"><input id="shared-inner" type="checkbox" checked> 与 Outer 共用连接</label><div id="inner-fields" hidden><label class="field"><span>模型名称</span><input data-key="QINYUAN_INNER_MODEL" maxlength="128"></label><label class="field"><span>Base URI</span><input data-key="QINYUAN_INNER_BASE_URL" type="url"></label><label class="field"><span>API Key <small id="inner-key-state">未配置</small></span><input id="inner-key" type="password" autocomplete="new-password" placeholder="留空保留已有密钥"></label><button class="text-button clear-key" data-role="inner">清除 Inner 密钥</button></div><p id="shared-description" class="note">共用模型、地址与密钥；两个角色仍独立请求。</p></section>
+        </div><div class="actions"><button class="primary save-settings">保存模型连接</button><span class="muted">新配置用于新运行，已有任务沿冻结配置核验。</span></div>
+        <section id="migration-card" class="card warning" hidden><h2>检测到 .env 中的明文密钥</h2><p>先加密保存并核验，再移除对应明文键。不会创建明文备份。</p><button id="migrate-key" class="secondary">迁移现有密钥</button></section>
+      </section>
+      <section data-page="agent" hidden><div class="page-heading"><div><span class="eyebrow">RUNTIME SETTINGS</span><h1>清晰的运行边界</h1><p>显示实际配置及单位，仅编辑现有运行参数。</p></div></div><section class="card"><h2>模型传输</h2><div id="timeout-fields" class="form-grid"></div><p class="note">规划调用的总时长由任务截止控制；连接、首次输出、停顿超时仍有效。</p></section><section class="card"><h2>Sandbox 资源档位</h2><label class="field"><span>新运行使用的档位</span><select data-key="QINYUAN_SANDBOX_PROFILE"><option value="linux">Linux · 标准</option><option value="linux-heavy">Linux · 高资源</option><option value="windows">Windows / Wine</option></select></label><dl id="capacity-details" class="facts"></dl><p class="note">容量来自已验证策略，输出预留不作为 max_tokens 发送；推理强度 high。参数修改不会为已有任务追加额度。</p></section><button class="primary save-settings">保存 Agent 参数</button></section>
+      <section data-page="security" hidden><div class="page-heading"><div><span class="eyebrow">WINDOWS SECURITY</span><h1>证据目录与安全配置</h1><p>自动检查使用普通权限；手动核验或修改时才请求管理员权限。</p></div></div><section class="card"><div class="card-heading"><h2>Microsoft Defender</h2><span id="security-state" class="badge">待检查</span></div><p id="security-reason" class="note"></p><dl id="security-details" class="facts"></dl><div class="actions"><button data-security="Check">管理员核验</button><button data-security="Apply" class="secondary">配置精确排除</button><button data-security="Remove" class="text-button">撤销本项目规则</button></div><p class="note">只管理 stage-evidence、d7-http-evidence、sensitive-evidence 三类精确目录规则。匹配目录中的恶意样本也可能跳过内容扫描；实时保护与防篡改保持原状。</p></section></section>
+      <section data-page="basic" hidden><div class="page-heading"><div><span class="eyebrow">ENVIRONMENT CHECK</span><h1>基本环境</h1><p>只读检查，不自动安装或修改系统配置。</p></div><button data-check="basic">重新检测</button></div><div id="checks-basic" class="check-list"></div><section class="card"><h2>安装入口</h2><div class="actions"><button data-link="python">Python ↗</button><button data-link="uv">uv ↗</button><button data-link="docker">Docker Desktop ↗</button><button data-link="webview">WebView2 ↗</button></div></section></section>
+      <section data-page="images" hidden><div class="page-heading"><div><span class="eyebrow">SANDBOX IMAGES</span><h1>镜像与运行身份</h1><p>按当前资源档位检测镜像和目标转发能力。</p></div><button data-check="images">重新检测</button></div><div id="checks-images" class="check-list"></div></section>
+      <section data-page="files" hidden><div class="page-heading"><div><span class="eyebrow">FILES & DEPENDENCIES</span><h1>文件与依赖</h1><p>检查项目解释器、必要文件与模块。</p></div><button data-check="files">重新检测</button></div><div id="checks-files" class="check-list"></div></section>
+      <section data-page="dependencies" hidden><div class="page-heading"><div><span class="eyebrow">PROJECT SETUP</span><h1>准备项目依赖</h1><p>按项目锁文件同步 Agent 环境。</p></div></div><section class="card"><h2>Python 依赖</h2><p>使用 uv sync --locked，不自动升级依赖。同步前须停止工作台及其运行。</p><div class="actions"><button data-prepare="dependencies" class="primary">准备依赖</button><button id="stop-service">停止空闲工作台</button></div></section></section>
+      <section data-page="build" hidden><div class="page-heading"><div><span class="eyebrow">BUILD LOCALLY</span><h1>构建 Sandbox 镜像</h1><p>以项目根目录为上下文，使用 Sandbox 中的 Dockerfile。</p></div></div><div class="build-grid"><section class="card"><span class="role-number">LINUX</span><h2>Linux 分析环境</h2><p>标准与高资源档位共用。</p><code>Sandbox/dockerfile</code><button data-prepare="linux" class="secondary">构建 Linux 镜像</button></section><section class="card"><span class="role-number">WINDOWS / WINE</span><h2>Windows 分析环境</h2><p>自动先构建依赖的 Linux 镜像。</p><code>Sandbox/windows.dockerfile</code><button data-prepare="windows" class="secondary">构建 Windows 镜像</button></section><section class="card"><span class="role-number">NETWORK</span><h2>目标网络转发</h2><p>单独构建，按任务网络能力使用。</p><code>Sandbox/target_forwarder.dockerfile</code><button data-prepare="forwarder" class="secondary">构建转发镜像</button></section></div><p class="note">构建完成后核验实际镜像 ID。产物不匹配时显示待处理，不自动更改运行身份。</p></section>
+      <section id="download-console" class="console" hidden><div class="console-head"><strong id="download-state">准备记录</strong><div class="actions"><select id="download-filter" aria-label="日志分类"><option value="all">全部记录</option><option value="download">准备与构建</option><option value="environment">环境核验</option></select><button id="copy-logs">复制诊断</button><button id="cancel-download">取消准备</button></div></div><progress id="download-progress" hidden></progress><pre id="download-logs" aria-live="polite">暂无准备记录。</pre></section>
+      <footer class="main-footer"><span>QINYUAN AGENT</span><span>本地控制 · 独立运行 · 可追溯证据</span></footer>
+    </main>
+  </div>
+  <div id="notice" role="status" aria-live="polite" hidden></div>
+  <dialog id="close-dialog"><h2>工作台仍在运行</h2><p>可继续后台运行，或安全暂停赛程、停止普通任务后退出。暂停期间时钟继续。</p><p id="close-state" class="note"></p><div class="actions"><button id="keep-background" class="primary">继续后台运行</button><button id="pause-exit">安全停止后退出</button><button id="cancel-close">返回</button></div></dialog>
+</body>
+</html>

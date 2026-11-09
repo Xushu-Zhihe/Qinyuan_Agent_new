@@ -2,6 +2,11 @@
 # context. Keep the context small so image builds do not ship run data,
 # virtualenvs, test fixtures, or frontend dependencies to the daemon.
 .venv/
+.env
+.env.*
+.launcher-secrets/
+.launcher-background*
+desktop/
 .uv-cache/
 .test/
 .runs/

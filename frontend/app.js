@@ -6,7 +6,6 @@ let toastTimer;
 let runPoll;
 let runSelection = 0;
 let runRead = null;
-let securityPoll;
 const pendingLiveControls = new Map();
 const liveControlErrors = {
   operator_task_expired_or_terminal: "任务已到期或结束，不能靠加时恢复。",
@@ -333,88 +332,21 @@ async function saveTask(event) {
 async function archiveTask() { const task = state.tasks.find((item) => item.id === state.selected); if (!task) return; try { await request(`/api/challenges/${task.id}/archive`, { method: "POST", body: "{}", headers: { "Content-Type": "application/json" } }); state.showArchived = true; $("show-archived").checked = true; notify("题目已归档；现在可永久清理"); await loadTasks(); } catch (error) { notify(`归档失败：${error.message === "cancel_running_challenge_first" ? "请先取消并清理运行" : error.message}`); } }
 async function restoreTask() { const task = state.tasks.find((item) => item.id === state.selected); if (!task) return; try { await request(`/api/challenges/${task.id}/restore`, { method: "POST", body: "{}", headers: { "Content-Type": "application/json" } }); notify("题目已恢复"); await loadTasks(); } catch (error) { notify(`恢复失败：${error.message}`); } }
 async function purgeTask() { const task = state.tasks.find((item) => item.id === state.selected); if (!task) return; const confirmation = window.prompt(`永久清理“${task.title}”及其附件？\n请输入题目名称确认。`); if (confirmation === null) return; try { await request(`/api/challenges/${task.id}/purge`, { method: "POST", body: JSON.stringify({ confirm_title: confirmation }), headers: { "Content-Type": "application/json" } }); notify("题目和附件已永久清理"); resetForm(); await loadTasks(); showView("tasks"); } catch (error) { notify(`清理失败：${error.message === "archive_terminal_challenge_first" ? "请先结束运行并归档题目" : error.message}`); } }
-async function loadModel() { try { const value = await request("/api/model"); $("model-provider").value = value.provider; $("model-name").value = value.model; $("model-url").value = value.base_url; $("model-key").value = ""; $("model-state").textContent = value.key_configured ? "Key 已在内存" : "未配置 Key"; if (value.dual_llm_enabled) { $("outer-model-name").value = value.outer_model || ""; $("inner-model-name").value = value.inner_model || ""; $("dual-model-state").textContent = value.key_configured ? "双角色已配置" : "未配置"; } else { $("dual-model-state").textContent = "未配置"; } } catch (error) { notify(`读取模型配置失败：${error.message}`); } }
-async function saveModel(event) { event.preventDefault(); const key = $("model-key").value; if (!key) { notify("请输入 API Key；页面不会保存它"); return; } try { const value = await request("/api/model", { method: "PUT", body: JSON.stringify({ provider: $("model-provider").value, model: $("model-name").value.trim(), base_url: $("model-url").value.trim(), api_key: key }), headers: { "Content-Type": "application/json" } }); $("model-key").value = ""; $("model-state").textContent = value.key_configured ? "Key 已在内存" : "未配置 Key"; notify("模型配置已应用"); } catch (error) { notify(`配置失败：${error.message}`); } }
-async function saveDualModel(event) { event.preventDefault(); const key = $("dual-model-key").value; const outerModel = $("outer-model-name").value.trim(); const innerModel = $("inner-model-name").value.trim(); if (!key) { notify("请输入 API Key"); return; } if (!outerModel || !innerModel) { notify("请填写外层和内层模型名称"); return; } try { const value = await request("/api/model", { method: "PUT", body: JSON.stringify({ outer_model: outerModel, inner_model: innerModel, api_key: key }), headers: { "Content-Type": "application/json" } }); $("dual-model-key").value = ""; $("dual-model-state").textContent = value.key_configured ? "双角色已配置" : "未配置"; notify("双 LLM 角色配置已应用"); } catch (error) { notify(`配置失败：${error.message}`); } }
-function toggleModelMode(mode) { const isSingle = mode === "single"; $("mode-single").classList.toggle("active", isSingle); $("mode-dual").classList.toggle("active", !isSingle); $("single-model-section").hidden = !isSingle; $("dual-model-section").hidden = isSingle; notify(isSingle ? "已切换到单模型模式" : "已切换到双 LLM 角色模式"); }
 function renderWindowsSecurityHint() {
   const value = state.windowsSecurity;
   const realMode = $("run-mode-control").hidden ? state.executionProfile === "d7" : $("run-mode").value === "real";
   $("windows-security-hint").hidden = !value?.supported || !realMode || (value.verified && value.status === "excluded" && value.evidence_access?.status === "passed" && !value.busy);
 }
-function renderWindowsSecurity(value) {
-  state.windowsSecurity = value;
-  const statuses = { excluded: "已核验：证据目录排除已生效", not_excluded: "已核验：证据目录未被排除", partial: "已核验：部分证据目录排除生效", unknown: "无法确认当前配置", not_applicable: "当前服务不在 Windows 上，无需此配置" };
-  const failures = { script_execution_blocked: "配置助手被脚本策略阻止，尚未执行 Defender 检查", helper_result_read_failed: "检查回执读取失败，配置状态未确认" };
-  $("security-status").textContent = value.busy ? "正在等待管理员确认或执行检查…" : failures[value.reason] || statuses[value.status] || statuses.unknown;
-  const access = value.evidence_access || {};
-  if (!value.busy && access.status === "failed") $("security-status").textContent = "证据读写自检失败，当前配置尚未就绪";
-  const accessTarget = $("security-evidence-access");
-  if (accessTarget) {
-    const protection = access.evidence_protection || {};
-    const codes = (access.error_codes || []).join(" / ");
-    const winerror = protection.winerror ?? access.winerror;
-    accessTarget.textContent = value.busy ? "正在配置或验证…" : access.status === "passed" ? "已通过：当前用户可创建、加密写入并读取 HTTP 证据" : access.status === "failed" ? `失败：${codes || "证据目录访问或清理失败"}${winerror != null ? ` · Windows 错误 ${winerror}` : ""}。请检查目录权限及占用；仍可手动启动。` : "尚未验证当前用户的证据读写";
-  }
-  const reasons = {
-    not_checked: "尚未核验；普通权限下看不到排除项，不代表没有配置。",
-    awaiting_administrator_or_check: "请在 Windows 管理员提示中确认；本页自动更新操作结果。",
-    administrator_cancelled: "管理员确认已取消；设置结果未核验，可继续使用工作台。",
-    helper_failed_or_blocked: "配置助手未返回有效结果，可能受权限或脚本执行策略限制。请查看脚本说明或联系管理员。",
-    helper_result_read_failed: "管理员助手已结束，但工作台无法读取检查回执。请检查文件访问权限；不能据此判定排除未配置。",
-    script_execution_blocked: "PowerShell 的执行策略或签名要求拒绝加载脚本，管理员权限不会自动解除。文件安全区域映射也可能触发限制，即使没有下载标记；这不代表 Defender 排除未配置。",
-    administrator_required_to_verify_or_configure: "需要管理员权限才能可靠检查和配置。",
-    exclusions_not_visible: "排除列表不可见，不能判断配置是否完成。",
-    exclusions_read_failed: "无法读取排除列表，请检查 Defender 服务和组织策略。",
-    rule_configuration_failed: "配置未得到确认，可能受组织策略限制；请重新检查。",
-    rule_removal_failed: "撤销未得到确认，请重新检查。",
-    defender_path_check_unavailable: "无法核验目录实际排除状态，不能仅凭规则存在判断生效。",
-    data_directory_not_found: "数据目录不存在，无法核验。",
-    invalid_data_directory: "数据目录无效，请检查工作台启动参数。",
-    use_windows_powershell_exe: "请使用 Windows PowerShell 5.1 运行脚本。",
-    windows_only: "此页面只管理 Windows 主机的 Microsoft Defender。",
-  };
-  const partialReason = value.status === "partial" ? "部分目录已排除；逐目录状态见诊断，未排除目录仍受 Defender 扫描。" : null;
-  $("security-reason").textContent = partialReason || reasons[value.reason] || (value.action === "Remove" && value.exact_rule_present === false ? (value.status === "excluded" ? "本项目精确规则已撤销，但其他规则仍将此目录排除。" : "本项目精确规则已撤销。") : "结果为最近一次实际检查；外部更改后请重新检查。");
-  const paths = Array.isArray(value.paths) ? value.paths : [];
-  const exact = paths.length ? paths.filter(item => item.exact_rule_present).length : null;
-  $("security-diagnostic").textContent = [value.reason, value.error_type, value.exit_code == null ? null : `exit=${value.exit_code}`, value.errno == null ? null : `errno=${value.errno}`, value.winerror == null ? null : `winerror=${value.winerror}`, ...paths.map(item => `${item.leaf || "?"}:${item.status || "unknown"}`)].filter(Boolean).join(" · ");
-  $("security-data-dir").textContent = value.data_dir || "—";
-  $("security-pattern").textContent = (Array.isArray(value.patterns) && value.patterns.length ? value.patterns.join(" · ") : value.pattern) || "—";
-  $("security-rule").textContent = value.busy || value.exact_rule_present == null ? "尚未核验" : exact == null ? (value.exact_rule_present ? "存在" : "不存在（其他规则仍可能覆盖）") : `${exact}/${paths.length} 存在${exact === paths.length ? "" : "（部分缺失）"}`;
-  const flag = v => v == null ? "未知" : v ? "开启" : "关闭";
-  $("security-protection").textContent = `${flag(value.real_time_protection_enabled)} / ${flag(value.tamper_protected)}`;
-  $("security-checked-at").textContent = value.checked_at ? new Date(value.checked_at).toLocaleString() : "尚未检查";
-  $("security-script").textContent = `脚本：${value.script_path || "—"}`;
-  for (const action of ["check", "apply", "remove"]) $("security-" + action).disabled = !value.supported || value.busy;
-  renderWindowsSecurityHint();
-}
 async function refreshWindowsSecurity() {
-  clearTimeout(securityPoll);
-  try {
-    const value = await request("/api/windows-security");
-    renderWindowsSecurity(value);
-    if (value.busy || !$("security-view").hidden) securityPoll = setTimeout(refreshWindowsSecurity, value.busy ? 1500 : 10000);
-  } catch (_) {
-    renderWindowsSecurity({ ...state.windowsSecurity, status: "unknown", verified: false, reason: "helper_failed_or_blocked" });
-    if (!$("security-view").hidden) securityPoll = setTimeout(refreshWindowsSecurity, 10000);
-  }
-}
-async function changeWindowsSecurity(action) {
-  renderWindowsSecurity({ ...state.windowsSecurity, busy: true, status: "unknown", verified: false, reason: "awaiting_administrator_or_check" });
-  try {
-    renderWindowsSecurity(await request("/api/windows-security", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }) }));
-  } catch (_) { notify("操作请求结果未确认，正在读取当前状态；不会自动重发。"); }
-  await refreshWindowsSecurity();
+  try { state.windowsSecurity = await request("/api/windows-security"); renderWindowsSecurityHint(); }
+  catch (_) { state.windowsSecurity = { supported: true, status: "unknown" }; renderWindowsSecurityHint(); }
 }
 function showView(name, updateHistory = true) {
   if (name !== "detail") { clearTimeout(runPoll); runSelection += 1; }
   document.body.classList.toggle("detail-open", name === "detail");
   document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === (name === "detail" ? "tasks" : name)));
   document.querySelectorAll(".view").forEach((view) => { const active = view.id === `${name}-view`; view.hidden = !active; view.classList.toggle("active", active); });
-  $("current-view").textContent = name === "competition" ? "比赛控制" : name === "security" ? "Windows 安全配置" : name === "model" ? "模型角色" : name === "detail" ? "题目详情" : "任务与运行";
-  if (name === "model") loadModel();
-  if (name === "security") refreshWindowsSecurity();
+  $("current-view").textContent = name === "competition" ? "比赛控制" : name === "detail" ? "题目详情" : "任务与运行";
   if (name === "competition") CompetitionPage.load();
   if (updateHistory) {
     const route = name === "detail" ? (state.selected ? `#task/${state.selected}` : "#new") : `#${name}`;
@@ -428,7 +360,7 @@ function syncRoute() {
     if (state.tasks.some((task) => task.id === id)) { selectTask(id, false); showView("detail", false); return; }
   }
   if (route === "#new") { resetForm(); showView("detail", false); return; }
-  showView(route === "#competition" ? "competition" : route === "#security" ? "security" : route === "#model" ? "model" : "tasks", false);
+  showView(route === "#competition" ? "competition" : "tasks", false);
 }
 async function health() { try { const value = await request("/api/health"); state.executionProfile = value.capabilities?.execution_profile; $("profile-pill").textContent = state.executionProfile ? `profile ${state.executionProfile}` : `协议 v${value.capabilities?.protocol_version || 3}`; $("http-methods-control").hidden = !["d8_v20", "d8_v21", "d8_v22"].includes(state.executionProfile); $("run-mode").querySelector('option[value="real"]').textContent = value.capabilities?.real_sandbox_backend === "docker" ? "真实模型＋Docker Sandbox" : "真实模型＋本地模拟 Sandbox"; $("run-mode-control").hidden = !["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"].includes(state.executionProfile); if (["d8_v6", "d8_v7", "d8_v8", "d8_v9", "d8_v10", "d8_v11", "d8_v12", "d8_v13", "d8_v14", "d8_v15", "d8_v16", "d8_v17", "d8_v18", "d8_v19", "d8_v20", "d8_v21", "d8_v22"].includes(state.executionProfile)) { $("run-mode").value = value.capabilities.d7_mode || ""; $("run-mode").disabled = !!value.capabilities.d7_mode; } $("service-status").textContent = value.status === "ready" ? "服务已连接" : "服务状态异常"; $("connection-text").textContent = "回环服务"; } catch (_) { $("service-status").textContent = "服务未连接"; $("connection-text").textContent = "未连接"; $("profile-pill").textContent = "离线"; } }
 function toggleTaskSelection(taskId) {
@@ -482,11 +414,10 @@ async function batchCleanup() {
     notify(`批量清理失败：${error.message}`);
   }
 }
-function init() { document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view))); $("new-task").addEventListener("click", () => { resetForm(); showView("detail"); }); $("back-to-tasks").addEventListener("click", () => showView("tasks")); $("cancel-edit").addEventListener("click", () => showView("tasks")); $("refresh").addEventListener("click", () => loadTasks().catch((error) => notify(`刷新失败：${error.message}`))); $("show-archived").addEventListener("change", (event) => { state.showArchived = event.target.checked; renderTaskList(); }); $("select-mode").addEventListener("change", (event) => { toggleSelectMode(event.target.checked); }); $("batch-cleanup").addEventListener("click", batchCleanup); $("task-form").addEventListener("submit", saveTask); $("attachments").addEventListener("change", (event) => { const files = Array.from(event.target.files); const existing = state.tasks.find((item) => item.id === state.selected); if (state.pendingFiles.length + files.length + (existing?.attachments.length || 0) > 16) { notify("每题最多 16 个附件"); return; } state.pendingFiles.push(...files); renderAttachments(); if (existing) renderSavedAttachments(existing); }); $("archive-task").addEventListener("click", archiveTask); $("restore-task").addEventListener("click", restoreTask); $("purge-task").addEventListener("click", purgeTask); $("start-run").addEventListener("click", startRun); $("cancel-run").addEventListener("click", cancelRun); $("cleanup-run").addEventListener("click", cleanupRun); $("model-form").addEventListener("submit", saveModel); $("dual-model-form").addEventListener("submit", saveDualModel); $("mode-single").addEventListener("click", () => toggleModelMode("single")); $("mode-dual").addEventListener("click", () => toggleModelMode("dual")); $("clear-key").addEventListener("click", async () => { try { await request("/api/model/key", { method: "DELETE" }); $("model-key").value = ""; $("model-state").textContent = "未配置 Key"; notify("服务端内存 Key 已清除"); } catch (error) { notify(`清除失败：${error.message}`); } }); window.addEventListener("popstate", syncRoute); window.addEventListener("hashchange", syncRoute); health().then(refreshWindowsSecurity); loadTasks().then(syncRoute).catch((error) => { $("task-list").textContent = `服务未连接：${error.message}`; }); }
+function init() { document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view))); $("new-task").addEventListener("click", () => { resetForm(); showView("detail"); }); $("back-to-tasks").addEventListener("click", () => showView("tasks")); $("cancel-edit").addEventListener("click", () => showView("tasks")); $("refresh").addEventListener("click", () => loadTasks().catch((error) => notify(`刷新失败：${error.message}`))); $("show-archived").addEventListener("change", (event) => { state.showArchived = event.target.checked; renderTaskList(); }); $("select-mode").addEventListener("change", (event) => { toggleSelectMode(event.target.checked); }); $("batch-cleanup").addEventListener("click", batchCleanup); $("task-form").addEventListener("submit", saveTask); $("attachments").addEventListener("change", (event) => { const files = Array.from(event.target.files); const existing = state.tasks.find((item) => item.id === state.selected); if (state.pendingFiles.length + files.length + (existing?.attachments.length || 0) > 16) { notify("每题最多 16 个附件"); return; } state.pendingFiles.push(...files); renderAttachments(); if (existing) renderSavedAttachments(existing); }); $("archive-task").addEventListener("click", archiveTask); $("restore-task").addEventListener("click", restoreTask); $("purge-task").addEventListener("click", purgeTask); $("start-run").addEventListener("click", startRun); $("cancel-run").addEventListener("click", cancelRun); $("cleanup-run").addEventListener("click", cleanupRun); window.addEventListener("popstate", syncRoute); window.addEventListener("hashchange", syncRoute); health().then(refreshWindowsSecurity); loadTasks().then(syncRoute).catch((error) => { $("task-list").textContent = `服务未连接：${error.message}`; }); }
 document.addEventListener("DOMContentLoaded", init);
 document.addEventListener("DOMContentLoaded", () => {
   $("run-mode").addEventListener("change", renderWindowsSecurityHint);
-  for (const action of ["Check", "Apply", "Remove"]) $("security-" + action.toLowerCase()).addEventListener("click", () => changeWindowsSecurity(action));
 });
 document.addEventListener("DOMContentLoaded", () => $("resume-run").addEventListener("click", resumeRun));
 document.addEventListener("DOMContentLoaded", () => $("force-repair").addEventListener("click", forceRepair));

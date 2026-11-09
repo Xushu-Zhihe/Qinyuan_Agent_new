@@ -1,0 +1,9 @@
+[project]
+name = "qinyuan-desktop"
+version = "0.1.0"
+requires-python = ">=3.11,<3.14"
+dependencies = ["pywebview>=6,<7", "python-dotenv>=1,<2"]
+
+[dependency-groups]
+build = ["pyinstaller>=6,<7"]
+verify = ["playwright>=1.55,<2", "pytest>=9,<10"]

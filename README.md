@@ -50,11 +50,33 @@ uv sync --frozen
 
 `pyproject.toml` 声明项目依赖，`uv.lock` 锁定具体版本，两者都应保留。
 
+### 桌面启动器
+
+运行 `start-launcher.cmd` 打开 Python＋WebView2 桌面启动器。桌面环境由 `desktop/pyproject.toml` 和独立锁文件管理，不依赖 Agent `.venv` 完整。四个模块为启动、设置、检测、下载；浏览器工作台只保留比赛控制、任务与运行。
+
+在启动页配置 NSSCTF 或 TSecBench 连接、并发与时长默认值。配置管理复用原平台存储，尚未启动工作台时不启动 Agent 或赛程；点击“启动工作台”才启动/连接本地服务并打开浏览器，实际开赛仍由浏览器明确触发。BenchAgent 显示待定，不自动获取扣分提示。
+
+“设置 → 外观”提供背景图片添加、移除与 0–100% 不透明度滑动条，拖动实时预览，松开后保存。支持 PNG/JPEG/WebP（最大 16 MiB），仅保存一个本地副本 `.launcher-background`；背景副本不进入 Git 或 Docker 构建上下文。启动器 EXE 与窗口使用 `frontend/assets/launcher.ico` 多尺寸图标。
+
+模型和 Agent 普通配置保存到项目 `.env`，模型密钥按角色与端点关联，由 Windows 当前用户 DPAPI 保存在 `.launcher-secrets`；比赛凭据按原 profile 身份关联。GUI 不回显密钥。已有 `OPENAI_API_KEY` 可通过设置页明确迁移，核验加密存储后移除明文键。桌面配置启用后，真实模型从加密存储读取凭据；未迁移或未填密钥时真实运行预检拒绝，不隐式转发旧明文密钥。Outer/Inner 可以共用连接或分别使用现有已验证模型/端点，容量仍按各角色实际策略冻结。
+
+“下载 → 项目依赖”使用 `uv sync --locked`；同步前停止相关项目进程。“下载 → Sandbox 镜像”从项目根目录构建 `Sandbox/dockerfile`、`windows.dockerfile` 和 `target_forwarder.dockerfile`，Windows 构建先准备 Linux。构建与运行身份核验分别展示，固定 ID 不符时保持待处理，不自动改写身份。Docker 构建可能联网；取消客户端后无法证明服务端停止时显示待核验。
+
+启动器关闭时，活动运行可继续后台运行，或沿原控制链安全暂停赛程/停止普通任务后退出；未知停止不能宣称成功。桌面日志使用原 sys 通道并按错误类别和安全码记录，位于数据目录 `launcher.log.jsonl`，最多保留一个 2 MiB 备份。准备页日志按准备/环境核验筛选并支持复制。
+
+独立 EXE 的构建命令：
+
+```powershell
+uv run --project desktop --group build --locked pyinstaller --noconfirm --distpath desktop/dist --workpath desktop/build desktop/launcher.spec
+```
+
+产物为 `desktop/dist/QinyuanLauncher.exe`，可在当前项目内运行；外置发行使用 `--project <项目根目录>` 指定 Agent 项目。宿主仍需要 WebView2/.NET 运行支持；启动器不自动安装 Docker Desktop 或调整系统防护。
+
 ### Windows 安全配置
 
 “配置排除（管理员）”和“检查”在管理员助手返回后，继续由工作台实际用户运行 HTTP 证据读写自检。自检复用正式存储的路径固定、SID-only ACL、DPAPI 加密、完整写入发布、校验与解密读取，在当前数据目录下创建临时测试内容并清理；不读取现有任务证据或访问网络。页面分别显示 Defender 排除和当前用户读写结果，权限／目录占用错误不会被“排除已生效”掩盖。失败保留手动启动；检查结果仅代表该时点，不保证后续不存在目录占用、权限变化或磁盘故障。无需新增按钮。
 
-启动后打开侧栏 **Windows 安全配置**，集中检查、配置或撤销当前数据目录的 Microsoft Defender 排除规则。按钮由本地服务发起标准 UAC 管理员确认；页面自动跟踪操作完成并显示核验时间，外部改动后请重新点击检查。未核验、取消或配置失败均只提示，允许继续运行，不会自动重试配置或重新执行任务。固定助手子进程使用 `-ExecutionPolicy Bypass` 加载内置脚本，只放宽该子进程的脚本检查；不修改用户/系统全局执行策略，组策略、UAC 和 Defender 权限仍有效。更新后端代码后需要重启工作台，仅刷新网页不会重新加载后端。
+在桌面启动器中打开 **设置 → Windows 安全配置**，集中检查、配置或撤销当前数据目录的 Microsoft Defender 排除规则。按钮由本地服务发起标准 UAC 管理员确认；页面自动跟踪操作完成并显示核验时间，外部改动后请重新点击检查。未核验、取消或配置失败均只提示，允许继续运行，不会自动重试配置或重新执行任务。固定助手子进程使用 `-ExecutionPolicy Bypass` 加载内置脚本，只放宽该子进程的脚本检查；不修改用户/系统全局执行策略，组策略、UAC 和 Defender 权限仍有效。更新后端代码后需要重启工作台，仅刷新网页不会重新加载后端。
 
 规则固定为三条叶子目录：`<实际 data-dir>\runs\*\agent-state\*\stage-evidence`、`<实际 data-dir>\runs\*\agent-state\*\d7-http-evidence`、`<实际 data-dir>\runs\*\agent-state\*\sensitive-evidence`，覆盖后续运行；不排除整个项目、`runs`、`agent-state`、Python 或 Docker 进程。配置一次追加三条精确规则，撤销只移除这三条，均不关闭实时保护或防篡改。匹配目录中的真实恶意样本也会跳过常规内容扫描；其他目录和 EDR/行为告警不在本规则保证范围内。目录排除是否生效由 `MpCmdRun -CheckExclusion` 逐条核验，规则存在和实际生效分别显示；普通权限不可见时保持未知。参见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-exclusions-configure)。
 
@@ -68,7 +90,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent_adapters\windows
 
 脚本默认 Check，不修改 Defender 配置；会创建并清理空目录以验证路径，不读取或执行恶意样本。JSON 的 `status` 区分 `excluded`、`not_excluded`、`unknown`；`exact_rule_present` 单独表示本项目规则是否存在，撤销后其他排除项仍可能覆盖目录。退出码 0/1/2 分别表示已排除/未排除/无法核验，撤销成功后通常为 1。上面命令的 Bypass 只影响新开的固定助手进程。如组织策略或 Defender 服务限制仍使其无法完成，请由管理员处理或在 Windows 安全中心管理同一范围；工作台不会绕过组织策略。
 
-启动工作台：
+也可单独启动浏览器工作台：
 
 ```powershell
 .\start-workbench.cmd
@@ -104,7 +126,7 @@ if (-not (Test-Path .env)) {
 |---|---|
 | `QINYUAN_LLM_BACKEND` | 当前真实链路使用 `openai` 兼容传输 |
 | `QINYUAN_MODEL` | 当前部署实际可用的 DeepSeek 模型名称 |
-| `OPENAI_API_KEY` | 模型平台密钥 |
+| `OPENAI_API_KEY` | 独立 CLI 的明文配置入口；桌面模式应迁移到当前用户加密存储 |
 | `QINYUAN_SEARCH_API_KEY` | 可选，DeepSeek官方Search/Fetch独立凭据；不随主模型切换 |
 | `OPENAI_BASE_URL` | 必须与当前适配器冻结的传输地址一致 |
 | `QINYUAN_LLM_TIMEOUT_SECONDS` | 单次总时限，默认 `600` 秒，受 TaskRun 剩余时间约束 |

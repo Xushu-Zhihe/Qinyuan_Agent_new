@@ -48,7 +48,7 @@ agent_adapters = ["*.ps1"]
 Skills = ["**/*.md", "**/*.py", "**/*.json"]
 "MCPs.Mcp_client" = ["registry.json"]
 "MCPs.LibcSearcher_Mcp" = ["database.json"]
-frontend = ["*.html", "*.js", "*.css"]
+frontend = ["*.html", "*.js", "*.css", "assets/*.ico", "assets/*.png"]
 
 [tool.uv]
 package = true

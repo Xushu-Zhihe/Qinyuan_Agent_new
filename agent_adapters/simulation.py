@@ -35,12 +35,17 @@ def simulation_config(*, rolling=False):
 
 def real_config(*, contract_version=6, http=False, http_timeout_seconds=60, rolling=True):
     from agent_adapters.deepseek_roles import default_capacity_policy, TRANSPORT
+    from agent_adapters.launcher_settings import role_values
     capacity_policy = default_capacity_policy()
     result = {"handoff_config": asdict(D8HandoffConfig(
-                capacity_policy, capacity_policy,
+                capacity_policy, default_capacity_policy("inner_action"),
                 D8Capacity())),
             "d5_sensitive_requirements": [], "model_transport": dict(TRANSPORT),
             "sandbox_backend": "local_simulated"}
+    values, _, endpoint, _ = role_values("outer_planning")
+    if values.get("QINYUAN_DESKTOP_SETTINGS") == "1":
+        inner_endpoint = role_values("inner_action")[2]
+        result["model_transport"].update(base_url=endpoint, inner_base_url=inner_endpoint)
     if contract_version in {18, 19, 20, 21, 22}:
         from agent_adapters.docker_profile import sandbox_config
         result.update(sandbox_backend="docker", sandbox_config=sandbox_config())

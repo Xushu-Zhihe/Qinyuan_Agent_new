@@ -26,17 +26,12 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="7" height="7" rx="1.6"/><rect x="14" y="4" width="7" height="7" rx="1.6"/><rect x="3" y="14" width="7" height="7" rx="1.6"/><rect x="14" y="14" width="7" height="7" rx="1.6"/></svg>
             </span>任务与运行
           </button>
-          <button class="nav-item" type="button" data-view="model">
-            <span class="nav-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3.2"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
-            </span>模型角色
-          </button>
-          <button class="nav-item" type="button" data-view="security"><span class="nav-icon" aria-hidden="true">◇</span>Windows 安全配置</button>
+
         </nav>
 
         <div class="rail-foot">
           <span class="status-dot"></span><strong id="service-status">连接检查中</strong>
-          <p>只监听回环地址。密钥仅存在于服务进程内存。</p>
+          <p>本地运行控制台。模型与环境设置在桌面启动器中管理。</p>
         </div>
       </aside>
 
@@ -52,16 +47,10 @@
 
         <section id="competition-view" class="view" hidden>
           <div class="page-head c-page-head">
-            <div><p class="eyebrow">QINYUAN / COMPETITION DESK</p><h1>比赛启动器</h1><p class="subheading">选择平台模板与连接配置，管理题目、赛程和 Agent 进展。</p></div>
+            <div><p class="eyebrow">QINYUAN / COMPETITION DESK</p><h1>比赛控制</h1><p class="subheading">管理题目、赛程和 Agent 进展；连接与环境设置由桌面启动器管理。</p></div>
             <span id="competition-bound-source" class="section-meta">尚未绑定赛程</span>
           </div>
-          <section class="c-panel c-launcher" aria-label="平台模板与连接配置">
-            <div><h2>选择比赛模板</h2><p class="competition-note">每个平台可保存多份连接配置；选择模板不会领取或启动题目。</p></div>
-            <div id="competition-templates" class="c-template-grid"></div>
-            <div class="competition-heading"><h3 id="competition-config-title">已保存配置</h3><button id="competition-create-profile" class="quiet-button" type="button">＋ 为此模板新建配置</button></div>
-            <div id="competition-configurations" class="c-config-list"></div>
-            <p id="competition-template-note" class="competition-note"></p>
-          </section>
+          <section class="c-panel"><div class="competition-heading"><h2>比赛连接</h2><label class="field"><span>桌面启动器已保存的配置</span><select id="competition-profile"><option value="">尚无配置</option></select></label></div><input id="competition-adapter" type="hidden" value="arena"><p id="competition-template-note" class="competition-note">请在桌面启动器中配置平台与凭据。</p></section>
           <section class="c-command c-panel" aria-label="赛程控制">
             <label class="field"><span>查看题目槽位（单题加时作用于此槽位，其余控制作用于整个赛程）</span><select id="competition-lane"><option value="">当前赛程</option></select></label>
             <div class="c-command-head"><span class="c-live-dot" aria-hidden="true"></span><p id="competition-schedule-status" role="status">尚未创建赛程</p><span id="competition-freshness" class="competition-note">等待读取</span></div>
@@ -114,20 +103,6 @@
             </div>
             <aside class="c-inspector" aria-label="比赛配置与截止状态">
               <section class="c-panel"><h2>截止与限制来源</h2><dl id="competition-deadlines" class="c-facts"></dl><div id="competition-schedule-progress" class="competition-note"></div></section>
-<details class="competition-settings c-panel" open><summary>比赛来源与凭据</summary>
-              <div class="competition-heading"><h2>比赛配置</h2><button id="competition-new" class="quiet-button" type="button">＋ 新建</button></div>
-              <label class="field"><span>已保存配置</span><select id="competition-profile"><option value="">新建配置</option></select></label>
-              <form id="competition-form">
-                <fieldset id="competition-fields" class="competition-fields">
-                  <label class="field"><span>配置名称</span><input id="competition-name" maxlength="80" required placeholder="例如：训练场 Arena"></label>
-                  <label class="field"><span>平台模板</span><select id="competition-adapter"><option value="arena">NSSCTF Arena</option><option value="benchmark">TSecBench</option></select></label>
-                  <label class="field"><span>平台根地址</span><input id="competition-url" type="url" required maxlength="2048" placeholder="https://www.nssctf.cn"><small>活跃来源锁定；同源凭据可修正。</small></label>
-                  <label class="field"><span>读取超时（秒）</span><input id="competition-timeout" type="number" min="1" max="60" value="10" required></label>
-                  <label class="field"><span id="competition-credential-label">Agent Token（不含 Bearer 前缀）</span><input id="competition-credential" type="password" autocomplete="new-password" maxlength="8192" placeholder="只发送给本地服务；留空保留同配置凭据"><small>凭据仅保存在服务进程内存，重启后需重新输入。</small></label>
-                </fieldset>
-                <div class="form-actions"><button id="competition-save" class="secondary-button" type="submit">保存配置</button><button id="competition-clear" class="quiet-button" type="button" disabled>清除凭据</button></div>
-              </form>
-            </details>
               <details class="c-panel" id="competition-run-settings" open><summary>新赛程参数</summary>
 <form id="competition-schedule-form">
                   <fieldset id="competition-schedule-fields" class="competition-fields">
@@ -217,7 +192,7 @@
               </div>
             </header>
 
-            <p id="windows-security-hint" class="run-read-error" hidden>Windows 证据目录排除或当前用户读写尚未通过核验。<a href="#security">打开安全配置</a>；仍可手动继续运行。</p>
+            <p id="windows-security-hint" class="run-read-error" hidden>Windows 证据目录排除或当前用户读写尚未通过核验。请在桌面启动器的“设置 → Windows 安全配置”中核验；仍可手动继续运行。</p>
             <section id="run-confirmation" class="run-confirmation" aria-label="候选答案人工确认" aria-live="polite" hidden></section>
             <section id="run-focus" class="run-focus" aria-label="当前运行状态" aria-live="polite" hidden></section>
             <div id="run-stages" class="run-stages" aria-label="运行概览，各项可并行推进"></div>
@@ -345,120 +320,6 @@
           </section>
         </section>
 
-        <section id="security-view" class="view" hidden aria-labelledby="security-title">
-          <div class="page-head">
-            <div><p class="eyebrow">LOCAL ENVIRONMENT</p><h1 id="security-title">Windows 安全配置</h1>
-              <p class="subheading">配置证据目录排除后，以工作台当前用户验证 HTTP 证据的目录权限、加密写入和读取。失败会显示原因，仍可手动开始任务。</p></div>
-          </div>
-          <section class="c-panel security-panel">
-            <h2>Microsoft Defender · 证据目录</h2>
-            <p id="security-status" role="status" aria-live="polite">尚未检查</p>
-            <p id="security-reason"></p>
-            <p id="security-diagnostic" class="section-meta"></p>
-            <dl class="security-scope">
-              <dt>数据目录</dt><dd id="security-data-dir">—</dd>
-              <dt>本项目排除规则</dt><dd id="security-pattern">—</dd>
-              <dt>精确规则</dt><dd id="security-rule">尚未核验</dd>
-              <dt>当前用户证据读写</dt><dd id="security-evidence-access">尚未验证</dd>
-              <dt>实时保护 / 防篡改</dt><dd id="security-protection">尚未读取</dd>
-              <dt>最近检查 / 操作时间</dt><dd id="security-checked-at">尚未检查</dd>
-            </dl>
-            <div class="form-actions">
-              <button id="security-check" class="secondary-button" type="button">检查（管理员）</button>
-              <button id="security-apply" class="primary-button" type="button">配置排除（管理员）</button>
-              <button id="security-remove" class="danger-button" type="button">撤销本项目规则（管理员）</button>
-            </div>
-            <p class="subheading">一次配置覆盖所有运行的 stage-evidence、d7-http-evidence、sensitive-evidence 三个证据目录；其中保存的真实恶意样本也会跳过常规内容扫描。实时保护与防篡改设置保持原状，其他排除规则保持原状。</p>
-            <p class="subheading">点击按钮后按 Windows 管理员提示确认。配置助手的独立子进程使用 ExecutionPolicy Bypass 加载内置脚本，仅该子进程放宽脚本检查，不更改全局执行策略，组织策略和 Defender 权限限制仍有效。页面自动更新操作进度，结果以显示的核验时间为准；外部修改安全设置后请重新检查。撤销只移除上面列出的三条精确规则，其他规则可能仍覆盖这些目录。</p>
-            <details><summary>脚本与故障处理</summary><p id="security-script" class="subheading"></p><p class="subheading">取消管理员确认、组织策略或脚本执行策略限制，都会显示“无法确认”；不会关闭保护、自动重试或禁止任务运行。命令行使用说明见 README 的 Windows 安全配置。</p></details>
-          </section>
-        </section>
-
-        <!-- ============ 模型 ============ -->
-        <section id="model-view" class="view" hidden>
-          <div class="page-head">
-            <div>
-              <p class="eyebrow">PROCESS MEMORY ONLY</p>
-              <h1>模型角色</h1>
-              <p class="subheading">外层负责规划与审核，内层负责执行与自判。两者各自独立请求，共用一份进程内密钥。</p>
-            </div>
-            <span class="phase-pill">Key 不落盘</span>
-          </div>
-
-          <div class="model-mode-toggle">
-            <button id="mode-single" class="mode-button active" type="button">单模型模式</button>
-            <button id="mode-dual" class="mode-button" type="button">双 LLM 角色模式</button>
-          </div>
-
-          <div id="single-model-section" class="model-grid">
-            <section class="section-block">
-              <div class="section-heading"><div><span class="section-index">01</span><h2>供应商</h2></div><span id="model-state" class="section-meta">未读取</span></div>
-              <form id="model-form">
-                <label class="field"><span>接口类型</span><select id="model-provider"><option value="deepseek">DeepSeek</option><option value="openai_compatible">自定义 OpenAI 兼容</option></select></label>
-                <label class="field"><span>模型名称</span><input id="model-name" required maxlength="128" placeholder="deepseek-chat"></label>
-                <label class="field"><span>Base URL</span><input id="model-url" required maxlength="2048" spellcheck="false" placeholder="https://api.deepseek.com"></label>
-                <label class="field"><span>API Key</span><input id="model-key" type="password" autocomplete="new-password" required placeholder="仅发送到本地服务内存"></label>
-                <div class="form-actions"><button class="primary-button" type="submit">应用配置</button><button id="clear-key" class="secondary-button" type="button">清除内存 Key</button></div>
-              </form>
-            </section>
-            <aside class="side-note">
-              <h2>配置边界</h2>
-              <p>服务进程重启后必须重新填写 Key。页面不使用 localStorage、草稿文件或 URL 保存密钥。</p>
-              <dl>
-                <div><dt>协议</dt><dd>OpenAI Chat Completions JSON</dd></div>
-                <div><dt>DeepSeek</dt><dd>仅 HTTPS 官方地址</dd></div>
-                <div><dt>自定义端点</dt><dd>仅 HTTPS，无凭据嵌入</dd></div>
-              </dl>
-            </aside>
-          </div>
-
-          <div id="dual-model-section" class="model-grid" hidden>
-            <section class="section-block dual-llm-config">
-              <div class="section-heading"><div><span class="section-index">01</span><h2>双 LLM 角色</h2></div><span id="dual-model-state" class="section-meta">未配置</span></div>
-
-              <form id="dual-model-form">
-              <div class="role-flow">
-                <div class="role-card outer-role-card">
-                  <div class="role-header">
-                    <span class="role-icon">◐</span>
-                    <div><h3>Outer · 外层</h3><p class="role-desc">规划 Turn 与 Intent，复核证据，判定结论</p></div>
-                  </div>
-                  <label class="field"><span>模型名称</span><input id="outer-model-name" required maxlength="128" placeholder="deepseek-chat"></label>
-                  <ul class="role-duty"><li>决定下一跳做什么</li><li>只有它能写 verified Fact</li></ul>
-                </div>
-
-                <div class="role-separator">
-                  <span class="separator-line"></span>
-                  <span class="separator-icon">⇄</span>
-                  <span class="separator-line"></span>
-                  
-                </div>
-
-                <div class="role-card inner-role-card">
-                  <div class="role-header">
-                    <span class="role-icon">◑</span>
-                    <div><h3>Inner · 内层</h3><p class="role-desc">按单个 Intent 执行动作，自判并提交证据</p></div>
-                  </div>
-                  <label class="field"><span>模型名称</span><input id="inner-model-name" required maxlength="128" placeholder="deepseek-chat"></label>
-                  <ul class="role-duty"><li>生命周期等于一个 Intent</li><li>只能提议，不能自写结论</li></ul>
-                </div>
-              </div>
-
-              <label class="field shared-key-field"><span>共享 API Key</span><input id="dual-model-key" type="password" autocomplete="new-password" required placeholder="仅发送到本地服务内存"></label>
-              <div class="form-actions"><button class="primary-button" type="submit">应用双角色配置</button></div>
-              </form>
-            </section>
-            <aside class="side-note">
-              <h2>为什么要两个角色</h2>
-              <p>执行者最清楚现场，但也最想证明自己成功。把「做」和「算不算数」分开，结论才可复核。</p>
-              <dl>
-                <div><dt>Outer</dt><dd>高层决策、任务规划、结果审查</dd></div>
-                <div><dt>Inner</dt><dd>工具调用、命令执行、观察记录</dd></div>
-                <div><dt>交接物</dt><dd>Intent Fact 候选 + 证据 + 下一跳提案</dd></div>
-              </dl>
-            </aside>
-          </div>
-        </section>
       </main>
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>

@@ -53,7 +53,11 @@ def model_capacity_policy(model, endpoint):
     raise ValueError("d8_model_capacity_configuration_unsupported")
 
 
-def default_capacity_policy():
+def default_capacity_policy(role="outer_planning"):
+    from agent_adapters.launcher_settings import role_values
+    values, model, endpoint, _ = role_values(role)
+    if values.get("QINYUAN_DESKTOP_SETTINGS") == "1":
+        return model_capacity_policy(model, endpoint)
     return model_capacity_policy(MODEL, TRANSPORT["base_url"])
 
 
@@ -146,17 +150,33 @@ def _configured_model():
 
 
 MODEL = _configured_model()
+_BOUND_ENDPOINTS = {}
+
+
+def role_endpoint(role):
+    if role in _BOUND_ENDPOINTS:
+        return _BOUND_ENDPOINTS[role]
+    from agent_adapters.launcher_settings import role_values
+    values, _, endpoint, _ = role_values(role.role)
+    return endpoint if values.get("QINYUAN_DESKTOP_SETTINGS") == "1" else TRANSPORT["base_url"]
 
 
 def role_config(role, *, version=1):
     if version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}:
         raise ValueError("d8_prompt_version_unsupported")
-    return D1RoleConfig(role, "deepseek", MODEL,
+    from agent_adapters.launcher_settings import role_values
+    values, model, _, _ = role_values(role)
+    return D1RoleConfig(role, "deepseek", model if values.get("QINYUAN_DESKTOP_SETTINGS") == "1" else MODEL,
                         "qinyuan.d8." + ("inner" if role == "inner_action" else "outer") + f".v{version}", PARAMETERS)
 
 
 def validate_role(role, *, version=None):
     allowed = (version,) if version is not None else (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
+    if role in _BOUND_ENDPOINTS:
+        # A live CLI run keeps its already validated model/endpoint binding.
+        expected = D1RoleConfig(role.role, "deepseek", role.model, role.prompt_template, PARAMETERS)
+        if role == expected and any(role.prompt_template == "qinyuan.d8." + ("inner" if role.role == "inner_action" else "outer") + f".v{v}" for v in allowed):
+            return
     if all(role != role_config(role.role, version=v) for v in allowed):
         raise ValueError("d8_real_role_configuration_mismatch")
 
@@ -168,6 +188,20 @@ def settings_from_file(role, env_file):
     if path.is_symlink() or not path.is_file():
         raise ValueError("d8_model_configuration_unavailable")
     values = dotenv_values(path, interpolate=False)
+    if values.get("QINYUAN_DESKTOP_SETTINGS") == "1":
+        from agent_adapters.launcher_settings import SecretStore, role_values, model_secret_key
+        values, model, endpoint, secret = role_values(role.role, path)
+        if model != role.model or endpoint != role_endpoint(role):
+            raise ValueError("d8_model_transport_configuration_mismatch")
+        model_capacity_policy(model, endpoint)
+        from agent_adapters.deepseek_model import stream_timeouts_from_values
+        custom = endpoint != "https://api.deepseek.com"
+        if custom and values.get("QINYUAN_ALLOW_CUSTOM_ENDPOINT") != "1":
+            raise ValueError("d8_custom_endpoint_requires_explicit_opt_in")
+        key = SecretStore(path.parent / ".launcher-secrets").get(model_secret_key(secret, endpoint)) or ""
+        return DeepSeekSettings(model, key, endpoint,
+            float(values.get("QINYUAN_LLM_TIMEOUT_SECONDS") or TRANSPORT["timeout_seconds"]),
+            allow_custom_endpoint=custom, **stream_timeouts_from_values(values))
     try:
         timeout = float(values.get("QINYUAN_LLM_TIMEOUT_SECONDS") or TRANSPORT["timeout_seconds"])
     except (TypeError, ValueError):
@@ -388,7 +422,7 @@ def build_payload(envelope, role, *, context_loader=None, image_loader=None):
         if images:
             from agent_adapters.image_observations import attach_images
             payload = attach_images(payload, images,
-                image_loader if TRANSPORT['base_url'] == 'https://api.deepseek.com' else None,
+                image_loader if role_endpoint(role) == 'https://api.deepseek.com' else None,
                 model=stage_runtime(request).get('image_model', 'deepseek-flash'))
         return payload
 
@@ -961,7 +995,7 @@ class EstimatedCapacity:
             image_loader=getattr(self, 'image_loader', None))
         size = len(payload_bytes(payload))
         requested_output = payload.get("max_tokens", policy.output_reserve_units)
-        if (policy != model_capacity_policy(role.model, TRANSPORT["base_url"])
+        if (policy != model_capacity_policy(role.model, role_endpoint(role))
                 or type(requested_output) is not int
                 or not 0 < requested_output <= policy.output_reserve_units):
             raise ValueError("d22_model_capacity_binding_mismatch")
@@ -1067,9 +1101,12 @@ def _invoke_with_connect_retry(transport, payload, timeout_seconds, token, diagn
 class D8DeepSeekModel:
     def __init__(self, role, settings, *, transport=None):
         validate_role(role)
-        if settings.model != role.model or settings.base_url != TRANSPORT["base_url"]:
+        if settings.model != role.model or settings.base_url != role_endpoint(role):
             raise ValueError("d8_model_transport_configuration_mismatch")
         self.role_config, self.settings = role, settings
+        from agent_adapters.launcher_settings import role_values
+        if role_values(role.role)[0].get("QINYUAN_DESKTOP_SETTINGS") == "1":
+            _BOUND_ENDPOINTS[role] = settings.base_url
         self.transport = transport or DeepSeekModelAdapter(settings, worker=_raw_http_worker)
         self._runtime = None
         self._diagnostic_evidence = None

@@ -73,88 +73,50 @@ const CompetitionPage = (() => {
   const node = (tag, text, cls) => { const n = document.createElement(tag); n.textContent = text; if (cls) n.className = cls; return n; };
   const status = (text) => { el("status").textContent = text; };
   function controls() {
-    el("fields").disabled = busy;
-    const locked = session && session.state.status !== "finished" && session.config.profile.id === current?.id;
-    el("adapter").disabled = el("url").disabled = busy || Boolean(locked);
     sessionControls();
-    for (const id of ["profile", "new", "save"]) el(id).disabled = busy;
-    el("check").disabled = busy || dirty || !current;
-    el("clear").disabled = busy || dirty || !current?.credential_configured;
-    renderLauncher();
+    el("profile").disabled=busy || sessionBusy;
+    el("check").disabled=busy || !current;
   }
   function resetPreview() { previewItems = []; selectedRemote = ""; el("question-picker").replaceChildren(new Option("尚未读取题目", "")); el("preview").replaceChildren(node("p", "尚未读取当前配置的题目信息。")); el("summary").replaceChildren(); renderQueue(); }
   function template() {return templates.find(item=>item.id===el("adapter").value);}
   function credentialLabel() {
     const selected=template();
     if (!selected) return;
-    el("credential-label").textContent=selected.credential_label;
     el("template-note").textContent=selected.note;
     el("concurrency-field").hidden=!selected.queue;
     if (!selected.queue) el("concurrency").value="1";
     el("order-note").hidden=!selected.level_order;
   }
-  function renderLauncher() {
-    const adapter=el("adapter").value;
-    el("templates").replaceChildren(...templates.map(item=> {
-      const button=node("button",undefined,"c-template-card");button.type="button";
-      button.setAttribute("aria-pressed",String(item.id===adapter));button.disabled=busy || sessionBusy;
-      button.append(node("strong",item.name),node("span",item.description));
-      button.addEventListener("click",()=> {
-        if(item.id===el("adapter").value)return;
-        const saved=profiles.find(profile=>profile.adapter===item.id);
-        select(saved || null,item.id);
-      });return button;
-    }));
-    el("config-title").textContent=`${template()?.name || adapter} · 已保存配置`;
-    const matching=profiles.filter(profile=>profile.adapter===adapter);
-    el("configurations").replaceChildren(...matching.map(profile=> {
-      const button=node("button",undefined,"c-config-card");button.type="button";
-      button.setAttribute("aria-pressed",String(profile.id===current?.id));button.disabled=busy || sessionBusy;
-      button.append(node("strong",profile.name),node("span",profile.base_url),node("small",profile.credential_configured ? "凭据已配置" : "待配置凭据"));
-      button.addEventListener("click",()=>select(profile));return button;
-    }));
-    if(!matching.length)el("configurations").append(node("p","尚无配置，点击新建后填写连接信息。","competition-note"));
-    el("create-profile").disabled=busy || sessionBusy;
-  }
   function options() {
-    el("profile").replaceChildren(new Option("新建配置", ""), ...profiles.map(p => new Option(p.name, p.id)));
+    el("profile").replaceChildren(new Option("请在桌面启动器中保存配置", ""), ...profiles.map(p => new Option(p.name, p.id)));
     el("profile").value = current?.id || "";
   }
   function select(profile, adapter=profile?.adapter || el("adapter").value || "arena") {
     if(profile?.id!==current?.id || !profile) {el("queue").value="";el("concurrency").value="1";}
     revision += 1; current = profile;
-    el("name").value = profile?.name || "";
     el("adapter").value = adapter;
-    el("url").value = profile?.base_url ?? template()?.base_url ?? "";
     const flagHeadInput = el("flag-head"); if (flagHeadInput) flagHeadInput.value = el("adapter").value === "arena" ? "NSSCTF" : "";
-    el("timeout").value = profile?.timeout_seconds || 10;
-    el("credential").value = "";
     dirty = !profile;
-    credentialLabel(); options(); resetPreview(); controls(); renderLauncher();
-    status(profile ? (profile.credential_configured ? "凭据已配置，尚未检查连接。" : "配置已保存；请输入平台凭据后保存。") : "新建比赛配置后即可检查连接。");
+    credentialLabel(); options(); resetPreview(); controls();
+    status(profile ? (profile.credential_configured ? "凭据已配置，尚未检查连接。" : "请在桌面启动器中补充该连接的凭据。") : "请在桌面启动器中保存比赛连接配置。");
   }
   async function load() {
     if (busy) return;
     try {
       const firstLoad=!initialized;
       [profiles,templates] = await Promise.all([request(endpoint),request("/api/competition/templates")]);
-      if (!initialized) { initialized = true; select(profiles[0] || null); }
+      if (!initialized) {
+        initialized = true;
+        const defaults=await request("/api/launch-defaults");
+        select(profiles.find(p=>p.id===defaults.QINYUAN_LAUNCH_PROFILE) || profiles[0] || null);
+        el("question-minutes").value=defaults.QINYUAN_LAUNCH_QUESTION_MINUTES;
+        el("overall-minutes").value=defaults.QINYUAN_LAUNCH_OVERALL_MINUTES;
+        el("concurrency").value=current?.adapter==="benchmark"?defaults.QINYUAN_LAUNCH_CONCURRENCY:"1";
+      }
       else {if(!dirty && current) current=profiles.find(profile=>profile.id===current.id) || current;options();controls();}
-      renderLauncher();await refreshSession();
+     await refreshSession();
       if(firstLoad && session) {const bound=profiles.find(profile=>profile.id===session.config.profile.id);if(bound && bound.id!==current?.id) {select(bound);renderSession();renderQueue();}}
     } catch (e) { status(errors[e.message] || `本地配置读取失败：${e.message}`); }
-  }
-  async function save(event) {
-    event.preventDefault(); revision += 1; busy = true; controls();
-    try {
-      const value = { name: el("name").value, adapter: el("adapter").value, base_url: el("url").value,
-        timeout_seconds: Number(el("timeout").value), credential: el("credential").value };
-      const result = await request(current ? `${endpoint}/${current.id}` : endpoint, {method: current ? "PUT" : "POST",
-        headers: {"Content-Type":"application/json"}, body: JSON.stringify(value)});
-      profiles = profiles.filter(p => p.id !== result.id); profiles.push(result);
-      select(result);
-    } catch (e) { status(errors[e.message] || `配置保存失败：${e.message}`); }
-    finally { el("credential").value = ""; busy = false; controls(); }
   }
   function render(value) {
     const {items:allItems, agent} = value.preview;
@@ -223,14 +185,7 @@ const CompetitionPage = (() => {
     } catch (e) { status(errors[e.message] || `连接检查失败：${e.message}`); }
     finally { busy = false; controls(); }
   }
-  async function clear() {
-    busy = true; controls();
-    try {
-      const result = await request(`${endpoint}/${current.id}/credential`, {method:"DELETE"});
-      profiles = profiles.map(p => p.id === result.id ? result : p); select(result);
-    } catch (e) { status(errors[e.message] || `凭据清除失败：${e.message}`); }
-    finally { busy = false; controls(); }
-  }
+
   function sessionControls() {
     const active = lanes.some(row=>row.state.status!=="finished");
     el("schedule-fields").disabled = sessionBusy || Boolean(active);
@@ -244,7 +199,7 @@ const CompetitionPage = (() => {
     el("queue").disabled = el("fill-queue").disabled = sessionBusy || Boolean(active) || current?.adapter!=="benchmark";
     el("sort-level").disabled=sessionBusy || busy || Boolean(active) || !template()?.level_order || !draftQueue().length;
     el("lane").disabled=sessionBusy || Boolean(pendingExtension);
-    el("adapter").disabled = el("url").disabled = busy || Boolean(active && session.config.profile.id===current?.id);
+    el("profile").disabled = busy || sessionBusy || active;
     el("extend-question").disabled = sessionBusy || session?.state.status==="finished" || !session?.state.challenge_id;
     el("open-task").disabled = !session?.state.challenge_id;
     if (active) el("stop-after").checked = lanes.filter(row=>row.state.status!=="finished").every(row=>row.state.stop_after_current);
@@ -436,7 +391,6 @@ const CompetitionPage = (() => {
     scheduleCommand(pendingExtension);
   }
   document.addEventListener("DOMContentLoaded", () => {
-    el("create-profile").addEventListener("click",()=>select(null));
     el("lane").addEventListener("change",()=> {selectedLane=el("lane").value;revision+=1;refreshSession();});
     el("sort-level").addEventListener("click",()=> {
       const levels=new Map(previewItems.map(item=>[String(item.remote_ref),item.level]));
@@ -457,12 +411,8 @@ const CompetitionPage = (() => {
     el("open-task").addEventListener("click",async()=> {const id=session?.state.challenge_id;if(!id)return;await loadTasks();if(!state.tasks.some(task=>task.id===id)){el("schedule-error").textContent=errors.challenge_not_found;return;}selectTask(id,false);showView("detail");});
     setInterval(()=> {if (!document.getElementById("competition-view").hidden) refreshSession();},2000);
     sessionControls();
-    el("form").addEventListener("submit", save);
     el("profile").addEventListener("change", () => select(profiles.find(p => p.id === el("profile").value) || null));
-    el("new").addEventListener("click", () => select(null));
-    el("form").addEventListener("input", () => { dirty = true; resetPreview(); credentialLabel(); controls(); status("配置尚未保存；保存后再测试连接。"); });
-    el("adapter").addEventListener("change", () => { el("url").value = template()?.base_url || ""; el("queue").value=""; const flagHeadInput = el("flag-head"); if (flagHeadInput) flagHeadInput.value = el("adapter").value === "arena" ? "NSSCTF" : ""; credentialLabel();renderLauncher();renderQueue(); });
-    el("check").addEventListener("click", check); el("clear").addEventListener("click", clear);
+    el("check").addEventListener("click", check);
   });
   return {load};
 })();

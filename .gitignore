@@ -1,5 +1,10 @@
 # ---- 本地环境 ----
 .env
+.launcher-secrets/
+.launcher-background*
+/desktop/.venv/
+/desktop/build/
+/desktop/dist/
 .env.*.local
 .venv/
 venv/
@@ -60,6 +65,6 @@ Qinyuan_Agent_dual_llm_flow_v3.svg
 restrict
 TODO.md
 Plan/
-
+frontend/Image
 .runs
 Control

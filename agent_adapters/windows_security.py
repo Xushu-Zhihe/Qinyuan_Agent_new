@@ -58,7 +58,7 @@ class WindowsSecuritySetup:
             return {**self.state, "patterns": list(self.state["patterns"])}
 
     def start(self, action: str):
-        if action not in {"Check", "Apply", "Remove"}:
+        if action not in {"Probe", "Check", "Apply", "Remove"}:
             raise WorkbenchError("windows_security_invalid_action")
         with self.lock:
             if not self.supported:
@@ -78,6 +78,8 @@ class WindowsSecuritySetup:
             return self.snapshot()
 
     def _invoke(self, action: str):
+        elevate = action != "Probe"
+        action = "Check" if action == "Probe" else action
         # No browser-supplied paths or shell commands cross the privilege boundary.
         powershell = str(Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
         with tempfile.TemporaryDirectory(prefix="qinyuan-defender-") as temporary:
@@ -103,7 +105,7 @@ class WindowsSecuritySetup:
                      "catch { $e=$_.Exception; while ($e.InnerException) { $e=$e.InnerException }; "
                      "if ($e -is [System.ComponentModel.Win32Exception] -and $e.NativeErrorCode -eq 1223) { exit 1223 }; exit 3 }")
             process = subprocess.run(
-                [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand", _encoded(outer)],
+                [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand", _encoded(outer if elevate else inner)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
