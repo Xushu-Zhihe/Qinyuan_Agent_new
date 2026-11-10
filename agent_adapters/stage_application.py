@@ -241,6 +241,15 @@ class StageApplication:
             get_logger("ctrl").info("stage.review_settled" if binding in change.reviews else "stage.review_blocked",
                 run=self.task_id, operation=binding.review_operation_id,
                 source_operation=binding.proposal_operation_id, phase="stage_review")
+            request = self.evidence.request(binding.review_operation_id)
+            if binding in change.reviews and fact_candidates(request.proposal) and stage_runtime(request).get("method_reuse") == "reviewed_same_task_v3":
+                from agent_core.stage_methods import StageMethods, method_review_counts
+                verdict = self.evidence.read_model_result(self.store.load_d4_operation(binding.review_operation_id)).result
+                collected = sum(m["review_operation_id"] == binding.review_operation_id
+                    for m in StageMethods(self.evidence, self.task_id).catalog())
+                get_logger("ctrl").info("stage.method_reviewed", run=self.task_id,
+                    operation=binding.review_operation_id, phase="stage_review",
+                    **method_review_counts(request, verdict, collected))
         return result
 
     def _conversation_sources(self, session):
@@ -563,6 +572,14 @@ class StageApplication:
             # the author's argument for it. User turns (review feedback, tool
             # observations) stay; only the author's own prose is withheld.
             messages = tuple(message for message in messages if message.get("role") == "user")
+        from agent_core.stage_methods import StageMethods, relevant_methods, method_review_inputs
+        method_service = StageMethods(self.evidence, self.task_id)
+        method_policy = self.evidence.read("policy", self.task_id).get("method_reuse")
+        method_candidates, method_diagnostics = {}, {}
+        if method_policy == "reviewed_same_task_v3" and stage == "stage_review" and fact_candidates(proposal):
+            method_candidates, bodies, method_diagnostics = method_service.candidates(proposal, all_history)
+            if bodies:
+                messages += ({"role": "user", "content": json.dumps({"method_tool_requests": bodies}, ensure_ascii=False)},)
         if stage == "stage_review" and (fact_candidates(proposal) or isinstance(proposal, StageMethodRegistration)):
             from agent_core.stage_contracts import StageMethodFact
             method_sources = (proposal.method["source_ref"],) if isinstance(proposal, StageMethodRegistration) else tuple(dict.fromkeys(claim.method["source_ref"]
@@ -574,7 +591,7 @@ class StageApplication:
                     for body in self.evidence.history_tool_requests((item,)):
                         captured = self.evidence.read("mcp-method-inputs", item.record_id)
                         if captured is not None:
-                            body["captured_inputs"] = captured
+                            body["captured_inputs"] = method_review_inputs(body["call"], captured)
                         bodies.append(body)
                 messages += ({"role": "user", "content": json.dumps({"method_tool_requests": bodies}, ensure_ascii=False)},)
         if stage == "stage_action" and self._tools_in_flight:
@@ -600,9 +617,19 @@ class StageApplication:
                 if entry.state in {"pending", "blocked"}
                 and (self.evidence.request(entry.proposal_operation_id).context.session == session
                     or entry.proposal_operation_id in visible)]}
-        from agent_core.stage_methods import StageMethods, relevant_methods
-        runtime["methods_enabled"] = self.evidence.read("policy", self.task_id).get("method_reuse") == "reviewed_same_task_v2"
-        runtime["methods"] = relevant_methods(StageMethods(self.evidence, self.task_id).catalog(history=all_history), context.history)
+        runtime["methods_enabled"] = method_policy in {"reviewed_same_task_v2", "reviewed_same_task_v3"}
+        runtime["methods"] = relevant_methods(method_service.catalog(history=all_history,
+            diagnostics=method_diagnostics), context.history)
+        if method_policy == "reviewed_same_task_v3":
+            runtime["method_reuse"] = method_policy
+            if method_candidates:
+                runtime["method_candidates"] = method_candidates
+            if stage == "stage_action":
+                runtime["working_scripts"] = method_service.working_scripts(all_history, preferred=retrieved)
+            if method_candidates or method_diagnostics:
+                get_logger("ctrl").info("stage.method_availability", run=self.task_id, operation=identity,
+                    phase=stage, candidates=sum(map(len, method_candidates.values())),
+                    available=len(runtime["methods"]), reasons=method_diagnostics)
         if closing:
             runtime["closure_context"] = True
         if stage == "stage_action":

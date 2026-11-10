@@ -10,7 +10,7 @@ from agent_core.domain import IntentStatus
 from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8RevisionTarget
 from agent_core.output_contracts import D8ModelResponse, D8FormatIssue, array, obj, tagged, text, decode_response, NATIVE_TRAILING_BRACE_POLICY
 from agent_core.stage_contracts import (
-    StageMethodFact, StageMethodReview, StageMethodRegistration, StagePinnedCall, method_fact,
+    StageMethodRegistration, StagePinnedCall, method_fact,
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot, RoadTurnClosure, RoadTurnClosureReview,
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete, StageSessionSummary, StageStrategyAdvice, StageRoadSuggestion, StageTurnSnapshot, TurnAchievement, TurnCompletion, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, TurnPlanningState, StagePlanningDecision,
@@ -1024,11 +1024,29 @@ def model_contract(request):
         **({"fact_sources": "catalog_readback_v1"} if stage_runtime(request).get("fact_sources") == "catalog_readback_v1" else {}),
         "planning_validation": "retain_pending_v1",
         "output_normalization": NATIVE_TRAILING_BRACE_POLICY,
-        "rules": ("Use optional pin_files on mcp_call only when preserving a method: list absolute sandbox script/input paths. "
+        "rules": ("Recent working_scripts are saved code, not verified methods or Fact evidence. "
+            "Use history_details on their source_ref to read the full original; prepare_working_script writes a fresh "
+            "writable copy without executing the script or registering a method. Read it, edit only necessary parts, "
+            "then use the ordinary file execution tool. No whole-script regeneration is required. "
+            "During Fact review, method_candidates maps candidate indices (None for a singleton) to eligible bound "
+            "source refs. Optionally return method={source_ref,capability,conditions,dependencies} to collect a useful "
+            "method in this same review, without requiring Inner to declare one. Choose only that candidate's refs. "
+            "The capability can cover a useful subset of a composite Fact; review the entire Fact separately. "
+            "Omit method when it is not useful or dependencies are uncertain. Never accept because of exit code alone. "
+            "For an explicit Inner method declaration use method_decision instead; do not return both verdict forms. "
+            "Optional parameters=['data_path'] declares the existing data_path as variable. reuse_method.inputs may "
+            "change only that declared field; new input bytes are captured for a fresh execution. Code stays fixed, "
+            "and the previous Fact proves nothing about the new input. Other adaptations use a work copy. "
+            if stage_runtime(request).get("method_reuse") == "reviewed_same_task_v3"
+            and request.stage in {"stage_action", "stage_review"} else "") +
+            ("Use optional pin_files on mcp_call only when preserving a method: list absolute sandbox script/input paths. "
             "Unlisted imports, sessions and environment dependencies remain conditions, never a claim of standalone replay. "
             "Optional method metadata on a Fact declares the exact observed tool call and explicit method dependencies. "
             "Do not infer dependencies from Fact citations. A Fact can be accepted while method_decision is unavailable; "
-            "accept a method only when its original execution actually achieved the declared result and dependencies are complete. "
+            + ("accept a method only when its original execution actually achieved its declared capability (the whole Fact "
+               "when no capability is specified) and dependencies are complete. "
+               if stage_runtime(request).get("method_reuse") == "reviewed_same_task_v3" else
+               "accept a method only when its original execution actually achieved the declared result and dependencies are complete. ") +
             "Methods are same-TaskRun references, never Fact support or permission. Use history_details on a Fact to inspect "
             "its method and full original arguments; reuse_method proposes a fresh authorized call, never replays an operation. "
             "Use register_method to attach a method to an existing Fact without creating another Fact. "
@@ -1492,10 +1510,10 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
             return RoadTurnClosureReview(*(TurnPlanningReview(item["decision"], checked(item, "reason"),
                 tuple(item.get("support_refs", ()))) for item in (value["road"], value["turn"])))
         if isinstance(request.proposal, StageFactBatch):
+            from agent_core.stage_methods import parse_method_review
             return StageFactBatchReview(tuple(
-                (StageMethodReview if "method_decision" in item else TurnPlanningReview)(
-                    **{**item, "support_refs": tuple(item.get("support_refs", ()))})
-                for item in value["decisions"]))
+                parse_method_review(request, item, request.proposal.candidates[index], index)
+                for index, item in enumerate(value["decisions"])))
         if isinstance(request.proposal, StageConclusionChange):
             return D8ChangeDecision(value["decision"], checked(value, "reason"), value.get("goal_supported"), value.get("scope_explanation"))
         indices = tuple(value.get("accepted_road_indices", ()))
@@ -1504,14 +1522,17 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
                 reject('stage.road_selection_invalid', '$/accepted_road_indices', 'nonempty_in_range_accepted_road_indices', 'invalid_indices')
         elif indices:
             reject('stage.road_selection_invalid', '$/accepted_road_indices', 'empty_for_non_accept_decision', 'nonempty')
-        if "method_decision" in value:
-            return StageMethodReview(value["decision"], checked(value, "reason"), refs, indices,
-                                     value["method_decision"])
+        if "method_decision" in value or "method" in value:
+            from agent_core.stage_methods import parse_method_review
+            return parse_method_review(request, value, request.proposal, None)
         return TurnPlanningReview(value["decision"], checked(value, "reason"), refs, indices)
     if request.stage == "stage_supervision":
         return StageStrategyAdvice(value["decision"], checked(value, "reason"), refs,
                                    _road_suggestion(request, value.get("suggestion")))
     kind = value["kind"]
+    if kind == "prepare_working_script":
+        from agent_core.stage_methods import resolve_working_script
+        return resolve_working_script(request, value["source_ref"])
     if kind == "materialize_method":
         from agent_core.stage_methods import resolve_materialization
         return resolve_materialization(request, value["method_ref"])
@@ -1519,7 +1540,7 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
         return StageMethodRegistration(value["fact_ref"], value["method"], checked(value, "reason"))
     if kind == "reuse_method":
         from agent_core.stage_methods import resolve_method_call
-        return resolve_method_call(request, value["method_ref"])
+        return resolve_method_call(request, value["method_ref"], value.get("inputs"))
     if kind == "tool_details":
         if "query" in value:
             query = value["query"].strip()

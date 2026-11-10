@@ -68,6 +68,7 @@ class Desktop:
         self.lock = threading.RLock()
         self.window = None
         self.closing = False
+        self.page_loaded = False
 
     def instance(self):
         if not self.record.exists():
@@ -170,7 +171,7 @@ class Desktop:
         if action == "service":
             return self.ensure_service()
         if action == "service_status":
-            return self.request("GET", "/api/desktop") if self.instance() else {"active": False}
+            return {**self.request("GET", "/api/desktop"), "running": True} if self.instance() else {"running": False, "active": False}
         if action == "open":
             self.ensure_service()
             instance = self.instance()
@@ -226,10 +227,25 @@ class Desktop:
         raise WorkbenchError("launcher.action_invalid")
 
     def on_closing(self):
-        if self.closing:
+        if self.closing or not self.page_loaded:
             return True
-        self.window.evaluate_js("window.launcherClose()")
+        # WinForms invokes this on its UI thread; evaluate_js needs that same
+        # thread to process its result, so never wait for it in FormClosing.
+        threading.Thread(target=self._show_close_prompt, daemon=True).start()
         return False
+
+    def _show_close_prompt(self):
+        try:
+            self.window.evaluate_js("window.launcherClose(); void 0")
+        except Exception as error:
+            logger.warning("launcher.close_prompt_failed", category="dependency",
+                code="launcher.close_prompt_failed", exception_type=type(error).__name__)
+            if not self.closing:
+                self.closing = True
+                self.window.destroy()
+
+    def on_loaded(self):
+        self.page_loaded = True
 
 
 def main():
@@ -260,6 +276,7 @@ def main():
     desktop.window = webview.create_window("Qinyuan Agent", str(assets / "launcher.html"),
         js_api=Bridge(), width=1160, height=790, min_size=(900, 640))
     desktop.window.events.closing += desktop.on_closing
+    desktop.window.events.loaded += desktop.on_loaded
     try:
         webview.start(gui="edgechromium", icon=str(assets / "assets/launcher.ico"))
     except webview.WebViewException:

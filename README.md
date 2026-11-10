@@ -25,7 +25,7 @@ Qinyuan Agent 是一个面向 CTF 与授权安全实验的双 LLM Agent。它通
 
 全自动比赛运行通过绑定的平台验证器确认答案。单题人工模式登记答案候选后，运行页直接显示“确定”“错误”：确定结束，错误返回原规划继续；新运行五分钟无操作按默认确定结束，明确标记超时来源，不冒充人工/平台已验证。总时限仍优先，也支持人工取消。操作结果不明或共享状态需要核验时会等待恢复，不自动重放工具。
 
-做题页根据模型请求与工具操作的最新快照显示待结算状态，支持同时呈现 Inner、Outer 和工具。进度读取只应用当前选择下的最新请求；运行中在每次响应后约一秒刷新，非运行状态约五秒刷新，超时保留快照并重试。同题刷新保留节点选择、展开内容和已加载证据，未结算状态不代表已确认存活。
+做题页根据模型请求与工具操作的最新快照显示待结算状态，支持同时呈现 Inner、Outer 和工具。进度读取只应用当前选择下的最新请求；运行中在每次响应后约一秒刷新，非运行状态约五秒刷新，失败或生成中不返回旧投影；同一运行已有成功视图时，正常后台刷新不反复显示生成警告；界面保留的上次成功内容明确标为历史参照，并等待本次成功结果。同题刷新保留节点选择、展开内容和已加载证据，未结算状态不代表已确认存活。
 
 当前双角色推理强度使用 high。已观测单题的答案发现和调用耗时较好；效果是否适用于更复杂题目仍以实际运行结果为准。
 
@@ -54,7 +54,7 @@ uv sync --frozen
 
 运行 `start-launcher.cmd` 打开 Python＋WebView2 桌面启动器。桌面环境由 `desktop/pyproject.toml` 和独立锁文件管理，不依赖 Agent `.venv` 完整。四个模块为启动、设置、检测、下载；浏览器工作台只保留比赛控制、任务与运行。
 
-在启动页配置 NSSCTF 或 TSecBench 连接、并发与时长默认值。配置管理复用原平台存储，尚未启动工作台时不启动 Agent 或赛程；点击“启动工作台”才启动/连接本地服务并打开浏览器，实际开赛仍由浏览器明确触发。BenchAgent 显示待定，不自动获取扣分提示。
+在启动页配置 NSSCTF 或 TSecBench 连接、并发与时长默认值。配置管理复用原平台存储，尚未启动工作台时不启动 Agent 或赛程；点击“启动工作台”才启动/连接本地服务并打开浏览器，GUI 在启动/停止后即时核验状态，并每三秒及重新聚焦时同步；独立 CLI 工作台也登记同一数据目录的实例身份，实际开赛仍由浏览器明确触发。BenchAgent 显示待定，不自动获取扣分提示。
 
 “设置 → 外观”提供背景图片添加、移除与 0–100% 不透明度滑动条，拖动实时预览，松开后保存。支持 PNG/JPEG/WebP（最大 16 MiB），仅保存一个本地副本 `.launcher-background`；背景副本不进入 Git 或 Docker 构建上下文。启动器 EXE 与窗口使用 `frontend/assets/launcher.ico` 多尺寸图标。
 
@@ -62,15 +62,15 @@ uv sync --frozen
 
 “下载 → 项目依赖”使用 `uv sync --locked`；同步前停止相关项目进程。“下载 → Sandbox 镜像”从项目根目录构建 `Sandbox/dockerfile`、`windows.dockerfile` 和 `target_forwarder.dockerfile`，Windows 构建先准备 Linux。构建与运行身份核验分别展示，固定 ID 不符时保持待处理，不自动改写身份。Docker 构建可能联网；取消客户端后无法证明服务端停止时显示待核验。
 
-启动器关闭时，活动运行可继续后台运行，或沿原控制链安全暂停赛程/停止普通任务后退出；未知停止不能宣称成功。桌面日志使用原 sys 通道并按错误类别和安全码记录，位于数据目录 `launcher.log.jsonl`，最多保留一个 2 MiB 备份。准备页日志按准备/环境核验筛选并支持复制。
+启动器原生关闭回调异步通知页面，不在 UI 线程等待 JavaScript；关闭提示独立于普通操作的忙碌状态，后台状态读取迟缓时仍可选择保留后台并关闭窗口。活动运行可继续后台运行，或沿原控制链安全暂停赛程/停止普通任务后退出；未知停止不能宣称成功。桌面日志使用原 sys 通道并按错误类别和安全码记录，位于数据目录 `launcher.log.jsonl`，最多保留一个 2 MiB 备份。准备页日志按准备/环境核验筛选并支持复制。
 
 独立 EXE 的构建命令：
 
 ```powershell
-uv run --project desktop --group build --locked pyinstaller --noconfirm --distpath desktop/dist --workpath desktop/build desktop/launcher.spec
+uv run --project desktop --group build --locked pyinstaller --noconfirm --distpath . --workpath desktop/build desktop/launcher.spec
 ```
 
-产物为 `desktop/dist/QinyuanLauncher.exe`，可在当前项目内运行；外置发行使用 `--project <项目根目录>` 指定 Agent 项目。宿主仍需要 WebView2/.NET 运行支持；启动器不自动安装 Docker Desktop 或调整系统防护。
+产物为 项目根目录的 `QinyuanLauncher.exe`，可在当前项目内运行；外置发行使用 `--project <项目根目录>` 指定 Agent 项目。宿主仍需要 WebView2/.NET 运行支持；启动器不自动安装 Docker Desktop 或调整系统防护。
 
 ### Windows 安全配置
 

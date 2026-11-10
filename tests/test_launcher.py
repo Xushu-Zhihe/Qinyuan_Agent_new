@@ -124,7 +124,66 @@ def test_preparation_rejects_live_environment_and_unknown_actions(tmp_path):
 def test_desktop_bridge_rejects_unknown_host_action(tmp_path):
     desktop = Desktop(root=tmp_path)
     assert desktop.invoke("shell", "whoami")["error"] == "launcher.action_invalid"
-    assert desktop.invoke("service_status")["data"] == {"active": False}
+    assert desktop.invoke("service_status")["data"] == {"running": False, "active": False}
+
+
+def test_standalone_workbench_registers_for_desktop_status(tmp_path):
+    import time
+    root=Path(__file__).resolve().parent.parent
+    directory=tmp_path/'data'
+    env={k:v for k,v in os.environ.items() if k not in {'QINYUAN_DESKTOP_TOKEN','QINYUAN_DESKTOP_INSTANCE'}}
+    process=subprocess.Popen([str(root/'.venv/Scripts/python.exe'),'-m','agent_adapters.workbench',
+        '--port','0','--data-dir',str(directory)],cwd=root,env=env,stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    desktop=Desktop(root=root,data_dir=directory)
+    try:
+        for _ in range(100):
+            if desktop.record.exists():break
+            assert process.poll() is None
+            time.sleep(.1)
+        status=desktop.invoke('service_status')
+        assert status['ok'] and status['data']['running'] is True and status['data']['active'] is False
+        desktop.request('POST','/api/desktop',{'action':'shutdown'})
+        assert process.wait(10)==0
+        assert desktop.invoke('service_status')['data']['running'] is False
+    finally:
+        if process.poll() is None:process.terminate();process.wait(10)
+
+
+def test_native_close_callback_never_waits_for_javascript(tmp_path):
+    desktop = Desktop(root=tmp_path)
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    def evaluate(script):
+        assert script == "window.launcherClose(); void 0"
+        entered.set()
+        assert release.wait(3)
+    desktop.window = SimpleNamespace(evaluate_js=evaluate)
+    desktop.on_loaded()
+    results = []
+    def close():
+        results.append(desktop.on_closing())
+        returned.set()
+    caller = threading.Thread(target=close)
+    caller.start()
+    try:
+        assert returned.wait(1), "Closing callback blocked the native UI thread"
+        assert entered.wait(1)
+        assert results == [False] and not desktop.closing
+    finally:
+        release.set(); caller.join(3)
+    desktop.closing = True
+    assert desktop.on_closing() is True
+
+
+def test_close_without_working_page_preserves_background(tmp_path):
+    desktop = Desktop(root=tmp_path)
+    assert desktop.on_closing() is True
+    desktop.on_loaded()
+    closed = []
+    def broken_page(_): raise RuntimeError("PRIVATE")
+    desktop.window = SimpleNamespace(evaluate_js=broken_page, destroy=lambda: closed.append(True))
+    desktop._show_close_prompt()
+    assert closed == [True] and desktop.closing
 
 
 def test_profiles_can_be_prepared_without_starting_workbench(tmp_path):

@@ -1,7 +1,9 @@
-"""Same-TaskRun method views derived from accepted facts and original tool receipts."""
+"""Same-TaskRun work copies and reviewed methods derived from original tool receipts."""
 from copy import deepcopy
 
-from agent_core.stage_contracts import StageFactBatch, StageMethodFact, StageMethodRegistration, StageMethodCall, StageMethodMaterialize, fact_review_parts, reviewed_fact
+from agent_core.stage_contracts import (StageFactBatch, StageMethodFact, StageMethodRegistration,
+    StageMethodCall, StageMethodVariant, StageMethodMaterialize, StageWorkingScript,
+    StageSelectedMethodReview, StageMethodReview, fact_review_parts, reviewed_fact)
 from agent_core.stage_storage import _fail
 from agent_core.turn_modeling import digest
 from qinyuan_core import Category
@@ -16,9 +18,13 @@ def method_schema(request, schema):
     sources = [i.ref for i in request.context.history
                if i.identity == 'tool_observation_not_fact' and i.source_status == 'available']
     methods = runtime.get('methods', ())
+    assisted = runtime.get('method_reuse') == 'reviewed_same_task_v3'
     declaration = obj({'source_ref': {'type': 'string', 'enum': sources},
         'dependencies': {**array({'type': 'string', 'enum': [m['ref'] for m in methods]}, maximum=8),
                          'uniqueItems': True}, 'conditions': text()})
+    if assisted:
+        declaration['properties'].update(capability={**text(1024), 'minLength': 1},
+            parameters={**array({'type': 'string', 'enum': ['data_path']}, maximum=1), 'uniqueItems': True})
     def extend(node):
         if not isinstance(node, dict):
             return
@@ -49,26 +55,55 @@ def method_schema(request, schema):
             node = schema['properties']['decisions']['items'] if isinstance(request.proposal, StageFactBatch) else schema
             node['properties']['method_decision'] = {'type': 'string', 'enum': ['accept', 'unavailable']}
             # Missing verdict means unavailable; Fact review remains independently usable.
-    if (request.stage == 'stage_action' and methods and any(
+        candidates = runtime.get('method_candidates', {})
+        if candidates:
+            node = schema['properties']['decisions']['items'] if isinstance(request.proposal, StageFactBatch) else schema
+            selection = deepcopy(declaration)
+            selection['properties']['source_ref']['enum'] = list(dict.fromkeys(
+                ref for refs in candidates.values() for ref in refs))
+            selection['required'] = ['source_ref', 'capability']
+            node['properties']['method'] = selection
+    executable = request.stage == 'stage_action' and any(
             c.get('properties', {}).get('kind', {}).get('const') == 'mcp_call'
-            for c in schema.get('anyOf', ()))):
+            for c in schema.get('anyOf', ()))
+    if executable and runtime.get('working_scripts') and any(t['qualified_name'] == 'shell.run_bash' for t in request.tools):
+        schema['anyOf'].append(obj({'kind': {'type': 'string', 'const': 'prepare_working_script'},
+            'source_ref': {'type': 'string', 'enum': [s['source_ref'] for s in runtime['working_scripts']]}}))
+    if executable and methods:
         names = {tool['qualified_name'] for tool in request.tools}
         eligible = [m['ref'] for m in methods if m['call']['tool_name'] in names]
         if 'shell.run_bash' in names:
             schema['anyOf'].append(obj({'kind': {'type': 'string', 'const': 'materialize_method'},
                 'method_ref': {'type': 'string', 'enum': [m['ref'] for m in methods]}}))
         if eligible:
-            schema['anyOf'].append(obj({'kind': {'type': 'string', 'const': 'reuse_method'},
-                'method_ref': {'type': 'string', 'enum': eligible}}))
+            fields = {'kind': {'type': 'string', 'const': 'reuse_method'},
+                'method_ref': {'type': 'string', 'enum': eligible}}
+            if assisted and any(m.get('parameters') and m['ref'] in eligible for m in methods):
+                fields['inputs'] = obj({'data_path': {**text(4096), 'minLength': 1}}, optional=('data_path',))
+            schema['anyOf'].append(obj(fields, optional=('inputs',)))
     return schema
 
 
-def resolve_method_call(request, ref):
+def resolve_method_call(request, ref, inputs=None):
     from agent_core.stage_planning import stage_runtime
     method = next((m for m in stage_runtime(request).get('methods', ()) if m['ref'] == ref), None)
     if method is None or method['task_run_id'] != request.task_run_id:
         _fail('stage.method_unavailable', Category.POLICY)
-    call = method['call']
+    call = deepcopy(method['call'])
+    if inputs:
+        if set(inputs) - set(method.get('parameters', ())):
+            _fail('stage.method_input_undeclared', Category.INPUT)
+        from Sandbox.image_readback import validate_image_path
+        try:
+            path = validate_image_path(inputs['data_path'])
+        except ValueError:
+            _fail('stage.method_input_path_invalid', Category.INPUT)
+        old = call['arguments']['data_path']
+        if any(k != 'data_path' and v == old for k, v in call['arguments'].items()):
+            _fail('stage.method_input_alias', Category.INPUT)
+        call['arguments']['data_path'] = path
+        call['pin_files'] = list(dict.fromkeys([p for p in call.get('pin_files', ()) if p != old] + [path]))
+        call['expected_files'] = [p for p in call.get('expected_files', ()) if p[0] != old]
     from agent_core.output_contracts import shape_issues
     tool = next((t for t in request.tools if t['qualified_name'] == call['tool_name']), None)
     if tool is None:
@@ -76,15 +111,157 @@ def resolve_method_call(request, ref):
     # The original call still has to satisfy the current tool schema.
     if shape_issues(call['arguments'], tool['input_schema']):
         _fail('stage.method_arguments_changed', Category.INPUT)
-    return StageMethodCall(call['tool_name'], call['arguments'], tuple(call.get('pin_files', ())),
-                           tuple(tuple(p) for p in call.get('expected_files', ())), ref)
+    fields = (call['tool_name'], call['arguments'], tuple(call.get('pin_files', ())),
+              tuple(tuple(p) for p in call.get('expected_files', ())), ref)
+    return StageMethodVariant(*fields, inputs) if inputs else StageMethodCall(*fields)
+
+
+def parse_method_review(request, value, candidate, index):
+    """Bind optional method verdicts to the exact batch candidate, independently of Fact truth."""
+    from agent_core.stage_contracts import TurnPlanningReview
+    from agent_core.stage_planning import stage_runtime
+    assisted = stage_runtime(request).get('method_reuse') == 'reviewed_same_task_v3'
+    if assisted and (not value['reason'].strip() or '\x00' in value['reason']):
+        raise ValueError('stage.output_text_invalid')
+    fields = {**value, 'support_refs': tuple(value.get('support_refs', ()))}
+    method = fields.pop('method', None)
+    if method is not None:
+        refs = stage_runtime(request).get('method_candidates', {}).get(str(index), ())
+        if method['source_ref'] not in refs or not method['capability'].strip() or '\x00' in method['capability']:
+            raise ValueError('stage.method_selection_invalid')
+        if 'method_decision' in fields:
+            raise ValueError('stage.method_verdict_ambiguous')
+        return StageSelectedMethodReview(**fields, method={'conditions': '', 'dependencies': [], **method})
+    if assisted:
+        # A homogeneous batch shape may carry this field for a Fact with no method.
+        # It grants nothing and must not be counted as a method acceptance.
+        if not isinstance(candidate, StageMethodFact) or fields['decision'] != 'accept':
+            fields.pop('method_decision', None)
+    return (StageMethodReview if 'method_decision' in fields else TurnPlanningReview)(**fields)
+
+
+def method_review_counts(request, result, collected):
+    from agent_core.stage_contracts import fact_candidates, StageFactBatchReview
+    from agent_core.stage_planning import stage_runtime
+    candidates = fact_candidates(request.proposal)
+    reviews = result.decisions if isinstance(result, StageFactBatchReview) else (result,)
+    offered, selected = 0, 0
+    for (index, claim), review in zip(candidates, reviews):
+        offered += bool(isinstance(claim, StageMethodFact) or
+                        stage_runtime(request).get('method_candidates', {}).get(str(index)))
+        selected += bool(review.decision == 'accept' and (getattr(review, 'method', None) is not None
+            or isinstance(claim, StageMethodFact) and getattr(review, 'method_decision', None) == 'accept'))
+    return {'offered': offered, 'selected': selected, 'collected': collected}
+
+
+def method_review_inputs(call, captured):
+    """Show captured source as code and input versions as metadata, without binary base64."""
+    import base64
+    import io
+    import tokenize
+    files = []
+    for item in captured['files']:
+        view = {k: item[k] for k in ('path', 'sha256')}
+        if item['path'] == call['arguments'].get('script_path'):
+            raw = base64.b64decode(item['base64'], validate=True)
+            try:
+                encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+                view['content'] = raw.decode(encoding)
+            except (SyntaxError, LookupError, UnicodeError):
+                view['content_unavailable'] = 'source_encoding_invalid'
+        files.append(view)
+    return {'request_sha256': captured['request_sha256'], 'files': files}
 
 
 class StageMethods:
     def __init__(self, evidence, task_id):
         self.evidence, self.task_id = evidence, task_id
 
-    def catalog(self, *, history=None):
+    def source(self, item, *, successful=True, include_artifacts=False):
+        """Read immutable execution bytes; mutable files are never a historical fallback."""
+        if item is None or item.task_run_id != self.task_id or item.identity != 'tool_observation_not_fact' or item.source_status != 'available':
+            return None, 'source_unavailable'
+        evidence = self.evidence
+        bodies = evidence.history_tool_requests((item,))
+        if not bodies:
+            return None, 'call_missing'
+        receipt = evidence.read('mcp-result', item.record_id)['payload']
+        if receipt.get('status') != 'completed' or receipt.get('timed_out') or successful and receipt.get('exit_code', 0) != 0:
+            return None, 'execution_unsuccessful'
+        original = call = bodies[0]['call']
+        if not include_artifacts and any(call.get(k) for k in ('materialize_ref', 'working_ref')):
+            return None, 'artifact_operation'
+        captured = evidence.read('mcp-method-inputs', item.record_id)
+        expected = receipt.get('method_inputs_sha256')
+        if expected and (captured is None or digest(captured) != expected):
+            _fail('stage.method_input_binding_changed', Category.UNKNOWN)
+        if captured is not None:
+            if not expected:
+                return None, 'capture_unbound'
+            if captured['request_sha256'] != digest(evidence.read('mcp-call', item.record_id)):
+                _fail('stage.method_input_binding_changed', Category.UNKNOWN)
+            call = captured['resolved_call']
+        pinned = {p[0] for p in call.get('expected_files', ())}
+        if successful and any((k.endswith('_path') or k in {'path', 'cwd'}) and v not in pinned
+                              for k, v in call['arguments'].items()):
+            return None, 'input_not_fixed'
+        return {'call': call, 'original_call': original, 'captured': captured,
+                'files': captured['files'] if captured else []}, None
+
+    def candidates(self, proposal, history):
+        from agent_core.stage_contracts import fact_candidates
+        available = {i.ref: i for i in history}
+        candidates, bodies, diagnostics = {}, {}, {}
+        for index, claim in fact_candidates(proposal):
+            if isinstance(claim, StageMethodFact) or claim.inferred:
+                continue
+            refs = []
+            for ref in claim.support_refs:
+                item = available.get(ref)
+                if item is None or item.identity != 'tool_observation_not_fact':
+                    continue
+                source, reason = self.source(item)
+                if source is None:
+                    diagnostics[reason] = diagnostics.get(reason, 0) + 1
+                    continue
+                refs.append(ref)
+                bodies[ref] = {'observation_ref': ref, 'call': source['original_call']}
+                if source['captured'] is not None:
+                    bodies[ref]['captured_inputs'] = method_review_inputs(source['original_call'], source['captured'])
+            if refs:
+                candidates[str(index)] = refs
+        return candidates, list(bodies.values()), diagnostics
+
+    def working_scripts(self, history, *, preferred=(), maximum=3):
+        """Index recent saved code without certifying or capturing exploration files."""
+        import hashlib
+        scripts, seen = [], set()
+        if preferred:
+            refs = set(preferred)
+            history = (*[i for i in history if i.ref not in refs], *[i for i in history if i.ref in refs])
+        for item in reversed(history):
+            if item.identity != 'tool_observation_not_fact':
+                continue
+            source, _ = self.source(item, successful=False)
+            if source is None:
+                continue
+            script = source['call']['arguments'].get('script')
+            if not isinstance(script, str) or not script:
+                continue
+            sha = hashlib.sha256(script.encode('utf-8')).hexdigest()
+            key = (source['call']['tool_name'], sha, tuple((f['path'], f['sha256']) for f in source.get('files', ())))
+            if key in seen:
+                continue
+            seen.add(key)
+            scripts.append({'source_ref': item.ref, 'task_run_id': self.task_id,
+                'tool_name': source['call']['tool_name'], 'script': script,
+                'sha256': sha, 'turn_id': item.turn_id, 'road_id': item.intent_id,
+                **({'files': source['files']} if source.get('files') else {})})
+            if len(scripts) == maximum:
+                break
+        return scripts
+
+    def catalog(self, *, history=None, diagnostics=None):
         evidence = self.evidence
         history = evidence.history(self.task_id) if history is None else history
         from agent_core.conclusion_revisions import ConclusionRevisions
@@ -104,11 +281,12 @@ class StageMethods:
                 _fail('stage.method_review_binding_changed', Category.UNKNOWN)
             request = evidence.request(review_id)
             candidate, review = reviewed_fact(request.proposal, evidence.read_model_result(operation).result, index)
-            if (isinstance(candidate, StageMethodFact) and review.decision == 'accept'
-                    and candidate.content == fact.content
-                    and getattr(review, 'method_decision', 'unavailable') == 'accept'
-                    and candidate.method['source_ref'] in candidate.support_refs):
-                specifications['method:' + fact.ref] = (fact, review_id, candidate.method)
+            spec = (review.method if isinstance(review, StageSelectedMethodReview) else
+                    candidate.method if isinstance(candidate, StageMethodFact)
+                    and getattr(review, 'method_decision', 'unavailable') == 'accept' else None)
+            if (spec is not None and review.decision == 'accept' and candidate.content == fact.content
+                    and spec['source_ref'] in candidate.support_refs):
+                specifications['method:' + fact.ref] = (fact, review_id, spec)
         for operation in evidence.store.list_d4_operations(self.task_id):
             if operation.start.role != 'outer_planning' or operation.completion is None or operation.application_ref is None:
                 continue
@@ -132,37 +310,24 @@ class StageMethods:
             fact, review_id, spec = specification
             visiting.add(ref)
             source = available.get(spec['source_ref'])
-            calls = evidence.history_tool_requests((source,)) if source is not None else ()
-            if not calls:
+            resolved, reason = self.source(source, include_artifacts=True)
+            if resolved is None:
+                if diagnostics is not None:
+                    diagnostics[reason] = diagnostics.get(reason, 0) + 1
                 visiting.remove(ref)
                 return None
-            receipt = evidence.read('mcp-result', source.record_id)['payload']
-            if receipt.get('status') != 'completed' or receipt.get('exit_code', 0) != 0 or receipt.get('timed_out'):
-                visiting.remove(ref)
-                return None
-            call = calls[0]['call']
-            captured = evidence.read('mcp-method-inputs', source.record_id)
-            expected_capture = receipt.get('method_inputs_sha256')
-            if expected_capture and (captured is None or digest(captured) != expected_capture):
-                _fail('stage.method_input_binding_changed', Category.UNKNOWN)
-            if captured is not None and not expected_capture:
-                visiting.remove(ref)
-                return None
-            if captured is not None:
-                claim = evidence.read('mcp-call', source.record_id)
-                if captured['request_sha256'] != digest(claim):
-                    _fail('stage.method_input_binding_changed', Category.UNKNOWN)
-                call = captured['resolved_call']
-
-            # Mutable path arguments require execution-bound snapshots before reuse.
-            args = call['arguments']
-            pinned = {p[0] for p in call.get('expected_files', ())}
-            if any((k.endswith('_path') or k in {'path', 'cwd'}) and v not in pinned for k, v in args.items()):
+            call = resolved['call']
+            parameters = spec.get('parameters', ())
+            if any(k != 'data_path' or k not in call['arguments'] for k in parameters):
+                if diagnostics is not None:
+                    diagnostics['parameter_unavailable'] = diagnostics.get('parameter_unavailable', 0) + 1
                 visiting.remove(ref)
                 return None
             dependencies = []
             for dependency in spec['dependencies']:
                 if build(dependency) is None:
+                    if diagnostics is not None:
+                        diagnostics['dependency_unavailable'] = diagnostics.get('dependency_unavailable', 0) + 1
                     visiting.remove(ref)
                     return None
                 dependencies.append(dependency)
@@ -170,7 +335,9 @@ class StageMethods:
                 'source_ref': source.ref, 'review_operation_id': review_id,
                 'call_sha256': digest(call), 'call': call, 'dependencies': dependencies,
                 'conditions': spec['conditions'], 'turn_id': fact.turn_id, 'road_id': fact.intent_id,
-                **({'files': captured['files']} if captured else {})}
+                **({'files': resolved['files']} if resolved['files'] else {}),
+                **({'capability': spec['capability']} if spec.get('capability') else {}),
+                **({'parameters': list(parameters)} if parameters else {})}
             entries[ref] = entry
             visiting.remove(ref)
             return entry
@@ -259,7 +426,7 @@ for item in manifest['files']:
     if hashlib.sha256(data).hexdigest()!=item['sha256']:raise ValueError('method.materialization_hash')
     folder=directory(parent)
     try:
-        try:fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400,dir_fd=folder)
+        try:fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600 if manifest.get('writable') else 0o400,dir_fd=folder)
         except FileExistsError:
             fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=folder)
             with os.fdopen(fd,'rb') as handle:
@@ -274,10 +441,6 @@ print(json.dumps({'root':root,'files':[{k:v for k,v in f.items() if k!='base64'}
 
 
 def resolve_materialization(request, ref):
-    import base64
-    import json
-    import shlex
-    import zlib
     from agent_core.stage_planning import stage_runtime
     methods = stage_runtime(request).get('methods', ())
     if not any(m['ref'] == ref and m['task_run_id'] == request.task_run_id for m in methods):
@@ -285,11 +448,35 @@ def resolve_materialization(request, ref):
     if not any(t['qualified_name'] == 'shell.run_bash' for t in request.tools):
         _fail('stage.method_tool_unavailable', Category.POLICY)
     manifest = method_artifacts(methods, ref)
+    return StageMethodMaterialize('shell.run_bash', {'script': materialization_script(manifest)}, ref)
+
+
+def materialization_script(manifest):
+    import base64
+    import json
+    import shlex
+    import zlib
     payload = base64.b64encode(zlib.compress(json.dumps(manifest).encode('utf-8'))).decode('ascii')
     script = 'python3 -I -c ' + shlex.quote(MATERIALIZE_WORKER) + ' ' + shlex.quote(payload)
     if len(script.encode('utf-8')) > 65536:
         _fail('stage.method_materialization_capacity', Category.CAPACITY)
-    return StageMethodMaterialize('shell.run_bash', {'script': script}, ref)
+    return script
+
+
+def resolve_working_script(request, ref):
+    from agent_core.stage_planning import stage_runtime
+    script = next((s for s in stage_runtime(request).get('working_scripts', ()) if s['source_ref'] == ref), None)
+    if script is None or script['task_run_id'] != request.task_run_id:
+        _fail('stage.working_script_unavailable', Category.POLICY)
+    if not any(t['qualified_name'] == 'shell.run_bash' for t in request.tools):
+        _fail('stage.method_tool_unavailable', Category.POLICY)
+    entry = {'ref': ref, 'dependencies': [], 'files': script.get('files', ()), 'call': {'tool_name': script['tool_name'],
+                                                   'arguments': {'script': script['script']}}}
+    manifest = method_artifacts([entry], ref)
+    root = '/workspace/work/.working/' + digest({'request': request.model_request_id, 'source': ref})
+    files = [{**f, 'materialized_path': root + f['path']} for f in manifest['files']]
+    return StageWorkingScript('shell.run_bash', {'script': materialization_script(
+        {'root': root, 'files': files, 'writable': True, 'reviewed': False})}, ref)
 
 
 def relevant_methods(methods, history):

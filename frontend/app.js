@@ -203,6 +203,7 @@ function renderRun(run, events = [], progress = null) {
   RunView.render({ run, events, progress, challengeId: state.selected });
 }
 let runReadBackoff = 0;
+let displayedSnapshotRunId = null;
 async function refreshRun(id, selection = runSelection) {
   if (state.selected !== id || selection !== runSelection) return;
   if (runRead?.taskId === id && runRead?.selection === selection) return;
@@ -216,13 +217,17 @@ async function refreshRun(id, selection = runSelection) {
     if (runRead !== reader || state.selected !== id || selection !== runSelection) return;
     retry = data.snapshot?.state === "refreshing" || data.snapshot?.state === "unavailable";
     const snapshotFailed = data.snapshot?.state === "unavailable" || data.progress?.recovery?.reason === "state_read_failed";
-    const initialSnapshot = data.snapshot?.state === "refreshing" && !data.progress;
+    const initialSnapshot = data.snapshot?.state === "refreshing" && displayedSnapshotRunId !== data.run_id;
     $("run-read-error").hidden = !snapshotFailed && !initialSnapshot;
-    if (snapshotFailed) $("run-read-error").textContent = "进度暂不可用，稍后重试。";
-    else if (initialSnapshot) $("run-read-error").textContent = "正在生成进度快照。";
-    if (data.snapshot?.state !== "refreshing" || data.progress) renderRun(data.run, data.events, data.progress);
+    if (snapshotFailed) $("run-read-error").textContent = "当前快照生成失败，稍后重试；已有内容仅为上次成功读取，不能视为当前状态。";
+    else if (initialSnapshot) $("run-read-error").textContent = "正在生成当前快照；已有内容仅为上次成功读取。";
+    const currentSnapshot = !snapshotFailed && (!data.snapshot || data.snapshot.state === "ready");
+    if (currentSnapshot) {
+      renderRun(data.run, data.events, data.progress);
+      displayedSnapshotRunId=data.run_id;
+    }
     const task = state.tasks.find((item) => item.id === id);
-    if (task && data.run) { task.run = { ...data.run, result: data.progress || data.run.result }; task.status = data.run.status; $("editor-state").textContent = task.status; $("detail-task-status").textContent = statusLabel(task)[1]; renderTaskList(); }
+    if (task && data.run) { task.run = { ...data.run, result: currentSnapshot ? data.progress || data.run.result : null }; task.status = data.run.status; $("editor-state").textContent = task.status; $("detail-task-status").textContent = statusLabel(task)[1]; if(currentSnapshot)renderTaskList(); }
   } catch (error) {
     if (runRead !== reader || state.selected !== id || selection !== runSelection) return;
     retry = true;

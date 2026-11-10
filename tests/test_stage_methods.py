@@ -207,7 +207,8 @@ def test_materialization_restores_dependency_files_without_running_methods():
     with pytest.raises(StageStateError, match='stage.method_dependency_cycle'):
         method_artifacts(methods, 'two')
 
-def test_materialization_worker_writes_immutable_files(tmp_path, capsys):
+@pytest.mark.parametrize('writable', [False, True])
+def test_materialization_worker_preserves_saved_files_and_work_copies(tmp_path, capsys, writable):
     import base64, hashlib, json, os, stat, zlib
     from types import SimpleNamespace
     from agent_core.stage_methods import MATERIALIZE_WORKER
@@ -249,7 +250,7 @@ def test_materialization_worker_writes_immutable_files(tmp_path, capsys):
     data = b'unchanged cached output'
     item = {'materialized_path': '/workspace/work/.methods/test/workspace/work/data.bin',
             'base64': base64.b64encode(data).decode(), 'sha256': hashlib.sha256(data).hexdigest()}
-    manifest = {'root': '/workspace/work/.methods/test', 'files': [item]}
+    manifest = {'root': '/workspace/work/.methods/test', 'files': [item], 'writable': writable}
     def run():
         payload = base64.b64encode(zlib.compress(json.dumps(manifest).encode())).decode()
         scope = dict(base64=base64, hashlib=hashlib, json=json, os=proxy, stat=stat, zlib=zlib,
@@ -332,7 +333,10 @@ def test_pinned_file_execution_is_bound_to_receipt_and_reusable(case, monkeypatc
         return raw
     def assess(request, raw):
         if getattr(request.proposal, 'method', None):
-            assert 'captured_inputs' in str(request.messages)
+            import json
+            body = next(json.loads(m['content']) for m in request.messages if '"method_tool_requests"' in m['content'])
+            file, = body['method_tool_requests'][0]['captured_inputs']['files']
+            assert file['content'] == "print('observed')\n" and 'base64' not in file
             raw['method_decision'] = 'accept'
         return raw
     case.models.inner.transform, case.models.outer.transform = act, assess
@@ -417,3 +421,141 @@ def test_materialization_failure_keeps_classified_receipt(case):
     assert result['status']=='failed' and result['code']=='method.materialization_conflict'
     assert result['category']=='dependency'
     assert len(case.tools.calls)==2
+
+
+def test_empty_catalog_collects_partial_capability_in_existing_fact_review(case):
+    from agent_core.stage_contracts import StageFactProposal
+    reviewed = []
+    assert not StageMethods(case.app.evidence, case.app.task_id).catalog()
+    def act(request, raw):
+        if raw.get('kind') == 'fact_candidate':
+            raw['content'] = 'The tool returned observed and exited successfully.'
+        return raw
+    def assess(request, raw):
+        if type(request.proposal) is StageFactProposal:
+            refs = stage_runtime(request)['method_candidates']['None']
+            assert refs == list(request.proposal.support_refs)
+            assert 'printf observed' in str(request.messages)
+            raw['method'] = {'source_ref': refs[0], 'capability': 'Read the controlled stdout only.'}
+            reviewed.append(request.model_request_id)
+        return raw
+    case.models.inner.transform, case.models.outer.transform = act, assess
+    asyncio.run(case.app.run(case.token))
+    methods = StageMethods(case.app.evidence, case.app.task_id).catalog()
+    assert len(reviewed) == len(methods) == 1
+    assert methods[0]['review_operation_id'] == reviewed[0]
+    assert methods[0]['capability'] == 'Read the controlled stdout only.'
+    assert methods[0]['dependencies'] == [] and methods[0]['conditions'] == ''
+    assert len(case.tools.calls) == 1
+    assert not any(type(r.proposal).__name__ == 'StageMethodRegistration' for r in case.models.outer.calls)
+
+
+def test_working_script_available_before_any_fact_without_certifying_it(case):
+    from agent_core.stage_methods import resolve_working_script
+    prepared = []
+    def act(request, raw):
+        scripts = stage_runtime(request).get('working_scripts', ())
+        if raw.get('kind') == 'fact_candidate' and scripts and not prepared:
+            assert not stage_runtime(request)['methods']
+            from agent_adapters.deepseek_roles import _stage_input
+            assert 'script' not in _stage_input(request)['current']['working_scripts'][0]
+            prepared.append(scripts[0]['source_ref'])
+            wrong = replace(request, task_run_id='another-task')
+            with pytest.raises(StageStateError, match='stage.working_script_unavailable'):
+                resolve_working_script(wrong, scripts[0]['source_ref'])
+            return {'kind': 'prepare_working_script', 'source_ref': scripts[0]['source_ref']}
+        return raw
+    case.models.inner.transform = act
+    asyncio.run(case.app.run(case.token))
+    assert len(prepared) == 1 and len(case.tools.calls) == 2
+    assert case.tools.calls[0][1]['script'] == 'printf observed'
+    assert case.tools.calls[1][1]['script'].startswith('python3 -I -c ')
+    assert not StageMethods(case.app.evidence, case.app.task_id).catalog()
+    entries = StageMethods(case.app.evidence, case.app.task_id).working_scripts(case.app.evidence.history(case.app.task_id))
+    assert len(entries) == 1 and entries[0]['script'] == 'printf observed'
+
+
+def test_method_review_batch_drops_nonexistent_verdict_and_rejects_cross_candidate_source():
+    from types import SimpleNamespace
+    from agent_core.stage_contracts import StageFactProposal, StageMethodFact, StageSelectedMethodReview
+    from agent_core.stage_methods import parse_method_review, method_review_counts
+    from agent_core.stage_contracts import StageFactBatch, StageFactBatchReview
+    first = StageMethodFact('First', 'observed', ('a',), method={'source_ref': 'a'})
+    second = StageFactProposal('Second', 'observed', ('b',))
+    request = SimpleNamespace(proposal=StageFactBatch((first, second)), execution_context={'stage_runtime': {
+        'method_reuse': 'reviewed_same_task_v3', 'method_candidates': {'1': ['b']}}})
+    raw = {'decision': 'accept', 'reason': 'supported', 'method_decision': 'accept'}
+    results = StageFactBatchReview(tuple(parse_method_review(request, raw, claim, index)
+        for index, claim in enumerate((first, second))))
+    assert not hasattr(results.decisions[1], 'method_decision')
+    assert method_review_counts(request, results, 1) == {'offered': 2, 'selected': 1, 'collected': 1}
+    method = {'source_ref': 'a', 'capability': 'partial', 'conditions': 'same', 'dependencies': []}
+    with pytest.raises(ValueError, match='stage.method_selection_invalid'):
+        parse_method_review(request, {**raw, 'method': method}, second, 1)
+    selected = parse_method_review(request, {'decision': 'accept', 'reason': 'supported',
+        'method': {**method, 'source_ref': 'b'}}, second, 1)
+    assert isinstance(selected, StageSelectedMethodReview)
+    # Frozen earlier requests retain their original parsed fields and hashes.
+    request.execution_context['stage_runtime']['method_reuse'] = 'reviewed_same_task_v2'
+    assert parse_method_review(request, raw, second, 1).method_decision == 'accept'
+
+
+def test_declared_data_input_uses_fresh_capture_and_keeps_code_and_original_fact(case):
+    from types import SimpleNamespace
+    from MCPs.Mcp_client.client import MCPExecutionResult
+    from agent_core.stage_contracts import StageFactProposal
+    tool = 'crypto.sympy'
+    case.tools.specs = [{'qualified_name': tool, 'description': 'controlled expression', 'tags': ['crypto'],
+        'input_schema': {'type': 'object', 'properties': {'expression': {'type': 'string'},
+            'data_path': {'type': 'string'}}, 'required': ['expression', 'data_path'], 'additionalProperties': False}}]
+    case.tools.list_registered_tools = lambda: [SimpleNamespace(qualified_name=tool)]
+    case.tools.bind_agent = lambda *args, **kwargs: case.tools
+    old, new = '/workspace/work/old.json', '/workspace/work/new.json'
+    files = {old: b'{"n":7}', new: b'{"n":11}'}
+    case.app.mcp.service = SimpleNamespace(read_image=lambda task, path: files[path])
+    async def call_tool(name, arguments):
+        case.tools.calls.append((name, arguments))
+        return MCPExecutionResult(case.app.task_id, 'controlled-sandbox', name, 'python', (),
+                                  'completed', 0, 'observed', '', False)
+    case.tools.call_tool = call_tool
+    reused = []
+    def act(request, raw):
+        if raw.get('kind') == 'mcp_call':
+            return {'kind': 'mcp_call', 'tool_name': tool, 'arguments': {'expression': 'factorint(n)', 'data_path': old},
+                    'pin_files': [old]}
+        if raw.get('kind') == 'road_resolution' and not reused:
+            method = stage_runtime(request)['methods'][0]
+            with pytest.raises(StageStateError, match='stage.method_input_undeclared'):
+                resolve_method_call(request, method['ref'], {'expression': '0'})
+            with pytest.raises(StageStateError, match='stage.method_input_path_invalid'):
+                resolve_method_call(request, method['ref'], {'data_path': '/etc/passwd'})
+            reused.append(method['ref'])
+            return {'kind': 'reuse_method', 'method_ref': method['ref'], 'inputs': {'data_path': new}}
+        return raw
+    def assess(request, raw):
+        if type(request.proposal) is StageFactProposal:
+            raw['method'] = {'source_ref': request.proposal.support_refs[0], 'capability': 'Factor supplied n.',
+                'conditions': 'JSON integer n.', 'dependencies': [], 'parameters': ['data_path']}
+        return raw
+    case.models.inner.transform, case.models.outer.transform = act, assess
+    asyncio.run(case.app.run(case.token))
+    assert case.tools.calls == [(tool, {'expression': 'factorint(n)', 'data_path': path}) for path in (old, new)]
+    method, = StageMethods(case.app.evidence, case.app.task_id).catalog()
+    assert method['call']['arguments']['data_path'] == old
+    operations = [op for op in case.app.store.list_d4_operations(case.app.task_id) if op.start.category == 'tool_dispatch']
+    captures = [case.app.evidence.read('mcp-method-inputs', op.start.operation_id) for op in operations]
+    assert [c['files'][0]['path'] for c in captures] == [old, new]
+    assert captures[0]['files'][0]['sha256'] != captures[1]['files'][0]['sha256']
+    assert len([i for i in case.app.evidence.history(case.app.task_id) if i.record_type == 'verified_fact']) == 1
+
+
+def test_history_read_prioritizes_older_working_code_without_expanding_default_index():
+    from types import SimpleNamespace
+    history = [SimpleNamespace(ref=str(n), task_run_id='task', identity='tool_observation_not_fact',
+                               turn_id='turn' + str(n), intent_id='road' + str(n)) for n in range(5)]
+    methods = StageMethods(None, 'task')
+    methods.source = lambda item, **kwargs: ({'call': {'tool_name': 'shell.run_bash',
+                                                    'arguments': {'script': 'echo ' + item.ref}}}, None)
+    assert [s['source_ref'] for s in methods.working_scripts(history)] == ['4', '3', '2']
+    selected = methods.working_scripts(history, preferred=('0',))
+    assert [s['source_ref'] for s in selected] == ['0', '4', '3']

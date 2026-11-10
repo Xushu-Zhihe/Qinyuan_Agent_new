@@ -25,8 +25,10 @@ def test_four_module_navigation_settings_and_preparation(tmp_path):
         browser = p.chromium.launch(channel="msedge", headless=True)
         page = browser.new_page(viewport={"width": 1160, "height": 790}, device_scale_factor=1)
         errors, calls = [], []
+        service_running=False
         page.on("pageerror", lambda error: errors.append(str(error)))
         def invoke(action, value):
+            nonlocal service_running
             calls.append((action, value))
             data = None
             if action == "snapshot": data = fixture
@@ -41,7 +43,9 @@ def test_four_module_navigation_settings_and_preparation(tmp_path):
             elif action == "background_opacity": data = {"revision": "appearance-revision"}
             elif action == "check": data = [{"name": "Docker Engine", "status": "passed", "detail": "可用"}]
             elif action in {"prepare", "progress"}: data = {"status": "completed", "logs": ["[download] 核验完成"]}
-            elif action == "service_status": data = {"active": True}
+            elif action == "service_status": data = {"running":service_running,"active":True}
+            elif action == "open": service_running=True; data=True
+            elif action == "stop_service": service_running=False; data=True
             return {"ok": True, "data": data}
         page.expose_function("desktopInvoke", invoke)
         page.add_init_script("window.pywebview={api:{invoke:(action,value)=>window.desktopInvoke(action,value)}};")
@@ -49,6 +53,8 @@ def test_four_module_navigation_settings_and_preparation(tmp_path):
         page.get_by_role("button", name="TSecBench", exact=False).wait_for()
         page.get_by_role("button", name="TSecBench", exact=False).click()
         assert page.locator("#launch-concurrency").is_enabled()
+        page.locator("#launch-button").click()
+        playwright.expect(page.locator("#service-badge")).to_have_text("工作台已连接")
         screenshot = os.environ.get("QINYUAN_UI_SCREENSHOT")
         if screenshot:
             page.screenshot(path=screenshot, full_page=True)
@@ -58,7 +64,8 @@ def test_four_module_navigation_settings_and_preparation(tmp_path):
         page.locator('[data-key="QINYUAN_INNER_BASE_URL"]').fill("https://api.deepseek.com")
         page.get_by_role("button", name="保存模型连接").click()
         page.wait_for_function("document.getElementById('notice').textContent.includes('配置已保存')")
-        saved = next(v for a, v in calls if a == "settings")
+        page.wait_for_function("settings.values.QINYUAN_INNER_MODEL === 'deepseek-v4-pro'")
+        saved = next(v for a, v in reversed(calls) if a == "settings")
         assert saved["values"]["QINYUAN_INNER_MODEL"] == "deepseek-v4-pro"
         page.locator('[data-pane="appearance"]').click()
         page.locator("#choose-background").click()
@@ -78,8 +85,41 @@ def test_four_module_navigation_settings_and_preparation(tmp_path):
         page.locator('[data-prepare="windows"]').click()
         page.wait_for_function("document.getElementById('download-state').textContent.includes('已完成')")
         assert ("prepare", "windows") in calls
+        service_running=False
+        page.evaluate("() => refreshServiceStatus()")
+        playwright.expect(page.locator("#service-badge")).to_have_text("工作台未启动")
         page.evaluate("window.launcherClose()")
         page.locator("#close-dialog[open]").wait_for()
+        page.locator("#cancel-close").click()
+        page.evaluate("""() => {
+          const invoke=window.pywebview.api.invoke;
+          window.pywebview.api.invoke=(action,value)=>{
+            if(action==='service_status')return Promise.resolve({ok:true,data:{active:false}});
+            if(action==='stop_service')return new Promise(resolve=>window.releaseIdleStop=()=>resolve({ok:true,data:true}));
+            if(action==='close')window.unexpectedClose=true;
+            return invoke(action,value);
+          };
+          window.launcherClose();
+        }""")
+        page.wait_for_function("typeof window.releaseIdleStop === 'function'")
+        page.locator("#cancel-close").click()
+        page.evaluate("() => {window.releaseIdleStop();return Promise.resolve().then(()=>Promise.resolve());}")
+        assert not page.evaluate("Boolean(window.unexpectedClose)")
+        # Neither a stuck ordinary action nor a stuck status read may disable
+        # the explicit keep-background close button.
+        page.evaluate("""() => {
+          const invoke=window.pywebview.api.invoke;
+          window.pywebview.api.invoke=(action,value)=>{
+            if(action==='check'||action==='service_status')return new Promise(()=>{});
+            if(action==='close')window.closeRequested=value;
+            return invoke(action,value);
+          };
+        }""")
+        page.locator('[data-tab="checks"]').click()
+        page.evaluate("window.launcherClose(); void 0")
+        page.locator("#close-dialog[open]").wait_for()
+        page.locator("#keep-background").click()
+        page.wait_for_function("window.closeRequested === 'background'")
         assert errors == []
         browser.close()
 
@@ -114,6 +154,30 @@ def test_workbench_keeps_two_views_and_task_editor(tmp_path):
             page.locator("#save-task").click()
             import re
             playwright.expect(page.locator("#task-id")).to_have_value(re.compile(r"[a-f0-9-]{36}"))
+            task_id=page.locator("#task-id").input_value()
+            projection={
+                "run_id":"display-run", "run":{"status":"running"}, "events":[],
+                "progress":{"errors":[{"code":"state_read_failed"}]},
+                "snapshot":{"state":"unavailable","generated_at":None,"error":"state_read_failed"}}
+            page.route("**/api/challenges/*/progress", lambda route: route.fulfill(json=projection))
+            page.evaluate("""() => {
+                clearTimeout(runPoll);runRead?.abort();runRead=null;
+                window.snapshotDraws=0;renderRun=()=>{window.snapshotDraws++};
+            }""")
+            page.evaluate("() => refreshRun(state.selected)")
+            playwright.expect(page.locator("#run-read-error")).to_contain_text("当前快照生成失败")
+            assert page.evaluate("window.snapshotDraws") == 0
+            assert page.evaluate("id => state.tasks.find(t=>t.id===id).run.result", task_id) is None
+            projection.update(progress={"checkpoint":{"sequence":1}},snapshot={"state":"ready","generated_at":1})
+            page.evaluate("() => refreshRun(state.selected)")
+            assert page.evaluate("window.snapshotDraws") == 1
+            projection.update(progress=None,snapshot={"state":"refreshing","generated_at":None})
+            page.evaluate("() => refreshRun(state.selected)")
+            playwright.expect(page.locator("#run-read-error")).to_be_hidden()
+            assert page.evaluate("window.snapshotDraws") == 1
+            projection.update(snapshot={"state":"unavailable","generated_at":None,"error":"state_read_failed"})
+            page.evaluate("() => refreshRun(state.selected)")
+            playwright.expect(page.locator("#run-read-error")).to_contain_text("当前快照生成失败")
             assert errors == []
             browser.close()
         request = urllib.request.Request(url + "/api/desktop", data=b'{"action":"shutdown"}',

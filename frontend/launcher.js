@@ -2,6 +2,21 @@
 const $ = (id) => document.getElementById(id);
 let settings, templates = [], profiles = [], adapter = "arena", profileId = "", downloadPoll, securityPoll, closePoll;
 let busy = false, connected = false;
+let serviceStatusRead;
+function renderServiceStatus(running) {
+  connected=running===true;
+  $("service-badge").textContent=running===null?"工作台状态待确认":connected?"工作台已连接":"工作台未启动";
+  $("local-status").textContent=running===null?"后台连接异常":connected?"本地服务就绪":"配置准备就绪";
+}
+async function refreshServiceStatus() {
+  if(serviceStatusRead)return serviceStatusRead;
+  serviceStatusRead=(async()=>{
+    try {const status=await rpc("service_status");renderServiceStatus(status.running ?? true);}
+    catch (_) {renderServiceStatus(null);}
+    finally {serviceStatusRead=null;}
+  })();
+  return serviceStatusRead;
+}
 const labels = {passed:"通过",failed:"失败",unknown:"待核验",not_applicable:"不适用"};
 const messages = {
   "settings.configuration_changed":"配置文件已被其他程序修改，请重新打开启动器后再保存。",
@@ -124,7 +139,7 @@ function selectProfile(profile, type=profile?.adapter || adapter) {
 async function loadProfiles() {
   profiles=await rpc("profiles");
   selectProfile(profiles.find(p=>p.id===profileId)||profiles.find(p=>p.id===settings.values.QINYUAN_LAUNCH_PROFILE)||profiles[0]||null);
-  $("service-badge").textContent=connected?"工作台已连接":"工作台未启动";$("local-status").textContent=connected?"本地服务就绪":"配置准备就绪";
+  renderServiceStatus(connected);
 }
 async function saveProfile() {
   if(!$("profile-form").reportValidity()) return;
@@ -169,18 +184,32 @@ async function pollDownload() {
     if(["running","cancel_requested"].includes(s.status))downloadPoll=setTimeout(pollDownload,1000);
   } catch(e) {notice(e.message);}
 }
-window.launcherClose=()=>perform(async()=>{
-  const s=await rpc("service_status");
-  if(s.active || ["running","cancel_requested","cancelled_unverified"].includes((await rpc("progress")).status)) {
-    $("close-dialog").showModal();return;
-  }
-  await rpc("stop_service");await rpc("close","background");
-});
-async function finishClose() {
+let closeCycle=0;
+window.launcherClose=async()=>{
+  if($("close-dialog").open)return;
+  const cycle=++closeCycle;
+  $("close-state").textContent="正在检查后台状态；也可直接保留后台并关闭窗口。";
+  $("pause-exit").disabled=true;
+  $("close-dialog").showModal();
+  try {
+    const s=await rpc("service_status"), progress=await rpc("progress");
+    if(cycle!==closeCycle)return;
+    const preparing=["running","cancel_requested","cancelled_unverified"].includes(progress.status);
+    if(!s.active && !preparing) {
+      await rpc("stop_service");
+      if(cycle===closeCycle)await rpc("close","background");
+    } else {
+      $("pause-exit").disabled=preparing;
+      $("close-state").textContent=preparing?"准备任务仍在运行或取消待核验；关闭窗口不代表它已停止。":"后台运行可继续，或等待安全暂停后退出。";
+    }
+  } catch(e) {if(cycle===closeCycle)$("close-state").textContent=e.message+"；可保留后台并关闭窗口。";}
+};
+async function finishClose(cycle) {
   try { const s=await rpc("service_status");
-    if(!s.active) {await rpc("stop_service");await rpc("close","background");return;}
+    if(cycle!==closeCycle)return;
+    if(!s.active) {await rpc("stop_service");if(cycle===closeCycle)await rpc("close","background");return;}
     $("close-state").textContent="正在等待原运行控制确认停止。未知结果请在工作台核验；不会强制退出。";
-    closePoll=setTimeout(finishClose,1500);
+    closePoll=setTimeout(()=>finishClose(cycle),1500);
   } catch(e) {$("close-state").textContent=e.message;}
 }
 async function initialize() {
@@ -194,6 +223,8 @@ async function initialize() {
     applySettings(snapshot.settings);await showBackground(snapshot.background);selectProfile(null);await rpc("security","Probe");refreshSecurity();
     runCheck("basic").catch(e=>notice(e.message));
     try {await loadProfiles();$("launch-concurrency").value=adapter==="benchmark"?settings.values.QINYUAN_LAUNCH_CONCURRENCY:"1";}catch(e){notice(e.message);}
+    refreshServiceStatus();
+    setInterval(refreshServiceStatus,3000);
   } catch(e) {notice(e.message);}
 }
 document.addEventListener("click",e=>{
@@ -225,12 +256,18 @@ $("profile-form").addEventListener("submit",e=>{e.preventDefault();perform(saveP
 $("check-profile").addEventListener("click",()=>perform(async()=>{const v=await rpc("profile_check",profileId);$("preview-summary").textContent=`连接成功 · 已读取 ${v.preview?.items?.length??0} 道题目；未领取或启动题目。`;}));
 $("clear-profile").addEventListener("click",()=>perform(async()=>{await rpc("profile_clear",profileId);await loadProfiles();}));
 $("migrate-key").addEventListener("click",()=>perform(async()=>{applySettings(await rpc("migrate",settings.revision));notice("密钥已加密保存并移除明文键。");}));
-$("launch-button").addEventListener("click",()=>perform(async()=>{if(await saveSettings())await rpc("open");}));
-$("stop-service").addEventListener("click",()=>perform(async()=>{await rpc("stop_service");$("service-badge").textContent="工作台已停止";notice("空闲工作台已请求停止。");}));
+$("launch-button").addEventListener("click",()=>perform(async()=>{if(await saveSettings()){await rpc("open");await refreshServiceStatus();}}));
+$("stop-service").addEventListener("click",()=>perform(async()=>{await rpc("stop_service");await refreshServiceStatus();notice("空闲工作台已请求停止。");}));
+window.addEventListener("focus",refreshServiceStatus);
 $("cancel-download").addEventListener("click",()=>perform(async()=>{await rpc("cancel_prepare");await pollDownload();}));
 $("download-filter").addEventListener("change",pollDownload);
 $("copy-logs").addEventListener("click",()=>perform(async()=>{await navigator.clipboard.writeText($("download-logs").textContent);notice("已复制当前分类的诊断记录。");}));
-$("keep-background").addEventListener("click",()=>perform(()=>rpc("close","background")));
-$("pause-exit").addEventListener("click",()=>perform(async()=>{await rpc("close","pause");finishClose();}));
-$("cancel-close").addEventListener("click",()=>{clearTimeout(closePoll);$("close-dialog").close();});
+$("keep-background").addEventListener("click",()=>{++closeCycle;clearTimeout(closePoll);rpc("close","background").catch(e=>notice(e.message));});
+$("pause-exit").addEventListener("click",async()=>{
+  const cycle=closeCycle;$("pause-exit").disabled=true;
+  try {await rpc("close","pause");if(cycle===closeCycle)finishClose(cycle);}
+  catch(e){$("close-state").textContent=e.message;$("pause-exit").disabled=false;}
+});
+$("cancel-close").addEventListener("click",()=>{++closeCycle;clearTimeout(closePoll);$("close-dialog").close();});
+$("close-dialog").addEventListener("cancel",()=>{++closeCycle;clearTimeout(closePoll);});
 if(window.pywebview?.api)initialize();else window.addEventListener("pywebviewready",initialize,{once:true});

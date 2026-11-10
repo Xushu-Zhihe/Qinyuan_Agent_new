@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import secrets
 import json
 import os
 import re
@@ -154,9 +155,10 @@ class Workbench:
         protocol_version: int | None = None,
         d7_mode: str | None = None,
         execution_profile: str = "d7",
+        desktop_token: str | None = None,
     ):
         self.root = root.resolve()
-        self.desktop_token = os.environ.get("QINYUAN_DESKTOP_TOKEN", "")
+        self.desktop_token = desktop_token if desktop_token is not None else os.environ.get("QINYUAN_DESKTOP_TOKEN", "")
         self.root.mkdir(parents=True, exist_ok=True)
         from agent_adapters.windows_security import WindowsSecuritySetup
 
@@ -249,7 +251,7 @@ class Workbench:
         self.competitions = CompetitionConnections(self)
         from agent_adapters.competition_schedule import CompetitionSchedules
         self.schedules = CompetitionSchedules(self)
-        if self.desktop_token:
+        if self.desktop_token and os.name == "nt":
             from agent_adapters.launcher_settings import SecretStore
             self.competitions.credentials = SecretStore(Path(__file__).resolve().parent.parent / ".launcher-secrets" / "competition")
         self.runner.start_recovery()
@@ -1024,6 +1026,7 @@ def main(argv=None):
             protocol_version=protocol,
             d7_mode=args.d7_mode,
             execution_profile=profile,
+            desktop_token=os.environ.get("QINYUAN_DESKTOP_TOKEN") or secrets.token_urlsafe(32),
         )
         server = WorkbenchServer(("127.0.0.1", args.port), workbench)
     except ValueError as exc:
@@ -1037,7 +1040,7 @@ def main(argv=None):
     except sqlite3.Error:
         parser.exit(1, "Cannot open the workbench database. Check the data directory and permissions.\n")
     with server:
-        instance = os.environ.get("QINYUAN_DESKTOP_INSTANCE")
+        instance = os.environ.get("QINYUAN_DESKTOP_INSTANCE") or str(workbench.root / ".desktop-instance.json")
         if instance and workbench.desktop_token:
             record = Path(instance)
             record.parent.mkdir(parents=True, exist_ok=True)

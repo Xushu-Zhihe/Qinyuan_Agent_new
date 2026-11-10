@@ -180,7 +180,7 @@ def execution_policy(config):
         "capacity": asdict(config.handoff_config),
         "human_confirmation": "assume_after_300s_v1",
         "review_queue": {"binding": "immutable_proposal_v1", "dispatch": "async_planning_v1"},
-        "method_reuse": "reviewed_same_task_v2",
+        "method_reuse": "reviewed_same_task_v3",
         "tool_execution": {"schema": "v2", "max_in_flight": MAX_IN_FLIGHT_TOOLS,
                            "sandbox_target_in_flight": 1,
                            "max_calls_per_decision": MAX_IN_FLIGHT_TOOLS,

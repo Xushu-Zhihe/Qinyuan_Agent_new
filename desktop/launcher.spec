@@ -1,4 +1,4 @@
-# Build from the project root: uv run --project desktop --group build pyinstaller desktop/launcher.spec
+# Build from the project root: uv run --project desktop --group build --locked pyinstaller --distpath . --workpath desktop/build desktop/launcher.spec
 from pathlib import Path
 
 root = Path(SPECPATH).parent

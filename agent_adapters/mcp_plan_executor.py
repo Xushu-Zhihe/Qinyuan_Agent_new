@@ -361,6 +361,18 @@ class MCPPlanExecutor:
             if not tool_allowed(self.app.store, self.app.task_id, call):
                 raise ExecutionRecoveryRequired('stage.resource_outcome_unknown')
         from agent_adapters.public_web import NAMES
+        if getattr(call, "working_ref", ""):
+            from agent_core.stage_methods import StageMethods, resolve_working_script
+            request = self.evidence.request(request_id)
+            if resolve_working_script(request, call.working_ref) != call:
+                raise ExecutionRecoveryRequired("stage.working_script_changed")
+            item, = self.evidence.read_history(self.app.task_id, (call.working_ref,), observations_only=True)
+            source, _ = StageMethods(self.evidence, self.app.task_id).source(item, successful=False)
+            from agent_core.stage_planning import stage_runtime
+            frozen = next(s for s in stage_runtime(request)["working_scripts"] if s["source_ref"] == call.working_ref)
+            if (source is None or source["call"]["arguments"].get("script") != frozen["script"]
+                    or source["files"] != frozen.get("files", [])):
+                raise ExecutionRecoveryRequired("stage.working_script_source_changed")
         if getattr(call, "materialize_ref", ""):
             from agent_core.stage_methods import resolve_materialization
             request = self.evidence.request(request_id)
@@ -372,13 +384,14 @@ class MCPPlanExecutor:
             if not any(m["ref"] == call.materialize_ref for m in current):
                 raise ExecutionRecoveryRequired("stage.method_source_changed")
         if getattr(call, "method_ref", ""):
-            from agent_core.stage_methods import StageMethods
+            from agent_core.stage_methods import StageMethods, resolve_method_call
+            from agent_core.stage_planning import stage_runtime
+            request = self.evidence.request(request_id)
             method = next((m for m in StageMethods(self.evidence, self.app.task_id).catalog()
                            if m["ref"] == call.method_ref), None)
-            if (method is None or method["call"]["tool_name"] != call.tool_name
-                    or method["call"]["arguments"] != call.arguments
-                    or tuple(method["call"].get("pin_files", ())) != call.pin_files
-                    or tuple(tuple(p) for p in method["call"].get("expected_files", ())) != call.expected_files):
+            frozen = next((m for m in stage_runtime(request).get("methods", ()) if m["ref"] == call.method_ref), None)
+            if (method is None or method != frozen or resolve_method_call(request, call.method_ref,
+                    getattr(call, "input_overrides", None)) != call):
                 raise ExecutionRecoveryRequired("stage.method_source_changed")
         public = call.tool_name in NAMES
         if public:
@@ -568,7 +581,7 @@ class MCPPlanExecutor:
             failure = ExecutionRecoveryRequired(code)
             failure.operation_context = context
             raise failure from exc
-        if getattr(call, "materialize_ref", "") and (payload.get("status") != "completed" or payload.get("exit_code", 0) != 0):
+        if (getattr(call, "materialize_ref", "") or getattr(call, "working_ref", "")) and (payload.get("status") != "completed" or payload.get("exit_code", 0) != 0):
             codes = ("scope", "hash", "conflict", "symlink", "directory")
             code = next(("method.materialization_" + c for c in codes
                          if "method.materialization_" + c in payload.get("stderr", "")), "method.materialization_failed")

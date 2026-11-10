@@ -1132,9 +1132,7 @@ class Runner:
         with self._lock:
             entry = self._snapshots.get(key)
             if entry is None or entry.done.is_set() and entry.delivered:
-                previous = entry.result if entry is not None else None
-                generated = entry.generated_at if entry is not None else None
-                entry = ProgressSnapshot(result=previous, generated_at=generated)
+                entry = ProgressSnapshot()
                 self._snapshots[key] = entry
                 # Keep at most 64 idle display entries; in-flight work stays bound.
                 for old in list(self._snapshots):
@@ -1151,26 +1149,29 @@ class Runner:
             ready = entry.done.is_set()
             if ready:
                 entry.delivered = True
-            result = entry.result
+            result = entry.result if ready and not entry.failed else None
             snapshot = dict(state="unavailable" if ready and entry.failed else "ready" if ready else "refreshing",
                 generated_at=entry.generated_at)
+            if ready and entry.failed:
+                snapshot["error"] = "state_read_failed"
         return {"run_id": run["run_id"], "run": run, "events": self.events(challenge_id, run=run)["events"],
             "progress": result, "snapshot": snapshot}
 
     def _generate_progress(self, challenge_id, run, entry):
         from qinyuan_core import get_logger
         started = time.monotonic()
+        failed = False
         try:
             result = self._progress_once(challenge_id, run=run)["progress"]
         except Exception as error:  # display boundary; never retain a hidden healthy verdict
-            result = {"errors": [{"code": "state_read_failed", "exception_type": type(error).__name__}],
-                "recovery": {"required": True, "reason": "state_read_failed"}}
-            entry.failed = True
+            result = None
+            failed = True
             get_logger("sys").warning("workbench.snapshot_failed", category="dependency",
                 run=run["run_id"], code="state_read_failed", exception_type=type(error).__name__)
         with self._lock:
             entry.result = result
-            entry.generated_at = time.time()
+            entry.failed = failed
+            entry.generated_at = None if failed else time.time()
             entry.done.set()
         elapsed = time.monotonic() - started
         if elapsed >= 2:
@@ -1210,9 +1211,7 @@ class Runner:
 
                     progress = snapshot_task_progress(directory, declaration)
             except (OSError, ValueError, KeyError, TypeError):
-                progress = {
-                    "recovery": {"required": True, "reason": "state_or_evidence_unreadable"}
-                }
+                raise WorkbenchError("state_read_failed", 409) from None
         return {"run_id": run["run_id"], "run": run, "events": events, "progress": progress}
 
     def execution(self, challenge_id: str, execution_id: str):

@@ -5,6 +5,7 @@
 /desktop/.venv/
 /desktop/build/
 /desktop/dist/
+/QinyuanLauncher.exe
 .env.*.local
 .venv/
 venv/

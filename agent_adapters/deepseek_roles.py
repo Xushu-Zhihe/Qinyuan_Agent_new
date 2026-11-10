@@ -384,7 +384,13 @@ def _stage_input(request):
                 context[key] = environment["stage_runtime"][key]
         if environment["stage_runtime"].get("methods"):
             context["methods"] = [{**{k: method[k] for k in ("ref", "fact_ref", "source_ref", "dependencies", "conditions")},
+                **{k: method[k] for k in ("capability", "parameters") if k in method},
                 "tool_name": method["call"]["tool_name"]} for method in environment["stage_runtime"]["methods"]]
+        if environment["stage_runtime"].get("method_candidates"):
+            context["method_candidates"] = environment["stage_runtime"]["method_candidates"]
+        if environment["stage_runtime"].get("working_scripts"):
+            context["working_scripts"] = [{k: script[k] for k in ("source_ref", "tool_name", "sha256", "turn_id", "road_id")}
+                for script in environment["stage_runtime"]["working_scripts"]]
         if environment["stage_runtime"].get("action_checkpoint") is not None:
             context["action_checkpoint"] = environment["stage_runtime"]["action_checkpoint"]
     history = []

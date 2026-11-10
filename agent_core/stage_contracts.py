@@ -41,6 +41,16 @@ class StageMethodMaterialize(MCPCall):
 
 
 @dataclass(frozen=True, slots=True)
+class StageWorkingScript(MCPCall):
+    working_ref: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StageMethodVariant(StageMethodCall):
+    input_overrides: dict | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StageToolBatch:
     calls: tuple[MCPCall, ...]
 
@@ -277,6 +287,13 @@ class StageMethodFact(StageFactProposal):
 @dataclass(frozen=True, slots=True)
 class StageMethodReview(TurnPlanningReview):
     method_decision: Literal["accept", "unavailable"] = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class StageSelectedMethodReview(TurnPlanningReview):
+    """A scoped method selected from execution-bound candidates during Fact review."""
+
+    method: dict | None = None
 
 
 def method_fact(value):

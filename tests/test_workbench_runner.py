@@ -684,10 +684,14 @@ def test_progress_coalesces_slow_reads_and_exposes_failures(tmp_path, monkeypatc
         assert entry.done.wait(5)
         result = runner.progress("challenge")
         assert result["snapshot"]["state"] == "unavailable"
-        assert result["progress"]["errors"][0]["code"] == "state_read_failed"
+        assert result["progress"] is None
+        assert result["snapshot"]["error"] == "state_read_failed"
+        assert result["snapshot"]["generated_at"] is None
         assert "PRIVATE" not in str(result)
         gate.clear()
-        runner.progress("challenge")
+        retrying = runner.progress("challenge")
+        assert retrying["snapshot"] == {"state": "refreshing", "generated_at": None}
+        assert retrying["progress"] is None
         entry, = runner._snapshots.values()
         gate.set()
         assert entry.done.wait(5)
