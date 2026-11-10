@@ -612,6 +612,40 @@ def review_report(run_dir, con, calls, operations, requests):
         inconsistent_fence_ids=sorted(set(fences) & tools.keys()))
 
 
+def _stage_result_value(run_dir, identity):
+    result = read_payload(run_dir / "stage-evidence" / ("stage-result-" + str(identity) + ".json"))
+    if result.get("outcome") != "valid":
+        return {}
+    try:
+        calls = result.get("tool_calls")
+        content = (json.loads(calls[0]["function"]["arguments"])["result"] if calls else result.get("content"))
+        content = json.loads(content) if isinstance(content, str) else content
+        return content if isinstance(content, dict) else {}
+    except (KeyError, IndexError, TypeError, ValueError):
+        return {}
+
+
+def boundary_operation_report(run_dir, con, operations, requests):
+    commits = {r["mutation_id"]: r["committed_at"] for r in query(con,
+        "select mutation_id,committed_at from control_mutations")}
+    rows = []
+    for identity, request in requests.items():
+        runtime = (request.get("execution_context") or {}).get("stage_runtime") or {}
+        joint, draft = runtime.get("joint_fact_closure"), runtime.get("draft_for")
+        if not joint and request.get("stage") != "stage_draft":
+            continue
+        operation = operations.get(identity, {})
+        application = operation.get("application")
+        value = _stage_result_value(run_dir, identity)
+        decision = ({key: value[key].get("decision") for key in ("road", "turn") if isinstance(value.get(key), dict)}
+            or value.get("decision")) if joint else None
+        rows.append(dict(operation_id=identity, kind="joint_closure_review" if joint else "successor_draft",
+            parent_operation_id=joint or draft, started_at=operation.get("start", {}).get("started_at"),
+            finished_at=operation.get("end", {}).get("finished_at"), applied_at=commits.get(application),
+            applied=application is not None, decision=decision))
+    return rows
+
+
 def intent_revision_report(run_dir, con, operations, requests):
     """Read exact correction branches; unknown application timing stays unknown."""
     branches = {r["branch_id"]: dict(r) for r in query(con,
@@ -627,21 +661,7 @@ def intent_revision_report(run_dir, con, operations, requests):
     def elapsed(start, end):
         return end - start if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end >= start else None
     def result_value(identity):
-        result = read_payload(run_dir / "stage-evidence" / ("stage-result-" + str(identity) + ".json"))
-        if result.get("outcome") != "valid":
-            return None
-        content = result.get("content")
-        if isinstance(content, str) and not result.get("tool_calls"):
-            try:
-                content = json.loads(content)
-            except ValueError:
-                return None
-        if result.get("tool_calls"):
-            try:
-                content = json.loads(result["tool_calls"][0]["function"]["arguments"])["result"]
-            except (KeyError, IndexError, TypeError, ValueError):
-                return None
-        return content if isinstance(content, dict) else {}
+        return _stage_result_value(run_dir, identity)
     def decision(identity):
         return (result_value(identity) or {}).get("decision")
     successors = {}
@@ -714,7 +734,7 @@ def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
             error=None, finish="-"))
         call.update(finished=completion.get("finished_at"), ledger_state=completion.get("result_kind"),
             applied=row["application_ref"] is not None, ledger_known=True, started_known=start.get("started_at") is not None)
-    planning = {"stage_intent", "stage_roads", "stage_continuation"}
+    planning = {"stage_intent", "stage_roads", "stage_continuation", "stage_draft"}
     grouped, intervals, plan_intervals = {}, [], []
     for call in calls.values():
         group = grouped.setdefault(call["stage"], dict(calls=0, cumulative_seconds=0.0,
@@ -756,6 +776,7 @@ def planning_report(run_dir: Path, con: sqlite3.Connection) -> dict:
     model_union = interval_seconds(intervals) if intervals else None
     plan_union = interval_seconds(plan_intervals) if intervals else None
     return dict(stages=grouped, planning_stages=sorted(planning), outcomes=outcomes,
+        boundary_operations=boundary_operation_report(run_dir, con, operations, requests),
         intent_revision_chains=intent_revision_report(run_dir, con, operations, requests),
         reviews=review_report(run_dir, con, calls, operations, requests),
         unreadable_ledger_rows=unreadable_rows,

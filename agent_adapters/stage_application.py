@@ -22,7 +22,7 @@ from agent_core.redaction import D5Redactor
 from agent_core.runtime import RuntimeEvent, TaskRunStatus
 from agent_core.sqlite_control_store import SqliteControlStore
 from agent_core.stage_contracts import (
-    StageMethodRegistration,
+    StageMethodRegistration, TurnCriterionRevision, StageFactClosure,
     PlanningExhausted, PlanningSession, RoadResolution, RoadSnapshot, RoadTurnClosure, RoadTurnClosureReview, StageFactApplication,
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageToolDetails, StageFactProposal, StageIncomplete,
     StageReviewBinding, StageRunConfig, StageStateChange, StageTurnSnapshot,
@@ -86,9 +86,10 @@ def catalog_with_completion_support(catalog, eligible_refs):
 
 class StageApplication:
     def __init__(self, directory, *, config, sandbox, workspace_sandbox, inner_model, outer_model,
-                 clock, capacity_port, mcp_manager=None, target_network_adapter=None, sensitive_values=(), goal_validation=None, http_sandbox=None, import_sandbox=None):
+                 clock, capacity_port, mcp_manager=None, target_network_adapter=None, sensitive_values=(), goal_validation=None, http_sandbox=None, import_sandbox=None, successor_drafts=False):
         self.directory, self.config, self.clock = directory, config, clock
         self.goal_validation = goal_validation
+        self.successor_drafts = successor_drafts
         self.store = SqliteControlStore.open(directory / "control.sqlite", clock=clock)
         self.evidence = StageEvidence(directory / "stage-evidence", self.store)
         self.store.stage_evidence = self.evidence
@@ -141,7 +142,10 @@ class StageApplication:
         return stable_id(self.task_id, name)
 
     def _policy(self):
-        return execution_policy(self.config)
+        policy = execution_policy(self.config)
+        if self.successor_drafts:
+            policy["successor_drafts"] = "isolated_v1"
+        return policy
 
     def start(self, request, *, source_root=None, effective_model_backend=ModelBackend.DEEPSEEK_OPENAI, task_run_id=None):
         from agent_core.http_validation import valid_target
@@ -493,6 +497,12 @@ class StageApplication:
             if t.turn_id == session.owner_id or any(r.road_id == session.owner_id for r in t.roads)), None)
         if stage == "stage_intent":
             turn = None
+        if isinstance(proposal, TurnCriterionRevision):
+            origin = self.evidence.request(proposal_id)
+            target_id = stage_runtime(origin).get("criterion_target")
+            target = self.store.load_turn(self.task_id, target_id) if target_id else origin.context.turn
+            if target is not None:
+                turn = self.store.load_turn(self.task_id, target.turn_id)
         if stage == "stage_action":
             queued = {entry.proposal_operation_id for entry in self.store.list_stage_reviews(self.task_id)}
             resource = "stage/" + session.scope + "/" + session.owner_id
@@ -560,6 +570,15 @@ class StageApplication:
                     "settled_road": asdict(review_request.proposal),
                     "review": asdict(reviewed),
                 }, ensure_ascii=False)},)
+                if (stage_runtime(review_request).get("joint_fact_closure")
+                        and not isinstance(review_request.proposal, RoadTurnClosure)):
+                    original = self.evidence.read_model_result(self.store.load_d4_operation(review_request.proposal_operation_id)).result
+                    if isinstance(original.closure, RoadTurnClosure):
+                        messages += ({"role": "user", "content": json.dumps({
+                            "source_operation_id": review_request.proposal_operation_id,
+                            "code": "stage.joint_turn_support_missing",
+                            "reason": "The conditional Turn completion was not submitted: its selected candidate supports were not accepted. Propose a new completion with valid formal support or report incomplete.",
+                        })},)
         else:
             messages = self._conversation(session, sources, action_history=all_history if stage == "stage_action" else None)
         if (stage == "stage_review" and isinstance(proposal, StagePlanningDecision)
@@ -677,12 +696,22 @@ class StageApplication:
                     runtime["last_experiment"] = {"operation_id": operation.start.operation_id, **result}
                     break
         if turn is not None:
+            from agent_core.stage_storage import criterion_version
+            runtime["criterion_version"] = criterion_version(self.store, self.task_id, turn)
             fact_revisions = self.evidence.knowledge(self.task_id).visible_fact_revisions(turn.turn_id)
             if fact_revisions:
                 runtime["fact_revisions"] = fact_revisions
         revision = self._intent_revision(stage, session, branch, proposal_id, proposal)
         if revision is not None:
             runtime["intent_revision"] = revision
+            if stage in {"stage_intent", "stage_continuation"}:
+                target = next((scope.owner_id for scope, identity in stage_plans.bindings(self.store, self.task_id)
+                    if scope.scope == "turn_planning" and identity == revision["proposal_operation_id"]), None)
+                target = self.store.load_turn(self.task_id, target) if target else None
+                if target is not None and target.planning_state is TurnPlanningState.SUPERSEDED and target.achievement is None:
+                    from agent_core.stage_storage import criterion_version
+                    runtime["criterion_version"] = criterion_version(self.store, self.task_id, target)
+                    runtime["criterion_target"] = target.turn_id
         if (self.goal is not None and self.goal_validation == "external"
                 and not self.store.list_d7_answer_candidates(self.task_id)
                 and any(i.record_type == "progress" and i.identity == "tool_observation_not_fact"
@@ -696,6 +725,7 @@ class StageApplication:
                 runtime["route_reassessment"] = {"operation_id": advice, "reason": value.reason,
                     "support_refs": list(value.support_refs)}
         if stage == "stage_action" and session.scope == "road_execution":
+            runtime["fact_closure"] = True
             for operation, source, _ in reversed(sources):
                 if source.context.session != session:
                     continue
@@ -933,7 +963,7 @@ class StageApplication:
         identity = self._id("stage/review/" + proposal_id)
         request = self.evidence.request(identity) if self.evidence.read("request", identity) is not None else replace(
             self._request("stage_review", session, proposal_id=proposal_id, proposal=proposal), model_request_id=identity)
-        return await self.models.call(request, token)
+        return await self._closure_review(request, token)
 
     async def _knowledge_action(self, request, identity, value, token):
         knowledge = self.evidence.knowledge(self.task_id)
@@ -964,6 +994,8 @@ class StageApplication:
                 if existing is None:
                     self._commit(StageStateChange(review_submissions=(identity,), branches=(StageBranchFork(identity),)))
                 await self.reviews.start(token)
+                if isinstance(value, StageFactClosure):
+                    await self.reviews.collect(token, wait=True)
                 return True
             try:
                 review_id, review = await self._queued_review(request.context.session, identity, value, token)
@@ -1399,7 +1431,18 @@ class StageApplication:
             self._commit(StageStateChange(reviews=(binding,)))
             return
         changes = []
-        if isinstance(proposal, TurnIntent):
+        if isinstance(proposal, TurnCriterionRevision):
+            source = self.evidence.request(binding.proposal_operation_id)
+            target_id = stage_runtime(source).get("criterion_target")
+            origin = self.store.load_turn(self.task_id, target_id) if target_id else source.context.turn
+            turn = self.store.load_turn(self.task_id, origin.turn_id)
+            intent = replace(turn.intent, completion_criterion=proposal.completion_criterion,
+                support_refs=tuple(dict.fromkeys((*turn.intent.support_refs, *proposal.support_refs))))
+            changes = [replace(turn, intent=intent, planning_state=TurnPlanningState.ACTIVE)]
+            if turn.parent_turn_id:
+                parent = self.store.load_turn(self.task_id, turn.parent_turn_id)
+                changes.append(replace(parent, planning_state=TurnPlanningState.WAITING_CHILD))
+        elif isinstance(proposal, TurnIntent):
             child = StageTurnSnapshot(self._id("stage/turn/" + binding.proposal_operation_id), proposal,
                 TurnPlanningState.ACTIVE, turn.turn_id)
             changes = [replace(turn, planning_state=TurnPlanningState.WAITING_CHILD), child]
@@ -1443,6 +1486,117 @@ class StageApplication:
             code=proposal.kind if isinstance(proposal, StagePlanningDecision) else type(proposal).__name__,
             turn=turn.turn_id, parent=turn.parent_turn_id)
 
+    def _promote_successor_draft(self, turn):
+        if not self.successor_drafts or turn.achievement is None:
+            return False
+        for operation in self.store.list_d4_operations(self.task_id):
+            if (operation.start.role != "inner_action" or operation.application_ref is not None
+                    or operation.completion is None or operation.completion.result_kind != "completed"):
+                continue
+            request = self.evidence.request(operation.start.operation_id)
+            if request.stage != "stage_draft" or stage_runtime(request).get("draft_for") != self.evidence.model_root(turn.achievement.review_operation_id):
+                continue
+            if (self.evidence.read("result", operation.start.operation_id) or {}).get("outcome") != "valid":
+                continue
+            if request.context.turn.intent != turn.intent:
+                continue
+            value = self.evidence.read_model_result(operation).result
+            from agent_core.stage_planning import frozen_history
+            current = {i.ref: i for i in self.evidence.history(self.task_id)}
+            original = frozen_history(request)
+            if any(ref not in current or ref not in original or current[ref] != original[ref] for ref in value.support_refs):
+                continue
+            self._submit_planning(request, operation.start.operation_id, value)
+            return True
+        return False
+
+    async def _closure_review(self, request, token):
+        if not self.successor_drafts or not isinstance(request.proposal, (RoadTurnClosure, TurnCompletion)) or self.reviews.job is not None:
+            return await self.models.call(request, token)
+        from agent_adapters.stage_reviews import _GenerationToken
+        saved_draft = self._id("stage/draft/" + request.model_request_id)
+        if self.evidence.read("request", saved_draft) is not None:
+            return await self.models.call(request, token)
+        turn = request.context.turn
+        draft = self._request("stage_draft", PlanningSession("turn_planning", turn.turn_id))
+        draft = replace(draft, model_request_id=saved_draft, execution_context={**draft.execution_context,
+            "stage_runtime": {**stage_runtime(draft), "draft_for": request.model_request_id}})
+        self.reviews.job = SimpleNamespace(request=request, members=(request.proposal_operation_id,),
+            token=_GenerationToken(token), task=None)
+        self.reviews.job.task = asyncio.create_task(self.models.call(request, self.reviews.job.token))
+        await asyncio.sleep(0)
+        self.reviews.foreground = SimpleNamespace(request=draft, token=_GenerationToken(token), task=None)
+        self.reviews.foreground.task = asyncio.create_task(self.models.call(draft, self.reviews.foreground.token))
+        try:
+            result = await self.reviews.job.task
+            verdict = result[1].turn if isinstance(result[1], RoadTurnClosureReview) else result[1]
+            if verdict.decision != "accept" or not self.reviews.foreground.task.done():
+                self.reviews.foreground.token.superseded_by = result[0]
+            try:
+                await self.reviews.foreground.task
+            except StageModelSuperseded:
+                pass
+            except StageRecoveryRequired as error:
+                if (error.code != "stage.dispatch_stopped" or token.is_cancelled
+                        or self.clock() >= self.state.task_run.deadline_at
+                        or self.store.load_d4_operation(saved_draft) is not None):
+                    raise
+            except StageModelTransportFailure as error:
+                if error.context["model_call"]["stage"] != "stage_draft":
+                    raise
+                get_logger("ctrl").warning("stage.successor_draft_unavailable", run=self.task_id,
+                    operation=saved_draft, phase="stage_draft", category="dependency",
+                    code="stage.draft_transport_unavailable")
+            return result
+        finally:
+            if any(not entry.task.done() for entry in (self.reviews.job, self.reviews.foreground)):
+                await self.reviews.stop()
+            self.reviews.foreground = self.reviews.job = None
+
+    async def _continue_joint_closure(self, turn, token):
+        from agent_core.stage_storage import resolved_fact_closure
+        from agent_core.stage_planning import blocking_fact_revisions
+        running = next((r for r in turn.roads if r.status is IntentStatus.RUNNING), None)
+        if running is None:
+            return False
+        for entry in self.store.list_stage_reviews(self.task_id):
+            if entry.state != "settled":
+                continue
+            identity = entry.proposal_operation_id
+            source = self.evidence.read_model_result(self.store.load_d4_operation(identity))
+            if not isinstance(source.result, StageFactClosure) or source.session.owner_id != running.road_id:
+                continue
+            original = self.evidence.request(identity)
+            if original.context.turn.intent != turn.intent:
+                continue
+            review_id = self._id("stage/review-closure/" + identity)
+            operation = self.store.load_d4_operation(review_id)
+            if operation is not None and operation.application_ref is not None:
+                continue
+            await self._collect_tools(drain=True)
+            history = self.evidence.history(self.task_id)
+            closure = resolved_fact_closure(self.store, self.task_id, identity, history)
+            if closure is None:
+                continue
+            if isinstance(source.result.closure, RoadTurnClosure) and not isinstance(closure, RoadTurnClosure):
+                get_logger("ctrl").warning("stage.joint_closure_partial", run=self.task_id, operation=identity,
+                    phase="stage_completion", category="input", code="stage.joint_turn_support_missing",
+                    turn=turn.turn_id, road=running.road_id)
+            request = self.evidence.request(review_id) if self.evidence.read("request", review_id) else replace(
+                self._request("stage_review", source.session, proposal_id=identity, proposal=closure), model_request_id=review_id)
+            if blocking_fact_revisions(request):
+                continue
+            runtime = {**stage_runtime(request), "joint_fact_closure": identity}
+            request = replace(request, execution_context={**request.execution_context, "stage_runtime": runtime})
+            completed_id, review = await self._closure_review(request, token)
+            if self.store.load_d4_operation(completed_id).application_ref is not None:
+                continue
+            binding = StageReviewBinding(identity, completed_id)
+            parts = review.parts(closure) if isinstance(closure, RoadTurnClosure) else ((closure, review),)
+            self._apply_closure(self.store.load_turn(self.task_id, turn.turn_id), running, binding, parts)
+            return True
+        return False
+
     async def _run(self, token):
         self._token = token
         await self._prepare_inputs(token)
@@ -1471,10 +1625,15 @@ class StageApplication:
                 await self._decide_route(advice, token)
                 continue
             turn = active_turn(self.store.list_stage_turns(self.task_id))
+            if turn is not None and await self._continue_joint_closure(turn, token):
+                continue
             if turn is None:
                 request = self._request("stage_intent", PlanningSession("turn_planning", root_id))
                 proposal, review, binding = await self._review(request, token)
                 if binding is None:
+                    continue
+                if isinstance(proposal, TurnCriterionRevision):
+                    self._apply_planning(None, proposal, review, binding)
                     continue
                 changes = () if review.decision != "accept" or isinstance(proposal, PlanningExhausted) else (
                     StageTurnSnapshot(root_id, proposal, TurnPlanningState.ACTIVE),)
@@ -1494,6 +1653,9 @@ class StageApplication:
                     await self._wait_isolated()
                     return StageRunResult(self.task_id, turn, "stage.exhausted")
                 if not _just_registered_roads(self.store, self.task_id, turn.turn_id):
+                    if self._promote_successor_draft(turn):
+                        await self.reviews.start(token)
+                        continue
                     proposal, review, binding = await self._review(self._request("stage_continuation",
                         PlanningSession("turn_planning", turn.turn_id)), token)
                     if binding is not None:

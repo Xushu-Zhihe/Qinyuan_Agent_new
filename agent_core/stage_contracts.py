@@ -98,6 +98,13 @@ class RoadCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class TurnCriterionRevision:
+    completion_criterion: str
+    reason: str
+    support_refs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class RoadSnapshot:
     road_id: str
     candidate: RoadCandidate
@@ -210,7 +217,7 @@ class StagePlanningDecision:
 
 
 TurnPlanningProposal: TypeAlias = (
-    TurnIntent | tuple[RoadCandidate, ...] | TurnCompletion | PlanningExhausted | RoadResolution
+    TurnIntent | TurnCriterionRevision | tuple[RoadCandidate, ...] | TurnCompletion | PlanningExhausted | RoadResolution
     | StageFactSelection | StageHistoryRead | StageConclusionChange | StagePlanningDecision
 )
 
@@ -314,6 +321,24 @@ class StageFactBatch:
     @property
     def reason(self):
         return "Independent conclusion candidates"
+
+
+@dataclass(frozen=True, slots=True)
+class StageFactClosure(StageFactBatch):
+    closure: RoadResolution
+
+    def resolve(self, references):
+        def refs(values):
+            return tuple(references[v] for v in values)
+        value = self.closure
+        road = RoadResolution(value.outcome, value.reason, refs(value.support_refs))
+        if isinstance(value, RoadTurnClosure):
+            try:
+                completion = TurnCompletion(value.completion.reason, refs(value.completion.support_refs))
+            except KeyError:
+                return road
+            return RoadTurnClosure(road.outcome, road.reason, road.support_refs, completion)
+        return road
 
 
 @dataclass(frozen=True, slots=True)

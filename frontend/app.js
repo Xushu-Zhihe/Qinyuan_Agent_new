@@ -172,7 +172,7 @@ function resetForm() {
 function selectTask(id, navigate = true) {
   const task = state.tasks.find((item) => item.id === id); if (!task) return;
   const changed = state.selected !== id;
-  if (changed) { runRead?.abort(); runReadBackoff = 0; RunView.reset(); }
+  if (changed) { runRead?.abort(); runReadBackoff = 0; displayedSnapshotRunId = null; snapshotReadFailure = null; RunView.reset(); }
   if (state.selected !== id) {
     $("user-hint-content").value = pendingLiveControls.get(`${id}/user_hint`)?.value.payload.content || "";
     $("user-hint-status").textContent = "下一次新决策可读取；不会打断当前生成，也不会自动成为已验证事实。";
@@ -204,6 +204,7 @@ function renderRun(run, events = [], progress = null) {
 }
 let runReadBackoff = 0;
 let displayedSnapshotRunId = null;
+let snapshotReadFailure = null;
 async function refreshRun(id, selection = runSelection) {
   if (state.selected !== id || selection !== runSelection) return;
   if (runRead?.taskId === id && runRead?.selection === selection) return;
@@ -215,16 +216,21 @@ async function refreshRun(id, selection = runSelection) {
   try {
     const data = await request(`/api/challenges/${id}/progress`, { signal: reader.signal, cache: "no-store" });
     if (runRead !== reader || state.selected !== id || selection !== runSelection) return;
-    retry = data.snapshot?.state === "refreshing" || data.snapshot?.state === "unavailable";
-    const snapshotFailed = data.snapshot?.state === "unavailable" || data.progress?.recovery?.reason === "state_read_failed";
-    const initialSnapshot = data.snapshot?.state === "refreshing" && displayedSnapshotRunId !== data.run_id;
+    const runId = data.run_id ?? data.run?.run_id ?? null;
+    const readFailed = data.snapshot?.state === "unavailable" || ["state_read_failed", "state_read_busy"].includes(data.progress?.recovery?.reason);
+    const refreshing = data.snapshot?.state === "refreshing";
+    if (readFailed) snapshotReadFailure = { taskId: id, runId };
+    const snapshotFailed = readFailed || (refreshing && snapshotReadFailure?.taskId === id && snapshotReadFailure.runId === runId);
+    retry = readFailed || refreshing;
+    const initialSnapshot = refreshing && displayedSnapshotRunId !== runId;
     $("run-read-error").hidden = !snapshotFailed && !initialSnapshot;
     if (snapshotFailed) $("run-read-error").textContent = "当前快照生成失败，稍后重试；已有内容仅为上次成功读取，不能视为当前状态。";
     else if (initialSnapshot) $("run-read-error").textContent = "正在生成当前快照；已有内容仅为上次成功读取。";
     const currentSnapshot = !snapshotFailed && (!data.snapshot || data.snapshot.state === "ready");
     if (currentSnapshot) {
+      snapshotReadFailure = null;
       renderRun(data.run, data.events, data.progress);
-      displayedSnapshotRunId=data.run_id;
+      displayedSnapshotRunId=runId;
     }
     const task = state.tasks.find((item) => item.id === id);
     if (task && data.run) { task.run = { ...data.run, result: currentSnapshot ? data.progress || data.run.result : null }; task.status = data.run.status; $("editor-state").textContent = task.status; $("detail-task-status").textContent = statusLabel(task)[1]; if(currentSnapshot)renderTaskList(); }

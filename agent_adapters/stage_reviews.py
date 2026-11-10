@@ -8,7 +8,7 @@ from agent_adapters.stage_evidence import StageModelSuperseded, StageModelTransp
 from agent_adapters.output_evidence import safe_failure_details
 from agent_core.command_contracts import T6EvidenceCapacityError
 from agent_core.stage_contracts import (
-    StageBranchFork, StageFactApplication, StageFactBatch, StageReviewBinding, StageStateChange,
+    StageBranchFork, StageFactApplication, StageFactBatch, StageFactClosure, StageReviewBinding, StageStateChange,
     fact_candidates, reviewed_fact, TurnIntent,
 )
 from agent_core.stage_planning import review_members, stage_runtime, conversation_operation_ids
@@ -40,9 +40,7 @@ class StageReviews:
         self.job = self.foreground = None
 
     def _root(self, request):
-        while request.correction_of_model_request_id or request.capacity_recovery_of:
-            request = self.app.evidence.request(request.correction_of_model_request_id or request.capacity_recovery_of)
-        return request.model_request_id
+        return self.app.evidence.model_root(request.model_request_id)
 
     def _owned(self, identity, entry):
         if entry is None or entry.task.done() or identity not in self.app.models.live_operations:
@@ -80,6 +78,8 @@ class StageReviews:
         sources = [app.evidence.read_model_result(app.store.load_d4_operation(identity)) for identity in members]
         value = sources[0].result if len(members) == 1 else StageFactBatch(tuple(
             claim for source in sources for _, claim in fact_candidates(source.result)))
+        if isinstance(value, StageFactClosure):
+            value = StageFactBatch(value.candidates)
         request = app._request("stage_review", first.context.session, proposal_id=members[0], proposal=value)
         if isinstance(value, TurnIntent) and first.context.turn is None:
             request = replace(request, context=replace(request.context, turn=None,

@@ -303,6 +303,7 @@ def _http_worker(
     connection, settings, payload, timeout,
     max_response_bytes=MAX_RESPONSE_BYTES,
     preserve_content=False,
+    capture_reasoning=False,
 ):
     """Never print or transmit raw errors/credentials through the result channel."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -372,7 +373,7 @@ def _http_worker(
             from agent_adapters.model_stream import ModelStreamError, read_chat_stream
             try:
                 data, reasoning_chars = read_chat_stream(response, max_response_bytes, report,
-                    allow_tool_calls=preserve_content and bool(payload.get("tools")))
+                    allow_tool_calls=preserve_content and bool(payload.get("tools")), capture_reasoning=capture_reasoning)
             except ModelStreamError as exc:
                 report(transport_end=exc.transport_end)
                 connection.send({"error": exc.kind, "reason": exc.code})
@@ -422,6 +423,8 @@ def _http_worker(
             )
             return
         report(**_response_diagnostic(data, message, choice.get("finish_reason"), message.get("content"), reasoning_chars=reasoning_chars))
+        if capture_reasoning and not payload.get("stream") and isinstance(message.get("reasoning_content"), str):
+            report(reasoning_chunk=message["reasoning_content"])
         if (not payload.get("stream") and choice.get("finish_reason") == "length"
                 and message.get("content") in (None, "") and isinstance(message.get("reasoning_content"), str)):
             thought = message["reasoning_content"]
@@ -556,7 +559,7 @@ class DeepSeekModelAdapter:
         )
         return NormalizedIntentActionResponse(action)
 
-    def _invoke_payload(self, payload, timeout_seconds, cancellation_token, *, diagnostic=None):
+    def _invoke_payload(self, payload, timeout_seconds, cancellation_token, *, diagnostic=None, reasoning_context=None):
         diagnostic = diagnostic if diagnostic is not None else {}
         diagnostic["transport_end"] = "not_dispatched"
         diagnostic["worker_exit_confirmed"] = True
@@ -575,9 +578,12 @@ class DeepSeekModelAdapter:
         # A socket read must not retain a shorter, superseded task budget.
         worker_timeout = (max(timeout, self.settings.first_output_timeout_seconds, self.settings.idle_timeout_seconds)
                           if task_deadline_only else timeout)
-        process = context.Process(target=self._worker, args=(writer, self.settings, payload, worker_timeout))
+        process = context.Process(target=self._worker, args=(writer, self.settings, payload, worker_timeout),
+            **({"kwargs": {"capture_reasoning": True}} if reasoning_context else {}))
         started = time.monotonic()
         end = started + timeout
+        from agent_adapters.model_stream import SlowInnerReasoning
+        reasoning_log = SlowInnerReasoning(reasoning_context, self.settings.api_key) if reasoning_context else None
         connect_end = started + self.settings.connect_timeout_seconds
         connected = False
         streaming = payload.get("stream") is True
@@ -590,6 +596,8 @@ class DeepSeekModelAdapter:
             diagnostic["transport_end"] = "unknown"
             writer.close()
             while True:
+                if reasoning_log:
+                    reasoning_log.tick()
                 if task_deadline_only:
                     end = time.monotonic() + cancellation_token.remaining_seconds
                 if cancellation_token.is_cancelled:
@@ -624,6 +632,9 @@ class DeepSeekModelAdapter:
                         return ModelError(ModelErrorKind.CANCELLED, "model_cancelled")
                     if "diagnostic" in result:
                         detail = result["diagnostic"]
+                        thought = detail.pop("reasoning_chunk", None)
+                        if reasoning_log and thought:
+                            reasoning_log.receive(thought)
                         elapsed = time.monotonic() - started
                         if (detail.get("response_utf8_bytes") or 0) > (diagnostic.get("response_utf8_bytes") or 0):
                             diagnostic.setdefault("first_byte_seconds", elapsed)
@@ -670,6 +681,9 @@ class DeepSeekModelAdapter:
             diagnostic["transport_end"] = "worker_lost"
             return ModelError(ModelErrorKind.PROVIDER_FAILURE, "model_worker_lost")
         finally:
+            if reasoning_log:
+                reasoning_log.close(diagnostic.get("done_seen") is True or
+                    not streaming and diagnostic.get("finish_reason") is not None)
             if process.pid is not None:
                 if process.is_alive():
                     process.terminate()

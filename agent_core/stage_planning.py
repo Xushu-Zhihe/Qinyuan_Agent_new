@@ -10,7 +10,7 @@ from agent_core.domain import IntentStatus
 from agent_core.conclusion_revision_contracts import D8ChangeDecision, D8RevisionTarget
 from agent_core.output_contracts import D8ModelResponse, D8FormatIssue, array, obj, tagged, text, decode_response, NATIVE_TRAILING_BRACE_POLICY
 from agent_core.stage_contracts import (
-    StageMethodRegistration, StagePinnedCall, method_fact,
+    StageMethodRegistration, StagePinnedCall, method_fact, TurnCriterionRevision, StageFactClosure,
     PlanningExhausted, PlanningSession, RoadCandidate, RoadResolution, RoadSnapshot, RoadTurnClosure, RoadTurnClosureReview,
     StageConclusionChange, StageFactSelection, StageHistoryRead, StageFactProposal, StageIncomplete, StageSessionSummary, StageStrategyAdvice, StageRoadSuggestion, StageTurnSnapshot, TurnAchievement, TurnCompletion, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, TurnPlanningState, StagePlanningDecision,
@@ -128,6 +128,7 @@ def conversation_operation_ids(request):
 
 
 RULES = {
+    "stage_draft": "Draft only the next useful Goal and complete completion criterion, using existing evidence refs. The parent's closure is pending: this is conditional background, not achieved support. Do not propose execution, register a Turn, or expand authority. Do not repeat established history. Submit one complete turn_intent draft.",
     "stage_continuation": "Plan the next useful deliverable, criterion and known premises from this achieved Turn in its retained Inner session. Leave alternative methods, experiment recipes, parameters and controls to the successor's own Road planning; do not lock its goal to one unverified technical hypothesis. Submit a grounded stage that can begin without pre-solving it. A brief revisable outlook is background. Alternatively select a pending own Road, add/reorder own Roads retaining pending candidates, report known settled blockage, or request independent final validation. Child feedback is scoped evidence, not failure of the parent's historical achievement. Never replay closed Roads or unknown operations.",
     "stage_intent": "Propose the nearest useful, independently checkable deliverable within the TaskRun goal and authority. For an unfamiliar input or environment, choose an outcome that resolves a prerequisite for the next decision; do not bundle triage, mechanism validation and final answer recovery into one Turn. A checkable final answer is not by itself a well-scoped stage. A simple, already bounded task may finish in one Turn. Define the result and criterion, leaving method-specific hypotheses, tools and experiment recipes to Roads unless the user fixed them. Do not turn one file read, parameter change or ordinary probe into a stage. Known premises are optional; never invent evidence. A brief revisable outlook is background, not registered future stages. Submit once the next useful result and criterion are clear; no complete future solution is required. Choose the first deliverable from the input shape, not from a preferred habit: attachment only - what the artifact actually is, plus any interaction contract its own files state; endpoint only - what the endpoint actually speaks, from one minimal probe and its exact reply bytes; attachment and endpoint - the artifact's own service script, config or compose file decides the protocol, so read that contract before designing any request; neither - name what is missing and what the operator must supply, and never invent a target.",
     "stage_roads": "Propose grounded, distinct solution chains for this Turn's fixed deliverable, in execution priority order. One Road is valid when only one approach is grounded; never fill a quota or split a chain merely by tool, URL or parameter. Keep the coherent hypothesis, main method and distinguishing observation; detail only enough to begin. In the existing description identify the decisive uncertain premise and what observation would make further work on this chain unhelpful. Test that premise before elaborating downstream experiments; parameters and contingent branches unfold during execution. Retain pending candidates when reordering; preserve closed identities and outcomes. New business exploration with changed premises is a new Road. Report known settled blockage with return_to_parent; technical waiting is not exhaustion. An artifact's source, service script, Dockerfile or compose file is part of the first Turn's observation: its accepted commands and reply format decide the next action. File size and type alone do not settle how the service is driven, and re-extracting the same artifact does not add information.",
@@ -539,7 +540,7 @@ TOOL_PREPARATION_GUIDANCE = (
     "capacity error, record the capability gap and choose another useful check instead of repeating the same "
     "missing command. "
 )
-INNER_STAGES = {"stage_intent", "stage_roads", "stage_action", "stage_completion", "stage_continuation"}
+INNER_STAGES = {"stage_intent", "stage_roads", "stage_action", "stage_completion", "stage_continuation", "stage_draft"}
 OUTPUT_TOOL = "submit_stage_result"
 
 
@@ -810,7 +811,7 @@ def fact_source_issues(request, value, *, native=False):
     if value.get("kind") == "fact_revision" and isinstance(value.get("candidate"), dict):
         return [replace(issue, path=issue.path.replace("/support_refs", "/candidate/support_refs", 1))
             for issue in fact_source_issues(request, {"kind": "fact_candidate", **value["candidate"]}, native=native)]
-    if value.get("kind") == "fact_candidates" and isinstance(value.get("candidates"), list):
+    if value.get("kind") in {"fact_candidates", "fact_closure"} and isinstance(value.get("candidates"), list):
         issues = []
         root = "$/result" if native else "$"
         for index, item in enumerate(value["candidates"]):
@@ -968,10 +969,26 @@ def stage_output_issues(request, raw, *, result_schema=None, normalization_polic
 
 
 def model_contract(request):
+    joint_guidance = (
+        " If observations support both Facts and closure now, use fact_closure to propose candidates and a conditional closure together. "
+        "Closure support_refs may contain zero-based candidate indices or existing formal references. "
+        "Candidates are not formal until individually accepted. Outer first reviews Facts, then closure; rejected items require explicit disposition. "
+        if request.stage == "stage_action" and stage_runtime(request).get("fact_closure") else "")
+    criterion_guidance = (
+        " Keep the current Goal unchanged. revise_criterion submits a complete replacement criterion, not an appended clause. "
+        "The original Inner authors it; Outer judges the full Goal and criterion together. "
+        "A disguised change of deliverable requires a new Turn. Method changes belong in Roads. "
+        "For existing Roads, explain their applicability in the existing reason and verify it against the new criterion; "
+        "do not implicitly approve an incompatible route. "
+        if isinstance(request.proposal, TurnCriterionRevision) or stage_runtime(request).get("criterion_target")
+        or request.stage in {"stage_roads", "stage_continuation"} and stage_runtime(request).get("criterion_version") else "")
     intent_review = request.stage == "stage_review" and isinstance(request.proposal, TurnIntent)
     planning_review = request.stage == "stage_review" and isinstance(request.proposal, (TurnIntent, tuple))
-    planning = request.stage in {"stage_intent", "stage_roads", "stage_continuation"} or planning_review
+    planning = request.stage in {"stage_intent", "stage_roads", "stage_continuation", "stage_draft"} or planning_review
     planning_guidance = PLANNING_SCOPE_GUIDANCE if planning else ""
+    if request.stage in {"stage_continuation", "stage_draft"}:
+        planning_guidance += (" State only the next complete deliverable and its criterion, referencing established premises. "
+            "Do not restate the parent history or regenerate an already established solution. Retain unresolved issues and source limits. ")
     if planning_review:
         planning_guidance += (
             " Review grounding, authority, scope and whether work can start; do not derive the solution, "
@@ -1024,6 +1041,7 @@ def model_contract(request):
         **({"fact_sources": "catalog_readback_v1"} if stage_runtime(request).get("fact_sources") == "catalog_readback_v1" else {}),
         "planning_validation": "retain_pending_v1",
         "output_normalization": NATIVE_TRAILING_BRACE_POLICY,
+        **({"criterion_revision": "audited_v1"} if stage_runtime(request).get("criterion_version") else {}),
         "rules": ("Recent working_scripts are saved code, not verified methods or Fact evidence. "
             "Use history_details on their source_ref to read the full original; prepare_working_script writes a fresh "
             "writable copy without executing the script or registering a method. Read it, edit only necessary parts, "
@@ -1139,7 +1157,7 @@ def model_contract(request):
                "with the same evidence again. Correct the candidate or cite a relevant original observation, "
                "continue investigating, or settle the Road if no useful test remains."
                if request.stage == "stage_action" and stage_runtime(request).get("direct_candidate_rejection") else ""),
-        "instruction": (("Return one complete JSON result using the submit_stage_result tool schema. "
+        "instruction": joint_guidance + criterion_guidance + (("Return one complete JSON result using the submit_stage_result tool schema. "
             if compact_action(request) else "Return one complete JSON result object matching output_contract.schema. ")
             + "Do not copy the contract envelope or wrap the result in version/stage/schema keys. No Markdown or extra fields."
             " Tool arguments are closed: use exactly the declared keys for the chosen tool_name;"
@@ -1228,9 +1246,13 @@ def _schema(request, *, compact=False):
     exhausted = tagged("exhausted", supported)
     completions = [tagged("turn_completion", {**supported, "support_refs": formal_refs})] if formal else []
     feedback = tagged("return_to_parent", supported)
+    if request.stage == "stage_draft":
+        return tagged("turn_intent", {"description": text(), "completion_criterion": text(), "support_refs": refs})
     if request.stage == "stage_intent":
-        return {"anyOf": [tagged("turn_intent", {"description": text(), "completion_criterion": text(),
-            "support_refs": refs}), exhausted]}
+        choices = [tagged("turn_intent", {"description": text(), "completion_criterion": text(), "support_refs": refs}), exhausted]
+        if stage_runtime(request).get("criterion_target"):
+            choices.append(tagged("revise_criterion", {**supported, "completion_criterion": text()}))
+        return {"anyOf": choices}
     if request.stage in {"stage_roads", "stage_continuation"}:
         if stage_runtime(request).get("route_advice") and request.stage != "stage_continuation":
             return {"anyOf": [tagged("select_road", {**supported, "road_id": {"type": "string", "enum": [
@@ -1241,6 +1263,8 @@ def _schema(request, *, compact=False):
         choices = [tagged("roads", {"roads": array(obj({"description": text(),
             "support_refs": refs}), minimum=1)}), exhausted, feedback, *knowledge_actions(request),
             *(completions if request.stage == "stage_roads" and request.context.turn.achievement is None else ())]
+        if stage_runtime(request).get("criterion_target") or stage_runtime(request).get("criterion_version") and request.context.turn.achievement is None:
+            choices.append(tagged("revise_criterion", {**supported, "completion_criterion": text()}))
         if request.stage == "stage_continuation":
             validation = {**supported, "support_refs": formal_refs}
             if request.context.goal_validation is not None:
@@ -1418,6 +1442,14 @@ def knowledge_actions(request):
     # information, and the whole batch (and its review) is lost for nothing.
     branches.append(tagged("fact_candidates", {"candidates": array({"anyOf": [
         obj(candidate["properties"], optional=("kind",)) for candidate in candidates]}, minimum=1)}))
+    if (request.stage == "stage_action" and stage_runtime(request).get("fact_closure")
+            and not blocking_fact_revisions(request) and not request.context.pending_operation_ids):
+        closure_refs = {**array({"anyOf": [reference(formal), {"type": "integer", "minimum": 0}]}, maximum=8),
+            "uniqueItems": True}
+        support = {"reason": text(), "support_refs": closure_refs}
+        closure = obj({"outcome": {"type": "string", "enum": ["succeeded", "failed", "inconclusive", "abandoned", "skipped"]},
+            **support, "completion": obj({**support, "support_refs": {**closure_refs, "minItems": 1}})}, optional=("completion",))
+        branches.append(tagged("fact_closure", {"candidates": branches[-1]["properties"]["candidates"], "closure": closure}))
     for operation in ("correct", "withdraw", "restore", "report_conflict", "resolve_conflict", "replace_support", "link_verified"):
         properties = {"operation": {"type": "string", "const": operation}, "target_refs": {**array(reference(conclusions),
             minimum=2 if operation in {"report_conflict", "resolve_conflict"} else 1,
@@ -1592,6 +1624,8 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
         return PlanningExhausted(checked(value, "reason"), refs)
     if kind == "turn_intent":
         return TurnIntent(checked(value, "description"), checked(value, "completion_criterion"), refs)
+    if kind == "revise_criterion":
+        return TurnCriterionRevision(checked(value, "completion_criterion"), checked(value, "reason"), refs)
     if kind in {"roads", "extend_roads"}:
         if kind == "extend_roads":
             prior = {r.candidate for r in request.context.turn.roads}
@@ -1612,6 +1646,20 @@ def parse(request, raw, *, result_schema=None, normalization_policy=NATIVE_TRAIL
             return RoadTurnClosure(IntentStatus(value["outcome"]), checked(value, "reason"), refs,
                 TurnCompletion(checked(completion, "reason"), tuple(completion["support_refs"])))
         return RoadResolution(IntentStatus(value["outcome"]), checked(value, "reason"), refs)
+    if kind == "fact_closure":
+        if fact_source_issues(request, {**value, "kind": "fact_candidates"}):
+            raise ValueError("stage.fact_source_ineligible")
+        closing = value["closure"]
+        def closure_refs(item):
+            refs = tuple(item["support_refs"])
+            if any(type(ref) is int and not 0 <= ref < len(value["candidates"]) for ref in refs):
+                raise ValueError("stage.closure_candidate_invalid")
+            return refs
+        args = (IntentStatus(closing["outcome"]), checked(closing, "reason"), closure_refs(closing))
+        closure = (RoadTurnClosure(*args, TurnCompletion(checked(closing["completion"], "reason"),
+            closure_refs(closing["completion"]))) if "completion" in closing else RoadResolution(*args))
+        return StageFactClosure(tuple(method_fact({k: v for k, v in item.items() if k != "kind"})
+            for item in value["candidates"]), closure)
     if kind == "fact_candidates":
         if fact_source_issues(request, value):
             raise ValueError("stage.fact_source_ineligible")
@@ -1663,6 +1711,14 @@ def request_from_dict(raw, proposal_kind):
             candidate = proposal["candidate"]
             data["proposal"] = StageFactRevision(**{**proposal, "candidate": method_fact(candidate) if candidate else None})
             return StageModelRequest(**data)
+        if proposal_kind == "StageFactClosure":
+            closing = proposal["closure"]
+            args = (IntentStatus(closing["outcome"]), closing["reason"], tuple(closing["support_refs"]))
+            completion = closing.get("completion")
+            closure = (RoadTurnClosure(*args, TurnCompletion(completion["reason"], tuple(completion["support_refs"])))
+                if completion is not None else RoadResolution(*args))
+            data["proposal"] = StageFactClosure(tuple(method_fact(item) for item in proposal["candidates"]), closure)
+            return StageModelRequest(**data)
         if proposal_kind == "StageFactBatch":
             data["proposal"] = StageFactBatch(tuple(method_fact(item) for item in proposal["candidates"]))
             return StageModelRequest(**data)
@@ -1680,7 +1736,7 @@ def request_from_dict(raw, proposal_kind):
             data["proposal"] = RoadTurnClosure(IntentStatus(proposal["outcome"]), proposal["reason"],
                 tuple(proposal["support_refs"]), TurnCompletion(completion["reason"], tuple(completion["support_refs"])))
             return StageModelRequest(**data)
-        kinds = {c.__name__: c for c in (TurnIntent, TurnCompletion, PlanningExhausted, RoadResolution, StageFactProposal, StagePlanningDecision)}
+        kinds = {c.__name__: c for c in (TurnIntent, TurnCriterionRevision, TurnCompletion, PlanningExhausted, RoadResolution, StageFactProposal, StagePlanningDecision)}
         proposal = {**proposal, "support_refs": tuple(proposal["support_refs"])}
         if proposal_kind == "RoadResolution":
             proposal["outcome"] = IntentStatus(proposal["outcome"])

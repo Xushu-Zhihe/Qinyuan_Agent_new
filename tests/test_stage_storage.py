@@ -39,6 +39,9 @@ class Evidence:
         self.outputs = {}
         self.history = {}
 
+    def read(self, kind, identity):
+        return None
+
     def read_model_result(self, operation):
         return self.outputs[operation.start.operation_id]
 

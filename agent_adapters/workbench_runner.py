@@ -1161,13 +1161,22 @@ class Runner:
         from qinyuan_core import get_logger
         started = time.monotonic()
         failed = False
+        failure = None
         try:
             result = self._progress_once(challenge_id, run=run)["progress"]
+            if isinstance(result, dict):
+                failure = next((item for item in result.get("errors", ())
+                    if item.get("code") in {"state_read_failed", "state_read_busy"}), None)
+                if failure is not None:
+                    result, failed = None, True
         except Exception as error:  # display boundary; never retain a hidden healthy verdict
             result = None
             failed = True
+            failure = {"code": "state_read_failed", "exception_types": [type(error).__name__]}
+        if failed:
             get_logger("sys").warning("workbench.snapshot_failed", category="dependency",
-                run=run["run_id"], code="state_read_failed", exception_type=type(error).__name__)
+                run=run["run_id"], code=failure["code"],
+                **{key: failure[key] for key in ("read_stage", "exception_types", "error_codes", "exception_chain") if key in failure})
         with self._lock:
             entry.result = result
             entry.failed = failed

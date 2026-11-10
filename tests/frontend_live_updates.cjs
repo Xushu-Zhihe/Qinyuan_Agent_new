@@ -322,13 +322,19 @@ async function pollingAcceptance() {
     assert.equal(elements.get("run-read-error").hidden, true);
     assert.deepEqual([...timers.values()].map(t => t.delay), [1000]);
   }
-  for (const snapshotState of ["unavailable", "refreshing"]) {
+  for (const [snapshotState, delay] of [["unavailable", 2000], ["ready", 4000]]) {
     const failed = vm.runInContext("refreshRun('task')", context);
     pending.at(-1).resolve({ run: {status:"running"}, progress: {recovery:{required:true,reason:"state_read_failed"}}, snapshot: {state:snapshotState,generated_at:1} });
     await failed;
     assert.equal(elements.get("run-read-error").hidden, false, "unreadable snapshot hidden during retry");
-    assert.match(elements.get("run-read-error").textContent, /进度暂不可用/);
+    assert.match(elements.get("run-read-error").textContent, /快照生成失败/);
+    assert.deepEqual([...timers.values()].map(t => t.delay), [delay], "failed read did not enter retry backoff");
   }
+  const retrying = vm.runInContext("refreshRun('task')", context);
+  pending.at(-1).resolve({ run: {status:"running"}, progress: null, snapshot: {state:"refreshing"} });
+  await retrying;
+  assert.match(elements.get("run-read-error").textContent, /快照生成失败/, "retry replaced the known failure with a generating message");
+  assert.deepEqual([...timers.values()].map(t => t.delay), [8000]);
   const recovered = vm.runInContext("refreshRun('task')", context);
   pending.at(-1).resolve({ run: {status:"running"}, progress: {}, snapshot: {state:"ready"} });
   await recovered;

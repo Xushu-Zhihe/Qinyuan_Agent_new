@@ -15,6 +15,121 @@ from agent_adapters.output_evidence import FileD8OutputEvidence, safe_model_erro
 from agent_core.modeling import ModelErrorKind, model_call_timeout
 
 
+def test_slow_inner_logs_all_received_text_only_after_threshold():
+    from agent_adapters.model_stream import SlowInnerReasoning
+    now, records = [0.0], []
+    log = SlowInnerReasoning({"operation": "test"}, "secret", clock=lambda: now[0],
+        emit=lambda event, **fields: records.append((event, fields)))
+    log.receive("开头" + "m" * 9000)
+    now[0] = 240
+    log.tick()
+    assert not records
+    now[0] = 240.001
+    log.tick()
+    log.tick()
+    log.receive("结尾")
+    log.close(True)
+    assert sum(event == "model.inner_reasoning_slow" for event, _ in records) == 1
+    assert "".join(fields["reasoning_content"] for _, fields in records
+        if "reasoning_content" in fields) == "开头" + "m" * 9000 + "结尾"
+    assert records[-1][1]["status"] == "complete"
+
+
+def test_slow_inner_redacts_split_credential_and_records_partial():
+    from agent_adapters.model_stream import SlowInnerReasoning
+    now, records = [0.0], []
+    log = SlowInnerReasoning({}, "abcab", clock=lambda: now[0],
+        emit=lambda event, **fields: records.append((event, fields)))
+    now[0] = 241
+    log.receive("before abc")
+    log.receive("ab after abcab")
+    log.close(False)
+    text = "".join(fields.get("reasoning_content", "") for _, fields in records)
+    assert text == "before [REDACTED] after [REDACTED]"
+    assert records[-1][1]["status"] == "received_partial"
+
+
+def test_short_reasoning_is_discarded_and_empty_slow_reasoning_is_explicit():
+    from agent_adapters.model_stream import SlowInnerReasoning
+    now, records = [0.0], []
+    emit = lambda event, **fields: records.append((event, fields))
+    short = SlowInnerReasoning({}, "", clock=lambda: now[0], emit=emit)
+    short.receive("private")
+    short.close(True)
+    assert not records and not short.parts
+    empty = SlowInnerReasoning({}, "", clock=lambda: now[0], emit=emit)
+    now[0] = 241
+    empty.close(False)
+    assert records[-1][1]["status"] == "unavailable"
+
+
+def test_slow_reasoning_sink_failure_is_classified_without_raising_model_failure(monkeypatch):
+    import qinyuan_core
+    from agent_adapters.model_stream import SlowInnerReasoning
+    now, failures = [0.0], []
+    monkeypatch.setattr(qinyuan_core, "get_logger", lambda channel: SimpleNamespace(
+        error=lambda event, **fields: failures.append((channel, event, fields))))
+    def unavailable(event, **fields):
+        raise OSError("controlled log sink failure")
+    log = SlowInnerReasoning({"operation": "slow-inner"}, "private-key", clock=lambda: now[0], emit=unavailable)
+    now[0] = 241
+    log.receive("received text")
+    log.close(False)
+    assert log.failed and len(failures) == 1
+    assert failures[0][0] == "store" and failures[0][2]["category"] == "persistence"
+    assert failures[0][2]["operation"] == "slow-inner"
+
+
+def test_stream_reasoning_capture_remains_separate_from_model_result():
+    raw = chunk({"reasoning_content": "actual reasoning"}) + chunk({"content": "{}"}, "stop") + b"data: [DONE]\n\n"
+    reports = []
+    data, count = read_chat_stream(io.BytesIO(raw), 4096,
+        lambda **fields: reports.append(fields), capture_reasoning=True)
+    assert count == len("actual reasoning")
+    assert data["choices"][0]["message"] == {"content": "{}"}
+    assert [r["reasoning_chunk"] for r in reports if "reasoning_chunk" in r] == ["actual reasoning"]
+
+
+def test_inner_transport_logs_during_sse_silence_without_persisting_chunks_in_result(monkeypatch):
+    from agent_adapters import model_stream
+    now, records = [1000.0], []
+    observer = model_stream.SlowInnerReasoning
+    monkeypatch.setattr(model_stream, "SlowInnerReasoning", lambda context, secret: observer(
+        context, secret, clock=lambda: now[0], emit=lambda event, **fields: records.append((now[0], event, fields))))
+    scheduled = [(1001, {"connected": True}), (1002, {"diagnostic": {
+        "reasoning_chunk": "before private-", "reasoning_chars": 15}}),
+        (1242, {"diagnostic": {"reasoning_chunk": "key after", "reasoning_chars": 24}}),
+        (1243, {"diagnostic": {"done_seen": True}}),
+        (1244, {"payload": {"content": "{}", "finish_reason": "stop"}})]
+    class Pipe:
+        def poll(self, delay): now[0] += 1; return bool(scheduled and scheduled[0][0] <= now[0])
+        def recv(self): return scheduled.pop(0)[1]
+        def close(self): pass
+    class Process:
+        pid, alive = 1, True
+        def start(self): pass
+        def is_alive(self): return self.alive
+        def terminate(self): self.alive = False
+        def join(self, timeout): pass
+        def kill(self): self.alive = False
+        def close(self): pass
+    def process(**options):
+        assert options["kwargs"] == {"capture_reasoning": True}
+        return Process()
+    monkeypatch.setattr(deepseek_model.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(deepseek_model.multiprocessing, "get_context", lambda mode: SimpleNamespace(
+        Pipe=lambda **kw: (Pipe(), Pipe()), Process=process))
+    detail = {}
+    result = DeepSeekModelAdapter(DeepSeekSettings("offline", "private-key", idle_timeout_seconds=300))._invoke_payload(
+        {"stream": True}, 300, SimpleNamespace(is_cancelled=False), diagnostic=detail,
+        reasoning_context={"operation": "slow-inner"})
+    triggered = [at for at, event, _ in records if event == "model.inner_reasoning_slow"]
+    assert triggered == [1241]
+    assert "".join(fields.get("reasoning_content", "") for _, _, fields in records) == "before [REDACTED] after"
+    assert records[-1][2]["status"] == "complete"
+    assert "reasoning_chunk" not in detail and "reasoning_content" not in result
+
+
 def chunk(delta=None, finish=None, **extra):
     return b"data: " + json.dumps({"choices": [{"index": 0, "delta": delta or {},
         "finish_reason": finish}], **extra}, ensure_ascii=False).encode() + b"\r\n\r\n"

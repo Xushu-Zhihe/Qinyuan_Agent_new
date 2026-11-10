@@ -16,10 +16,11 @@ from agent_core.modeling import CancellationToken, ModelError, ModelErrorKind, m
 from agent_core.operation_accounting import D4OperationCompletion, D4OperationRecord, D4OperationStart
 from agent_core.output_contracts import D8ModelResponse, D8OutputRequest, D8FormatIssue
 from agent_core.stage_contracts import (
-    PlanningExhausted, RoadCandidate, RoadTurnClosureReview, StageConclusionChange, StageFactSelection, StageHistoryRead,
+    PlanningExhausted, PlanningSession, RoadCandidate, RoadTurnClosure, RoadTurnClosureReview, TurnCompletion,
+    StageConclusionChange, StageFactSelection, StageHistoryRead,
     StageFactProposal, StageModelEvidence, StageSessionSummary, TurnIntent,
     TurnPlanningContext, TurnPlanningProposal, TurnPlanningReview, StagePlanningDecision,
-    StageFactBatch, StageFactBatchReview, StageFactRevision, fact_candidates, reviewed_fact, fact_review_parts,
+    StageFactBatch, StageFactBatchReview, StageFactRevision, StageFactClosure, fact_candidates, reviewed_fact, fact_review_parts,
 )
 from agent_core.stage_planning import INNER_STAGES, MAX_STAGE_CORRECTIONS, STAGE_CALL_POLICY, StageModelRequest, model_contract, parse, request_from_dict, review_members, conversation_operation_ids, stage_runtime
 from agent_core.stage_planning import OUTPUT_TOOL
@@ -178,6 +179,12 @@ class StageEvidence:
                 or not self.historical and contract != self.contract(request)):
             _fail("stage.model_contract_changed", Category.POLICY)
         return request
+
+    def model_root(self, identity):
+        request = self.request(identity)
+        while request.correction_of_model_request_id or request.capacity_recovery_of:
+            request = self.request(request.correction_of_model_request_id or request.capacity_recovery_of)
+        return request.model_request_id
 
     def contract(self, request):
         self.correction_depth(request)
@@ -355,6 +362,17 @@ class StageEvidence:
         operation = self.store.load_d4_operation(request.model_request_id)
         config = self.store.load_stage_run_config(request.task_run_id)
         review_id = stop["review_operation_id"]
+        draft = request.stage == "stage_draft" and stage_runtime(request).get("draft_for") == self.model_root(review_id)
+        if draft:
+            closing = self.request(review_id)
+            self.read_model_result(self.store.load_d4_operation(review_id))
+            if (closing.stage != "stage_review" or closing.task_run_id != request.task_run_id
+                    or closing.context.turn is None or closing.context.turn != request.context.turn
+                    or request.context.session != PlanningSession("turn_planning", closing.context.turn.turn_id)
+                    or not isinstance(closing.proposal, (RoadTurnClosure, TurnCompletion))
+                    or stage_runtime(closing).get("criterion_version") != stage_runtime(request).get("criterion_version")
+                    or (self.read("policy", request.task_run_id) or {}).get("successor_drafts") != "isolated_v1"):
+                raise StageRecoveryRequired("stage.draft_stop_binding_changed")
         if (operation is None or request.stage not in INNER_STAGES or operation.start.role != "inner_action" or operation.start.category not in {"action", "planning"}
                 or operation.start.task_run_id != request.task_run_id or operation.start.context_sha256 != digest(asdict(request))
                 or operation.start.role_config_ref != request.role_config_ref
@@ -363,7 +381,7 @@ class StageEvidence:
                 or request.role_config_ref != config.inner_role.role_config_ref
                 or operation.start.budget_policy_ref != config.budget.budget_policy_ref
                 or stop["request_sha256"] != digest(asdict(request))
-                or not set(self.review_interruptions(review_id)).intersection(conversation_operation_ids(request))
+                or not draft and not set(self.review_interruptions(review_id)).intersection(conversation_operation_ids(request))
                 or stop["local_invoke_exited"] is not True or stop["returned_kind"] not in {"response", "cancelled", "transport_failure"}):
             raise StageRecoveryRequired("stage.branch_stop_binding_changed")
         if stop["returned_kind"] == "cancelled":
@@ -462,7 +480,7 @@ class StageEvidence:
                     or operation.start.budget_policy_ref != config.budget.budget_policy_ref):
                 _fail("stage.proposal_missing", Category.UNKNOWN)
             proposed = self.read_model_result(operation)
-            if stage_runtime(self.request(identity)).get("fact_sources") == "catalog_readback_v1":
+            if fact_candidates(request.proposal) and stage_runtime(self.request(identity)).get("fact_sources") == "catalog_readback_v1":
                 required = {ref for _, claim in fact_candidates(proposed.result) for ref in claim.support_refs}
                 if not required <= {i.ref for i in request.context.history}:
                     _fail("stage.source_resolution_omitted", Category.POLICY)
@@ -480,6 +498,14 @@ class StageEvidence:
             sources.append((identity, proposed))
         value = sources[0][1].result if len(sources) == 1 else StageFactBatch(tuple(
             claim for _, proposed in sources for _, claim in fact_candidates(proposed.result)))
+        if isinstance(value, StageFactClosure):
+            if stage_runtime(request).get("joint_fact_closure") == members[0]:
+                from agent_core.stage_storage import resolved_fact_closure
+                value = resolved_fact_closure(self.store, request.task_run_id, members[0], request.context.history, evidence=self)
+                if value is None:
+                    _fail("stage.joint_closure_support_missing", Category.POLICY)
+            else:
+                value = StageFactBatch(value.candidates)
         if request.proposal != value:
             _fail("stage.proposal_changed", Category.UNKNOWN)
         return tuple(sources)
@@ -1071,7 +1097,7 @@ class StageModelCalls:
             request = self.prepare(request)
             record = self.store.load_d4_operation(identity)
             result = self.evidence.read("result", identity)
-            category = "handoff_summary" if request.stage == "stage_summary" else "planning" if request.stage in {"stage_intent", "stage_roads", "stage_continuation"} else "action" if inner else (
+            category = "handoff_summary" if request.stage == "stage_summary" else "planning" if request.stage in {"stage_intent", "stage_roads", "stage_continuation", "stage_draft"} else "action" if inner else (
                 "fact_review" if fact_candidates(request.proposal) or isinstance(request.proposal, StageConclusionChange) else "review")
             if record is None:
                 task = self.store.load_task_run(request.task_run_id)

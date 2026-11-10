@@ -705,6 +705,31 @@ def test_progress_coalesces_slow_reads_and_exposes_failures(tmp_path, monkeypatc
             assert entry.done.wait(5)
 
 
+@pytest.mark.parametrize("code", ["state_read_failed", "state_read_busy", "stage.model_output_unusable"])
+def test_progress_distinguishes_failed_projection_from_valid_recovery_state(tmp_path, monkeypatch, caplog, code):
+    from types import SimpleNamespace
+    from agent_adapters.workbench_runner import Runner
+    runner = Runner(SimpleNamespace(root=tmp_path))
+    runner._snapshot_wait = 1
+    run = dict(directory=str(tmp_path), run_id="run", agent_task_run_id="task")
+    monkeypatch.setattr(runner, "_current", lambda _: dict(run))
+    monkeypatch.setattr(runner, "events", lambda _, **kwargs: {"events": []})
+    view = {"errors": [{"code": code, "read_stage": "configuration_read", "exception_types": ["AttributeError"]}],
+        "recovery": {"required": True, "reason": code}}
+    monkeypatch.setattr(runner, "_progress_once", lambda _, **kwargs: {"progress": view})
+    result = runner.progress("challenge")
+    failed = code.startswith("state_read_")
+    assert result["snapshot"]["state"] == ("unavailable" if failed else "ready")
+    if failed:
+        assert result["progress"] is None and result["snapshot"]["generated_at"] is None
+        entry, = runner._snapshots.values()
+        assert entry.result is None
+        diagnostic = next(record.qy for record in caplog.records if record.message == "workbench.snapshot_failed")
+        assert diagnostic["code"] == code and diagnostic["read_stage"] == "configuration_read"
+    else:
+        assert result["progress"] == view and result["snapshot"]["generated_at"] is not None
+
+
 def test_http_recovery_wakes_once_per_evidence_and_respects_operator_pause(tmp_path, monkeypatch):
     import threading
     from types import SimpleNamespace

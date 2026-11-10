@@ -1081,11 +1081,12 @@ def _trace_capacity(stage, size, limit, payload):
               " ".join(f"{k}={v}" for k, v in top), file=sys.stderr, flush=True)
 
 
-def _raw_http_worker(connection, settings, payload, timeout):
-    _http_worker(connection, settings, payload, timeout, TRANSPORT["max_response_bytes"], True)
+def _raw_http_worker(connection, settings, payload, timeout, *, capture_reasoning=False):
+    _http_worker(connection, settings, payload, timeout, TRANSPORT["max_response_bytes"], True,
+        capture_reasoning=capture_reasoning)
 
 
-def _invoke_with_connect_retry(transport, payload, timeout_seconds, token, diagnostic):
+def _invoke_with_connect_retry(transport, payload, timeout_seconds, token, diagnostic, reasoning_context=None):
     """Re-dispatch only a connection that never came up; return (raw, attempts).
 
     Any other failure keeps the single attempt: a connected-but-failed call may
@@ -1093,14 +1094,15 @@ def _invoke_with_connect_retry(transport, payload, timeout_seconds, token, diagn
     generation or bill twice. ``worker_exit_confirmed`` must be true as well, so
     a child whose state is unknown is never re-dispatched.
     """
-    raw = transport._invoke_payload(payload, timeout_seconds, token, diagnostic=diagnostic)
+    options = {"reasoning_context": reasoning_context} if reasoning_context else {}
+    raw = transport._invoke_payload(payload, timeout_seconds, token, diagnostic=diagnostic, **options)
     attempts = 1
     while (isinstance(raw, ModelError) and raw.short_reason in CONNECT_RETRY_REASONS
             and diagnostic.get("connected_seconds") is None
             and diagnostic.get("worker_exit_confirmed") is True
             and attempts < MAX_CONNECT_ATTEMPTS):
         attempts += 1
-        raw = transport._invoke_payload(payload, timeout_seconds, token, diagnostic=diagnostic)
+        raw = transport._invoke_payload(payload, timeout_seconds, token, diagnostic=diagnostic, **options)
     return raw, attempts
 
 
@@ -1159,6 +1161,9 @@ class D8DeepSeekModel:
         transport = {"transport_end": "not_observed", "http_status": None, "finish_reason": None,
                      "usage": None, "response_utf8_bytes": None, "content_chars": None,
                      "content_utf8_bytes": None, "content_is_none": None, "reasoning_chars": None}
+        reasoning_context = ({"run": sent["task_run_id"], "request": identity, "operation": identity,
+            "phase": sent["stage"]} if self.role_config.role == "inner_action"
+            and isinstance(self.transport, DeepSeekModelAdapter) else None)
         def save_result(error=None):
             if evidence is not None:
                 evidence.save("provider-result", identity, {
@@ -1175,7 +1180,8 @@ class D8DeepSeekModel:
                 cache_probe(payload=payload, sent=sent, role=self.role_config.role,
                     session=getattr(getattr(request, "context", None), "session", None))
                 raw, attempts = _invoke_with_connect_retry(
-                    self.transport, payload, timeout_seconds, token, transport)
+                    self.transport, payload, timeout_seconds, token, transport,
+                    reasoning_context)
                 if (isinstance(raw, ModelError) and transport.get('http_status') in {400, 404, 422}
                         and transport.get('worker_exit_confirmed') is True
                         and any(isinstance(m['content'], list) and any(p.get('type') == 'image_url'
@@ -1193,7 +1199,7 @@ class D8DeepSeekModel:
                         http_status=transport['http_status'], image_observed=False)
                     transport = {}
                     payload = fallback
-                    raw, attempts = _invoke_with_connect_retry(self.transport, payload, timeout_seconds, token, transport)
+                    raw, attempts = _invoke_with_connect_retry(self.transport, payload, timeout_seconds, token, transport, reasoning_context)
                 if attempts > 1:
                     from qinyuan_core import get_logger
                     transport["connect_attempts"] = attempts

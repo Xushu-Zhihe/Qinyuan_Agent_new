@@ -1,6 +1,74 @@
-"""Bounded Chat Completions SSE reader. Reasoning text is counted, never retained."""
+"""Bounded SSE reader and operation-scoped slow Inner diagnostics."""
 
 import json
+import time
+
+
+class SlowInnerReasoning:
+    """Cache received text until the slow threshold, then log increments."""
+
+    def __init__(self, context, secret, *, clock=time.monotonic, emit=None):
+        from qinyuan_core import get_logger
+        self.context, self.secret, self.clock = context, secret, clock
+        self.emit = emit or get_logger("model").warning
+        self.started = clock()
+        self.parts, self.tail = [], ""
+        self.triggered = self.failed = False
+        self.offset = self.received = 0
+
+    def _write(self, event, **fields):
+        if self.failed:
+            return
+        try:
+            self.emit(event, **self.context, **fields)
+        except OSError:
+            self.failed = True
+            from qinyuan_core import get_logger
+            get_logger("store").error("model.reasoning_log_failed", **self.context,
+                category="persistence", code="model.reasoning_log_write_failed")
+
+    def tick(self):
+        elapsed = self.clock() - self.started
+        if elapsed > 240 and not self.triggered:
+            self.triggered = True
+            self._write("model.inner_reasoning_slow", category="performance",
+                code="model.inner_call_over_240s", threshold_seconds=240, elapsed_seconds=elapsed)
+            self._flush()
+
+    def receive(self, text):
+        self.received += len(text)
+        self.parts.append(text)
+        self.tick()
+        if self.triggered:
+            self._flush()
+
+    def _flush(self, *, final=False):
+        text = self.tail + "".join(self.parts)
+        self.parts.clear()
+        if self.secret:
+            text = text.replace(self.secret, "[REDACTED]")
+        keep = 0
+        if self.secret and not final:
+            for size in range(1, min(len(self.secret), len(text) + 1)):
+                if text.endswith(self.secret[:size]):
+                    keep = size
+        self.tail = text[-keep:] if keep else ""
+        text = text[:-keep] if keep else text
+        if text:
+            self._write("model.inner_reasoning_chunk", category="diagnostic",
+                offset=self.offset, reasoning_content=text)
+            self.offset += len(text)
+
+    def close(self, complete):
+        self.tick()
+        if self.triggered:
+            self._flush(final=True)
+            self._write("model.inner_reasoning_ended", category="diagnostic",
+                status=("unavailable" if not self.received else "complete" if complete else "received_partial"),
+                received_chars=self.received, elapsed_seconds=self.clock() - self.started,
+                log_failed=self.failed)
+        self.parts.clear()
+        self.tail = ""
 
 
 def safe_finish_reason(value):
@@ -35,7 +103,7 @@ class ModelStreamError(ValueError):
         super().__init__(code)
 
 
-def read_chat_stream(response, limit, report, *, allow_tool_calls=False):
+def read_chat_stream(response, limit, report, *, allow_tool_calls=False, capture_reasoning=False):
     buffer = b""
     data_lines = []
     event_bytes = 0
@@ -157,6 +225,8 @@ def read_chat_stream(response, limit, report, *, allow_tool_calls=False):
             elif key == "reasoning_content" and text:
                 reasoning_head = (reasoning_head + text)[:4096]
                 reasoning_tail = (reasoning_tail + text)[-4096:]
+                if capture_reasoning:
+                    report(reasoning_chunk=text)
         reason = choice.get("finish_reason")
         if reason is not None:
             if not isinstance(reason, str) or not reason or finish is not None:

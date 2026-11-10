@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from uuid import uuid4
 
 import pytest
@@ -72,6 +72,49 @@ def test_batch_items_stay_closed_without_the_tag():
         {**item, "extra": "not declared"}]}))
     with pytest.raises(ValueError, match="stage.output_invalid"):
         parse(request, response)
+
+
+@pytest.mark.parametrize("tagged", [False, True])
+@pytest.mark.parametrize("method", [False, True])
+@pytest.mark.parametrize("completion", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("support", ["candidate", "formal", "mixed"])
+def test_fact_closure_legal_shapes_round_trip(tagged, method, completion, native, support):
+    from agent_core.stage_contracts import StageFactClosure, StageMethodFact, RoadTurnClosure
+    from agent_core.stage_planning import request_from_dict
+    request = action_request(facts=1)
+    request = replace(request, execution_context={"stage_runtime": {"fact_closure": True, "methods_enabled": True}})
+    item = claim(request)
+    if not tagged:
+        item.pop("kind")
+    if method:
+        item["method"] = {"source_ref": item["support_refs"][0], "dependencies": [], "conditions": "same input"}
+    formal = next(item.ref for item in request.context.history if item.record_type == "verified_fact")
+    refs = [0] if support == "candidate" else [formal] if support == "formal" else [0, formal]
+    closure = {"outcome": "succeeded", "reason": "observed", "support_refs": refs}
+    if completion:
+        closure["completion"] = {"reason": "criterion met", "support_refs": refs}
+    value = {"kind": "fact_closure", "candidates": [item], "closure": closure}
+    response = (D8ModelResponse("", "tool_calls", ({"id": "output", "type": "function", "function": {
+        "name": "submit_stage_result", "arguments": json.dumps({"result": value})}},))
+        if native else D8ModelResponse(json.dumps(value)))
+    parsed = parse(request, response)
+    assert isinstance(parsed, StageFactClosure)
+    assert isinstance(parsed.candidates[0], StageMethodFact) is method
+    assert isinstance(parsed.closure, RoadTurnClosure) is completion
+    review = replace(request, stage="stage_review", proposal=parsed)
+    restored = request_from_dict(json.loads(json.dumps(asdict(review))), type(parsed).__name__)
+    assert restored == review
+
+
+@pytest.mark.parametrize("support", [-1, 1, True, "verified_fact:absent:" + "0" * 64])
+def test_fact_closure_invalid_support_is_a_correctable_value_error(support):
+    request = action_request()
+    request = replace(request, execution_context={"stage_runtime": {"fact_closure": True}})
+    value = {"kind": "fact_closure", "candidates": [claim(request)], "closure": {
+        "outcome": "succeeded", "reason": "observed", "support_refs": [support]}}
+    with pytest.raises(ValueError, match=r"stage\."):
+        parse(request, D8ModelResponse(json.dumps(value)))
 
 
 def test_hint_names_the_kinds_and_why_one_is_absent():

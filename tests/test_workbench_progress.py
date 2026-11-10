@@ -67,7 +67,9 @@ def test_progress_reports_corrupt_evidence_without_partial_truth(tmp_path):
     path = next((directory / "commands").glob("output-*.json"))
     path.write_bytes(b"damaged")
     before = hashes(directory)
-    value = workbench.runner.progress(challenge_id)["progress"]
-    assert value["recovery"]["reason"] == "state_or_evidence_unreadable"
-    assert value["verified_facts"] == []
+    value = workbench.runner.progress(challenge_id)
+    assert value["snapshot"]["state"] == "unavailable"
+    assert value["snapshot"]["error"] == "state_read_failed"
+    assert value["snapshot"]["generated_at"] is None
+    assert value["progress"] is None
     assert hashes(directory) == before

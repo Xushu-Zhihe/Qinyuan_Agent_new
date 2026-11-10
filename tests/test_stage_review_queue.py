@@ -262,6 +262,25 @@ def test_successor_waits_for_parent_closure_then_plans_and_executes_without_own_
     assert any(branch["road_id"] in {road.road_id for road in child.roads} for branch in inherited)
 
 
+def test_rejected_successor_criterion_reuses_stage_identity_and_preserves_parent(case):
+    from agent_core.stage_planning import stage_runtime
+    state = install_successor(case, reject_goal=True)
+    original = case.models.inner.transform
+    def revise(request, raw):
+        if stage_runtime(request).get("criterion_target"):
+            return {"kind": "revise_criterion", "completion_criterion": "a further supported observation from the successor",
+                "reason": "clarify the same successor deliverable", "support_refs": []}
+        if request.stage == "stage_roads" and request.context.turn.parent_turn_id and request.context.turn.roads:
+            return {"kind": "roads", "roads": [{"description": "inspect the corrected successor criterion", "support_refs": []}]}
+        return original(request, raw)
+    case.models.inner.transform = revise
+    result = asyncio.run(finish_parent_before_successor(case, state))
+    root, child = case.app.store.list_stage_turns(case.app.task_id)
+    assert root.achievement is not None and child.turn_id == result.turn.turn_id
+    assert child.intent.description == "verify the direct successor"
+    assert child.intent.completion_criterion == "a further supported observation from the successor"
+
+
 def test_rejected_successor_intent_returns_to_parent_planner_and_preserves_achievement(case):
     state = install_successor(case, reject_goal=True)
     result = asyncio.run(finish_parent_before_successor(case, state))

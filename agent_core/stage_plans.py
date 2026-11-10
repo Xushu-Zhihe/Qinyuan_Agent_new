@@ -25,6 +25,11 @@ def admitted(store, identity):
 
 
 def status(store, task_id, session, *, evidence=None):
+    if session.scope == "turn_planning":
+        from agent_core.stage_storage import criterion_version, load_turn
+        turn = load_turn(store, task_id, session.owner_id)
+        if turn is not None and not criterion_version(store, task_id, turn, evidence=evidence).startswith("initial:"):
+            return "accepted"
     binding = next((row for row in bindings(store, task_id) if row[0] == session), None)
     if binding is None:
         return "accepted"
@@ -79,6 +84,18 @@ def submissions(store, task_id, change):
                 _fail("stage.planning_target_unbound", Category.POLICY)
             turn = new[0]
             parent = request.context.turn
+            if request.stage == "stage_draft":
+                from agent_core.stage_storage import _review_target_current
+                _review_target_current(store, task_id, identity)
+                if parent is None:
+                    _fail("stage.draft_parent_unsettled", Category.POLICY)
+                parent = old.get(parent.turn_id)
+                if (parent is None or parent.achievement is None
+                        or store.stage_evidence.model_root(parent.achievement.review_operation_id) != stage_runtime(request).get("draft_for")):
+                    _fail("stage.draft_parent_unsettled", Category.POLICY)
+                operation = store.load_d4_operation(parent.achievement.review_operation_id)
+                if operation is None or operation.application_ref is None:
+                    _fail("stage.draft_parent_unsettled", Category.POLICY)
             if (parent is None and current is not None or parent is not None
                     and (current is None or parent.turn_id != current.turn_id)):
                 _fail("stage.planning_frontier_changed", Category.POLICY)

@@ -177,7 +177,7 @@ class Network:
 
 
 @pytest.fixture
-def case(tmp_path):
+def case(tmp_path, request):
     outer, inner = (D1RoleConfig(role, "fake", "test", "test") for role in ("outer_planning", "inner_action"))
     authorization_id = str(uuid4())
     config = D3RunConfig(outer, inner, D3Authorization(authorization_id, ()), outer.role_config_ref,
@@ -192,7 +192,7 @@ def case(tmp_path):
     now = SimpleNamespace(value=1800000000.0)
     args = dict(config=config, sandbox=Sandbox(), workspace_sandbox=SimpleNamespace(),
         inner_model=models.inner, outer_model=models.outer, clock=lambda: now.value, mcp_manager=tools,
-        capacity_port=FakeUnicodeCapacity(), target_network_adapter=Network())
+        capacity_port=FakeUnicodeCapacity(), target_network_adapter=Network(), successor_drafts=getattr(request, "param", False))
     app = StageApplication(tmp_path, **args)
     request = TaskRequest.from_dict({"goal": "check the controlled result", "deadline_seconds": 3600,
         "target": {"endpoints": [{"url": "http://example.test:8080"}]}})
@@ -202,6 +202,260 @@ def case(tmp_path):
         token=SimpleNamespace(is_cancelled=False))
     yield case
     asyncio.run(case.app.close())
+
+
+@pytest.mark.parametrize("criterion_changed", [True, False])
+def test_criterion_revision_updates_same_turn_and_preserves_original_evidence(case, criterion_changed):
+    from agent_core.stage_contracts import TurnCriterionRevision
+    revised = []
+    def act(request, raw):
+        if request.stage == "stage_roads" and not revised:
+            revised.append(request)
+            return {"kind": "revise_criterion", "completion_criterion": (
+                "the observed result is supported by a formal Fact" if criterion_changed else request.context.turn.intent.completion_criterion),
+                "reason": "clarify how the same deliverable is verified", "support_refs": []}
+        return raw
+    case.models.inner.transform = act
+    result = asyncio.run(case.app.run(case.token))
+    original = revised[0].context.turn
+    assert result.turn.turn_id == original.turn_id
+    assert result.turn.intent.description == original.intent.description
+    assert (result.turn.intent.completion_criterion != original.intent.completion_criterion) is criterion_changed
+    reviews = [r for r in case.models.outer.calls if isinstance(r.proposal, TurnCriterionRevision)]
+    assert len(reviews) == 1
+    assert reviews[0].context.turn.intent == original.intent
+    assert case.app.store.load_turn(case.app.task_id, result.turn.turn_id).intent == result.turn.intent
+    from agent_core.stage_storage import _review_target_current
+    with pytest.raises(StageStateError) as stale:
+        _review_target_current(case.app.store, case.app.task_id, revised[0].model_request_id)
+    assert stale.value.code == ("stage.review_target_changed" if criterion_changed else "stage.criterion_version_changed")
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+@pytest.mark.parametrize("candidate_kind", [False, True])
+def test_fact_closure_uses_two_reviews_without_inner_resubmission(case, monkeypatch, interrupt, candidate_kind):
+    from agent_core.stage_contracts import StageFactBatch
+    def act(request, raw):
+        if raw.get("kind") == "fact_candidate":
+            candidate = dict(raw) if candidate_kind else {k: v for k, v in raw.items() if k != "kind"}
+            return {"kind": "fact_closure", "candidates": [candidate],
+                "closure": {"outcome": "succeeded", "reason": "local observation obtained", "support_refs": [0],
+                    "completion": {"reason": "criterion supported by this observation", "support_refs": [0]}}}
+        return raw
+    def assess(request, raw):
+        if isinstance(request.proposal, StageFactBatch):
+            return {"decisions": [{"decision": "accept", "reason": "direct observation"} for _ in request.proposal.candidates]}
+        if isinstance(request.proposal, RoadTurnClosure):
+            return {part: {"decision": "accept", "reason": "supported"} for part in ("road", "turn")}
+        return raw
+    case.models.inner.transform, case.models.outer.transform = act, assess
+    if interrupt:
+        def stopped(turn, road, binding, parts):
+            raise RuntimeError("controlled closure application interruption")
+        monkeypatch.setattr(case.app, "_apply_closure", stopped)
+        with pytest.raises(RuntimeError, match="controlled closure application interruption"):
+            asyncio.run(case.app.run(case.token))
+        task_id = case.app.task_id
+        asyncio.run(case.app.close())
+        case.app = StageApplication(case.path, **case.args)
+        case.app.bind(task_id)
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.achievement is not None
+    assert not any(r.stage == "stage_completion" for r in case.models.inner.calls)
+    assert len([r for r in case.models.outer.calls if isinstance(r.proposal, StageFactBatch)]) == 1
+    assert len([r for r in case.models.outer.calls if isinstance(r.proposal, RoadTurnClosure)]) == 1
+    assert case.app.store._connection.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+    from agent_core.stage_storage import resolved_fact_closure
+    first = next(r for r in case.models.outer.calls if isinstance(r.proposal, StageFactBatch))
+    history = case.app.evidence.history(case.app.task_id)
+    unavailable = tuple(replace(item, source_status="unavailable") if item.record_type == "verified_fact" else item for item in history)
+    assert resolved_fact_closure(case.app.store, case.app.task_id, first.proposal_operation_id, unavailable) is None
+    from agent_adapters.web.task_result import _stage_task_result
+    from agent_core.sqlite_control_store import SqliteControlStore
+    with SqliteControlStore.open_readonly(case.path / "control.sqlite") as reader:
+        assert reader.stage_evidence is None
+        view = _stage_task_result(case.path, {"task_run_id": case.app.task_id, "mode": "simulated"}, reader, case.args["config"])
+        assert not view["errors"] and len(view["verified_facts"]) == 1
+        assert reader._connection.total_changes == 0
+
+
+@pytest.mark.parametrize("turn_supported", [True, False])
+def test_joint_closure_waits_for_explicit_withdrawal_of_unreferenced_rejected_fact(case, turn_supported):
+    from agent_core.stage_contracts import StageFactBatch
+    from agent_core.stage_planning import stage_runtime
+    disposed = []
+    def act(request, raw):
+        if request.stage == "stage_completion" and not turn_supported:
+            assert "stage.joint_turn_support_missing" in json.dumps(request.messages)
+        issues = stage_runtime(request).get("fact_revisions", ())
+        pending = [item for item in issues if item["status"] not in {"corrected", "withdrawn"}]
+        if pending:
+            disposed.append(pending[0]["revision_ref"])
+            return {"kind": "fact_revision", "revision_ref": pending[0]["revision_ref"],
+                "decision": "withdraw", "reason": "the second claim was unsupported"}
+        if raw.get("kind") == "fact_candidate":
+            candidate = {k: v for k, v in raw.items() if k != "kind"}
+            return {"kind": "fact_closure", "candidates": [candidate, {**candidate, "content": "Unsupported extra assertion."}],
+                "closure": {"outcome": "succeeded", "reason": "observed", "support_refs": [0],
+                    "completion": {"reason": "supported", "support_refs": [0 if turn_supported else 1]}}}
+        return raw
+    def assess(request, raw):
+        if isinstance(request.proposal, StageFactBatch):
+            return {"decisions": [{"decision": "accept", "reason": "observed"},
+                {"decision": "revise", "reason": "unsupported assertion"}]}
+        if isinstance(request.proposal, RoadTurnClosure):
+            assert disposed
+            return {part: {"decision": "accept", "reason": "supported"} for part in ("road", "turn")}
+        if isinstance(request.proposal, RoadResolution):
+            assert disposed and request.context.turn.achievement is None
+        return raw
+    case.models.inner.transform, case.models.outer.transform = act, assess
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.achievement is not None and len(disposed) == 1
+    assert case.app.store._connection.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+    assert any(r.stage == "stage_completion" for r in case.models.inner.calls) is not turn_supported
+
+
+@pytest.mark.parametrize("reject_revision", [False, True])
+def test_rejected_initial_criterion_can_be_revised_without_new_turn(case, reject_revision):
+    from agent_core.stage_contracts import TurnCriterionRevision
+    from agent_core.stage_planning import stage_runtime
+    rejected = []
+    revised = []
+    def assess(request, raw):
+        if isinstance(request.proposal, TurnIntent) and not rejected:
+            rejected.append(request)
+            return {"decision": "revise", "reason": "clarify the criterion, keep the same deliverable"}
+        if isinstance(request.proposal, TurnCriterionRevision):
+            revised.append(request)
+            if reject_revision and len(revised) == 1:
+                return {"decision": "revise", "reason": "make the same criterion more explicit"}
+        return raw
+    def act(request, raw):
+        if stage_runtime(request).get("criterion_target"):
+            return {"kind": "revise_criterion", "completion_criterion": "a formal Fact supports the observed result",
+                "reason": "same result with explicit evidence requirement", "support_refs": []}
+        return raw
+    case.models.inner.transform, case.models.outer.transform = act, assess
+    result = asyncio.run(case.app.run(case.token))
+    turns = case.app.store.list_stage_turns(case.app.task_id)
+    assert len(turns) == 1 and result.turn.achievement is not None
+    assert turns[0].intent.description == rejected[0].proposal.description
+    assert any(isinstance(r.proposal, TurnCriterionRevision) for r in case.models.outer.calls)
+    assert len(revised) == (2 if reject_revision else 1)
+
+
+@pytest.mark.parametrize("revised", [None, "road", "turn"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_fact_closure_format_correction_preserves_partial_review_application(case, monkeypatch, revised, restart):
+    from agent_core.stage_contracts import StageFactBatch
+    assessed = []
+    def act(request, raw):
+        if raw.get("kind") == "fact_candidate":
+            return {"kind": "fact_closure", "candidates": [raw], "closure": {
+                "outcome": "succeeded", "reason": "observed", "support_refs": [0],
+                "completion": {"reason": "supported", "support_refs": [0]}}}
+        return raw
+    def assess(request, raw):
+        if isinstance(request.proposal, StageFactBatch):
+            return {"decisions": [{"decision": "accept", "reason": "observed"}]}
+        if isinstance(request.proposal, RoadTurnClosure):
+            assessed.append(request)
+            if len(assessed) == 1:
+                return {"road": "invalid review shape"}
+            return {part: {"decision": "revise" if part == revised else "accept", "reason": "repair " + part}
+                for part in ("road", "turn")}
+        return raw
+    case.models.inner.transform, case.models.outer.transform = act, assess
+    if restart:
+        apply = case.app._apply_closure
+        def committed(turn, road, binding, parts):
+            apply(turn, road, binding, parts)
+            raise RuntimeError("controlled interruption after corrected review commit")
+        monkeypatch.setattr(case.app, "_apply_closure", committed)
+        with pytest.raises(RuntimeError, match="controlled interruption after corrected review commit"):
+            asyncio.run(case.app.run(case.token))
+        task_id = case.app.task_id
+        asyncio.run(case.app.close())
+        case.app = StageApplication(case.path, **case.args)
+        case.app.bind(task_id)
+    result = asyncio.run(case.app.run(case.token))
+    assert result.turn.achievement is not None and result.turn.roads[0].status is IntentStatus.SUCCEEDED
+    assert len(assessed) == 2 and len(case.tools.calls) == 1
+    assert case.app.store._connection.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("case", [True], indirect=True)
+@pytest.mark.parametrize("draft_ready", [True, False, "in_flight"])
+@pytest.mark.parametrize("review_corrected", [False, True])
+def test_successor_draft_is_isolated_until_parent_closure_applies(case, monkeypatch, draft_ready, review_corrected):
+    import threading
+    import time
+    from agent_core.stage_contracts import StageFactBatch
+    from agent_core.stage_planning import stage_runtime
+    drafted = []
+    draft_finished = threading.Event()
+    draft_entered = threading.Event()
+    reviewed = []
+    invoke = case.models.inner.invoke
+    def pending_draft(envelope, timeout, token):
+        if envelope.request.stage == "stage_draft" and draft_ready == "in_flight":
+            draft_entered.set()
+            end = time.monotonic() + 8
+            while not token.is_cancelled and time.monotonic() < end:
+                time.sleep(.001)
+            assert token.is_cancelled
+        return invoke(envelope, timeout, token)
+    monkeypatch.setattr(case.models.inner, "invoke", pending_draft)
+    call = case.app.models.call
+    async def completed_draft(request, token):
+        if request.stage == "stage_draft" and not draft_ready:
+            while not token.is_cancelled:
+                await asyncio.sleep(.001)
+        result = await call(request, token)
+        if request.stage == "stage_draft":
+            draft_finished.set()
+        return result
+    monkeypatch.setattr(case.app.models, "call", completed_draft)
+    def act(request, raw):
+        if request.stage == "stage_draft":
+            drafted.append(request)
+            assert request.context.turn.achievement is None
+            return {"kind": "turn_intent", "description": "verify the next controlled result",
+                "completion_criterion": "the next controlled result is supported", "support_refs": []}
+        if raw.get("kind") == "fact_candidate":
+            return {"kind": "fact_closure", "candidates": [{k: v for k, v in raw.items() if k != "kind"}],
+                "closure": {"outcome": "succeeded", "reason": "observed", "support_refs": [0],
+                    "completion": {"reason": "criterion supported", "support_refs": [0]}}}
+        return raw
+    def assess(request, raw):
+        if isinstance(request.proposal, StageFactBatch):
+            return {"decisions": [{"decision": "accept", "reason": "observed"} for _ in request.proposal.candidates]}
+        if isinstance(request.proposal, RoadTurnClosure):
+            if draft_ready is True:
+                assert draft_finished.wait(8)
+            elif draft_ready == "in_flight":
+                assert draft_entered.wait(8)
+            reviewed.append(request)
+            if review_corrected and len(reviewed) == 1:
+                return {"road": "invalid review shape"}
+            return {p: {"decision": "accept", "reason": "supported"} for p in ("road", "turn")}
+        if isinstance(request.proposal, TurnIntent) and request.proposal.description == "verify the next controlled result":
+            return {"decision": "reject", "reason": "no additional deliverable required"}
+        return raw
+    case.models.inner.transform, case.models.outer.transform = act, assess
+    submit = case.app._submit_planning
+    promoted = []
+    def checked(request, identity, proposal):
+        if request.stage == "stage_draft":
+            assert case.app.store.load_turn(case.app.task_id, request.context.turn.turn_id).achievement is not None
+            assert len(case.app.store.list_stage_turns(case.app.task_id)) == 1
+            promoted.append(identity)
+        return submit(request, identity, proposal)
+    monkeypatch.setattr(case.app, "_submit_planning", checked)
+    asyncio.run(case.app.run(case.token))
+    assert len(drafted) == int(bool(draft_ready))
+    assert len(promoted) == int(draft_ready is True)
 
 
 @pytest.mark.parametrize("revised,interrupt", [(None, None), (None, "before"), ("road", "after"), ("turn", "after")])

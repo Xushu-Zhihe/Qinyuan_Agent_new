@@ -7,6 +7,28 @@ import pytest
 from scripts import qymonitor as monitor
 
 
+def test_boundary_operations_preserve_parent_links_without_exposing_draft_body(tmp_path):
+    db = make_run(tmp_path)
+    with sqlite3.connect(db) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("CREATE TABLE control_mutations(mutation_id TEXT,committed_at REAL)")
+        con.execute("INSERT INTO control_mutations VALUES ('commit',40)")
+        evidence = tmp_path / "stage-evidence"
+        evidence.mkdir(exist_ok=True)
+        for identity, value in {"close": {"road": {"decision": "accept"}, "turn": {"decision": "revise"}},
+                "draft": {"kind": "turn_intent", "description": "unverified private draft"}}.items():
+            (evidence / ("stage-result-" + identity + ".json")).write_text(json.dumps({"outcome": "valid", "content": json.dumps(value)}))
+        operations = {"close": {"start": {"started_at": 20}, "end": {"finished_at": 30}, "application": "commit"},
+            "draft": {"start": {"started_at": 21}, "end": {"finished_at": 29}, "application": None}}
+        requests = {"close": {"stage": "stage_review", "execution_context": {"stage_runtime": {"joint_fact_closure": "original"}}},
+            "draft": {"stage": "stage_draft", "execution_context": {"stage_runtime": {"draft_for": "close"}}}}
+        rows = monitor.boundary_operation_report(tmp_path, con, operations, requests)
+        assert rows[0]["parent_operation_id"] == "original" and rows[0]["applied_at"] == 40
+        assert rows[0]["decision"] == {"road": "accept", "turn": "revise"}
+        assert rows[1]["parent_operation_id"] == "close" and not rows[1]["applied"]
+        assert "unverified private draft" not in repr(rows)
+
+
 @pytest.mark.parametrize("accepted", [True, False])
 def test_intent_revision_chain_uses_branch_lineage_and_application_time(tmp_path, accepted):
     db = make_run(tmp_path)
